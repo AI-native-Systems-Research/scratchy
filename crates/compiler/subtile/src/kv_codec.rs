@@ -14,9 +14,9 @@
 
 use std::collections::HashMap;
 
-use crate::handoff::{Expansion, ExpansionId, LoweredDecode};
+use crate::handoff::{EmbedState, Expansion, ExpansionId, LoweredDecode};
 use crate::lower::{ArchOp, InputRef, LoweringInput, OpDesc, kv_operand_bias};
-use crate::subtile_ir::{KvOperand, SubOp};
+use crate::subtile_ir::{KvOperand, RopeFormTag, SubOp};
 
 /// When a codec step runs: a runtime condition the target's worker evaluates.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -129,6 +129,9 @@ pub enum KvCodecError {
     Offset { op: usize, why: String },
     /// A coded op that another construct already expanded to.
     AlreadyExpanded { op: usize, name: &'static str },
+    /// A float8 KV writer whose checkpoint declares a rotation pairing the graph's form does not
+    /// state: `RopeRotate` would drop it.
+    InterleavedRotation { op: usize, name: &'static str },
 }
 
 impl std::fmt::Display for KvCodecError {
@@ -149,6 +152,11 @@ impl std::fmt::Display for KvCodecError {
             Self::AlreadyExpanded { op, name } => {
                 write!(f, "op {op} ({name}): already part of another expansion")
             }
+            Self::InterleavedRotation { op, name } => write!(
+                f,
+                "op {op} ({name}): a float8 KV writer rotates through `RopeRotate`, in the graph's \
+                 NeoX pairing, and this writer's checkpoint declares the interleaved one"
+            ),
         }
     }
 }
@@ -449,6 +457,151 @@ impl Expander<'_> {
         self.read_as[i] = out;
         Ok(())
     }
+}
+
+/// ⭐⭐⭐ THE FLOAT8 KV CACHE'S STEPS — `KvCodec::Fp8E4m3`, the reference's `kv_cache_dtype=fp8`
+/// (spyre-inference 4a7d21d, `ops/reshape_and_cache.py:20-29, 47-52`): the rope, then ONE
+/// whole-tensor `quantize_kv` of the new K and of the new V, then the per-head `index_copy_` of the
+/// float8 rows into the float8 pools. A rotating writer `RopeAppend(k, cos, sin, v, k_cache,
+/// v_cache)` becomes `RopeRotate(k, cos, sin)`, `KvQuantize { K }` of the rotated rows,
+/// `KvQuantize { V }` of `v`, and `KvAppend(kq, vq, k_cache, v_cache)`; an un-rotated writer
+/// `KvAppend(k, v, ..)` gains the two quantizes ahead of it. The writer's steps are one expansion,
+/// unguarded, and every reader of the writer reads the `KvAppend` it became.
+///
+/// `scales` is the codec fact's (`KvCodec::Fp8E4m3(scales)`); every quantize carries it.
+///
+/// ⛔ NOT `KvEncode`. An encode runs AFTER its writer, under a runtime guard, packing the cache half
+/// the writer filled into a SEPARATE store the attention reads instead (TurboQuant). The float8
+/// cache IS the pool: its quantize runs BEFORE the writer, unguarded, over the writer's own value
+/// operand, and the writer stores what the quantize produced.
+///
+/// ⛔ A ROTATION THE GRAPH'S FORM DOES NOT STATE IS REFUSED: `RopeRotate` rotates in the graph's own
+/// pairing, so a writer whose checkpoint declares the interleaved one would lose it.
+pub fn expand_kv_quantize<E: EmbedState>(
+    l: &LoweredDecode<E>,
+    scales: scratchy_ir::KvCacheScales,
+) -> Result<LoweredDecode<E>, KvCodecError> {
+    let ops = &l.input.ops;
+    let mut next = (l.op_expansion.iter().flatten())
+        .map(|e| e.id.0 + 1)
+        .max()
+        .unwrap_or(0);
+    let (mut out, mut tiles, mut expansion) = (Vec::new(), Vec::new(), Vec::new());
+    let mut at = vec![0; ops.len()];
+    let mut read_as = vec![0; ops.len()];
+    for (i, od) in ops.iter().enumerate() {
+        let name = od.op.name();
+        let inputs: Vec<InputRef> = (od.inputs.iter())
+            .map(|r| match *r {
+                InputRef::Op(j) => InputRef::Op(read_as[j]),
+                InputRef::Ext(e) => InputRef::Ext(e),
+            })
+            .collect();
+        let operand = |k: usize| {
+            inputs.get(k).copied().ok_or(KvCodecError::MissingOperand {
+                op: i,
+                name,
+                operand: k as u8,
+            })
+        };
+        let (writer, [k, v, k_cache, v_cache], rotation) = match od.op {
+            SubOp::RopeAppend {
+                attention,
+                rope,
+                layer,
+                attn,
+                pairing,
+                layout,
+                ..
+            } => {
+                if pairing != RopeFormTag::NeoX {
+                    return Err(KvCodecError::InterleavedRotation { op: i, name });
+                }
+                let head_dim = rope.head_dim(attention);
+                let rotated = out.len();
+                out.push(OpDesc {
+                    op: SubOp::rope_rotate(head_dim),
+                    m: od.m,
+                    inputs: vec![operand(0)?, operand(1)?, operand(2)?],
+                });
+                // The rotated K is the tile the writer's output realized.
+                tiles.push(l.op_tiles[i]);
+                expansion.push(None);
+                let writer = SubOp::KvAppend {
+                    attention,
+                    head_dim,
+                    layer,
+                    attn,
+                    layout,
+                };
+                let values = [InputRef::Op(rotated), operand(3)?, operand(4)?, operand(5)?];
+                (writer, values, Some(rotated))
+            }
+            SubOp::KvAppend { .. } => {
+                let values = [operand(0)?, operand(1)?, operand(2)?, operand(3)?];
+                (od.op, values, None)
+            }
+            _ => {
+                out.push(OpDesc {
+                    op: od.op,
+                    m: od.m,
+                    inputs,
+                });
+                tiles.push(l.op_tiles[i]);
+                expansion.push(l.op_expansion[i]);
+                at[i] = out.len() - 1;
+                read_as[i] = out.len() - 1;
+                continue;
+            }
+        };
+        if l.op_expansion[i].is_some() {
+            return Err(KvCodecError::AlreadyExpanded { op: i, name });
+        }
+        let own = Some(Expansion {
+            id: ExpansionId(next),
+            guard: None,
+        });
+        next += 1;
+        if let Some(r) = rotation {
+            expansion[r] = own;
+        }
+        let mut quantize = |operand: KvOperand, x: InputRef| {
+            out.push(OpDesc {
+                op: SubOp::KvQuantize { operand, scales },
+                m: od.m,
+                inputs: vec![x],
+            });
+            tiles.push(None);
+            expansion.push(own);
+            InputRef::Op(out.len() - 1)
+        };
+        let (kq, vq) = (quantize(KvOperand::K, k), quantize(KvOperand::V, v));
+        out.push(OpDesc {
+            op: writer,
+            m: od.m,
+            inputs: vec![kq, vq, k_cache, v_cache],
+        });
+        tiles.push(rotation.map_or(l.op_tiles[i], |_| None));
+        expansion.push(own);
+        at[i] = out.len() - 1;
+        read_as[i] = out.len() - 1;
+    }
+    Ok(l.with_ops(
+        LoweringInput {
+            sources: l.input.sources.clone(),
+            ops: out,
+            result: read_as[l.input.result],
+            exported: l.input.exported.map(|e| read_as[e]),
+        },
+        tiles,
+        (l.norm_gain_add_tiles.iter())
+            .map(|(op, tile)| (at[*op], *tile))
+            .collect(),
+        expansion,
+        (l.unnamed_reads.iter())
+            .map(|(w, r)| (at[*w], at[*r]))
+            .collect(),
+    ))
 }
 
 #[cfg(test)]
@@ -765,6 +918,104 @@ mod tests {
         match expand_kv_codec(&l, &FACTS) {
             Err(KvCodecError::NoWriter { op: 6, name }) => assert_eq!(name, "AttnDecode"),
             other => panic!("expected NoWriter at op 6, got {other:?}"),
+        }
+    }
+
+    /// ⭐ THE FLOAT8 CACHE'S STEPS — MATCH. A rotating writer becomes its rotation, the two
+    /// whole-tensor quantizes and the un-rotated writer of their rows: one expansion, unguarded; the
+    /// attention reads the writer it became, and the registry admits every op.
+    #[test]
+    fn a_float8_cache_quantizes_ahead_of_its_writer() {
+        use InputRef::Op;
+        let l = layer(64, 1);
+        let writer = l.input.ops[5].clone();
+        let x = expand_kv_quantize(&l, scratchy_ir::KvCacheScales::Unscaled).expect("expands");
+        assert_eq!(
+            shape(&x)[4..11],
+            [
+                ("RopeRotate", None),
+                ("RopeRotate", None),
+                ("KvQuantize", None),
+                ("KvQuantize", None),
+                ("KvAppend", None),
+                ("AttnDecode", None),
+                ("MatmulTile", None),
+            ]
+        );
+        let ins = |i: usize| x.input.ops[i].inputs.clone();
+        assert_eq!(ins(5), writer.inputs[..3].to_vec());
+        assert_eq!(ins(6), [Op(5)]);
+        assert_eq!(ins(7), [writer.inputs[3]]);
+        assert_eq!(ins(8), [Op(6), Op(7), writer.inputs[4], writer.inputs[5]]);
+        assert_eq!(ins(9)[3], Op(8), "the attention reads the writer");
+        assert!(
+            (6..=7).all(|i| matches!(
+                x.input.ops[i].op,
+                SubOp::KvQuantize {
+                    scales: scratchy_ir::KvCacheScales::Unscaled,
+                    ..
+                }
+            )),
+            "every quantize carries the codec's scales"
+        );
+        let id = |i: usize| x.op_expansion[i].map(|e| e.id);
+        assert!(id(5).is_some() && (6..=8).all(|i| id(i) == id(5)));
+        assert_eq!(id(9), None);
+        let bad = (x.input.ops.iter()).find(|od| !od.op.arity_ok(od.inputs.len()));
+        assert!(bad.is_none(), "{bad:?}");
+    }
+
+    /// An un-rotated writer (`kv_append`, Nemotron-H) gains the two quantizes ahead of it, and
+    /// stores their rows.
+    #[test]
+    fn a_float8_cache_quantizes_an_unrotated_writers_rows() {
+        use crate::subtile_ir::AttnMask;
+        use InputRef::{Ext, Op};
+        use scratchy_ir::model_facts::HeadDim;
+        let attention = one_layer_attention(256, 64, 64);
+        let mut input = one_layer_input_shaped(256, 64, 512, 64);
+        input.ops[4] = OpDesc {
+            op: SubOp::ScalarMul { scale: 1.0 },
+            m: 1,
+            inputs: vec![Op(1)],
+        };
+        input.ops[5] = OpDesc {
+            op: SubOp::kv_append(attention, HeadDim::new(64), 0, AttnMask::Causal),
+            m: 1,
+            inputs: vec![Op(2), Op(3), Ext(7), Ext(8)],
+        };
+        let x = expand_kv_quantize(&lowered(input), scratchy_ir::KvCacheScales::Unscaled)
+            .expect("expands");
+        assert_eq!(
+            shape(&x)[4..10],
+            [
+                ("ScalarMul", None),
+                ("KvQuantize", None),
+                ("KvQuantize", None),
+                ("KvAppend", None),
+                ("AttnDecode", None),
+                ("MatmulTile", None),
+            ]
+        );
+        let ins = |i: usize| x.input.ops[i].inputs.clone();
+        assert_eq!((ins(5), ins(6)), (vec![Op(2)], vec![Op(3)]));
+        assert_eq!(ins(7), [Op(5), Op(6), Ext(7), Ext(8)]);
+        assert_eq!(ins(8)[3], Op(7));
+    }
+
+    /// NEAR-MISS — a writer whose checkpoint declares the interleaved pairing: `RopeRotate` rotates
+    /// in the graph's own form, so the expansion refuses it by name rather than drop the pairing.
+    #[test]
+    fn a_float8_cache_refuses_an_interleaved_rotation() {
+        let mut l = layer(64, 1);
+        if let SubOp::RopeAppend { pairing, .. } = &mut l.input.ops[5].op {
+            *pairing = crate::subtile_ir::RopeFormTag::Interleaved;
+        }
+        match expand_kv_quantize(&l, scratchy_ir::KvCacheScales::Unscaled) {
+            Err(KvCodecError::InterleavedRotation { op: 5, name }) => {
+                assert_eq!(name, "RopeAppend")
+            }
+            other => panic!("expected InterleavedRotation at op 5, got {other:?}"),
         }
     }
 }

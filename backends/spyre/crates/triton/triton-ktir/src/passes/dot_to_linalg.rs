@@ -2058,7 +2058,11 @@ module {
         let c = m.census();
         let get = |n: &str| c.iter().find(|(k, _)| k == n).map(|(_, v)| *v).unwrap_or(0);
         assert_eq!(get("linalg.batch_matmul"), 1, "the dot lowered");
-        assert_eq!(get("arith.extf"), 1, "the widen is left standing, unclaimed");
+        assert_eq!(
+            get("arith.extf"),
+            1,
+            "the widen is left standing, unclaimed"
+        );
     }
 
     /// NEIGHBOUR — the attention's own form: a gathered fp8 page, reshaped, widened, and contracted
@@ -2103,7 +2107,11 @@ module {
         let c = m.census();
         let get = |n: &str| c.iter().find(|(k, _)| k == n).map(|(_, v)| *v).unwrap_or(0);
         assert_eq!(get("linalg.batch_matmul"), 1, "the dot lowered");
-        assert_eq!(get("arith.extf"), 1, "the widen is left standing, unclaimed");
+        assert_eq!(
+            get("arith.extf"),
+            1,
+            "the widen is left standing, unclaimed"
+        );
     }
 
     /// CONTROL — batch dims that disagree: no pairing of the batches exists, so

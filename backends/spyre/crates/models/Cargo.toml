@@ -28,10 +28,10 @@ superdsc-dump = []
 tp-2 = ["scratchy-target-spyre-compiler/tp-2", "scratchy-target-spyre/tp-2"]
 tp-4 = ["scratchy-target-spyre-compiler/tp-4", "scratchy-target-spyre/tp-4"]
 tp-8 = ["scratchy-target-spyre-compiler/tp-8", "scratchy-target-spyre/tp-8"]
-# THE KV POOLS' ELEMENT FORMAT (`kv/fp8` through scratchy-kv), on BOTH copies of the target crate for
-# the reason the worlds are: the bake is a host build dependency and cargo does not unify its features
-# with the binary's.
-kv-fp8 = ["scratchy-target-spyre-compiler/kv-fp8", "scratchy-target-spyre/kv-fp8"]
+# THE FLOAT8 KV CACHE (`kv/fp8` through scratchy-kv): this crate's build script hands the spyre
+# emitter `Spyre { kv_fp8 }`, whose `kv_store` selects the shared fact (`KvCodec::Fp8E4m3`) for every
+# model it bakes. Nothing else reads it.
+kv-fp8 = []
 
 [dependencies]
 # THE MODEL SCOPE: which models, heads and quant presets — `scratchy-models`' own features,

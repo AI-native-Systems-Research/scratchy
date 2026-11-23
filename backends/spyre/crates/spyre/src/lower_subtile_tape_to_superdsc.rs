@@ -579,15 +579,16 @@ pub(crate) fn scalar_registry<F: RopeForm>(ir: &SubtileIR<F>) -> Vec<f32> {
 }
 
 /// ⭐⭐⭐ THE BUNDLE'S SCALAR REGISTRY — the graph's own multipliers ([`scalar_registry`]), then
-/// every constant a WALKING program reads through the registry that the graph does not state (`triton_ktir_superdsc::layout::registry_constants`), in node order, each once. A walk
-/// states constants of its own — the batched decode's `finfo(f16).min` clamp — that no node's
-/// config names, and the door looks every one up by value ("registry desync" otherwise).
+/// every constant a program reads through the registry that the graph does not state
+/// (`triton_ktir_superdsc::layout::registry_constants`), in node order, each once. A program
+/// states constants of its own that no node's config names — the batched decode's
+/// `finfo(f16).min` clamp, the float8 quantize's `±FMAX` saturation — and the door looks every one
+/// up by value ("registry desync" otherwise).
 ///
-/// WALKING, because that is the program whose lowering the walk is, whatever it computes (the
-/// door's own dispatch, `loop_fold::walks`): its registry reads are its program's constants. Every
-/// other program reads the constants its node states — the per-`Program` bodies by their node's
-/// config, which the graph's list holds — and the program-side reading is the whole-function
-/// walk's, which a per-`Program` body's program need not satisfy.
+/// EVERY PROGRAM, walking or straight-line: `registry_constants` is each program's own reading of
+/// the values its lowering looks up (a per-`Program` body's by its node's config, a whole-function
+/// body's off its program), so a program whose constants the graph already states adds nothing,
+/// and one that states its own adds them here.
 ///
 /// ONE derivation for the two lists that must agree index for index: the placement's
 /// ([`compute_bundle_layout`], which the door looks values up in) and the wiring's
@@ -618,11 +619,7 @@ pub fn bundle_registry<T: ktir_superdsc::collective::Tp, F: RopeForm>(
         else {
             continue;
         };
-        for k in ops
-            .iter()
-            .filter_map(|e| e.ktir.as_ref())
-            .filter(|k| ktir_superdsc::emit::loop_fold::walks(k))
-        {
+        for k in ops.iter().filter_map(|e| e.ktir.as_ref()) {
             let values = triton_ktir_superdsc::layout::registry_constants(k)
                 .map_err(|e| SuperDscError(format!("{}: {}", k.func.name, e.message)))?;
             for v in values {
@@ -801,10 +798,10 @@ pub fn compute_bundle_layout<T: ktir_superdsc::collective::Tp, F: RopeForm>(
         }
         m
     };
-    // ⭐ THE KV POOLS AT THE BUILD'S KV FORMAT — `scratchy_triton_splice::KvFormat`, the one selection
-    // the splice states every paged kernel's pool pointers from: the pools keep fp16's geometry and
-    // take the format's bytes.
-    let kv_pools: std::collections::HashSet<u32> = kv_pool_tids(ir).into_iter().collect();
+    // ⭐ THE KV POOLS AT THEIR FORMAT — the tape's own statement
+    // ([`scratchy_triton_splice::kv_pool_formats`]), the one every paged kernel's pool pointers are
+    // stated from: the pools keep fp16's geometry and take the format's bytes.
+    let kv_pools = scratchy_triton_splice::kv_pool_formats(ir).map_err(SuperDscError)?;
     // ⭐⭐⭐ THE SEAT'S GATE TABLE (the quadruple's fourth word, the `SubOp::Sample` node's
     // `inputs[4]`) IS RESERVED AT THE CONVERT'S OWN DEVICE WIDTH — the β ruling
     // (front-b-noise, auditor 2026-10-27). The gate's chain crosses the i32→f32 convert
@@ -838,8 +835,8 @@ pub fn compute_bundle_layout<T: ktir_superdsc::collective::Tp, F: RopeForm>(
             *wide
         } else if fp8_weight_tids.contains(&tid) {
             Df::Fp8
-        } else if kv_pools.contains(&tid) {
-            <scratchy_triton_splice::KvFormat as ktir_superdsc::superdsc_opspec::DataFormat>::DF
+        } else if let Some(&(_, format)) = kv_pools.iter().find(|(p, _)| *p == tid) {
+            format.df()
         } else {
             Df::Fp16
         };
@@ -1704,8 +1701,15 @@ pub fn compute_bundle_layout<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     };
     // ⭐ THE CACHE IS ALLOCATED ROW-OUTERMOST, as spyre-inference's `allocate_pages` allocates it
     // (`head_major_kv_layout`) — before any op addresses it.
-    for &tid in &pools {
-        layout.allocate_row_outermost::<scratchy_triton_splice::KvFormat>(tid)?;
+    for &(tid, format) in kv_pools.iter().filter(|(p, _)| pools.contains(p)) {
+        match format {
+            scratchy_triton_splice::KvPoolFormat::Fp16 => {
+                layout.allocate_row_outermost::<ktir_superdsc::superdsc_opspec::Fp16>(tid)?
+            }
+            scratchy_triton_splice::KvPoolFormat::Fp8(_) => {
+                layout.allocate_row_outermost::<ktir_superdsc::superdsc_opspec::Fp8>(tid)?
+            }
+        }
     }
     Ok(layout)
 }

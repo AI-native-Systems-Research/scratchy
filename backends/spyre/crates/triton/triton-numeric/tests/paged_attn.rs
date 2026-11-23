@@ -18,15 +18,21 @@ use std::collections::HashMap;
 use ktir_core::arena::Arena;
 use ktir_core::ir::IRFunction;
 use ktir_core::opkind::OpKind;
-use triton_frontend::codegen::{self, ArgSpec, KernelSpec};
+use ktir_superdsc::superdsc_opspec::Fp16;
+use scratchy_triton_splice::{
+    AttnScale, BatchChunking, BatchedDecodeGeometry, BlockSize, HeadDim, HeadGeometry, HeadWidth,
+    KvHeads, KvWriteGeometry, PagedAttnGeometry, PagedKernel, PagedSequence, PoolPages, QueryHeads,
+    RotDim, SchedulerBlockTokens, TokenRows, WalkBlocks, batched_decode_kernel, kv_write_kernel,
+    paged_attn_kernel,
+};
+use triton_frontend::codegen::{self, KernelSpec};
 use triton_frontend::opt;
-use triton_frontend::semantic::Val;
 use triton_frontend::target::Target;
 
-const DECODE: &str = include_str!("../../../../kernels/page_attn_head_major_decode.py");
-const PREFILL: &str = include_str!("../../../../kernels/page_attn_head_major_prefill.py");
-const KV_WRITE: &str = include_str!("../../../../kernels/reshape_and_cache_head_major.py");
-const BATCHED: &str = include_str!("../../../../kernels/batched_decode_head_major.py");
+/// A test's positive extent, as the nonzero a geometry takes.
+fn nz(v: u32) -> std::num::NonZeroU32 {
+    std::num::NonZeroU32::new(v).expect("a test extent is positive")
+}
 
 /// A kernel through the whole ladder to the emulator's IR.
 fn lower(src: &str, spec: &KernelSpec) -> IRFunction<'static> {
@@ -43,42 +49,34 @@ fn lower(src: &str, spec: &KernelSpec) -> IRFunction<'static> {
         .unwrap_or_else(|e| panic!("to_ktir_emit refused the kernel: {e}"))
 }
 
-fn spec(file: &str, kernel: &str, pointers: &[(&str, &str)], ce: &[(&str, i128)]) -> KernelSpec {
-    let mut signature = HashMap::new();
-    let mut constexprs = HashMap::new();
-    for (k, v) in pointers {
-        signature.insert(k.to_string(), ArgSpec::parse(v).expect("pointer spec"));
-    }
-    for (k, v) in ce {
-        signature.insert(k.to_string(), ArgSpec::Constexpr);
-        constexprs.insert(k.to_string(), Val::Int(*v));
-    }
-    KernelSpec {
-        kernel: kernel.to_string(),
-        signature,
-        constexprs,
-        file: file.to_string(),
-    }
+/// The class's heads at `nqh` over `nkvh` of `hd`, as every paged kernel's builder takes them.
+fn heads(nqh: i128, nkvh: i128, hd: i128) -> HeadGeometry {
+    let hd = hd as u32;
+    HeadGeometry::new(
+        QueryHeads::new(nqh as u32),
+        KvHeads::new(nkvh as u32),
+        HeadDim::new(hd),
+        RotDim::new(hd),
+        BlockSize::new(SchedulerBlockTokens::REFERENCE.get()),
+    )
 }
 
-fn kv_write_spec(t: i128, nkvh: i128, hd: i128, num_rows: i128) -> KernelSpec {
-    spec(
-        "reshape_and_cache_head_major.py",
-        "reshape_and_cache_head_major_kernel",
-        &[
-            ("key", "*fp16"),
-            ("value", "*fp16"),
-            ("k_rows", "*fp16"),
-            ("v_rows", "*fp16"),
-            ("row_index", "*i32"),
-        ],
-        &[
-            ("T", t),
-            ("NUM_KV_HEADS", nkvh),
-            ("HEAD_SIZE", hd),
-            ("NUM_ROWS", num_rows),
-        ],
-    )
+/// The scheduler block a recording (or a census) states, as the kernels' builders take it.
+fn scheduler_block(tokens: i128) -> SchedulerBlockTokens {
+    SchedulerBlockTokens::of_whole_sticks(tokens as u32)
+}
+
+/// The KV write at a 16-bit pool of `pages` blocks of `block_size`, from its ONE builder
+/// (`kv_write_kernel`).
+fn kv_write(t: i128, nkvh: i128, hd: i128, block_size: i128, pages: i128) -> PagedKernel {
+    kv_write_kernel::<Fp16>(KvWriteGeometry {
+        rows: TokenRows::new(nz(t as u32)),
+        nkvh: KvHeads::new(nkvh as u32),
+        hd: HeadWidth::of_whole_sticks(hd as u32),
+        block: scheduler_block(block_size),
+        pages: PoolPages::new(nz(pages as u32)),
+    })
+    .expect("the KV write's spec")
 }
 
 #[derive(Clone, Copy)]
@@ -93,50 +91,25 @@ struct AttnShape {
 }
 
 /// The kernel a sequence's step runs — spyre-inference's dispatch: the decode kernel at one query
-/// row, the prefill kernel past it.
-fn attn_kernel(s: &AttnShape) -> (&'static str, KernelSpec) {
-    let decode = s.padded_query_len == 1;
-    let mut pointers = vec![
-        ("query", "*fp16"),
-        ("query_row_index", "*i32"),
-        ("k_pages", "*fp16"),
-        ("v_pages", "*fp16"),
-        ("page_index_table", "*i32"),
-    ];
-    if decode {
-        pointers.push(("kv_row_pool", "*i32"));
-    }
-    pointers.extend([("mask_stack", "*fp16"), ("out", "*fp16")]);
-    let mut ce = vec![
-        ("NUM_TOKENS", s.padded_query_len),
-        ("NUM_HEADS", s.num_heads),
-        ("NUM_KV_HEADS", s.num_kv_heads),
-        ("HEAD_SIZE", s.head_size),
-        ("BLOCK_SIZE", s.block_size),
-        ("NUM_PAGES", s.num_pages),
-        ("NUM_BLOCKS", s.num_blocks),
-    ];
-    let (src, file, kernel) = if decode {
-        (
-            DECODE,
-            "page_attn_head_major_decode.py",
-            "page_attn_head_major_decode_kernel",
-        )
-    } else {
-        ce.push(("PADDED_QUERY_LEN", s.padded_query_len));
-        (
-            PREFILL,
-            "page_attn_head_major_prefill.py",
-            "page_attn_head_major_prefill_kernel",
-        )
-    };
-    let mut k = spec(file, kernel, &pointers, &ce);
-    k.signature.insert("SCALE".to_string(), ArgSpec::Constexpr);
-    k.constexprs.insert(
-        "SCALE".to_string(),
-        Val::Float(1.0 / (s.head_size as f64).sqrt()),
-    );
-    (src, k)
+/// row, the prefill kernel past it — from its ONE builder (`paged_attn_kernel`).
+fn attn_kernel(s: &AttnShape) -> PagedKernel {
+    let rows = TokenRows::new(nz(s.padded_query_len as u32));
+    paged_attn_kernel::<Fp16>(PagedAttnGeometry {
+        seq: if s.padded_query_len == 1 {
+            PagedSequence::Decode
+        } else {
+            PagedSequence::Prefill {
+                padded_query_len: rows,
+            }
+        },
+        rows,
+        heads: heads(s.num_heads, s.num_kv_heads, s.head_size),
+        block: scheduler_block(s.block_size),
+        pages: PoolPages::new(nz(s.num_pages as u32)),
+        blocks: WalkBlocks::new(nz(s.num_blocks as u32)),
+        scale: AttnScale::new(1.0 / (s.head_size as f32).sqrt()),
+    })
+    .expect("the attention's spec")
 }
 
 fn count(f: &IRFunction, kind: OpKind) -> usize {
@@ -152,7 +125,8 @@ fn count(f: &IRFunction, kind: OpKind) -> usize {
 #[test]
 fn the_step_reaches_the_emulator_as_hardware_gathers_and_scatters() {
     // A prompt chunk's write: one scatter per kv head per cache (their per-head `index_copy_`).
-    let w = lower(KV_WRITE, &kv_write_spec(32, 8, 64, 8 * 8 * 64));
+    let k = kv_write(32, 8, 64, 64, 8);
+    let w = lower(k.src, &k.spec);
     assert_eq!(
         count(&w, OpKind::KtdpConstructIndirectAccessTile),
         2 * 8,
@@ -160,7 +134,8 @@ fn the_step_reaches_the_emulator_as_hardware_gathers_and_scatters() {
     );
     // A decode step's one token is under Triton's scatter floor of 8 rows: each row is its own
     // store at the row its head's index names — still an indirect tile, one per (head, cache).
-    let w1 = lower(KV_WRITE, &kv_write_spec(1, 8, 64, 8 * 8 * 64));
+    let k = kv_write(1, 8, 64, 64, 8);
+    let w1 = lower(k.src, &k.spec);
     assert_eq!(
         count(&w1, OpKind::KtdpConstructIndirectAccessTile),
         2 * 8,
@@ -175,8 +150,8 @@ fn the_step_reaches_the_emulator_as_hardware_gathers_and_scatters() {
         num_pages: 8,
         num_blocks: 3,
     };
-    let (src, k) = attn_kernel(&decode);
-    let a = lower(src, &k);
+    let k = attn_kernel(&decode);
+    let a = lower(k.src, &k.spec);
     // ⭐ THE WALK IS A LOOP — `walk_tiles`' ONE block body, not a copy per block.
     assert_eq!(
         count(&a, OpKind::ScfFor),
@@ -192,22 +167,22 @@ fn the_step_reaches_the_emulator_as_hardware_gathers_and_scatters() {
         "query, K, V and out through their indices"
     );
     // And the program is the same size however long the walk.
-    let (src, k) = attn_kernel(&AttnShape {
+    let k = attn_kernel(&AttnShape {
         num_pages: 64,
         num_blocks: 64,
         ..decode
     });
     assert_eq!(
-        lower(src, &k).ops_deep().len(),
+        lower(k.src, &k.spec).ops_deep().len(),
         a.ops_deep().len(),
         "a longer walk grew the program"
     );
     // The prompt kernel gathers each page ONCE, whole: every query head rides the one walk.
-    let (src, k) = attn_kernel(&AttnShape {
+    let k = attn_kernel(&AttnShape {
         padded_query_len: 32,
         ..decode
     });
-    let p = lower(src, &k);
+    let p = lower(k.src, &k.spec);
     assert_eq!(
         count(&p, OpKind::ScfFor),
         1,
@@ -413,8 +388,8 @@ fn attend(s: &Step, kp: &[f64], vp: &[f64], pt: Arg) -> Vec<f64> {
         num_pages: pages,
         num_blocks: nb,
     };
-    let (src, k) = attn_kernel(&shape);
-    let f = lower(src, &k);
+    let k = attn_kernel(&shape);
+    let f = lower(k.src, &k.spec);
     let (rows, width) = (mq as usize, (nqh * hd) as usize);
     let q_shape = vec![rows, width];
     // The batch is this one sequence: its rows are the query's rows, in order.
@@ -449,7 +424,8 @@ fn the_step_matches_spyre_inference(config: &str) {
     let pool_rows = s.geom("NUM_PAGES") * nkvh * s.geom("BLOCK");
 
     // THE WRITE — exact: a scatter moves bits.
-    let w = lower(KV_WRITE, &kv_write_spec(mq, nkvh, hd, pool_rows));
+    let k = kv_write(mq, nkvh, hd, s.geom("BLOCK"), s.geom("NUM_PAGES"));
+    let w = lower(k.src, &k.spec);
     let (t, kvh) = (mq as usize, nkvh as usize);
     let pool = vec![pool_rows as usize, hd as usize];
     // `kv_write_index`'s one `[T]` index per kv head, one after another: the recording holds the
@@ -600,37 +576,21 @@ impl Batch {
         let s = &self.step;
         let (nqh, nkvh, hd) = (s.geom("NQH"), s.geom("NKVH"), s.geom("HD"));
         let (block, pages) = (s.geom("BLOCK"), s.geom("NUM_PAGES"));
-        let mut k = spec(
-            "batched_decode_head_major.py",
-            "batched_decode_head_major_kernel",
-            &[
-                ("query", "*fp16"),
-                ("rep_row_ids", "*i32"),
-                ("k_pages", "*fp16"),
-                ("v_pages", "*fp16"),
-                ("chunk_page_ids", "*i32"),
-                ("mask_by_chunk", "*fp16"),
-                ("out", "*fp16"),
-            ],
-            &[
-                ("NUM_TOKENS", self.seqs),
-                ("NUM_SEQS", self.seqs),
-                ("BLOCKS_PER_CHUNK", self.blocks_per_chunk),
-                ("NUM_CHUNKS", self.num_chunks),
-                ("NUM_KV_HEADS", nkvh),
-                ("NUM_QUERIES_PER_KV", nqh / nkvh),
-                ("BLOCK_SIZE", block),
-                ("HEAD_SIZE", hd),
-                ("NUM_PAGES", pages),
-                ("ROWS_PER_PAGE", self.rows_per_page),
-            ],
-        );
-        k.signature.insert("SCALE".to_string(), ArgSpec::Constexpr);
-        k.constexprs.insert(
-            "SCALE".to_string(),
-            Val::Float(s.meta["derived"]["scale"].as_f64().expect("scale")),
-        );
-        let f = lower(BATCHED, &k);
+        let k = batched_decode_kernel::<Fp16>(BatchedDecodeGeometry {
+            rows: TokenRows::new(nz(self.seqs as u32)),
+            heads: heads(nqh, nkvh, hd),
+            block: scheduler_block(block),
+            pages: PoolPages::new(nz(pages as u32)),
+            chunking: BatchChunking {
+                seqs: self.seqs as u32,
+                blocks_per_chunk: self.blocks_per_chunk as u32,
+                num_chunks: self.num_chunks as u32,
+                rows_per_page: self.rows_per_page as u32,
+            },
+            scale: AttnScale::new(s.meta["derived"]["scale"].as_f64().expect("scale") as f32),
+        })
+        .expect("the batched decode's spec");
+        let f = lower(k.src, &k.spec);
         let (rows, width) = (self.seqs as usize, (nqh * hd) as usize);
         let e = self.entries() as usize;
         let index_rows = e * self.rows_per_page as usize;

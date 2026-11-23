@@ -99,7 +99,7 @@ pub struct BundleAttnParams {
 /// one [`QuantizedActivations`] per bundle pass, so q/k/v reading one rms output quantize it once
 /// and gate/up another once — main's per-BUNDLE set, which the walk dropped when the matmuls moved
 /// onto it and now takes back. Every buffer a program WRITES is forgotten before it lowers and again
-/// after ([`lk::written_buffers`]), so a held quantize only ever names the bytes a later matmul reads.
+/// after ([`lk::WrittenBuffers`]), so a held quantize only ever names the bytes a later matmul reads.
 ///
 /// `attn_params` is [`BundleAttnParams`] — main's own remaining parameters, for the two bodies whose
 /// device laws need a fact no program states.
@@ -113,12 +113,12 @@ pub fn lower<T: ktir_superdsc::collective::Tp>(
     // ⛔ WHAT THIS PROGRAM WRITES IS NOT THE QUANTIZE ANY EARLIER PROGRAM TOOK, before it lowers
     // (a matmul reading what its own program wrote reads the new bytes) and after (no later matmul
     // may reuse a chain over bytes this program replaced).
-    let written = lk::written_buffers(k)?;
-    for &t in &written {
+    let written = lk::WrittenBuffers::of(k)?;
+    for &t in written.tids() {
         quantized.written(t);
     }
     let ops = lower_kind(k, sym_id_base, layout, attn_params, quantized);
-    for &t in &written {
+    for &t in written.tids() {
         quantized.written(t);
     }
     ops
@@ -177,6 +177,12 @@ fn lower_kind<T: ktir_superdsc::collective::Tp>(
         // multiplies over generic ops, whole-tensor at corner 0 (the splice's own
         // region guard refuses a windowed one). No door fact is read off the program.
         Program::Sample => windowed(
+            name,
+            &r,
+            lower_function(k, layout, sym_id_base, None, quantized),
+        ),
+        // The float8 cache's quantize — its saturations and its narrowing, generic ops of the walk.
+        Program::KvQuantize => windowed(
             name,
             &r,
             lower_function(k, layout, sym_id_base, None, quantized),

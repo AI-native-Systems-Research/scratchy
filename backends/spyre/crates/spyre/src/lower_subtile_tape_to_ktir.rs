@@ -937,7 +937,6 @@ pub(crate) fn lower_one_node<T: ktir_superdsc::collective::Tp, F: RopeForm>(
         | SubOp::EncoderAttn { .. }
         | SubOp::GatedDeltaNet
         | SubOp::Mamba2 { .. }
-        | SubOp::KvAppend { .. }
         | SubOp::ExpertAct { .. }
         | SubOp::Mean => Unhandled(format!("{:?} has no SuperDSC kernel", node.op)),
         // ⭐ THE ALL-REDUCE'S CONSUME. The exchange itself is not a program — the bundle's CB
@@ -1108,6 +1107,21 @@ pub(crate) fn lower_one_node<T: ktir_superdsc::collective::Tp, F: RopeForm>(
             }
         }
         SubOp::RopeRotate { .. } => {
+            match scratchy_triton_splice::lower(node, ir, rows_are_requests) {
+                Ok(e) => Ops(vec![e]),
+                Err(reason) => Unhandled(reason),
+            }
+        }
+        // ⭐ AN UN-ROTATED KV WRITER LOWERS TO ITS PAGED WRITE (`lower_all`) — the float8 cache's
+        // (`KvCodec::Fp8E4m3`) and any other.
+        SubOp::KvAppend { .. } => {
+            match scratchy_triton_splice::lower_all(node, ir, rows_are_requests, query_rows) {
+                Ok(ops) => Ops(ops),
+                Err(reason) => Unhandled(reason),
+            }
+        }
+        // ⭐ THE FLOAT8 CACHE'S QUANTIZE — the one-op splice of `quantize_kv.py`.
+        SubOp::KvQuantize { .. } => {
             match scratchy_triton_splice::lower(node, ir, rows_are_requests) {
                 Ok(e) => Ops(vec![e]),
                 Err(reason) => Unhandled(reason),
@@ -2873,13 +2887,13 @@ pub fn lower_subtile_tape_to_ktir<T: ktir_superdsc::collective::Tp, F: RopeForm>
                             .entry(kct_resident_tid(kv.cache_tensor().index() as u32))
                             .or_insert(kct_tids);
                     }
-                    // ⭐ THE CLASS'S LAYER IDS, from its OWN rope table: the body's RopeAppend node
-                    // (the KV writer — "a layer is named by its KV writer") carries `per_layer_out`
+                    // ⭐ THE CLASS'S LAYER IDS, from its OWN writer table: the body's KV writer (a
+                    // RopeAppend or a KvAppend — "a layer is named by its KV writer") carries `per_layer_out`
                     // naming this class's rope nodes; `layer_index()` on each gives the ABSOLUTE
                     // layer id per class-relative iteration. This is the only source of the true
                     // order, and it is the tape's own. FIRST matching table wins.
                     if bodies[bi].layer_ids.is_empty()
-                        && matches!(n.op, SubOp::RopeAppend { .. })
+                        && matches!(n.op, SubOp::RopeAppend { .. } | SubOp::KvAppend { .. })
                         && per_layer_out.len() as u32 == iters
                     {
                         bodies[bi].layer_ids = per_layer_out
@@ -2888,7 +2902,7 @@ pub fn lower_subtile_tape_to_ktir<T: ktir_superdsc::collective::Tp, F: RopeForm>
                                 ir.nodes[nid.index()]
                                     .op
                                     .layer_index()
-                                    .expect("a RopeAppend names a layer")
+                                    .expect("a KV writer names a layer")
                             })
                             .collect();
                     }
@@ -2939,7 +2953,7 @@ pub fn lower_subtile_tape_to_ktir<T: ktir_superdsc::collective::Tp, F: RopeForm>
     for (bi, b) in bodies.iter().enumerate() {
         if b.layer_ids.len() != b.iters as usize {
             return Err(SuperDscError(format!(
-                "reroll-superdsc: body {bi} has {} RopeAppend layer ids but its loop runs {} \
+                "reroll-superdsc: body {bi} has {} KV-writer layer ids but its loop runs {} \
                  iterations — the layer cannot be named for every launch, so the true layer order \
                  is unknown and the launch table cannot be built",
                 b.layer_ids.len(),

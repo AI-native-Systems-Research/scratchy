@@ -11,8 +11,6 @@ description = "IBM Spyre (KTIR) backend for scratchy: host allocator + KTIR targ
 tp-2 = ["ktir-superdsc/tp-2"]
 tp-4 = ["ktir-superdsc/tp-4"]
 tp-8 = ["ktir-superdsc/tp-8"]
-# THE KV POOLS' ELEMENT FORMAT (`kv/fp8` from the CLI): the splice's `KvFormat` is `Fp8`.
-kv-fp8 = ["scratchy-triton-splice/kv-fp8"]
 # THE CARD's runtime (flex-rs, the resident executor, the session the worker drives) is not this
 # crate's: it is `scratchy-target-spyre-card`'s, which depends on this one. Here a card build adds
 # only its device compile.

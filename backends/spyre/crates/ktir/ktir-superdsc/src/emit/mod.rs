@@ -4992,8 +4992,8 @@ pub(crate) fn convert_dtypes(op: OpFunc) -> (Df, Df) {
 
 /// ⭐ THE STICK A CONVERT'S WORK DIVISION KEEPS WHOLE — the WIDER of its two formats' sticks
 /// ([`convert_dtypes`]): a convert touches both dataspaces per core, so a core's slab must be a whole
-/// stick of each. Read by every convert's opspec ([`convert_opspec`], the page widen's
-/// `widen_landing_opspec`).
+/// stick of each. Read by every convert's opspec ([`convert_opspec`], and a float8 page's gather
+/// widening as it lands: [`crate::ir::bridge::tiled_op_sdsc_op::Widens`]).
 pub(crate) fn convert_stick_df(op: OpFunc) -> Df {
     let (in_df, out_df) = convert_dtypes(op);
     if out_df.elems_per_stick() >= in_df.elems_per_stick() {

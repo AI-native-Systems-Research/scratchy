@@ -136,6 +136,17 @@ pub struct ModelEmission {
     pub items: TokenStream,
 }
 
+/// ⭐ HOW A TARGET STORES A MODEL'S KV CACHE — its choice of the shared KV codec fact
+/// ([`scratchy_ir::KvCodec`]), made once per build: dense, int8 codes wherever the codec takes the
+/// geometry at the heads the target's kernels code (`scratchy_ir::codec_for`), or float8 e4m3 for
+/// every body that holds KV.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KvStore {
+    Dense,
+    Int8(scratchy_ir::CodedHeads),
+    Fp8E4m3,
+}
+
 /// A target's emission, called by the shared pipeline.
 pub trait TargetEmitter: Sync {
     /// The target's name: the value of the `scratchy_target` cfg its models crate compiles
@@ -167,10 +178,9 @@ pub trait TargetEmitter: Sync {
         false
     }
 
-    /// The head dims the target's kernels code as int8 KV (`scratchy_ir::codec_for`), or `None`
-    /// for a target whose KV caches are dense.
-    fn coded_kv_heads(&self) -> Option<scratchy_ir::CodedHeads> {
-        None
+    /// How the target stores a model's KV cache ([`KvStore`]).
+    fn kv_store(&self) -> KvStore {
+        KvStore::Dense
     }
 
     /// Whether a decoder splices a multimodal tower's embeddings into its embedded rows on this

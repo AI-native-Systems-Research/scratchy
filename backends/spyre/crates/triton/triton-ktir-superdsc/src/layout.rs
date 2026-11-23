@@ -124,10 +124,12 @@ pub fn allocate_paged_cache(node: &KtirNode, layout: &BundleLayout) -> Result<()
         let allocated = match ptr
             .and_then(|p| ktir_superdsc::emit::lower_ktir_to_superdsc::param_elem(&node.func, p))
         {
-            Some(ktir_core::dtypes::DType::F16) => layout
-                .allocate_row_outermost::<ktir_superdsc::superdsc_opspec::Fp16>(b.get()),
-            Some(ktir_core::dtypes::DType::Fp8E4m3) => layout
-                .allocate_row_outermost::<ktir_superdsc::superdsc_opspec::Fp8>(b.get()),
+            Some(ktir_core::dtypes::DType::F16) => {
+                layout.allocate_row_outermost::<ktir_superdsc::superdsc_opspec::Fp16>(b.get())
+            }
+            Some(ktir_core::dtypes::DType::Fp8E4m3) => {
+                layout.allocate_row_outermost::<ktir_superdsc::superdsc_opspec::Fp8>(b.get())
+            }
             other => {
                 return Err(format!(
                     "{}: the paged cache at parameter {i} states element type {other:?} — a paged \
@@ -900,6 +902,7 @@ fn reserved_consts_for(p: Program) -> Option<&'static [&'static str]> {
         | Program::RmsNorm
         | Program::ScalarMul
         | Program::Elementwise(_)
+        | Program::KvQuantize
         | Program::SiluMul
         | Program::LmLast
         | Program::BlockCopy
@@ -1200,6 +1203,7 @@ fn scales_for(
         // parameters and finds none when the registry is empty). A value registered for them would
         // occupy a slot nothing asks for.
         Program::Elementwise(_)
+        | Program::KvQuantize
         | Program::SiluMul
         | Program::LmLast
         | Program::BlockCopy

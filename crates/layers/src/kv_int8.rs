@@ -10,7 +10,8 @@
 //! `head_dim` code bytes, and its scale as one `f32`. This module is the host reference a target's
 //! kernels encode and decode against, and the rule deciding which models code their KV.
 
-/// How a model's KV cache is stored. Fixed per model when it is built ([`codec_for`]); nothing
+/// How a model's KV cache is stored. Fixed per model when it is built ([`codec_for`]; a target
+/// that stores a float8 cache gives every model that holds KV [`KvCodec::Fp8E4m3`]); nothing
 /// chooses between them at runtime.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum KvCodec {
@@ -18,6 +19,21 @@ pub enum KvCodec {
     Dense,
     /// One int8 code per rotated element and one f32 scale per head row.
     Int8,
+    /// One float8 e4m3 byte per element, saturated at the format's max — the reference's
+    /// `kv_cache_dtype=fp8` — at the checkpoint's KV scales ([`KvCacheScales`]). Every KV writer
+    /// quantizes its new K and V ahead of the store
+    /// (`scratchy_subtile::kv_codec::expand_kv_quantize`).
+    Fp8E4m3(KvCacheScales),
+}
+
+/// ⭐ A FLOAT8 KV CACHE'S SCALES — the reference's per-layer `(k_scale, v_scale)`
+/// (spyre-inference `spyre_attn.py:1993-2002`), as the model's config states them at build.
+/// `Unscaled`: the config states no `kv_cache_scheme`, so K and V are stored as they are —
+/// `quantize_kv` divides by nothing, the attention's softmax scale takes no `k_scale` and its
+/// output no `v_scale`. A stated scheme adds its variant with its per-layer values.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum KvCacheScales {
+    Unscaled,
 }
 
 impl KvCodec {
@@ -31,6 +47,7 @@ impl std::fmt::Display for KvCodec {
         match self {
             Self::Dense => f.write_str("dense"),
             Self::Int8 => f.write_str("int8"),
+            Self::Fp8E4m3(_) => f.write_str("fp8 e4m3"),
         }
     }
 }

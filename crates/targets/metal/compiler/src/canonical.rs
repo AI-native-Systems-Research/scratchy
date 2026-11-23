@@ -487,7 +487,8 @@ pub fn lower_canonical(
     // Metal's int8 KV: the codec steps its declared facts insert.
     // Only on a model built with it (`ModelFacts::kv_codec`): a dense model runs none.
     let coded;
-    let l = if consts.kv_codec().is_int8() {
+    // At metal's stores: a float8 model is a build error by name here (`MetalKvCodec::of`).
+    let l = if scratchy_target_metal::MetalKvCodec::of(consts.kv_codec()).is_int8() {
         coded = expand_kv_codec(l, &METAL_KV_CODEC).map_err(CanonicalRefusal::KvCodec)?;
         &coded
     } else {

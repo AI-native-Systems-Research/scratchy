@@ -20,7 +20,9 @@ use scratchy_tensors::tensor::MAX_DIMS;
 // `SCALE_DTYPE` consts. They relocated to the cfg-free
 // `scratchy-tensors` core so this cfg-free crate can name them without a
 // backend feature.
-pub use scratchy_layers::kv_int8::{CodedHeads, DenseReason, KvCodec, KvRows, codec_for};
+pub use scratchy_layers::kv_int8::{
+    CodedHeads, DenseReason, KvCacheScales, KvCodec, KvRows, codec_for,
+};
 use scratchy_tensors::{ActDtype, ScaleDtype};
 
 pub mod model_facts;

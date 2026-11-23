@@ -913,9 +913,10 @@ pub struct Scatter {
     /// Where this store's run of entries starts in the index buffer, in entries — any entry: a
     /// per-row store writes one row at its own entry, and [`load_scatters`] coalesces the runs.
     pub first_entry: u32,
-    /// Sticks in one stored row — the tile's width: one at head dim 64, two at 128.
-    pub sticks: u32,
-    /// Where this store's rows start in the source, counted in rows of [`Self::sticks`] sticks. The
+    /// Elements in one stored row — the tile's width (a head: 128 at head dim 128). Its sticks are
+    /// the format's ([`load_scatters`] reads the format off the views).
+    pub width: u32,
+    /// Where this store's rows start in the source, counted in rows of [`Self::width`] elements. The
     /// source is stick-major `[rows, cols]` and its stick columns group into rows `sticks` wide, so
     /// row `r` of the group at column `c` is `(c / (sticks · stick)) · rows + r` — spyre-inference's
     /// `key[:, h]` row `t` is `h · T + t`, which is where their head-major `kv_write_index` puts its
@@ -981,7 +982,7 @@ pub fn scatters_of(k: &KtirNode) -> Result<Vec<Scatter>, Error> {
             src_tid: src.src_tid,
             entries,
             first_entry,
-            sticks: src.width / Fp16::ELEMS_PER_STICK,
+            width: src.width,
             src_row: src.src_row(),
             value,
         });
@@ -991,7 +992,7 @@ pub fn scatters_of(k: &KtirNode) -> Result<Vec<Scatter>, Error> {
 
 /// ⭐ THE ROWS A PLAIN LOAD READS OF A PARAMETER — the source side of a store through an indirect
 /// tile: which parameter, the window's corner and extent, and the view it reads. Read once, here,
-/// for every reader of a stored row's source ([`scatters_of`], [`narrow_families_of`]).
+/// for every reader of a stored row's source ([`scatters_of`]).
 pub(crate) struct ParamRows {
     /// The parameter the rows are loaded from.
     pub src_tid: u32,
@@ -999,14 +1000,10 @@ pub(crate) struct ParamRows {
     pub row: u32,
     /// The window's column corner, a multiple of its width.
     pub col: u32,
-    /// The window's rows.
-    pub rows: u32,
     /// The window's width, a whole number of fp16 sticks.
     pub width: u32,
     /// The view's rows.
     pub view_rows: u32,
-    /// The view's columns.
-    pub view_cols: u32,
 }
 
 impl ParamRows {
@@ -1080,12 +1077,7 @@ fn param_rows(
         .and_then(|t| t.dims())
         .and_then(|d| d.first().copied())
         .unwrap_or(0) as u32;
-    let view_cols = src_view
-        .result_type
-        .and_then(|t| t.dims())
-        .and_then(|d| d.get(1).copied())
-        .unwrap_or(0) as u32;
-    let (rows, width) = shape_2d(src_tile).unwrap_or((0, 0));
+    let (_, width) = shape_2d(src_tile).unwrap_or((0, 0));
     if width == 0 || !width.is_multiple_of(stick) || !col.is_multiple_of(width) {
         return err(format!(
             "{}: the scatter's source rows are {width} wide at column {col} — a scattered row is a \
@@ -1098,10 +1090,8 @@ fn param_rows(
         src_tid,
         row,
         col,
-        rows,
         width,
         view_rows,
-        view_cols,
     })
 }
 
@@ -1118,7 +1108,7 @@ struct RunPiece {
 /// cuts into index-stick ops — with the width of their rows and the first store's value.
 struct ScatterRun {
     key: (u32, u32, u32),
-    sticks: u32,
+    width: u32,
     value: Ssa,
     pieces: Vec<RunPiece>,
 }
@@ -1160,7 +1150,6 @@ pub fn load_scatters<T: crate::collective::Tp>(
             message: format!("{name}: t{tid} is not a parameter of the program"),
         })
     };
-    let stick = Fp16::ELEMS_PER_STICK;
     // Each (source, destination, table) triple in first-store order, with its stores' pieces.
     let mut runs: Vec<ScatterRun> = Vec::new();
     for sc in &scatters {
@@ -1171,16 +1160,16 @@ pub fn load_scatters<T: crate::collective::Tp>(
             src_row: sc.src_row,
         };
         match runs.iter_mut().find(|r| r.key == key) {
-            Some(r) if r.sticks == sc.sticks => r.pieces.push(piece),
+            Some(r) if r.width == sc.width => r.pieces.push(piece),
             Some(r) => {
                 return err(format!(
-                    "{name}: stores into t{} write rows of {} and of {} sticks through one table",
-                    sc.value_tid, r.sticks, sc.sticks
+                    "{name}: stores into t{} write rows of {} and of {} elements through one table",
+                    sc.value_tid, r.width, sc.width
                 ));
             }
             None => runs.push(ScatterRun {
                 key,
-                sticks: sc.sticks,
+                width: sc.width,
                 value: sc.value,
                 pieces: vec![piece],
             }),
@@ -1189,44 +1178,94 @@ pub fn load_scatters<T: crate::collective::Tp>(
     let mut ops = Vec::new();
     for ScatterRun {
         key: (src_tid, dst_tid, index_tid),
-        sticks,
+        width,
         value,
         mut pieces,
     } in runs
     {
         let RunExtent { e0, s0, total } = run_extent(name, &mut pieces)?;
         let (src, dst, index) = (region(src_tid)?, region(dst_tid)?, region(index_tid)?);
-        let width = StickExtent::<Fp16>::new(sticks * stick).map_err(|message| Error {
+        // ⭐ THE RUN MOVES BYTES AT THE FORMAT ITS VIEWS STATE — one match over the destination
+        // view's element type ([`Region::is_fp8`]) into the run's type, at the arm that reads it. A
+        // scatter copies; a source at another format than its destination is no scatter.
+        if src.is_fp8 != dst.is_fp8 {
+            return err(format!(
+                "{name}: rows of t{src_tid} (float8: {}) are scattered into t{dst_tid} (float8: \
+                 {}) — a scatter copies its rows, it converts none",
+                src.is_fp8, dst.is_fp8
+            ));
+        }
+        let run = RunAt {
+            src,
+            dst,
+            index,
+            width,
+            s0,
+            e0,
+            total,
+            value,
+        };
+        ops.extend(if dst.is_fp8 {
+            run.at::<crate::superdsc_opspec::Fp8, T>(name, k, layout, sym_id_base)?
+        } else {
+            run.at::<Fp16, T>(name, k, layout, sym_id_base)?
+        });
+    }
+    Ok(ops)
+}
+
+/// One coalesced run of a parameter's scattered rows, before its format is chosen: the views,
+/// the row width in elements, and where the run sits.
+struct RunAt<'a> {
+    src: &'a Region,
+    dst: &'a Region,
+    index: &'a Region,
+    width: u32,
+    s0: u32,
+    e0: u32,
+    total: u32,
+    value: Ssa,
+}
+
+impl RunAt<'_> {
+    /// The run at format `DF` — its row width whole `DF` sticks ([`StickExtent`]), its card form
+    /// [`scatter_run`]'s.
+    fn at<DF: DataFormat, T: crate::collective::Tp>(
+        &self,
+        name: &str,
+        k: &KtirNode,
+        layout: Option<&BundleLayout>,
+        sym_id_base: &mut i64,
+    ) -> Result<Vec<EmittedOp<T>>, Error> {
+        let width = StickExtent::<DF>::new(self.width).map_err(|message| Error {
             message: format!("{name}: {message}"),
         })?;
-        ops.extend(scatter_run::<Fp16, T>(
+        scatter_run::<DF, T>(
             name,
             k,
             layout,
             RunCopy {
-                src: &src.name(),
-                src_rows: src.v_rows,
-                groups: src.v_cols / width.elems(),
+                src: &self.src.name(),
+                src_rows: self.src.v_rows,
+                groups: self.src.v_cols / width.elems(),
                 width,
-                s0,
-                e0,
-                total,
-                dst,
-                index,
-                key: value,
+                s0: self.s0,
+                e0: self.e0,
+                total: self.total,
+                dst: self.dst,
+                index: self.index,
+                key: self.value,
             },
             sym_id_base,
-        )?);
+        )
     }
-    Ok(ops)
 }
 
 /// ⭐ WHERE ONE SCATTER RUN SITS — its first entry `e0`, the source row `s0` it reads first, and its
 /// row count. The card's scatter copies source row `s0 + j` through entry `e0 + j` and nothing else,
 /// so every store of the run continues it in order: its entry the run's end so far, its source row as
 /// far past `s0` as its entry is past `e0`. A store that does not is refused by name. The one
-/// statement of the run law, taken by a parameter's rows ([`load_scatters`]) and a narrowing family's
-/// ([`NarrowFamily::extent`]).
+/// statement of the run law, taken by a parameter's rows ([`load_scatters`]).
 pub(crate) struct RunExtent {
     pub e0: u32,
     pub s0: u32,
@@ -1280,7 +1319,7 @@ pub struct RunCopy<'a, DF: DataFormat> {
 }
 
 /// ⭐⭐⭐ ONE SCATTER RUN, ON THE CARD — the one card form of every run: a parameter's loaded rows
-/// ([`load_scatters`]) and a narrowed value's local ([`NarrowRun`]). A row of one stick, or a source
+/// ([`load_scatters`]), at the format its views state. A row of one stick, or a source
 /// of one row, is read in place; a wider row is relaid row-major through a scratch first, one stick
 /// permute per head group (the restickify torch-spyre's stickification inserts ahead of their
 /// `index_copy_`), because the destination is allocated row-outermost and takes an entry's sticks
@@ -1386,11 +1425,10 @@ pub fn scatter_run<DF: DataFormat, T: crate::collective::Tp>(
     let page = crate::superdsc_opspec::PageExtent::of_positions(sticks);
     let (dst_name, index_name) = (dst.name(), index.name());
     for (i, (first, entries)) in index_runs(total).into_iter().enumerate() {
-        let base = crate::superdsc_opspec::EntryBase::of_entries(e0 + first).map_err(|message| {
-            Error {
+        let base =
+            crate::superdsc_opspec::EntryBase::of_entries(e0 + first).map_err(|message| Error {
                 message: format!("{name}: {message}"),
-            }
-        })?;
+            })?;
         let scatter =
             crate::superdsc_opspec::GatherIndex::of_scratch_rows(index_name.clone(), page, base);
         let op = crate::ir::bridge::tiled_op_sdsc_op::assemble_scatter_copy(
@@ -1412,216 +1450,6 @@ pub fn scatter_run<DF: DataFormat, T: crate::collective::Tp>(
         ops.push(op);
     }
     Ok(ops)
-}
-
-/// ⭐⭐⭐ A NARROWING-STORE FAMILY — spyre-inference's `quantize_kv` then `index_copy_`
-/// (`ops/reshape_and_cache.py:20-29, 47-52`) as the KV write states it, one window at a time: each
-/// member loads a window of ONE f16 parameter, saturates it (`arith.maxnumf` against a splatted `lo`,
-/// then `arith.minnumf` against a splatted `hi` — `torch.clamp`'s `clamp_min` and `clamp_max`),
-/// narrows it to f8E4M3FN (`arith.truncf`) and stores it through an indirect tile. When the members'
-/// windows TILE the parameter's view exactly ([`tiles_the_view`]), the family is the reference's ONE
-/// elementwise pass over the whole tensor followed by its stores, and it lowers as torch-spyre lowers
-/// that: `clip` (`clamp_min`), `clip` (`clamp_max`) and `qfp8ch` over the whole view
-/// (`lower_clamp`, `lowering.py:1505-1579`; `spyre.qfp8ch` over `x.get_size()`,
-/// `lowering.py:2969-2992`), then ONE scatter run of the narrowed rows ([`scatter_run`]).
-///
-/// ⛔ THE FOLD'S LAWS: stated over op kinds and operand identity only; every interior value — the
-/// load, both saturations, the narrowing — has exactly one reader; ONE shape predicate,
-/// [`tiles_the_view`]; and a family that does not close — a member whose chain differs, members that
-/// disagree on the bounds or the row width, windows that leave a gap or overlap — is LEFT
-/// UNCLAIMED, its ops lowered one by one, where the f16→f8E4M3FN `arith.truncf` is the walk's own
-/// by-name refusal (`convert_kind_of`).
-pub(crate) struct NarrowFamily {
-    /// The f16 parameter every member loads.
-    pub src_tid: u32,
-    /// The parameter every member stores through its index.
-    pub dst_tid: u32,
-    /// The parameter holding the index.
-    pub index_tid: u32,
-    /// The `clamp_min` bound every member states.
-    pub lo: f32,
-    /// The `clamp_max` bound every member states.
-    pub hi: f32,
-    /// One stored row's width, whole float8 sticks.
-    pub width: StickExtent<crate::superdsc_opspec::Fp8>,
-    /// The source view's `[rows, cols]`.
-    pub view: (u32, u32),
-    /// The members, in program order.
-    members: Vec<NarrowMember>,
-}
-
-/// One member of a [`NarrowFamily`]: its three chain values, its share of the run, its window.
-pub(crate) struct NarrowMember {
-    /// The `arith.maxnumf` result.
-    pub clamp_min: Ssa,
-    /// The `arith.minnumf` result.
-    pub clamp_max: Ssa,
-    /// The `arith.truncf` result.
-    pub narrow: Ssa,
-    piece: RunPiece,
-    /// `(row, col, rows, cols)` of the source window.
-    window: (u32, u32, u32, u32),
-}
-
-impl NarrowFamily {
-    /// The first member in program order — the values the family's whole-view buffers are minted
-    /// by. A family is created with its first member.
-    pub fn leader(&self) -> &NarrowMember {
-        &self.members[0]
-    }
-
-    /// Every value the family's whole-view chain stands for: the walk lowers none of them.
-    pub fn claimed(&self) -> impl Iterator<Item = Ssa> + '_ {
-        self.members
-            .iter()
-            .flat_map(|m| [m.clamp_min, m.clamp_max, m.narrow])
-    }
-
-    /// The family's one scatter run ([`run_extent`]).
-    pub fn extent(&self, name: &str) -> Result<RunExtent, Error> {
-        let mut pieces: Vec<RunPiece> = self.members.iter().map(|m| m.piece).collect();
-        run_extent(name, &mut pieces)
-    }
-}
-
-/// ⭐ THE FAMILY'S ONE SHAPE PREDICATE — its members' source windows tile the source view exactly:
-/// every window inside the view, no two overlapping, their areas summing to the view's.
-fn tiles_the_view(fam: &NarrowFamily) -> bool {
-    let (vr, vc) = fam.view;
-    let w = &fam.members;
-    let inside = w.iter().all(|m| {
-        let (r, c, rows, cols) = m.window;
-        r + rows <= vr && c + cols <= vc
-    });
-    let disjoint = w.iter().enumerate().all(|(i, a)| {
-        w[i + 1..].iter().all(|b| {
-            let (ar, ac, arn, acn) = a.window;
-            let (br, bc, brn, bcn) = b.window;
-            ar + arn <= br || br + brn <= ar || ac + acn <= bc || bc + bcn <= ac
-        })
-    });
-    let area: u64 = w
-        .iter()
-        .map(|m| u64::from(m.window.2) * u64::from(m.window.3))
-        .sum();
-    inside && disjoint && area == u64::from(vr) * u64::from(vc)
-}
-
-/// [`NarrowFamily`] for every `(source, destination, index)` triple whose stores close the pattern
-/// and tile their source.
-pub(crate) fn narrow_families_of(k: &KtirNode) -> Result<Vec<NarrowFamily>, Error> {
-    use crate::superdsc_opspec::Fp8;
-    let f = &k.func;
-    let consts = index_constants(f);
-    let deep = f.ops_deep();
-    let def_of = |v: Ssa| f.operations.iter().find(|o| o.result == Some(v));
-    let one_reader = |v: Ssa| deep.iter().filter(|o| o.operands.contains(&v)).count() == 1;
-    // Each triple in first-store order; `None` once its members disagree (left unclaimed).
-    let mut groups: Vec<((u32, u32, u32), Option<NarrowFamily>)> = Vec::new();
-    for store in f
-        .operations
-        .iter()
-        .filter(|o| o.op_type == OpKind::KtdpStore)
-    {
-        let (Some(&narrow), Some(&tv)) = (store.operands.first(), store.operands.get(1)) else {
-            continue;
-        };
-        let Some(tile) = f
-            .operations
-            .iter()
-            .find(|o| o.result == Some(tv) && o.op_type == OpKind::KtdpConstructIndirectAccessTile)
-        else {
-            continue;
-        };
-        // The chain, link by link, from the store up: any other link is not this pattern.
-        let Some(trunc) = def_of(narrow).filter(|o| {
-            o.op_type == OpKind::ArithTruncf
-                && o.result_type.and_then(|t| t.elem()) == Some(ktir_core::dtypes::DType::Fp8E4m3)
-        }) else {
-            continue;
-        };
-        let Some(&clamp_max) = trunc.operands.first() else {
-            continue;
-        };
-        let Some(max_op) = def_of(clamp_max).filter(|o| o.op_type == OpKind::ArithMinnumf) else {
-            continue;
-        };
-        let Some((hi, clamp_min)) = super::whole_function::splat_scale_of(f, max_op) else {
-            continue;
-        };
-        let Some(min_op) = def_of(clamp_min).filter(|o| o.op_type == OpKind::ArithMaxnumf) else {
-            continue;
-        };
-        let Some((lo, x)) = super::whole_function::splat_scale_of(f, min_op) else {
-            continue;
-        };
-        let Some(load) = def_of(x).filter(|o| o.op_type == OpKind::KtdpLoad) else {
-            continue;
-        };
-        if ![x, clamp_min, clamp_max, narrow]
-            .into_iter()
-            .all(one_reader)
-        {
-            continue;
-        }
-        let src = param_rows(k, &consts, load)?;
-        let dst_tid = indirect_tile_param(k, tile, 0, "written")?;
-        let index_tid = indirect_tile_param(k, tile, 1, "index")?;
-        let (rows, _) = shape_2d(tile).ok_or_else(|| Error {
-            message: format!(
-                "{}: a narrowing store's indirect tile states no 2-D `shape`, so how many rows it \
-                 writes is unknown",
-                f.name
-            ),
-        })?;
-        let entry = indirect_tile_anchor(k, tile, &consts)?;
-        let member = NarrowMember {
-            clamp_min,
-            clamp_max,
-            narrow,
-            piece: RunPiece {
-                entry,
-                rows,
-                src_row: src.src_row(),
-            },
-            window: (src.row, src.col, src.rows, src.width),
-        };
-        let key = (src.src_tid, dst_tid, index_tid);
-        match groups.iter_mut().find(|(g, _)| *g == key) {
-            None => groups.push((
-                key,
-                StickExtent::<Fp8>::new(src.width)
-                    .ok()
-                    .map(|width| NarrowFamily {
-                        src_tid: src.src_tid,
-                        dst_tid,
-                        index_tid,
-                        lo,
-                        hi,
-                        width,
-                        view: (src.view_rows, src.view_cols),
-                        members: vec![member],
-                    }),
-            )),
-            Some((_, slot)) => {
-                let joined = match slot.take() {
-                    Some(mut fam)
-                        if fam.lo == lo && fam.hi == hi && fam.width.elems() == src.width =>
-                    {
-                        fam.members.push(member);
-                        Some(fam)
-                    }
-                    _ => None,
-                };
-                *slot = joined;
-            }
-        }
-    }
-    Ok(groups
-        .into_iter()
-        .filter_map(|(_, fam)| fam)
-        .filter(tiles_the_view)
-        .collect())
 }
 
 /// ⛔⛔⛔ THE GUARD FOR THE FACT THIS FILE USED TO DROP: an operand this emitter addresses at the
@@ -1792,7 +1620,7 @@ pub fn regions(k: &KtirNode) -> Result<Vec<Region>, Error> {
         ));
     }
     let consts = index_constants(&k.func);
-    let stored = store_views(&k.func);
+    let written = WrittenBuffers::of(k)?;
     let mut out = Vec::with_capacity(k.bindings.len());
     for (i, ((ptr, _), tid)) in k.func.arguments.iter().zip(k.bindings.iter()).enumerate() {
         let view = k
@@ -1937,7 +1765,7 @@ pub fn regions(k: &KtirNode) -> Result<Vec<Region>, Error> {
                 Some((s0, e0)) => Some((s0.min(s), e0.max(e))),
             })
             .unwrap_or((0, cols));
-        let is_out = view.result.is_some_and(|v| stored.contains(&v));
+        let is_out = written.contains(tid.get());
         let is_fp8 = view.attributes.iter().any(|(key, v)| {
             matches!(
                 (key, v),
@@ -1999,50 +1827,53 @@ pub fn param_elem(f: &IRFunction<'static>, ptr: Ssa) -> Option<ktir_core::dtypes
         .and_then(|view| view_elem(f, view))
 }
 
-/// Every view a `ktdp.store` writes through — the program's OUTPUT buffers. A store's second operand
-/// is the access tile it writes, and that tile's first operand is the view.
-/// Every buffer this program WRITES — the parameter behind every `ktdp.store`'s view, at any depth
-/// (a walk's body stores too) and through a direct or an indirect tile alike. What a bundle walk
-/// tells [`super::ktir_matmul_fp8::QuantizedActivations::written`], so a held fp8 quantize never
-/// outlives the bytes it was taken of.
-pub fn written_buffers(k: &KtirNode) -> Result<Vec<u32>, Error> {
-    let deep = k.func.ops_deep();
-    let def = |v: Option<&Ssa>| v.and_then(|v| deep.iter().find(|o| o.result == Some(*v)));
-    let mut out = Vec::new();
-    for st in deep.iter().filter(|o| o.op_type == OpKind::KtdpStore) {
-        // ⛔ A STORE WHOSE BUFFER CANNOT BE NAMED IS REFUSED, NOT SKIPPED: a skipped one is a write
-        // the held quantize never hears of, and the next matmul would read a stale scale.
-        let tid = def(st.operands.get(1))
-            .and_then(|tile| def(tile.operands.first()))
-            .and_then(|view| view.operands.first())
-            .and_then(|ptr| k.func.arguments.iter().position(|(a, _)| a == ptr))
-            .and_then(|i| k.bindings.get(i))
-            .ok_or_else(|| Error {
-                message: format!(
-                    "{}: a `ktdp.store` whose tile does not resolve to a parameter's view — the \
-                     buffer it writes cannot be named",
-                    k.func.name
-                ),
-            })?;
-        out.push(tid.get());
-    }
-    out.sort_unstable();
-    out.dedup();
-    Ok(out)
-}
+/// ⭐ THE BUFFERS A PROGRAM WRITES — its OUTPUTS, ONE answer every reader takes: the parameter
+/// behind every `ktdp.store`'s view, at any depth (a walk's body stores too) and through a direct
+/// or an indirect tile alike (a pool's scatter, `out.index_copy_`'s rows). [`regions`] marks a
+/// parameter [`Region::is_out`] iff its buffer is here, and a bundle walk tells
+/// [`super::ktir_matmul_fp8::QuantizedActivations::written`] every buffer here, so a held fp8
+/// quantize never outlives the bytes it was taken of.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WrittenBuffers(Vec<u32>);
 
-fn store_views(f: &IRFunction<'static>) -> std::collections::HashSet<Ssa> {
-    let tile_view: std::collections::HashMap<Ssa, Ssa> = f
-        .operations
-        .iter()
-        .filter(|o| o.op_type == OpKind::KtdpConstructAccessTile)
-        .filter_map(|o| Some((o.result?, *o.operands.first()?)))
-        .collect();
-    f.operations
-        .iter()
-        .filter(|o| o.op_type == OpKind::KtdpStore)
-        .filter_map(|o| tile_view.get(o.operands.get(1)?).copied())
-        .collect()
+impl WrittenBuffers {
+    /// The buffers `k` writes, ascending.
+    pub fn of(k: &KtirNode) -> Result<Self, Error> {
+        let deep = k.func.ops_deep();
+        let def = |v: Option<&Ssa>| v.and_then(|v| deep.iter().find(|o| o.result == Some(*v)));
+        let mut out = Vec::new();
+        for st in deep.iter().filter(|o| o.op_type == OpKind::KtdpStore) {
+            // ⛔ A STORE WHOSE BUFFER CANNOT BE NAMED IS REFUSED, NOT SKIPPED: a skipped one is an
+            // output no reader hears of — a launch that reads back nothing, a held quantize whose
+            // bytes were replaced.
+            let tid = def(st.operands.get(1))
+                .and_then(|tile| def(tile.operands.first()))
+                .and_then(|view| view.operands.first())
+                .and_then(|ptr| k.func.arguments.iter().position(|(a, _)| a == ptr))
+                .and_then(|i| k.bindings.get(i))
+                .ok_or_else(|| Error {
+                    message: format!(
+                        "{}: a `ktdp.store` whose tile does not resolve to a parameter's view — the \
+                         buffer it writes cannot be named",
+                        k.func.name
+                    ),
+                })?;
+            out.push(tid.get());
+        }
+        out.sort_unstable();
+        out.dedup();
+        Ok(Self(out))
+    }
+
+    /// Whether the program writes buffer `tid`.
+    pub fn contains(&self, tid: u32) -> bool {
+        self.0.binary_search(&tid).is_ok()
+    }
+
+    /// Every buffer the program writes, ascending.
+    pub fn tids(&self) -> &[u32] {
+        &self.0
+    }
 }
 
 /// Every `arith.constant` index in the func, by the SSA it defines — an access tile's corner is one
@@ -4084,6 +3915,10 @@ pub enum ConvertKind {
     /// failed to find a suitable op mapping", SchedulerStages.cpp:40). The Gumbel
     /// draw's fp16-log chain rides this convert.
     Fp32ToDl16,
+    /// `arith.truncf` f16 → f8E4M3FN. `OpFunc::Qfp8ch`, dxp `"qfp8ch"` — the float8 narrowing, the
+    /// W8A8 activation quantizer's convert ([`assemble_convert`]) and the reverse recipe of the
+    /// `fp8todl16` page widen: its output is the QFP8CH in-stick order that widen reads.
+    Fp16ToFp8,
 }
 
 impl ConvertKind {
@@ -4096,6 +3931,7 @@ impl ConvertKind {
             ConvertKind::Fp32ToInt32 => "fp32toint32",
             ConvertKind::Int32ToFp32 => "int32tofp32",
             ConvertKind::Fp32ToDl16 => "fp32todl16",
+            ConvertKind::Fp16ToFp8 => "qfp8ch",
         }
     }
 
@@ -4109,6 +3945,7 @@ impl ConvertKind {
             ConvertKind::Fp32ToInt32 => ktir_core::ddl_binds::DeviceOp::Fp32ToInt32,
             ConvertKind::Int32ToFp32 => ktir_core::ddl_binds::DeviceOp::Int32ToFp32,
             ConvertKind::Fp32ToDl16 => ktir_core::ddl_binds::DeviceOp::Fp32ToDl16,
+            ConvertKind::Fp16ToFp8 => ktir_core::ddl_binds::DeviceOp::Qfp8ch,
         }
     }
 
@@ -4124,6 +3961,8 @@ impl ConvertKind {
             // IEEE_FP32 in, fp16 out — the fp16 output's 64-elem stick is the wider
             // basis, the same law `dl16tofp32` reads from its input side.
             ConvertKind::Fp32ToDl16 => Df::Fp16,
+            // fp16 in, float8 out — the float8 output's 128-element stick is the wider basis.
+            ConvertKind::Fp16ToFp8 => Df::Fp8,
         }
     }
 
@@ -4185,6 +4024,11 @@ pub fn convert<T: crate::collective::Tp>(
     let whole = |x: &Region| x.r_start == 0 && x.c_start == 0 && x.v_rows == rows;
     let op_func = kind.op_func();
     let op_name = format!("{op_func}_o{}", out.tid);
+    // ⭐ EACH SIDE AT ITS OWN FORMAT — the op's one pair ([`ConvertKind::dtypes`], `convert_dtypes`
+    // at its own `op_func`), on both paths: the window mint prices a side's bytes at its handle's
+    // word length, so a side minted at the other side's format is priced wrong (a float8 output at
+    // fp16's two bytes overruns its one-byte-an-element placement).
+    let (in_df, out_df) = kind.dtypes();
     if !(whole(&out) && whole(&ins[0])) {
         // ⭐ THE BAND PATH — extents first (the elementwise door's own law: every operand holds
         // the op's sweep as its own window), then the width. A band is admitted only at the
@@ -4204,7 +4048,6 @@ pub fn convert<T: crate::collective::Tp>(
             ));
         }
         check_pointwise_cols_df(cols, "Convert", out.tid, kind.stick_df())?;
-        let (in_df, out_df) = kind.dtypes();
         // Each side's window at its OWN df, and each side's handle at its own storage: the band
         // side declares the PARENT `[v_rows, v_cols]` (the corner arithmetic addresses within
         // it, and the mint prices the parent's bytes at the side's real word length), the whole
@@ -4254,10 +4097,10 @@ pub fn convert<T: crate::collective::Tp>(
         cols = dev_cols;
     }
     check_pointwise_cols_df(cols, "Convert", out.tid, kind.stick_df())?;
-    // The handles are ANNOTATION-ONLY (`assemble_convert` reads `.name()`; the dtypes ride the
-    // `OpFunc` through `convert_dtypes`), so the RowBlocked mint is exact for both operands.
-    let in_h = rb(&ins[0].name(), rows, cols);
-    let out_h = rb(&out.name(), rows, cols);
+    // The descriptor reads only the handles' `.name()` (the dtypes ride the `OpFunc`); the window
+    // mint reads their formats, each side's own.
+    let in_h = rb_df(&ins[0].name(), rows, cols, in_df);
+    let out_h = rb_df(&out.name(), rows, cols, out_df);
     Ok(vec![assemble_convert(
         &op_name,
         op_func,

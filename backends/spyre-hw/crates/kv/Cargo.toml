@@ -8,7 +8,7 @@ description = "KV cache build scope: the element format the KV pools hold (`kv/<
 [features]
 # A crate of its own for the reason scratchy-tp is one: Cargo forbids aliasing one crate under two
 # names in one Cargo.toml, so `--features kv/fp8` needs a package named `kv`. Naming it selects the
-# float8 e4m3 pool (scratchy-triton-splice's `KvFormat`) for every model the build bakes; naming none
+# float8 e4m3 KV cache (the shared `KvCodec::Fp8E4m3`) for every model the build bakes; naming none
 # keeps the model's 16-bit pool.
 fp8 = ["scratchy-target-spyre-worker/kv-fp8"]
 

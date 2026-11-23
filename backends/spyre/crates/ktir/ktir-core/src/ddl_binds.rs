@@ -170,6 +170,7 @@ device_ops!(
     Dl16ToFp32,
     Fp32ToDl16,
     Fp8ToDl16,
+    Qfp8ch,
     // ── the reduce family
     Sum,
     Mean,
@@ -211,6 +212,7 @@ impl DeviceOp {
             DeviceOp::Dl16ToFp32 => "dl16tofp32",
             DeviceOp::Fp32ToDl16 => "fp32todl16",
             DeviceOp::Fp8ToDl16 => "fp8todl16",
+            DeviceOp::Qfp8ch => "qfp8ch",
             DeviceOp::Sum => "sum",
             DeviceOp::Mean => "mean",
             DeviceOp::Max => "max",
@@ -246,7 +248,8 @@ impl DeviceOp {
             | DeviceOp::Fp32ToInt32
             | DeviceOp::Dl16ToFp32
             | DeviceOp::Fp32ToDl16
-            | DeviceOp::Fp8ToDl16 => DeviceFamily::Convert,
+            | DeviceOp::Fp8ToDl16
+            | DeviceOp::Qfp8ch => DeviceFamily::Convert,
             DeviceOp::Sum | DeviceOp::Mean | DeviceOp::Max | DeviceOp::Min | DeviceOp::AbsMax => {
                 DeviceFamily::Reduce
             }
@@ -664,6 +667,17 @@ impl DeviceGen for Gen1 {
                    of dl16tofp32 (%chupcast_ops, :98; one fp8 stick SHUFFLEd into two fp16 \
                    sticks, :315-321). Its input is the QFP8CH in-stick order qfp8ch writes, so \
                    its fp16 output is standard",
+        },
+        DeviceOpRow {
+            op: DeviceOp::Qfp8ch,
+            dfs: &[DdlDf::Fp16, DdlDf::Fp8],
+            admitted: &[DdlDf::Fp16, DdlDf::Fp8],
+            arrangement: ElementArrangement::Standard,
+            citation: "qfp8ch — f16 in, SEN143_FP8 out: the W8A8 activation quantizer's convert \
+                   (`emit::convert_dtypes`' own row, `fq_afp8_op`). Its output is the QFP8CH \
+                   in-stick order the fp8todl16 row reads, so the widen of it is standard; \
+                   card-proven by the kv_fp8_round_trip leg (qfp8ch, the scatter and fp8todl16 \
+                   return the pattern bit-exact)",
         },
         // ── summeanmaxexx2.ddl / summeanmaxexx2_fp32.ddl — the reduce family,
         //    every combiner bound at BOTH formats (the fp16 template's stick

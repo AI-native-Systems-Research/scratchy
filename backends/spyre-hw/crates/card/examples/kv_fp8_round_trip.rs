@@ -7,12 +7,13 @@
 //!   --example kv_fp8_round_trip -- <work-dir>
 //! ```
 //!
-//! Six bundles, each a production program — the splice's own constructors, the ones chat's bake
+//! Eight bundles, each a production program — the splice's own constructors, the ones chat's bake
 //! calls — lowered and placed as a one-kernel bundle and compiled by the bake's own dxp door:
 //!
 //! * `ref` — the device's own `qfp8ch` (the W8A8 activation quantizer's convert door) over a host
 //!   `[rows, 128]` fp16 pool image: an fp8 pool image no write path of ours made;
-//! * `write` — `reshape_and_cache_head_major` at an fp8 pool;
+//! * `quantize0` / `quantize1` — `quantize_kv` over the K and V patterns: their float8 rows;
+//! * `write` — `reshape_and_cache_head_major` scattering those rows into fp8 pools;
 //! * `decode8` / `prefill8` — the paged attention at an fp8 pool;
 //! * `decode16` / `prefill16` — the same at an fp16 pool, the not-X control.
 //!
@@ -32,16 +33,23 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow, bail};
 use ktir_superdsc::collective::TpWorld;
 use ktir_superdsc::emit::EmittedOp;
-use ktir_superdsc::ktir_node::KtirNode;
+use ktir_superdsc::ktir_node::{KtirNode, Program};
 use ktir_superdsc::place::{PlaceId, act_name};
 use ktir_superdsc::placement::{BundleLayout, SegRole, TensorPlacement};
 use ktir_superdsc::reserved_tids::{PAGED_INT32_ZERO_TID, RESERVED_TID_FLOOR};
-use ktir_superdsc::superdsc_opspec::{Df, Fp8, Fp16};
+use ktir_superdsc::superdsc_opspec::{Df, Fp8, Fp16, StickExtent};
 use scratchy_target_spyre::superdsc_bake::{ChunkExplore, DxpTool};
 use scratchy_triton_splice::{
-    HeadWidth, KvWriteGeometry, PagedAttnGeometry, PagedSequence, SchedulerBlockTokens,
-    allocate_paged_cache, kv_write_program, paged_attn_program,
+    AttnScale, BlockSize, HeadDim, HeadGeometry, HeadWidth, KvHeads, KvQuantizeGeometry,
+    KvWriteGeometry, PagedAttnGeometry, PagedSequence, PoolPages, QueryHeads, RotDim,
+    SchedulerBlockTokens, TokenRows, WalkBlocks, allocate_paged_cache, kv_quantize_program,
+    kv_write_program, paged_attn_program,
 };
+
+/// A test's positive extent, as the nonzero a geometry takes.
+fn nz(v: u32) -> std::num::NonZeroU32 {
+    std::num::NonZeroU32::new(v).expect("a test extent is positive")
+}
 
 /// A one-card leg: a world of one.
 type W1 = TpWorld<1>;
@@ -81,18 +89,6 @@ fn pattern(which: u32, kv: u32, t: u32, d: u32) -> f32 {
     sign * (1.0 + m / 8.0) * 2f32.powi(e)
 }
 
-/// The value of an e4m3fn byte (bias 7, no infinity).
-fn e4m3(b: u8) -> f32 {
-    let sign = if b & 0x80 != 0 { -1.0 } else { 1.0 };
-    let e = i32::from((b >> 3) & 0xF);
-    let m = f32::from(b & 7);
-    if e == 0 {
-        sign * (m / 8.0) * 2f32.powi(-6)
-    } else {
-        sign * (1.0 + m / 8.0) * 2f32.powi(e - 7)
-    }
-}
-
 /// Every pattern value is its own e4m3 rounding — the card's `qfp8ch` encoder's byte, decoded.
 fn check_pattern() -> Result<()> {
     for which in 0..2 {
@@ -100,7 +96,7 @@ fn check_pattern() -> Result<()> {
             for t in 0..BLOCK {
                 for d in 0..HD {
                     let v = pattern(which, kv, t, d);
-                    let back = e4m3(ktir_core::codec::f32_to_e4m3(v));
+                    let back = ktir_core::codec::e4m3_to_f32(ktir_core::codec::f32_to_e4m3(v));
                     if back != v {
                         bail!(
                             "the pattern is not e4m3-exact at which={which} kv={kv} t={t} d={d}: \
@@ -160,23 +156,12 @@ fn f16_at(layout: &BundleLayout, tid: u32, vals: &[f32]) -> Result<Vec<u8>> {
     Ok(b)
 }
 
-/// The host page `prepare` rounds a staged prefix up to (`superdsc_exec::HOST_PAGE`).
-const HOST_PAGE: u64 = 4096;
-
 /// The directory written (`write_dir` + `write_placements`, after the lowering, so the synthetics
 /// are in the segment sizes) and compiled in place by the bake's own dxp door.
-///
-/// ⭐ EVERY SEGMENT TAKES ONE HOST PAGE OF PAD. `prepare` sends a host-owned slot's staged prefix
-/// rounded UP to a page, clamped to the shadow only before the rounding, and the shadow is the
-/// segment's 128-aligned size. A reserved constant staged at a segment's top (the `FP8_*448` sticks)
-/// would then round past it. A staged tensor ends at or before the layout's size `S`, so a page of
-/// pad past `S` holds every rounded prefix: the page-gather sweep's H2D window pad.
-fn bake(dir: &Path, ops: &[EmittedOp<W1>], layout: &mut BundleLayout, dxp: &DxpTool) -> Result<()> {
-    for b in layout.segment_bytes.iter_mut().filter(|b| **b > 0) {
-        *b += HOST_PAGE;
-    }
+fn bake(dir: &Path, ops: &[EmittedOp<W1>], layout: &BundleLayout, dxp: &DxpTool) -> Result<()> {
     let _ = std::fs::remove_dir_all(dir);
-    triton_ktir_superdsc::bake::write_dir(dir, ops).map_err(|e| anyhow!("{}: {e}", dir.display()))?;
+    triton_ktir_superdsc::bake::write_dir(dir, ops)
+        .map_err(|e| anyhow!("{}: {e}", dir.display()))?;
     triton_ktir_superdsc::bake::write_placements(dir, layout)
         .map_err(|e| anyhow!("{}: {e}", dir.display()))?;
     dxp.compile_dir(dir, ChunkExplore::of_group(ops.iter().map(|e| e.dsc())))
@@ -186,7 +171,11 @@ fn bake(dir: &Path, ops: &[EmittedOp<W1>], layout: &mut BundleLayout, dxp: &DxpT
 /// A splice-minted program, placed by the one-kernel layout and lowered by the walk chat's bake runs.
 fn lowered(node: &KtirNode) -> Result<(BundleLayout, Vec<EmittedOp<W1>>)> {
     let layout = triton_ktir_superdsc::layout::for_node(node).map_err(|e| anyhow!("{e}"))?;
-    allocate_paged_cache(node, &layout).map_err(|e| anyhow!("{e}"))?;
+    // A paged program's cache is allocated row-outermost (spyre-inference's `allocate_pages`); a
+    // program that states no cache (the float8 quantize) has none — the program's own kind says.
+    if matches!(node.program, Program::PagedAttn | Program::PagedKvWrite) {
+        allocate_paged_cache(node, &layout).map_err(|e| anyhow!("{e}"))?;
+    }
     let mut sym = 0i64;
     let ops = ktir_superdsc::emit::whole_function::lower_walk::<W1>(
         node,
@@ -233,7 +222,11 @@ fn reserved_inputs(
         },
     );
     let mut out = Vec::new();
-    for (&tid, p) in layout.placements.iter().filter(|(t, _)| **t >= RESERVED_TID_FLOOR) {
+    for (&tid, p) in layout
+        .placements
+        .iter()
+        .filter(|(t, _)| **t >= RESERVED_TID_FLOOR)
+    {
         let size = p.size as usize;
         let bytes = match synthetic.iter().find(|(t, _)| *t == tid) {
             Some((_, values)) => {
@@ -250,26 +243,12 @@ fn reserved_inputs(
             None if tid == PAGED_INT32_ZERO_TID => vec![0u8; size],
             None => bail!("t{tid}: a reserved placement this leg does not stage"),
         };
-        out.push(format!("t{tid}={}", put(dir, &format!("reserved_{tid}.bin"), &bytes)?));
+        out.push(format!(
+            "t{tid}={}",
+            put(dir, &format!("reserved_{tid}.bin"), &bytes)?
+        ));
     }
     Ok(out)
-}
-
-/// ⭐ THE READ-BACK ROLE. The one-kernel layout marks `Logits` only a parameter a DIRECT store writes
-/// (`store_views` follows `ktdp.construct_access_tile`s alone), and every output of the write and of
-/// the paged attention is written through an INDIRECT tile — the pools' scatters, `out.index_copy_`.
-/// `Executor::load` takes a bundle's read-back tensor from its `Logits` placement, so the leg marks
-/// the tensors it reads back. The role is placement metadata only: the segment, offset, size and every
-/// descriptor are the layout's.
-fn read_back(layout: &mut BundleLayout, tids: &[u32]) -> Result<()> {
-    for &tid in tids {
-        layout
-            .placements
-            .get_mut(&tid)
-            .ok_or_else(|| anyhow!("t{tid} is not placed"))?
-            .role = SegRole::Logits;
-    }
-    Ok(())
 }
 
 /// The per-sequence attention's `mask_stack` position in `paged_attn_program`'s positional mint
@@ -322,7 +301,6 @@ fn reference_pool(root: &Path, dxp: &DxpTool, which: u32) -> Result<Vec<u8>> {
         );
         off += size;
     }
-    // `bake` adds the one host page of pad every segment takes.
     l.segment_bytes[seg] = off;
     let mut sym = 0i64;
     let op = ktir_superdsc::emit::assemble_convert::<W1>(
@@ -336,7 +314,7 @@ fn reference_pool(root: &Path, dxp: &DxpTool, which: u32) -> Result<Vec<u8>> {
         Some(&l),
     )
     .map_err(|e| anyhow!("{e}"))?;
-    bake(&dir, &[op], &mut l, dxp)?;
+    bake(&dir, &[op], &l, dxp)?;
     let x = put(&dir, "image.bin", &f16_bytes(&pool_image(which)))?;
     let pool = dir.join("pool.bin");
     run(
@@ -348,20 +326,10 @@ fn reference_pool(root: &Path, dxp: &DxpTool, which: u32) -> Result<Vec<u8>> {
 }
 
 /// ⭐ PHASE 1 — the production KV write over the K and V patterns as `[T, NKVH·HD]` rows, into zeroed
-/// fp8 pools; the written pools' bytes.
+/// fp8 pools, as chat's bake runs it at a float8 cache: each pattern's `quantize_kv` (one bundle
+/// each, its float8 rows read back raw), then the write's scatter of those rows. The written pools'
+/// bytes.
 fn written_pools(root: &Path, dxp: &DxpTool) -> Result<(Vec<u8>, Vec<u8>)> {
-    let dir = root.join("write");
-    let node = kv_write_program::<Fp8>(KvWriteGeometry {
-        rows: T,
-        nkvh: NKVH,
-        hd: HeadWidth::of_whole_sticks(HD),
-        pages: PAGES,
-    })
-    .map_err(|e| anyhow!(e))?;
-    let (mut layout, ops) = lowered(&node)?;
-    // Both pools are read back (raw, below): `[key, value, k_rows, v_rows, row_index]`.
-    read_back(&mut layout, &[2, 3])?;
-    bake(&dir, &ops, &mut layout, dxp)?;
     let rows = |which: u32| -> Vec<f32> {
         let mut x = vec![0f32; (T * NKVH * HD) as usize];
         for t in 0..T {
@@ -373,19 +341,58 @@ fn written_pools(root: &Path, dxp: &DxpTool) -> Result<(Vec<u8>, Vec<u8>)> {
         }
         x
     };
+    // `[x, out]`: the f16 rows in, the float8 rows read back.
+    let quantized = |which: u32| -> Result<Vec<u8>> {
+        let dir = root.join(format!("quantize{which}"));
+        let node = kv_quantize_program(KvQuantizeGeometry {
+            rows: TokenRows::new(nz(T)),
+            cols: StickExtent::<Fp8>::new(NKVH * HD).map_err(|e| anyhow!(e))?,
+        })
+        .map_err(|e| anyhow!(e))?;
+        let (layout, ops) = lowered(&node)?;
+        bake(&dir, &ops, &layout, dxp)?;
+        let mut inputs = vec![
+            format!("t0={}", put(&dir, "x.bin", &f16_bytes(&rows(which)))?),
+            format!("stick:t0={T}"),
+        ];
+        inputs.extend(reserved_inputs(&dir, &node, &layout, T)?);
+        let out = dir.join("q.bin");
+        run(&dir, inputs, vec![format!("raw:t1={}", out.display())])?;
+        std::fs::read(&out).with_context(|| format!("read {}", out.display()))
+    };
+    let (key, value) = (quantized(0)?, quantized(1)?);
+    let dir = root.join("write");
+    let node = kv_write_program::<Fp8>(KvWriteGeometry {
+        rows: TokenRows::new(nz(T)),
+        nkvh: KvHeads::new(NKVH),
+        hd: HeadWidth::of_whole_sticks(HD),
+        block: SchedulerBlockTokens::REFERENCE,
+        pages: PoolPages::new(nz(PAGES)),
+    })
+    .map_err(|e| anyhow!(e))?;
+    let (layout, ops) = lowered(&node)?;
+    // Both pools are the write's outputs, read back (raw, below): `[key, value, k_rows, v_rows,
+    // row_index]`.
+    bake(&dir, &ops, &layout, dxp)?;
     // spyre-inference's `kv_write_index`: head `h` of slot `t` of page 0 is row `h·BLOCK + t`, one
     // `[T]` index per head, one after another.
     let index: Vec<u32> = (0..NKVH)
         .flat_map(|h| (0..T).map(move |t| h * BLOCK + t))
         .collect();
     let mut inputs = vec![
-        format!("t0={}", put(&dir, "key.bin", &f16_bytes(&rows(0)))?),
-        format!("stick:t0={T}"),
-        format!("t1={}", put(&dir, "value.bin", &f16_bytes(&rows(1)))?),
-        format!("stick:t1={T}"),
-        format!("t2={}", put(&dir, "k_zero.bin", &vec![0u8; size_of(&layout, 2)?])?),
+        format!("t0={}", put(&dir, "key.bin", &key)?),
+        "raw:t0".to_string(),
+        format!("t1={}", put(&dir, "value.bin", &value)?),
+        "raw:t1".to_string(),
+        format!(
+            "t2={}",
+            put(&dir, "k_zero.bin", &vec![0u8; size_of(&layout, 2)?])?
+        ),
         "raw:t2".to_string(),
-        format!("t3={}", put(&dir, "v_zero.bin", &vec![0u8; size_of(&layout, 3)?])?),
+        format!(
+            "t3={}",
+            put(&dir, "v_zero.bin", &vec![0u8; size_of(&layout, 3)?])?
+        ),
         "raw:t3".to_string(),
         format!("t4={}", put(&dir, "row_index.bin", &u32_bytes(&index))?),
         "raw:t4".to_string(),
@@ -442,19 +449,34 @@ fn attend(
     // `page_index_table` `[NUM_BLOCKS, 32]`: block 0's page id, page 0, at column 0.
     let table = vec![0u32; 32];
     let mut inputs = vec![
-        format!("t0={}", put(dir, &format!("{tag}_q.bin"), &f16_at(layout, 0, &q)?)?),
+        format!(
+            "t0={}",
+            put(dir, &format!("{tag}_q.bin"), &f16_at(layout, 0, &q)?)?
+        ),
         format!("stick:t0={rows}"),
-        format!("t1={}", put(dir, &format!("{tag}_qri.bin"), &u32_bytes(&qri))?),
+        format!(
+            "t1={}",
+            put(dir, &format!("{tag}_qri.bin"), &u32_bytes(&qri))?
+        ),
         "raw:t1".to_string(),
-        format!("t4={}", put(dir, &format!("{tag}_table.bin"), &u32_bytes(&table))?),
+        format!(
+            "t4={}",
+            put(dir, &format!("{tag}_table.bin"), &u32_bytes(&table))?
+        ),
         "raw:t4".to_string(),
-        format!("t{mask}={}", put(dir, &format!("{tag}_mask.bin"), &f16_at(layout, mask, &m)?)?),
+        format!(
+            "t{mask}={}",
+            put(dir, &format!("{tag}_mask.bin"), &f16_at(layout, mask, &m)?)?
+        ),
         format!("stick:t{mask}={rows}"),
         format!("stick:t{out}={rows}"),
     ];
     if decode {
         let pool_rows: Vec<u32> = (0..PAGES * NKVH).collect();
-        inputs.push(format!("t5={}", put(dir, &format!("{tag}_kvrp.bin"), &u32_bytes(&pool_rows))?));
+        inputs.push(format!(
+            "t5={}",
+            put(dir, &format!("{tag}_kvrp.bin"), &u32_bytes(&pool_rows))?
+        ));
         inputs.push("raw:t5".to_string());
     }
     match pools {
@@ -465,9 +487,19 @@ fn attend(
             inputs.push("raw:t3".to_string());
         }
         Pools::Fp16 => {
-            inputs.push(format!("t2={}", put(dir, &format!("{tag}_k.bin"), &f16_at(layout, 2, &[])?)?));
+            inputs.push(format!(
+                "t2={}",
+                put(dir, &format!("{tag}_k.bin"), &f16_at(layout, 2, &[])?)?
+            ));
             inputs.push("stick:t2=1".to_string());
-            inputs.push(format!("t3={}", put(dir, &format!("{tag}_v.bin"), &f16_at(layout, 3, &pool_image(1))?)?));
+            inputs.push(format!(
+                "t3={}",
+                put(
+                    dir,
+                    &format!("{tag}_v.bin"),
+                    &f16_at(layout, 3, &pool_image(1))?
+                )?
+            ));
             inputs.push("stick:t3=1".to_string());
         }
     }
@@ -509,13 +541,17 @@ fn main() -> Result<()> {
             .ok_or_else(|| anyhow!("usage: kv_fp8_round_trip <work-dir>"))?,
     );
     std::fs::create_dir_all(&root).with_context(|| format!("create {}", root.display()))?;
-    let dxp = DxpTool::resolve()
-        .ok_or_else(|| anyhow!("no dxp_standalone: DEEPTOOLS_PATH must name the SDK's share dir"))?;
+    let dxp = DxpTool::resolve().ok_or_else(|| {
+        anyhow!("no dxp_standalone: DEEPTOOLS_PATH must name the SDK's share dir")
+    })?;
     check_pattern()?;
     let mut failed: Vec<String> = Vec::new();
 
     // ── PHASE 0 and 1: the reference pools, the written pools, and the write's one check ──
-    let (ref_k, ref_v) = (reference_pool(&root, &dxp, 0)?, reference_pool(&root, &dxp, 1)?);
+    let (ref_k, ref_v) = (
+        reference_pool(&root, &dxp, 0)?,
+        reference_pool(&root, &dxp, 1)?,
+    );
     let (w_k, w_v) = written_pools(&root, &dxp)?;
     let image = (POOL_ROWS * HD) as usize;
     for (pool, w, r) in [("K", &w_k, &ref_k), ("V", &w_v, &ref_v)] {
@@ -533,16 +569,20 @@ fn main() -> Result<()> {
     }
 
     // ── PHASES 2c, 2, 3: decode and prefill attention, at the fp16 control and at fp8 ──
-    let hd = HeadWidth::of_whole_sticks(HD);
     let geometry = |seq: PagedSequence, rows: u32| PagedAttnGeometry {
         seq,
-        rows,
-        nqh: NQH,
-        nkvh: NKVH,
-        hd,
-        pages: PAGES,
-        blocks: 1,
-        scale: SCALE,
+        rows: TokenRows::new(nz(rows)),
+        heads: HeadGeometry::new(
+            QueryHeads::new(NQH),
+            KvHeads::new(NKVH),
+            HeadDim::new(HD),
+            RotDim::new(HD),
+            BlockSize::new(BLOCK),
+        ),
+        block: SchedulerBlockTokens::REFERENCE,
+        pages: PoolPages::new(nz(PAGES)),
+        blocks: WalkBlocks::new(nz(1)),
+        scale: AttnScale::new(SCALE),
     };
     let decode_slot = |s: u32| move |_r: u32| s;
     let prefill_slot = |r: u32| 2 * r;
@@ -551,7 +591,7 @@ fn main() -> Result<()> {
         (
             "prefill",
             PagedSequence::Prefill {
-                padded_query_len: PREFILL_ROWS,
+                padded_query_len: TokenRows::new(nz(PREFILL_ROWS)),
             },
             PREFILL_ROWS,
         ),
@@ -559,12 +599,10 @@ fn main() -> Result<()> {
         let at = |fmt: &str| root.join(format!("{name}{fmt}"));
         let n16 = paged_attn_program::<Fp16>(geometry(seq, rows)).map_err(|e| anyhow!(e))?;
         let n8 = paged_attn_program::<Fp8>(geometry(seq, rows)).map_err(|e| anyhow!(e))?;
-        let (mut l16, ops16) = lowered(&n16)?;
-        let (mut l8, ops8) = lowered(&n8)?;
-        read_back(&mut l16, &[out_tid(seq)])?;
-        read_back(&mut l8, &[out_tid(seq)])?;
-        bake(&at("16"), &ops16, &mut l16, &dxp)?;
-        bake(&at("8"), &ops8, &mut l8, &dxp)?;
+        let (l16, ops16) = lowered(&n16)?;
+        let (l8, ops8) = lowered(&n8)?;
+        bake(&at("16"), &ops16, &l16, &dxp)?;
+        bake(&at("8"), &ops8, &l8, &dxp)?;
         let slots: Vec<u32> = if seq == PagedSequence::Decode {
             SLOTS.to_vec()
         } else {
@@ -579,11 +617,36 @@ fn main() -> Result<()> {
             };
             for (phase, short, dir, node, layout, pools) in [
                 ("2c (fp16 control)", "c", at("16"), &n16, &l16, Pools::Fp16),
-                ("2 (read, reference pool)", "r", at("8"), &n8, &l8, Pools::Fp8 { k: &ref_k, v: &ref_v }),
-                ("3 (round trip, written pool)", "w", at("8"), &n8, &l8, Pools::Fp8 { k: &w_k, v: &w_v }),
+                (
+                    "2 (read, reference pool)",
+                    "r",
+                    at("8"),
+                    &n8,
+                    &l8,
+                    Pools::Fp8 {
+                        k: &ref_k,
+                        v: &ref_v,
+                    },
+                ),
+                (
+                    "3 (round trip, written pool)",
+                    "w",
+                    at("8"),
+                    &n8,
+                    &l8,
+                    Pools::Fp8 { k: &w_k, v: &w_v },
+                ),
             ] {
                 let tag = format!("{short}_s{s}");
-                let got = attend(&dir, node, layout, seq, rows, &pools, Launch { slot_of, tag: &tag })?;
+                let got = attend(
+                    &dir,
+                    node,
+                    layout,
+                    seq,
+                    rows,
+                    &pools,
+                    Launch { slot_of, tag: &tag },
+                )?;
                 match first_wrong(&got, rows, slot_of) {
                     None => println!("PASS phase {phase}: {name} slot law at s={s}"),
                     Some((i, g, w)) => failed.push(format!(

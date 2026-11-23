@@ -166,6 +166,10 @@ pub fn metal_colour_rule<F: RopeForm, S: OpStage>(op: &SubOp<F, S>) -> ColourRul
         // at all.
         | L::EmbedRowGather { .. }
         | L::ChainStage { .. }
+        // The float8 KV cache's quantize (metal stores no float8 cache, `MetalKvCodec::of`, so it
+        // never mints one), but the rule table is exhaustive by law, and the quantized rows' colour
+        // is FRESH whichever target runs it.
+        | L::KvQuantize { .. }
         // The collectives (tensor parallelism's; metal runs one rank, so the analysis inserts
         // none here): each writes the whole value into a buffer of its own.
         | L::AllReduce

@@ -3522,7 +3522,6 @@ impl LandingFrame<Fp16> {
             })
         }
     }
-
 }
 
 impl<DF: DataFormat> LandingFrame<DF> {

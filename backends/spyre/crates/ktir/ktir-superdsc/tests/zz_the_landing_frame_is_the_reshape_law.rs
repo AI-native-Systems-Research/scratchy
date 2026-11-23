@@ -315,8 +315,12 @@ fn a_frame_in_another_format_keeps_its_blocks_and_the_width_type_refuses() {
     assert_eq!(f8.width().stick_count(), 1);
     assert!(matches!(f8, LandingFrame::Blocks { .. }));
     assert_eq!(
-        f8.legs().map(|(_, r, o)| (r.get(), o.get())).collect::<Vec<_>>(),
-        f16.legs().map(|(_, r, o)| (r.get(), o.get())).collect::<Vec<_>>(),
+        f8.legs()
+            .map(|(_, r, o)| (r.get(), o.get()))
+            .collect::<Vec<_>>(),
+        f16.legs()
+            .map(|(_, r, o)| (r.get(), o.get()))
+            .collect::<Vec<_>>(),
         "the legs are the same entries at the same element offsets"
     );
     // A 64-wide frame is whole fp16 sticks and not whole fp8 sticks.
@@ -339,14 +343,41 @@ fn a_frame_in_another_format_keeps_its_blocks_and_the_width_type_refuses() {
 fn a_page_landing_addresses_as_its_blocks_under_every_division() {
     use ktir_superdsc::superdsc_opspec::{Df, PageLanding};
     let f16 = PageLanding::of(8, 128, 128, Df::Fp16);
-    assert_eq!(f16.off(3, 0, 0), 3 * 128 * 128, "a block-granular corner is the block's base");
-    assert_eq!(f16.off(0, 32, 0), 32 * 64, "row 32, stick 0: one stick a row");
-    assert_eq!(f16.off(0, 32, 64), 128 * 64 + 32 * 64, "row 32, stick 1: the second plane");
+    assert_eq!(
+        f16.off(3, 0, 0),
+        3 * 128 * 128,
+        "a block-granular corner is the block's base"
+    );
+    assert_eq!(
+        f16.off(0, 32, 0),
+        32 * 64,
+        "row 32, stick 0: one stick a row"
+    );
+    assert_eq!(
+        f16.off(0, 32, 64),
+        128 * 64 + 32 * 64,
+        "row 32, stick 1: the second plane"
+    );
     assert_eq!(f16.off(0, 4, 0), 4 * 64, "the prefill core-1 corner");
-    assert_eq!(f16.declared(), None, "several blocks declare none of their own");
+    assert_eq!(
+        f16.declared(),
+        None,
+        "several blocks declare none of their own"
+    );
     let fp8 = PageLanding::of(8, 128, 128, Df::Fp8);
-    assert_eq!(fp8.off(0, 32, 0), 32 * 128, "one fp8 stick a row: row-major");
+    assert_eq!(
+        fp8.off(0, 32, 0),
+        32 * 128,
+        "one fp8 stick a row: row-major"
+    );
     let one = PageLanding::of(1, 128, 128, Df::Fp16);
-    assert!(one.declared().is_some(), "one block several sticks wide declares its block");
-    assert_eq!(PageLanding::of(1, 128, 64, Df::Fp16).declared(), None, "one stick declares none");
+    assert!(
+        one.declared().is_some(),
+        "one block several sticks wide declares its block"
+    );
+    assert_eq!(
+        PageLanding::of(1, 128, 64, Df::Fp16).declared(),
+        None,
+        "one stick declares none"
+    );
 }
