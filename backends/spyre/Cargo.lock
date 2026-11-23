@@ -1837,6 +1837,7 @@ dependencies = [
  "scratchy-models",
  "scratchy-models-build",
  "scratchy-quantizations",
+ "scratchy-state-decoder-gdn",
  "scratchy-subtile",
  "scratchy-target-spyre",
  "scratchy-target-spyre-compiler",

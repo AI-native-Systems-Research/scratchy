@@ -19,8 +19,6 @@
 //! proc-macro time. Re-exporting the macro would re-introduce the
 //! macro→forward→macro cycle.
 
-pub mod gdn_slot_allocator;
-pub mod gdn_state_layout;
 // `info` is the non-generic, hashable backbone view used by
 // `scr model info`. The whole pipeline (BackboneDumpRegistration
 // inventory + Instruction::normalize) is backend-agnostic.

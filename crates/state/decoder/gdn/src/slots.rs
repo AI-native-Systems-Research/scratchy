@@ -2,7 +2,7 @@
 //! Per-request GDN recurrent-state slot allocator.
 //!
 //! A GDN layer keeps one recurrent-state slot per concurrently-resident
-//! sequence (see [`crate::gdn_state_layout::GdnStateLayout`]). Unlike the
+//! sequence (see [`crate::layout::GdnStateLayout`]). Unlike the
 //! paged KV cache there is no block paging: each active sequence owns exactly
 //! one slot for its whole lifetime, and the slot is recycled when the sequence
 //! finishes.
@@ -25,8 +25,8 @@
 //! ## Speculative decoding
 //!
 //! A verify step runs a sequence's drafts through its recurrent state, so a rejected draft would
-//! stay in it. The verify step leaves the state it started from in the slot and records its rows in
-//! the sequence's draft lane ([`scratchy_state_decoder_gdn::pool`]); [`GdnSlotAllocator::verified`]
+//! stay in it. The verify step leaves the state it started from in the slot and records its rows
+//! in the sequence's draft lane ([`crate::pool`]); [`GdnSlotAllocator::verified`]
 //! records how many drafts were kept, and the request's next step replays its rows up to the last
 //! kept one.
 //!
@@ -39,7 +39,7 @@
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 
-use scratchy_state_decoder_gdn::pool::{
+use crate::pool::{
     CheckpointRows, DraftLane, DraftLanes, GDN_SAVES, GdnSave, GdnSeqSlots, GdnSlot, GdnStart,
     GdnStep, RecordArea,
 };
@@ -167,9 +167,9 @@ impl GdnSlotAllocator {
 
     /// One step's GDN inputs, for its sequences in `cu_seqlens` order: each sequence's
     /// [`GdnSeqSlots`] (`state_indices`) and its [`GdnStep`] code. A verify step (`drafts > 0`)
-    /// keeps what a rejected draft needs undone (`scratchy_state_decoder_gdn::pool` module docs)
-    /// in the sequence's draft lane; a sequence whose step does not verify gives its lane back,
-    /// once every sequence's inputs are built (module docs).
+    /// keeps what a rejected draft needs undone (`pool` module docs) in the sequence's draft
+    /// lane; a sequence whose step does not verify gives its lane back, once every sequence's
+    /// inputs are built (module docs).
     ///
     /// ⭐ WHERE A SEQUENCE'S STATE STARTS COMES FROM WHERE IT STANDS, not from whether this
     /// allocator has seen the id before:

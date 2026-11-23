@@ -45,6 +45,8 @@ scratchy-models = { path = "../../../../crates/models/arch", default-features = 
 scratchy-target-spyre = { path = "../spyre" }
 scratchy-forward-compiler = { path = "../../../../crates/compiler" }
 scratchy-layers = { path = "../../../../crates/layers" }
+# The recurrent state the emitted code names for an arch that runs a recurrent mixer.
+scratchy-state-decoder-gdn = { workspace = true }
 scratchy-tensors = { path = "../../../../crates/tensors" }
 scratchy-quantizations = { path = "../../../../crates/models/quantization" }
 # The `BakedTokenizer`s the build bakes register against.

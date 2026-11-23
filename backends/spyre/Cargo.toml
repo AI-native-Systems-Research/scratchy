@@ -59,6 +59,7 @@ tracing = "0.1"
 
 # The shared crates, from the root workspace.
 scratchy-core-model = { path = "../../crates/core/model" }
+scratchy-state-decoder-gdn = { path = "../../crates/state/decoder/gdn" }
 
 # Profiles apply only from a workspace root, so these repeat the root workspace's (its comments
 # say why each is set), plus the two for spyre's own compiled models.

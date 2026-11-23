@@ -48,7 +48,7 @@ pub trait ScratchyWeights: Send + Sync {
     /// `Some(_)` for arches whose forward body contains a `gated_delta_net`
     /// op; the default (non-hybrid arches) returns `None`, so no GDN state
     /// pool is allocated and the `gdn_state` ForwardCtx field stays `None`.
-    fn gdn_runtime_config(&self) -> Option<crate::gdn_state_layout::GdnRuntimeConfig> {
+    fn gdn_runtime_config(&self) -> Option<scratchy_state_decoder_gdn::layout::GdnRuntimeConfig> {
         None
     }
 

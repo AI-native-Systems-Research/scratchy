@@ -8357,7 +8357,7 @@ pub fn emit_gdn_runtime_config_arm_body(
     let bits = linear.iter().copied();
     Some(quote! {
         ::core::option::Option::Some(
-            ::scratchy_forward_compiler::gdn_state_layout::GdnRuntimeConfig {
+            ::scratchy_state_decoder_gdn::layout::GdnRuntimeConfig {
                 conv_dim: #conv_dim,
                 conv_kernel: #conv_kernel,
                 num_k_heads: #num_k_heads,

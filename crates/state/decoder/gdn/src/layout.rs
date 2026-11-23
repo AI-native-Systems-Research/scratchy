@@ -17,9 +17,7 @@
 //! * ssm_state is the recurrent delta-rule state matrix `S[head_v, head_k]`
 //!   per value head.
 //!
-//! Like `PagedKvLayout` (now in a target's crate alongside the
-//! `cpu_golden` oracle) this lives at the crate root (not feature-gated) so
-//! the GPU pool sizing and the per-request slot allocator share one
+//! The GPU pool sizing and the per-request slot allocator share this one
 //! definition.
 //! The slot index is *not* part of the layout — it selects which slot of the
 //! leading axis; the layout describes the within-slot addressing only.
@@ -42,7 +40,7 @@ pub struct GdnStateLayout {
 }
 
 /// Runtime GDN config a hybrid arch reports to the worker so it can size and
-/// allocate the `scratchy_state_decoder_gdn::pool::GdnStatePool`. Backend-neutral:
+/// allocate the `crate::pool::GdnStatePool`. Backend-neutral:
 /// carries the per-layer dims + the per-global-layer linear-attention mask. The
 /// `num_slots` (= `max_num_seqs`) is supplied by the worker, not the model.
 ///
@@ -67,8 +65,8 @@ pub struct GdnRuntimeConfig {
 
 impl GdnRuntimeConfig {
     /// A slot's checkpoints: the model's drafts.
-    pub fn checkpoint_rows(&self) -> scratchy_state_decoder_gdn::pool::CheckpointRows {
-        scratchy_state_decoder_gdn::pool::CheckpointRows(self.spec_drafts)
+    pub fn checkpoint_rows(&self) -> crate::pool::CheckpointRows {
+        crate::pool::CheckpointRows(self.spec_drafts)
     }
 
     /// Number of GDN (linear-attention) layers.
@@ -77,8 +75,8 @@ impl GdnRuntimeConfig {
     }
 
     /// The state geometry the GDN state pool allocates each linear layer.
-    pub fn state_dims(&self) -> scratchy_state_decoder_gdn::pool::GdnStateDims {
-        scratchy_state_decoder_gdn::pool::GdnStateDims {
+    pub fn state_dims(&self) -> crate::pool::GdnStateDims {
+        crate::pool::GdnStateDims {
             conv_dim: self.conv_dim as usize,
             conv_kernel: self.conv_kernel as usize,
             num_v_heads: self.num_v_heads as usize,
