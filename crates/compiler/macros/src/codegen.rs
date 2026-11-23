@@ -8788,7 +8788,7 @@ mod tests {
                 continue;
             };
             let facts =
-                fill_canonical_params(&model, 1, false, &every_layer(&model), None, false).0;
+                fill_canonical_params(&model, 1, false, &every_layer(&model), None, None).0;
             // A body with no decoder attention (a vision tower, a drafter head) states
             // no scale — the law is over the configs that do.
             let Some(attention) = facts.attention() else {
@@ -8895,7 +8895,7 @@ mod tests {
             "SCALE_DTYPE",
         ];
         let m = shard_test_model(32, 8, 128, 11008);
-        let (facts, mla) = fill_canonical_params(&m, 1, false, &every_layer(&m), None, false);
+        let (facts, mla) = fill_canonical_params(&m, 1, false, &every_layer(&m), None, None);
         let ts = emit_canonical_params_impl(facts, &mla).to_string();
         assert!(ts.contains("const FACTS"), "the impl states FACTS: {ts}");
         for name in DERIVED {
@@ -8911,7 +8911,7 @@ mod tests {
         // Llama-2-7B-ish numbers: 32 q heads, 32 kv heads,
         // head_dim=128, intermediate=11008.
         let m = shard_test_model(32, 32, 128, 11008);
-        let facts = fill_canonical_params(&m, 1, false, &every_layer(&m), None, false).0;
+        let facts = fill_canonical_params(&m, 1, false, &every_layer(&m), None, None).0;
         // Q size = 32 * 128 = 4096; KV size = 32 * 128 = 4096.
         assert!(
             raw::num_q_heads(facts) == 32,
@@ -8943,7 +8943,7 @@ mod tests {
     #[test]
     fn canonical_params_at_tp_eq_2_shards_column_parallel_dims() {
         let m = shard_test_model(32, 32, 128, 11008);
-        let facts = fill_canonical_params(&m, 2, false, &every_layer(&m), None, false).0;
+        let facts = fill_canonical_params(&m, 2, false, &every_layer(&m), None, None).0;
         assert!(
             raw::num_q_heads(facts) == 16,
             "tp=2 must shard NUM_Q_HEADS to 16; got {}",
@@ -8989,7 +8989,7 @@ mod tests {
         // Llama-3-8B-ish numbers: 32 q heads, 8 kv heads,
         // head_dim=128, intermediate=14336.
         let m = shard_test_model(32, 8, 128, 14336);
-        let facts = fill_canonical_params(&m, 8, false, &every_layer(&m), None, false).0;
+        let facts = fill_canonical_params(&m, 8, false, &every_layer(&m), None, None).0;
         // 32 / 8 = 4
         assert!(
             raw::num_q_heads(facts) == 4,

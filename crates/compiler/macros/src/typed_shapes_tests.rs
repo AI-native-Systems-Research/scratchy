@@ -477,7 +477,7 @@ fn head_facts(
     model: &crate::config::ModelParams,
 ) -> scratchy_ir::model_facts::ModelFacts {
     let width = crate::codegen::target_width(program, inferred);
-    crate::codegen::fill_canonical_params(model, 1, false, &Default::default(), Some(width), false)
+    crate::codegen::fill_canonical_params(model, 1, false, &Default::default(), Some(width), None)
         .0
 }
 
