@@ -47,12 +47,8 @@ pub struct CodedHeads {
 }
 
 impl CodedHeads {
-    /// A target's table: `min` and `max` powers of two, `min <= max`.
+    /// A target's table: the narrowest and the widest head its kernels code.
     pub const fn new(min: u32, max: u32) -> Self {
-        assert!(
-            min.is_power_of_two() && max.is_power_of_two() && min <= max,
-            "int8 KV: a coded head table's bounds are powers of two, the least first"
-        );
         Self { min, max }
     }
 
