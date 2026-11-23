@@ -5112,7 +5112,7 @@ impl PagedKvPool {
     ///
     /// Two things unlock it, in order: size the pool to the batch actually being run rather than to the
     /// widest baked rung, and make a page DENSER instead of BIGGER (a 4-bit KV cache gives four times
-    /// the positions for the same bytes — TurboQuant is already in-tree for the GPU target). Then this goes back
+    /// the positions for the same bytes — int8 KV is already in-tree for the GPU target). Then this goes back
     /// up and the win comes with it.
     ///
     /// ⭐ A MEASURED POLICY, NOT A DERIVATION: 256 is chosen on the measurements above

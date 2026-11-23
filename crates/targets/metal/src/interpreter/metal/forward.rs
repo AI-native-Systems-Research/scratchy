@@ -561,7 +561,7 @@ pub enum ForwardError {
         num_seqs: usize,
         rung: MaxBlocksPerSeq,
     },
-    /// A step names group-0 block `block`, past the `mapped` its TurboQuant stores are mapped
+    /// A step names group-0 block `block`, past the `mapped` its int8 stores are mapped
     /// through: its caller grows them first (`SparseRegistry::reach`), or the forward would read
     /// un-wired memory.
     KvNotMapped { block: u32, mapped: usize },
@@ -630,7 +630,7 @@ impl std::fmt::Display for ForwardError {
             Self::KvNotMapped { block, mapped } => write!(
                 f,
                 "MetalWorkerPool::forward: block {block} is past the {mapped} blocks the \
-                 TurboQuant KV stores are mapped through (`SparseRegistry::reach` them first)"
+                 int8 KV stores are mapped through (`SparseRegistry::reach` them first)"
             ),
             Self::TooManySampledRows { sampled, overflow } => write!(
                 f,

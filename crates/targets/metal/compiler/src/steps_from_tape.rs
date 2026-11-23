@@ -318,14 +318,8 @@ impl OpColours {
     }
 }
 
-/// A KV codec step's writer: its layer, pairing, class, offsets and weight site.
-type CodecWriter = (
-    LayerId,
-    RopeFormTag,
-    AttnMask,
-    st::KvOffsets,
-    Vec<WeightSlot>,
-);
+/// A KV codec step's writer: its layer, pairing, class and weight site.
+type CodecWriter = (LayerId, RopeFormTag, AttnMask, Vec<WeightSlot>);
 
 /// Which arena buffers and KV layers a row touches — what the barrier walk fences on.
 #[derive(Clone, Debug, Default)]
@@ -905,13 +899,7 @@ impl Recording<'_> {
             })
             .ok_or_else(no)?;
         let layer = LayerId(layer as u32);
-        Ok((
-            layer,
-            RopeFormTag::NeoX,
-            class,
-            st::KvOffsets::CENTERED,
-            vec![self.rotary(i)],
-        ))
+        Ok((layer, RopeFormTag::NeoX, class, vec![self.rotary(i)]))
     }
 
     fn codec_writer(&self, i: usize, encode: usize) -> Result<CodecWriter, StepRefusal> {
@@ -930,15 +918,14 @@ impl Recording<'_> {
             .last()
             .ok_or_else(no)?;
         let e = self.fused(w, f)?;
-        let (layer, pairing, class, offsets) = match e.step {
-            MetalStep::RopeAppend(.., l, p, c, offsets, _) => (l, p, c, offsets),
-            // Normed K/V: a norm adds nothing.
-            MetalStep::RopeAppendNormed(.., l, p, c, _) => (l, p, c, st::KvOffsets::CENTERED),
+        let (layer, pairing, class) = match e.step {
+            MetalStep::RopeAppend(.., l, p, c, _, _)
+            | MetalStep::RopeAppendNormed(.., l, p, c, _) => (l, p, c),
             // Un-rotated: its cache is read as stored, the attention's convention for it.
-            MetalStep::KvAppend(_, _, l, c, offsets, _) => (l, RopeFormTag::NeoX, c, offsets),
+            MetalStep::KvAppend(_, _, l, c, _, _) => (l, RopeFormTag::NeoX, c),
             _ => return Err(no()),
         };
-        Ok((layer, pairing, class, offsets, e.sites))
+        Ok((layer, pairing, class, e.sites))
     }
 
     /// The scratch region the off-arena value op `j` writes (`op_abi::moe_write`).
@@ -1784,15 +1771,8 @@ impl Recording<'_> {
     /// the writer-less attention that reads it, when one does.
     fn query_only_rotate(&self, i: usize) -> Option<(LayerId, AttnMask)> {
         let ops = &self.l.input.ops;
-        // The attention reads the rotation directly, or through the codec's query rotation.
-        let reads = |q: Option<&InputRef>| match q {
-            Some(&InputRef::Op(j)) if j == i => true,
-            Some(&InputRef::Op(j)) => {
-                matches!(ops[j].op, SubOp::RotateRows { .. })
-                    && ops[j].inputs.first() == Some(&InputRef::Op(i))
-            }
-            _ => false,
-        };
+        // The attention reads the rotation directly.
+        let reads = |q: Option<&InputRef>| matches!(q, Some(&InputRef::Op(j)) if j == i);
         ops.iter().enumerate().find_map(|(j, od)| match od.op {
             SubOp::AttnDecode { mask, .. } if od.inputs.len() == 3 && reads(od.inputs.first()) => {
                 Some((self.prefix_layer(j)?, mask))
@@ -2252,20 +2232,16 @@ impl Recording<'_> {
             }
             // The KV codec: each step's operands are its writer's, its site the writer's.
             L::KvStage { operand } => {
-                let (layer, _, class, offsets, sites) = self.codec_operand(i, 0)?;
-                let mut e = em(S::KvStage(operand, layer, class, offsets), &[], &[], sites);
+                let (layer, _, class, sites) = self.codec_operand(i, 0)?;
+                let mut e = em(S::KvStage(operand, layer, class), &[], &[], sites);
                 // The layer's packed store in, the staging buffer out.
                 e.sig.kv_r = Some(layer);
                 e.sig.codec_staging = Access::Write;
                 e
             }
-            L::RotateRows { rows } => {
-                let x = self.read(i, 0)?;
-                em(S::RotateRows(x, rows), &[x], &[x], Vec::new())
-            }
             L::AttnPackedKv => {
                 // The layer's decode attention: its writer's layer and pairing.
-                let (layer, pairing, class, offsets, mut sites) = self.codec_operand(i, 2)?;
+                let (layer, pairing, class, mut sites) = self.codec_operand(i, 2)?;
                 let (q, out) = (self.read(i, 0)?, out()?);
                 // gpt-oss attention sinks: the twin's TRAILING weight input (arg 4 —
                 // the attention's 6th operand, carried by the codec expansion) binds the
@@ -2283,11 +2259,11 @@ impl Recording<'_> {
                     Ok(InputRef::Op(_)) => return Err(self.no(i, Refused::NotASource(4))),
                     Err(_) => {}
                 }
-                let step = S::AttnPackedKv(q, out, layer, pairing, class, offsets);
+                let step = S::AttnPackedKv(q, out, layer, pairing, class);
                 let mut e = em(step, &[q, out], &[out], sites);
                 e.sig.kv_r = Some(layer);
                 // A one-row full-attention decode may pass its partials through the op scratch
-                // (`attention_decode_gqa_tq`).
+                // (`attention_decode_gqa_int8`).
                 if class == AttnMask::Causal && self.l.input.ops[i].m <= 1 {
                     e.sig.op_scratch = Access::Write;
                 }

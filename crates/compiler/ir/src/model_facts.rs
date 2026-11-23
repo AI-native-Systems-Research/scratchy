@@ -946,14 +946,14 @@ pub struct FactsParts {
 pub struct ModelFacts(FactsParts);
 
 impl ModelFacts {
-    /// The facts, refused when its groups break a law between them: a TurboQuant KV codec codes an
+    /// The facts, refused when its groups break a law between them: an int8 KV codec codes an
     /// attention's keys and values, so it needs an attention; a head lent its target's width
     /// ([`TargetWidth::Lent`]) is that width.
     pub const fn new(parts: FactsParts) -> Self {
-        if let KvCodec::TurboQuant(_) = parts.kv_codec {
+        if let KvCodec::Int8 = parts.kv_codec {
             assert!(
                 parts.attention.is_some(),
-                "ModelFacts: a TurboQuant KV codec is an attention's"
+                "ModelFacts: an int8 KV codec is an attention's"
             );
         }
         if let Some(Target {
@@ -1499,11 +1499,11 @@ mod tests {
         }
     }
 
-    /// A TurboQuant KV codec on a body without attention codes nothing.
+    /// An int8 KV codec on a body without attention codes nothing.
     #[test]
-    #[should_panic(expected = "a TurboQuant KV codec is an attention's")]
-    fn a_turboquant_codec_without_attention_is_refused() {
-        ModelFacts::new(parts(None, KvCodec::TurboQuant(crate::TqBits::new(4))));
+    #[should_panic(expected = "an int8 KV codec is an attention's")]
+    fn an_int8_codec_without_attention_is_refused() {
+        ModelFacts::new(parts(None, KvCodec::Int8));
     }
 
     fn head_of(target: Target) -> ModelFacts {

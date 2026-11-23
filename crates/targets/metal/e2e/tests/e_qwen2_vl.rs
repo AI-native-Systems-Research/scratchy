@@ -240,40 +240,34 @@ async fn test_qwen2_vl_bug1_prefill_graph_skips_encoder() {
     assert_mentions_any(text, &["red", "circle", "round"], "Bug 1");
 }
 
-/// **Anti-reward-hack tripwire — TurboQuant + image KV.**
+/// **Anti-reward-hack tripwire — int8 KV + image KV.**
 ///
-/// TurboQuant KV compression corrupts image-embedding KV on metal: qwen2-vl
-/// answers "The is" to a red circle under TurboQuant, "a red circle" under
-/// fp16. The bug is in the QUANTIZER (image-derived K/V doesn't round-trip
-/// through `crates/targets/metal/shaders/turboquant.metal` /
-/// `crates/layers/src/turboquant.rs`), NOT in the KV routing.
+/// Image-derived K/V must round-trip through the int8 KV codec
+/// (`crates/targets/metal/shaders/kv_int8.h`, `crates/layers/src/kv_int8.rs`): qwen2-vl answers
+/// a red circle's colour and shape with its KV stored as int8.
 ///
-/// This test exists to make the fix un-gameable. It asserts
-/// `--kv-cache-dtype turboquant` **explicitly** — the server refuses to start
-/// unless the binary was built with the `turboquant` feature and this model's
-/// KV codec is TurboQuant — so the only way to turn it green is to make
-/// TurboQuant reconstruct image KV accurately.
+/// This test exists to make that un-gameable. It asserts `--kv-cache-dtype int8` **explicitly**
+/// — the server refuses to start unless this model's KV codec is int8 — so the only way to turn
+/// it green is to make int8 reconstruct image KV accurately.
 ///
 /// 🛑 DO NOT "fix" a failure here by:
-///   - making multimodal models dense (`turboquant::codec_for`, the
-///     `self.mm.is_some()` gate / `prefill_bucket_max_m`),
+///   - making multimodal models dense (`kv_int8::codec_for`),
 ///   - skipping/fp16-ing image-token KV positions,
 ///   - or relaxing this test's model/flags.
-/// Those are bypasses, not fixes — they leave TurboQuant broken on the data it
-/// fails on. The fix must live in the quantizer and keep TurboQuant ON here.
+/// Those are bypasses, not fixes. The fix must live in the codec and keep int8 ON here.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
-async fn test_qwen2_vl_turboquant_image_forced_on() {
+async fn test_qwen2_vl_int8_image_forced_on() {
     let model = if cfg!(feature = "metal") {
         TestModels::QWEN2_VL_7B_4BIT
     } else {
         TestModels::QWEN2_VL_2B_INSTRUCT
     };
     let server = TestServer::builder(model)
-        .with_args(&["--kv-cache-dtype", "turboquant"])
+        .with_args(&["--kv-cache-dtype", "int8"])
         .start()
         .await
-        .expect("Qwen2-VL server should start with TurboQuant KV");
+        .expect("Qwen2-VL server should start with int8 KV");
     let client = Client::new(server.base_url());
 
     let red = load_fixture_b64("red_circle_224.png");
@@ -294,7 +288,7 @@ async fn test_qwen2_vl_turboquant_image_forced_on() {
     assert_mentions_any(
         text,
         &["red", "circle", "round"],
-        "TurboQuant image KV (asserted --kv-cache-dtype turboquant)",
+        "int8 image KV (asserted --kv-cache-dtype int8)",
     );
 }
 

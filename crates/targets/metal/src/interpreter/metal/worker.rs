@@ -35,7 +35,6 @@ use super::pipelines::{PipelineLookupError, SpecializedPipelines};
 use super::runtime::RuntimeBindings;
 use crate::MetalAllocator;
 use crate::sparse_arena::SparseBuffer;
-use crate::tape::constants::TapeVariant;
 use crate::tape::ids::SourceIx;
 use crate::tape::lowered::ModelSources;
 use crate::tape::lowered::{PerScratch, ScratchKind};
@@ -341,15 +340,15 @@ impl Hosting {
 }
 
 /// What a host pool shares with its guest ([`ArenaShare::In`]): the slot each guest rank takes, its
-/// scratch by kind; and its TurboQuant scratch, which a guest of the same geometry stages through,
-/// and whole TurboQuant runtime — its packed KV stores, codebook and scratch — which a guest
-/// reading the host's KV binds (an MTP head with none of its own).
+/// scratch by kind; and its int8 KV scratch, which a guest of the same geometry stages through,
+/// and whole int8 KV store — its codes, scales and scratch — which a guest reading the host's KV
+/// binds (an MTP head with none of its own).
 #[derive(Clone, Default)]
 pub struct HostArena {
     pub arena: ByRank<Activation>,
     pub scratch: PerScratch<Option<Activation>>,
-    pub tq_scratch: Option<super::runtime::TqScratch>,
-    pub tq: Option<super::runtime::TqRuntimeBuffers>,
+    pub kv_scratch: Option<super::runtime::KvScratch>,
+    pub int8: Option<super::runtime::Int8KvBuffers>,
 }
 
 /// How a pool's arena relates to that of a model whose forwards never overlap its own, and follow
@@ -639,14 +638,14 @@ pub struct MetalWorker<W: CanonicalParams> {
     sparse: Option<SparseActivation>,
     /// Per-forward count of the blocks the step's longest sequence spans
     /// (`live_block_width` in `pool.rs`, set before each forward), for the
-    /// `TqStageRotated` and `RopeOnce*` grids: they cover the WHOLE active
+    /// `KvStage` and `RopeOnce*` grids: they cover the WHOLE active
     /// context and no more — the block-table row is the KV cap rung's width,
     /// which grows with the pool, not the context. `0` until the first
     /// forward sets it (dispatch falls back to the baked grid).
-    pub tq_dequant_max_blocks: std::sync::atomic::AtomicU32,
+    pub kv_stage_max_blocks: std::sync::atomic::AtomicU32,
     /// Whether some sequence of the step about to run has an unrotated
     /// (bit-31, span) block in its block table, set with
-    /// `tq_dequant_max_blocks`. Only a prefill attention that re-ropes K can
+    /// `kv_stage_max_blocks`. Only a prefill attention that re-ropes K can
     /// read such a block (`RuntimeGate::OnlyIfUnrotatedBlocks`).
     pub unrotated_blocks: std::sync::atomic::AtomicBool,
     /// Whether every sequence of the step about to run takes a plain
@@ -714,8 +713,8 @@ impl<W: CanonicalParams> MetalWorker<W> {
                 .map(|(_, &Slot(slot))| self.arena_activation[slot].clone())
                 .collect(),
             scratch: self.scratch.clone(),
-            tq_scratch: None,
-            tq: None,
+            kv_scratch: None,
+            int8: None,
         }
     }
 
@@ -1027,9 +1026,9 @@ impl<W: CanonicalParams> MetalWorker<W> {
                 vision_window_index,
                 vision_reverse_indices,
                 vision_position_ids,
-                // TurboQuant packed stores + codebook — pinned below when Some
+                // The int8 KV store — its scratch's chunk tables pinned below when Some
                 // (dispatch-bound by baked gpuAddress, same lazy-pager hazard).
-                tq,
+                int8,
                 // A target's captured rows for its drafter: bound by baked gpuAddress (16-byte
                 // placeholder on a model no drafter reads), pinned below.
                 draft_capture,
@@ -1105,15 +1104,11 @@ impl<W: CanonicalParams> MetalWorker<W> {
             pin(vision_window_index);
             pin(vision_reverse_indices);
             pin(vision_position_ids);
-            // TurboQuant: the codebook and the fp16 scratch's chunk tables are read by
-            // the dequant/quantize dispatch commands via baked gpuAddress, so pin them
-            // (same lazy-pager hazard); the packed, norms and scratch stores pin
-            // themselves, and each step of them as it is mapped (`SparseStores`).
-            // `None` for a dense model → no-op.
-            if let Some(t) = tq {
-                pin(&t.signs);
-                pin(&t.boundaries);
-                pin(&t.centroids);
+            // Int8: the fp16 scratch's chunk tables are read by the staging dispatch commands via
+            // baked gpuAddress, so pin them (same lazy-pager hazard); the codes, scales and
+            // scratch stores pin themselves, and each step of them as it is mapped
+            // (`SparseStores`). `None` for a dense model → no-op.
+            if let Some(t) = int8 {
                 pin(&t.scratch.k_table);
                 pin(&t.scratch.v_table);
             }
@@ -1142,9 +1137,6 @@ impl<W: CanonicalParams> MetalWorker<W> {
                 scratch[ScratchKind::RopedK]
                     .as_ref()
                     .map(Activation::buffer),
-                scratch[ScratchKind::AttnUnfused]
-                    .as_ref()
-                    .map(Activation::buffer),
                 pipelines,
                 sources,
                 runtime,
@@ -1164,7 +1156,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
             bucket_bakings,
             scratch,
             sparse,
-            tq_dequant_max_blocks: std::sync::atomic::AtomicU32::new(0),
+            kv_stage_max_blocks: std::sync::atomic::AtomicU32::new(0),
             unrotated_blocks: std::sync::atomic::AtomicBool::new(false),
             gdn_plain: std::sync::atomic::AtomicBool::new(true),
             gdn_plain_rows: std::sync::atomic::AtomicBool::new(true),
@@ -1410,20 +1402,20 @@ impl<W: CanonicalParams> MetalWorker<W> {
                     );
                 }
                 let tg_scaled = scale_tg_for_num_tokens(*tg, *scaling, facts);
-                // TurboQuant full-context staging: the baked grid is a
+                // Int8 full-context staging: the baked grid is a
                 // placeholder; the kernel needs (max_blocks, num_kv_heads,
                 // num_seqs) — block-table-driven, with early-exit past
                 // seqused_k; grid.z = the live batch's num_seqs.
-                let tg_scaled = if step.kernel == StepKernel::Kernel(KernelId::TqStageRotated) {
+                let tg_scaled = if step.kernel == StepKernel::Kernel(KernelId::KvStage) {
                     // grid.x must cover every block of the longest sequence
-                    // (`tq_dequant_max_blocks`). The static
+                    // (`kv_stage_max_blocks`). The static
                     // `W::MAX_BLOCKS_PER_SEQ` (128 for uniform arches like
                     // Llama) truncated the pass at 128 blocks / 2048 tokens, so
                     // the reused fp16 scratch's tail kept the PREVIOUS layer's
                     // KV → attention collapse to `!!!!` past 2048 tokens. The
                     // baked const stands in only while the width is unset (0).
                     let runtime_mb = self
-                        .tq_dequant_max_blocks
+                        .kv_stage_max_blocks
                         .load(std::sync::atomic::Ordering::Relaxed);
                     let baked =
                         <W as ::scratchy_forward_compiler::CanonicalParams>::MAX_BLOCKS_PER_SEQ;
@@ -1442,8 +1434,8 @@ impl<W: CanonicalParams> MetalWorker<W> {
                 // num_tokens (the NEW tokens only) — too few for a chunked-prefill CONTINUATION,
                 // leaving the prefix blocks past one bucket un-roped → garbage K → `!!!!` past
                 // 4096 tokens. Override grid.y to every block of the sequence
-                // (`tq_dequant_max_blocks`), within the rung's cap: the scratch holds it.
-                // Mirrors the TqStageRotated grid override above.
+                // (`kv_stage_max_blocks`), within the rung's cap: the scratch holds it.
+                // Mirrors the KvStage grid override above.
                 let tg_scaled = if matches!(
                     step.kernel,
                     StepKernel::Kernel(
@@ -1453,7 +1445,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
                     )
                 ) {
                     let runtime_mb = self
-                        .tq_dequant_max_blocks
+                        .kv_stage_max_blocks
                         .load(std::sync::atomic::Ordering::Relaxed)
                         as usize;
                     let cover = if runtime_mb == 0 {
@@ -1516,8 +1508,7 @@ fn is_fused(id: StepKernel) -> bool {
             | K::AffineQmvGated
             | K::RopeAppendNormed
             | K::NormAddScalarMul
-            | K::AttentionViaCacheTq
-            | K::AttentionDecodeGqaTq
+            | K::AttentionDecodeInt8
     )
 }
 
@@ -1542,19 +1533,11 @@ fn kernel_kind(id: StepKernel) -> KernelKind {
         | K::RopeOnceSteel
         | K::RopeOnceGqaShared => KernelKind::Rope,
         K::AttentionViaCache
-        | K::AttentionViaCacheTq
-        | K::AttentionDecodeGqaTq
+        | K::AttentionDecodeInt8
         | K::AttentionDecodeCombine
         | K::AttentionVerifyPack
         | K::AttentionVerifySplit
-        | K::AttentionPrefillSdpaPaged
-        | K::AttnGatherKRope
-        | K::AttnGatherVCopyT
-        | K::AttnQConvert
-        | K::AttnOConvert
-        | K::AttnCausalSoftmax
-        | K::AttnGemmQk
-        | K::AttnGemmPv => KernelKind::Attention,
+        | K::AttentionPrefillSdpaPaged => KernelKind::Attention,
         K::GatedDeltaNet => KernelKind::GatedDeltaNet,
         K::NormedGemv
         | K::AffineQmvQuad
@@ -1604,8 +1587,7 @@ fn kernel_kind(id: StepKernel) -> KernelKind {
         | K::Add
         | K::BiasAdd
         | K::Reshape
-        | K::TqStageRotated
-        | K::TqRotateRows
+        | K::KvStage
         | K::LoadRows
         | K::ConcatRows => KernelKind::Elementwise,
     }
@@ -1620,7 +1602,6 @@ fn bake_bucket<W: CanonicalParams>(
     splitk_scratch: Option<&Buffer>,
     moe_scratch: Option<&Buffer>,
     roped_k_scratch: Option<&Buffer>,
-    attn_unfused_scratch: Option<&Buffer>,
     pipelines: &SpecializedPipelines,
     sources: &ResolvedSources,
     runtime: &RuntimeBindings,
@@ -1662,7 +1643,6 @@ fn bake_bucket<W: CanonicalParams>(
                     /*splitk_scratch=*/ None,
                     moe_scratch,
                     /*roped_k_scratch=*/ None,
-                    /*attn_unfused_scratch=*/ None,
                     sources,
                     runtime,
                 )?;
@@ -1709,11 +1689,10 @@ fn bake_bucket<W: CanonicalParams>(
                     splitk_scratch,
                     moe_scratch,
                     roped_k_scratch,
-                    attn_unfused_scratch,
                     sources,
                     runtime,
                 )?;
-                let dispatch_for_cmd = mtl_size_pair(&cmd, pipelines.variant());
+                let dispatch_for_cmd = mtl_size_pair(&cmd);
                 (
                     pipeline,
                     bindings_for_cmd,
@@ -1877,7 +1856,6 @@ fn resolve_bindings(
     splitk_scratch: Option<&Buffer>,
     moe_scratch: Option<&Buffer>,
     roped_k_scratch: Option<&Buffer>,
-    attn_unfused_scratch: Option<&Buffer>,
     sources: &ResolvedSources,
     runtime: &RuntimeBindings,
 ) -> Result<Vec<(Buffer, u64, u64)>, WorkerError> {
@@ -1931,16 +1909,6 @@ fn resolve_bindings(
                     command_index,
                 })?;
                 (scratch.clone(), 0u64, *binding_index as u64)
-            }
-            Binding::AttnUnfusedScratch {
-                offset,
-                binding_index,
-            } => {
-                let scratch = attn_unfused_scratch.ok_or(WorkerError::ScratchBufferMissing {
-                    bucket_index,
-                    command_index,
-                })?;
-                (scratch.clone(), *offset as u64, *binding_index as u64)
             }
             Binding::MoeScratch {
                 binding_index,
@@ -2091,16 +2059,10 @@ fn pipeline_is_gemv(shape: &super::lowered::DispatchShape, dims: super::lowered:
     dims.m <= super::pipelines::GEMV_MAX_ROWS && shape.threads_per_threadgroup == (256, 1, 1)
 }
 
-fn mtl_size_pair(cmd: &LoweredCommand, variant: TapeVariant) -> (MTLSize, MTLSize) {
-    // A TurboQuant decode threadgroup serves the variant's query heads (`ConstantType::TqHeads`):
-    // its threadgroups count heads. Its pipeline lookup refuses a variant without them.
-    let heads = match (cmd.kernel, variant.tq_heads) {
-        (KernelId::AttentionViaCacheTq, Some(h)) => h.get(),
-        _ => 1,
-    };
+fn mtl_size_pair(cmd: &LoweredCommand) -> (MTLSize, MTLSize) {
     let tg = MTLSize {
         width: cmd.dispatch.threadgroups.0 as usize,
-        height: (cmd.dispatch.threadgroups.1 / heads) as usize,
+        height: cmd.dispatch.threadgroups.1 as usize,
         depth: cmd.dispatch.threadgroups.2 as usize,
     };
     let tpt = MTLSize {
@@ -2129,55 +2091,22 @@ mod tests {
         SourceRef, WeightTensor,
     };
     use crate::specialized_pipeline_cache::{ConstantValue, SpecializedPipelineCache};
+    use crate::tape::constants::TapeVariant;
     use scratchy_ir::CanonicalParams;
     use scratchy_layers::{Linear, LinearLayer, RmsNorm};
     use scratchy_tensors::{DType, DeviceAllocator, GpuTensor};
     use std::sync::Arc;
 
-    /// The test tapes' variant: `TestWeights`' block capacity, no TurboQuant decode attention.
+    /// The test tapes' variant: `TestWeights`' block capacity.
     const TEST_VARIANT: TapeVariant = TapeVariant {
         cap: crate::tape::ids::MaxBlocksPerSeq(TestWeights::MAX_BLOCKS_PER_SEQ),
-        tq_heads: None,
     };
-
-    /// A TurboQuant decode attention's threadgroups count query heads: one serves the picked
-    /// variant's heads, so the variant divides them. Every other command dispatches as baked.
-    #[test]
-    fn tq_decode_threadgroups_serve_the_variants_heads() {
-        use crate::tape::ids::{MaxBlocksPerSeq, TqDecodeHeads};
-        let command = |kernel| LoweredCommand {
-            kernel,
-            library: "attention",
-            function: "attention_via_cache_v2_f16_specialized",
-            constants: crate::interpreter::metal::lowered::baked(Vec::new()),
-            dispatch: DispatchShape {
-                threadgroups: (1, 32, 2),
-                threads_per_threadgroup: (64, 1, 1),
-                m_scaling: None,
-            },
-            bindings: crate::interpreter::metal::lowered::baked(Vec::new()),
-        };
-        let (tq, fp16) = (
-            command(KernelId::AttentionViaCacheTq),
-            command(KernelId::AttentionViaCache),
-        );
-        for heads in [1, 2, 4, 8] {
-            let variant = TapeVariant {
-                cap: MaxBlocksPerSeq(128),
-                tq_heads: Some(TqDecodeHeads(heads)),
-            };
-            let (tg, _) = mtl_size_pair(&tq, variant);
-            assert_eq!((tg.width, tg.height, tg.depth), (1, 32 / heads as usize, 2));
-            let (tg, _) = mtl_size_pair(&fp16, variant);
-            assert_eq!((tg.width, tg.height, tg.depth), (1, 32, 2));
-        }
-    }
 
     /// The decode-step gates follow whether every sequence contributes one
     /// token; the sequence gates follow the step's sequence count, not its
     /// token count; the span-block gates follow the step's block tables; the
     /// plain-GDN gates follow the step's GDN codes; `All` needs every gate: a
-    /// decode step runs none of a TurboQuant prefill attention's variants; and
+    /// decode step runs none of an int8 prefill attention's variants; and
     /// `Any` needs one: a replaying decode step runs a drafting model's GDN
     /// conv, which a plain one leaves to the one-command decode.
     #[test]
@@ -2395,7 +2324,7 @@ mod tests {
                     cmd.constants.to_vec(),
                 );
                 let pso = crate::aot::baked_build(&cache, &key).expect("pipeline");
-                let (grid, threads) = mtl_size_pair(cmd, TEST_VARIANT);
+                let (grid, threads) = mtl_size_pair(cmd);
                 let grid = scale_tg_for_num_tokens(grid, cmd.dispatch.m_scaling, step);
                 assert!(crate::mtl4_dispatch::dispatch_threadgroups(
                     &device,
@@ -2540,7 +2469,7 @@ mod tests {
             kv_cache_k: (0..num_layers).map(|_| alloc_buffer(device, 16)).collect(),
             kv_cache_v: (0..num_layers).map(|_| alloc_buffer(device, 16)).collect(),
             block_unrotated_flags: (0..num_layers).map(|_| alloc_buffer(device, 16)).collect(),
-            tq: None,
+            int8: None,
             num_tokens_u32: alloc_buffer(device, 4),
             num_sample_rows_u32: alloc_buffer(device, 4),
             sample_indices: alloc_buffer(device, 16),
@@ -2657,7 +2586,6 @@ mod tests {
             moe_scratch_bytes: 0,
             decode_partials: crate::tape::lowered::DecodePartials::default(),
             roped_k_scratch_bytes: 0,
-            attn_unfused_scratch_bytes: 0,
             logits_rows: crate::tape::lowered::LogitsRows::Bucket,
             live: &[],
             barrier_before: &[],
@@ -2791,12 +2719,11 @@ mod tests {
         let own = PerScratch::from_fn(|kind| match kind {
             ScratchKind::SplitK => 10,
             ScratchKind::Moe => 90,
-            ScratchKind::AttnUnfused => 3,
             ScratchKind::RopedK => 0,
         });
         let grown = Hosting::scratch(own, &guest);
         let bytes: Vec<u64> = grown.iter().map(|(_, &b)| b).collect();
-        assert_eq!(bytes, [10, 90, 5, 3]);
+        assert_eq!(bytes, [10, 90, 5]);
     }
 
     /// Whatever a host's arena keeps and however many ranks its guest has, no guest rank takes a
@@ -3067,7 +2994,6 @@ mod tests {
             moe_scratch_bytes: 0,
             decode_partials: crate::tape::lowered::DecodePartials::default(),
             roped_k_scratch_bytes: 0,
-            attn_unfused_scratch_bytes: 0,
             logits_rows: crate::tape::lowered::LogitsRows::Bucket,
             live: &[],
             barrier_before: &[],
@@ -3138,7 +3064,6 @@ mod tests {
             moe_scratch_bytes: 0,
             decode_partials: crate::tape::lowered::DecodePartials::default(),
             roped_k_scratch_bytes: 0,
-            attn_unfused_scratch_bytes: 0,
             logits_rows: crate::tape::lowered::LogitsRows::Bucket,
             live: &[],
             barrier_before: &[],
@@ -3309,7 +3234,6 @@ mod tests {
             moe_scratch_bytes: 0,
             decode_partials: crate::tape::lowered::DecodePartials::default(),
             roped_k_scratch_bytes: 0,
-            attn_unfused_scratch_bytes: 0,
             logits_rows: crate::tape::lowered::LogitsRows::Bucket,
             live: &[],
             barrier_before: &[],

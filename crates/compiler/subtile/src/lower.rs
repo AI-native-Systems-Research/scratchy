@@ -271,8 +271,7 @@ mod additive_offset_tests {
     use crate::subtile_ir::{EwKind, GainConvention, RowScale, SubOp};
 
     /// Every producer a KV writer's operand has across the arches: Qwen2's
-    /// `bias_add(gemm)` carries the bias — marked `Absent`, TurboQuant codes
-    /// it and Qwen2 decodes garbage — while projections and the qk-norms
+    /// `bias_add(gemm)` carries the bias — marked `Absent` — while projections and the qk-norms
     /// (Qwen3, Gemma) add nothing, and a per-head view carries its source's.
     #[test]
     fn kv_operand_producers_declare_their_offset() {

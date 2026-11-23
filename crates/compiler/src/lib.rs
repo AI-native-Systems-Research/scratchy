@@ -54,7 +54,7 @@ pub use scratchy_ir::{pack_moe_expert_bits, unpack_moe_expert_bits};
 // `scratchy_tensors::{ActDtype, ScaleDtype}` enums), so the
 // re-exports are unconditional and the macro path
 // `::scratchy_forward_compiler::CanonicalParams` keeps resolving.
-pub use scratchy_ir::{CanonicalParams, KvCodec, TqBits, WeightAccessors, model_facts};
+pub use scratchy_ir::{CanonicalParams, KvCodec, WeightAccessors, model_facts};
 // A compiled model's per-layer KV geometry (`ScratchyWeights::kv_layer_geometry`), as the macro
 // path `::scratchy_forward_compiler::LayerKvGeometry` names it.
 pub use scratchy_core_config::LayerKvGeometry;

@@ -33,7 +33,7 @@ fn python_costume_emits_the_qwen3_tape() {
         &configs_dir,
         None,
         &Scope::stems(&[("qwen3", "qwen3-0.6b")]),
-        &Metal { turboquant: false },
+        &Metal,
     )
     .expect("python-costume pipeline");
 
@@ -64,7 +64,7 @@ fn python_costume_emits_the_qwen3_tape() {
 /// a selected preset replaces the dense variant, it doesn't add to it.
 #[test]
 fn metal_lowers_the_mlx_affine_and_nvfp4_presets_only() {
-    let metal = Metal { turboquant: false };
+    let metal = Metal;
     for (arch, presets) in [
         (
             "llama",

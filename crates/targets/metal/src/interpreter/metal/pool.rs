@@ -41,9 +41,7 @@ use super::worker::{
 };
 use crate::MetalAllocator;
 use crate::tape::constants::TapeVariant;
-use crate::tape::ids::{
-    DecodeRows, HeadDim, MaxBlocksPerSeq, NumKvHeads, NumQHeads, TqDecodeHeads,
-};
+use crate::tape::ids::{DecodeRows, MaxBlocksPerSeq};
 use crate::tape::lowered::PerScratch;
 use crate::tape::lowered::{ClassedTape, KvAddressing};
 use objc2::runtime::ProtocolObject;
@@ -134,7 +132,7 @@ pub struct MetalBucketSpec {
     pub backbone_barriers: &'static [bool],
     pub lm_head_barriers: &'static [bool],
     /// The macro-baked tape rungs for this bucket — one per (generation
-    /// class × chunked addressing × KV cap × TurboQuant decode heads). The
+    /// class × chunked addressing × KV cap). The
     /// pool picks one at load. Empty in cuda-macro builds, where the metal
     /// statics are cfg'd out anyway, and for a canonical the front end refused.
     pub tapes: &'static [crate::tape::lowered::ClassedTape],
@@ -221,7 +219,7 @@ pub enum PoolBuildError {
     /// would fail at the door ([`bucket`]) anyway, so we fail early.
     NoBuckets,
     /// The device's IO-registry entry has no GPU core count
-    /// ([`crate::device::gpu_cores`]), which the TurboQuant decode tapes need.
+    /// ([`crate::device::gpu_cores`]), which the fold band's class needs.
     UnknownGpuCores,
     /// A guest of another pool's arena was asked to keep its logits for the host, which reads
     /// none of a guest's slots: they may be its host's sparse buffers.
@@ -305,7 +303,7 @@ impl RuntimeFactory {
     }
 
     /// Build a fresh set of runtime bindings for a worker on `device`, staging through its host's
-    /// TurboQuant scratch where it has one of the same geometry, and binding its host's KV where
+    /// int8 KV scratch where it has one of the same geometry, and binding its host's KV where
     /// it reads it ([`HostArena`]).
     pub fn build(&self, device: &Device, host: &HostArena) -> RuntimeBindings {
         ((self.0).0)(device, host)
@@ -508,41 +506,12 @@ fn probe_mtl4_availability(device: &Device) {
     tracing::info!(target: "scratchy-target-metal", available, "mtl4 capability probe");
 }
 
-/// The TurboQuant decode group whose query heads per threadgroup the device picks
-/// ([`TqDecodeHeads::for_group`]).
-#[derive(Clone, Copy)]
-pub struct TqGroup {
-    pub head_dim: HeadDim,
-    pub q_heads: NumQHeads,
-    pub kv_heads: NumKvHeads,
-}
-
-impl TqGroup {
-    /// A model's decode group: its attention's global class, the layers a TurboQuant KV cache
-    /// compresses. `None` for a model without attention.
-    pub const fn of(facts: scratchy_ir::model_facts::ModelFacts) -> Option<Self> {
-        match facts.attention() {
-            Some(attention) => {
-                let global = attention.global();
-                Some(Self {
-                    head_dim: HeadDim(global.head_dim().get()),
-                    q_heads: NumQHeads(global.q_heads().get()),
-                    kv_heads: NumKvHeads(global.kv_heads().get()),
-                })
-            }
-            None => None,
-        }
-    }
-}
-
 /// A model's baked tape rungs: what a caller picks the rung its pool runs on from
 /// ([`pick_rung`]) — before the pool exists (the KV pool's block-table width, the memory budget)
 /// as the pool itself does.
 #[derive(Clone, Copy)]
 pub struct MetalRungs {
     pub buckets: &'static [MetalBucketSpec],
-    /// The decode group ([`TqGroup::of`]); `None` for a model without attention.
-    pub tq: Option<TqGroup>,
     /// Its arena slots by size, as a guest and as a host ([`ArenaRanks`]).
     pub ranks: ArenaRanks,
     /// The door ([`bucket_row`](super::bucket::bucket_row)) at the model's bucket enum: the row a
@@ -555,9 +524,6 @@ pub struct MetalRungs {
 /// the tape each kept bucket runs.
 pub struct PickedRung<'a> {
     pub cap: MaxBlocksPerSeq,
-    /// The query heads one TurboQuant decode threadgroup serves on this device; `None` for a
-    /// model without attention.
-    pub tq_heads: Option<TqDecodeHeads>,
     pub tapes: Vec<(&'a MetalBucketSpec, &'a ClassedTape)>,
     /// The model's arena ranks, which it shares an arena with another model's by.
     pub ranks: ArenaRanks,
@@ -566,10 +532,7 @@ pub struct PickedRung<'a> {
 impl PickedRung<'_> {
     /// The values the picked tapes' variant-bound constants take.
     pub fn variant(&self) -> TapeVariant {
-        TapeVariant {
-            cap: self.cap,
-            tq_heads: self.tq_heads,
-        }
+        TapeVariant { cap: self.cap }
     }
 }
 
@@ -670,8 +633,8 @@ impl PickedRung<'_> {
     }
 }
 
-/// Pick the macro-baked rung a pool on `device` runs: the device's generation class and
-/// TurboQuant decode heads, the workload's `addressing`, and the smallest KV cap rung that holds
+/// Pick the macro-baked rung a pool on `device` runs: the device's generation class, the
+/// workload's `addressing`, and the smallest KV cap rung that holds
 /// `block_cap` blocks per sequence. Selection only; every fact of each tape was baked at macro
 /// expansion.
 ///
@@ -689,7 +652,6 @@ pub fn pick_rung(
 ) -> Result<PickedRung<'static>, PoolBuildError> {
     let MetalRungs {
         buckets: bucket_specs,
-        tq,
         ranks,
         door: _,
     } = *rungs;
@@ -719,15 +681,7 @@ pub fn pick_rung(
         buckets.push(smallest);
     }
     let need = MaxBlocksPerSeq(u32::try_from(block_cap).unwrap_or(u32::MAX));
-    let tq_heads =
-        tq.map(|g| TqDecodeHeads::for_group(g.head_dim, g.q_heads, g.kv_heads, gpu_cores));
-    // A tape with TurboQuant decode attention serves only the device's group, and a model without
-    // attention has none for it to serve.
-    let serves = |t: &&ClassedTape| {
-        t.gen_class == gen_class
-            && t.addressing == addressing
-            && t.tq_heads.is_none_or(|h| tq_heads == Some(h))
-    };
+    let serves = |t: &&ClassedTape| t.gen_class == gen_class && t.addressing == addressing;
     let no_rung = |s: &MetalBucketSpec| PoolBuildError::NoRung {
         bucket_m: s.bucket_m,
         need,
@@ -745,17 +699,11 @@ pub fn pick_rung(
     tracing::info!(
         target: "scratchy-target-metal",
         gpu_cores = gpu_cores.get(),
-        tq_decode_heads = tq_heads.map(TqDecodeHeads::get),
         kv_cap_rung = cap.get(),
         buckets = tapes.len(),
         "baked tape rung"
     );
-    Ok(PickedRung {
-        cap,
-        tq_heads,
-        tapes,
-        ranks,
-    })
+    Ok(PickedRung { cap, tapes, ranks })
 }
 
 /// Make the pool built into `pool` hold `guest`'s arena too (`ScratchyWeights::metal_host`, typed
@@ -888,8 +836,8 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         };
         let first = pool.spawn_worker(&share, &ranks)?;
         pool.hosting = HostArena {
-            tq_scratch: first.runtime.tq.as_ref().map(|t| t.scratch.clone()),
-            tq: first.runtime.tq.clone(),
+            kv_scratch: first.runtime.int8.as_ref().map(|t| t.scratch.clone()),
+            int8: first.runtime.int8.clone(),
             ..first.worker.hosted()
         };
         {
@@ -2109,7 +2057,7 @@ fn begin_step<W: CanonicalParams>(
         );
         worker
             .worker
-            .tq_dequant_max_blocks
+            .kv_stage_max_blocks
             .store(live_block_width(inputs, base.min(global)), Relaxed);
         worker
             .worker
@@ -2201,7 +2149,7 @@ fn step_has_unrotated_blocks(inputs: &ForwardInputs<'_>, block_size: u32) -> boo
 }
 
 /// The grid width, in blocks, of the kernels that walk a sequence's block-table row and exit past
-/// its `seq_used_k` (`TqStageRotated`, `RopeOnce*`): the blocks the step's longest sequence spans
+/// its `seq_used_k` (`KvStage`, `RopeOnce*`): the blocks the step's longest sequence spans
 /// at `block_size` (the model's smallest), within the row. The row is the KV cap rung's width,
 /// which follows the pool (16384 blocks for a large Mac's Gemma 4 pool), not the context; every
 /// block past the longest sequence's is one those kernels exit on. 0 without a block table: the
@@ -2334,13 +2282,12 @@ fn write_runtime_inputs(
             Padding::Zero,
         )?;
     }
-    // TurboQuant's stores hold group 0's blocks, mapped as the pool grows: a block past them is
+    // The int8 stores hold every group's blocks, mapped as the pool grows: a block past them is
     // un-wired, and a GPU read of that hangs past the watchdog rather than faulting.
-    if let Some(tq) = &runtime.tq {
-        let mapped = tq.mapped.load(std::sync::atomic::Ordering::Relaxed);
-        let group0 = inputs.block_tables.first().map_or(&[][..], |t| *t);
-        let named = group0
-            .iter()
+    if let Some(int8) = &runtime.int8 {
+        let mapped = int8.mapped.load(std::sync::atomic::Ordering::Relaxed);
+        let named = (inputs.block_tables.iter())
+            .flat_map(|t| t.iter())
             .map(|&b| b & !crate::UNROTATED_BLOCK_BIT)
             .max();
         if let Some(block) = named.filter(|&b| b as usize >= mapped) {
@@ -2494,10 +2441,9 @@ mod tests {
     /// row, each its sequence's last.
     const EVERY_ROW: [u32; 9] = [0, 1, 2, 3, 4, 5, 6, 7, 8];
 
-    /// The test tapes' variant: `TestWeights`' block capacity, no TurboQuant decode attention.
+    /// The test tapes' variant: `TestWeights`' block capacity.
     const TEST_VARIANT: TapeVariant = TapeVariant {
         cap: MaxBlocksPerSeq(TestWeights::MAX_BLOCKS_PER_SEQ),
-        tq_heads: None,
     };
 
     /// Test fixture: holds `CanonicalParams` constants AND the layer
@@ -2576,7 +2522,7 @@ mod tests {
             kv_cache_k: (0..num_layers).map(|_| alloc(device, 16)).collect(),
             kv_cache_v: (0..num_layers).map(|_| alloc(device, 16)).collect(),
             block_unrotated_flags: (0..num_layers).map(|_| alloc(device, 16)).collect(),
-            tq: None,
+            int8: None,
             num_tokens_u32: alloc(device, 4),
             num_sample_rows_u32: alloc(device, 4),
             sample_indices: alloc(device, 16),
@@ -2658,7 +2604,6 @@ mod tests {
             moe_scratch_bytes: 0,
             decode_partials: crate::tape::lowered::DecodePartials::default(),
             roped_k_scratch_bytes: 0,
-            attn_unfused_scratch_bytes: 0,
             logits_rows: crate::tape::lowered::LogitsRows::Bucket,
             live: &[],
         }
@@ -2968,7 +2913,7 @@ mod tests {
             kv_cache_k: vec![alloc(d, 16)],
             kv_cache_v: vec![alloc(d, 16)],
             block_unrotated_flags: vec![alloc(d, 16)],
-            tq: None,
+            int8: None,
             num_tokens_u32: alloc(d, 4),
             num_sample_rows_u32: alloc(d, 4),
             sample_indices: alloc(d, max_m_bytes),
@@ -3199,7 +3144,7 @@ mod tests {
         assert!(!has(&[1, 2, flagged(9), 0, 3, 4, 0, flagged(9)]));
     }
 
-    /// The block-walking grids (`TqStageRotated`, `RopeOnce*`) cover the longest sequence's
+    /// The block-walking grids (`KvStage`, `RopeOnce*`) cover the longest sequence's
     /// blocks, never the row: a large Mac's Gemma 4 pool pads every row to the 16384-block KV cap
     /// rung, and launching all of it charged every prefill step for the pool, not the prompt.
     #[test]
@@ -3839,7 +3784,6 @@ mod tests {
             moe_scratch_bytes: 0,
             decode_partials: crate::tape::lowered::DecodePartials::default(),
             roped_k_scratch_bytes: 0,
-            attn_unfused_scratch_bytes: 0,
             logits_rows: crate::tape::lowered::LogitsRows::Bucket,
             live: &[],
         };
@@ -3850,7 +3794,6 @@ mod tests {
                     gen_class,
                     addressing,
                     cap: MaxBlocksPerSeq(128),
-                    tq_heads: None,
                     tape,
                 });
             }
@@ -3931,7 +3874,6 @@ mod tests {
     fn test_rungs(specs: &[MetalBucketSpec], ranks: ArenaRanks) -> &'static MetalRungs {
         Box::leak(Box::new(MetalRungs {
             buckets: Box::leak(specs.to_vec().into_boxed_slice()),
-            tq: TqGroup::of(TestWeights::FACTS),
             ranks,
             door: super::super::bucket::bucket_row::<TestBucket>,
         }))

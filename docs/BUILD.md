@@ -20,9 +20,9 @@ Each binary links its one target. Add
 (`chat` — the in-process engine — is on by default), `multimodal` for the
 image-decode stack, `bench` for `scr bench serve`. Tab completion over real
 HuggingFace model ids is on by default in `scr` (`model/hf-completions`); pass
-`--no-default-features` to build with no network access at all. TurboQuant KV
-compression is on in `scr` (and off for spyre), fixed at build time — see
-[`turboquant`](#turboquant--kv-cache-compression-fixed-at-build-time).
+`--no-default-features` to build with no network access at all. The metal KV
+cache is int8, fixed at build time — see
+[int8 KV](#int8-kv--the-metal-kv-cache-fixed-at-build-time).
 
 ## There is no default model, quant or drafter scope
 
@@ -165,38 +165,32 @@ No `spec/*` feature named = only the heads inside their targets' checkpoints
 and the targets' default published drafters compile (in `scr`); a spyre
 build compiles none.
 
-## `turboquant` — KV cache compression, fixed at build time
+## int8 KV — the metal KV cache, fixed at build time
 
-On metal, a model's KV cache is either dense (the model's own dtype) or
-TurboQuant codes (3-bit for the Llama family, 4-bit otherwise), and the build
-decides which: nothing chooses at runtime. `scr`'s default features turn
-`turboquant` **on**; a spyre build does not have it. To build `scr` with a
-dense KV cache, drop the defaults: the same engine without `turboquant` or
-scratchy-models' `mtp-heads` (add `model/mtp-heads` back to keep MTP drafting,
-`model/hf-completions` for tab completion):
+On metal, every model whose geometry the codec takes stores its KV cache as int8
+(`scratchy_layers::kv_int8`, oMLX's `affine8`): each head row of K and V is
+rotated — a fixed ±1 sign per element, then an orthonormal Walsh–Hadamard
+transform — and stored as 8-bit codes against one f32 scale for the row. The
+writers encode as they write; decode attention reads the codes directly in the
+rotated domain; prefill reads the cached rows staged back into a dense scratch.
+Nothing chooses at runtime. A spyre build does not have it.
 
-```bash
-cargo build --release -p scratchy-target-metal-cli --no-default-features --features chat,model/llama-3.2-1b
-```
-
-With it on, every selected model whose geometry the codec takes is emitted with
-`KV_CODEC = TurboQuant`; the rest stay dense and the build names each one and
-why:
+The rest stay dense and the build names each one and why:
 
 ```
-warning: scratchy-target-metal-models@0.1.0: turboquant: qwen2.5-0.5b keeps a dense KV cache: its KV row is 12 KiB/token, below the 24 KiB TurboQuant threshold
+warning: scratchy-target-metal-models@0.1.0: int8 KV: phi-3.5-mini keeps a dense KV cache: head_dim 96 is not a power of two from 64 to 512
 ```
 
-A model stays dense when it has no KV cache, when its KV cache is an MLA
-latent, when a head_dim is not a power of two no wider than 512, or when its
-fp16 KV row is under 24 KiB/token — too small for the capacity to be worth the
-fidelity. The rule is `scratchy_layers::turboquant::codec_for`. The
-server logs the loaded model's codec at start (`KV cache codec: TurboQuant
-3-bit (built in)`).
+A model stays dense when it has no KV cache, when its KV cache is an MLA latent,
+or when a head_dim is not a power of two from 64 to 512 (the rotation is a
+Walsh–Hadamard transform; the decode kernel splits a head over whole 32-lane
+simdgroups, two at least). The rule is `scratchy_layers::kv_int8::codec_for`.
+The server logs the loaded model's codec at start (`KV cache codec: int8
+(built in)`).
 
 `--kv-cache-dtype` on metal takes the codec by default (`auto`) and can only
-*assert* it: `fp16` or `turboquant` refuses to start if the binary stores the
-model's KV cache the other way.
+*assert* it: `fp16` or `int8` refuses to start if the binary stores the model's
+KV cache the other way.
 
 ## `hf-completions` — shell tab completion over real model ids
 
@@ -255,7 +249,7 @@ scr model names --source compiled      # what this build resolved to
 
   ```bash
   cargo build -p scratchy-target-metal-cli --no-default-features \
-      --features chat,turboquant,model/mtp-heads,model/llama-3.2-1b
+      --features chat,model/mtp-heads,model/llama-3.2-1b
   ```
 
   `ureq` is then not even linked into the build script, so the build cannot

@@ -17,7 +17,6 @@
 use crate::tape::constants::ConstantValue;
 use crate::tape::ids::{
     BucketM, CommandIx, DecodeRows, LayerId, MaxBlocksPerSeq, PartArray, PartIx, SourceIx,
-    TqDecodeHeads,
 };
 
 /// One-of identifier for the kernel a `LoweredCommand` invokes.
@@ -112,28 +111,6 @@ pub enum KernelId {
     /// pair (`rope_once_gqa_shared_<dtype>_specialized`, in the `attention`
     /// library) covers any shape the gqa_shared kernel takes.
     RopeOnceGqaShared,
-    /// hd512 unfused attention (env `SCRATCHY_HD512_UNFUSED`): kv-head-major
-    /// gather of K (rope-on-read) into the attn-unfused scratch, STATIC row
-    /// stride (max_blocks*block_size) so per-head GEMM offsets are bakeable.
-    AttnGatherKRope,
-    /// hd512 unfused: kv-head-major TRANSPOSED gather of V → [kv, head_dim, kv_len]
-    /// so PV's `C = A @ B^T` gets B = V^T directly.
-    AttnGatherVCopyT,
-    /// hd512 unfused: Q `[total_q, nh, hd]` (token-major) → `[nh, Lq, hd]`
-    /// (head-major) bf16, so each head's QK^T A-operand is contiguous.
-    AttnQConvert,
-    /// hd512 unfused: O `[nh, Lq, hd]` (head-major) → `[total_q, nh, hd]`
-    /// (token-major) bf16 — the layout o_proj expects (same as gqa_shared).
-    AttnOConvert,
-    /// hd512 unfused: fused scale + chunked-prefill causal mask + row softmax
-    /// over scores `[Lq, kv_len]` (one head at a time), kv_len from seq_used.
-    AttnCausalSoftmax,
-    /// hd512 unfused: per-head QK^T via the plain bf16 NAX GEMM
-    /// (`gemm_nax_bf16_qk`); N = kv_len read from seq_used at runtime.
-    AttnGemmQk,
-    /// hd512 unfused: per-head PV via the plain bf16 NAX GEMM
-    /// (`gemm_nax_bf16_pv`); K = kv_len read from seq_used at runtime.
-    AttnGemmPv,
     /// Pure scalar broadcast multiply: `out = x * scale`.
     ScalarMul,
     /// Final logit softcapping: `out = cap * tanh(x / cap)` with the
@@ -469,29 +446,17 @@ pub enum KernelId {
     /// `elementwise.metal`. Bindings: `(embed @ 0 in/out, mm @ 1,
     /// dst_rows @ 2)`, `MmEmbedSpliceConstants` baked.
     MmEmbedSplice,
-    /// TurboQuant prefill: write a layer's K (or V) for the step's sequences
-    /// into the reused fp16 scratch in the codebook's ROTATED domain (R·k),
-    /// right before that layer's prefill attention — a table lookup per cached
-    /// key, a Walsh-Hadamard transform per new key. Maps to
-    /// `tq_stage_rotated_{f16,bf16}` in `attention.metallib`. The packed store
-    /// (canonical, ~4.7x smaller) is the only persistent KV; the scratch holds
-    /// one layer's image for the attention read, then is reused.
-    TqStageRotated,
-    /// TurboQuant prefill: rotate the attention's q rows into the codebook
-    /// domain (R·q) before it and its output rows back (Rᵀ·o) after it, in
-    /// place. Maps to `tq_{rotate,unrotate}_rows_{f16,bf16}` in
-    /// `attention.metallib`.
-    TqRotateRows,
-    /// TurboQuant decode attention: `AttentionViaCache` reading the packed
-    /// store directly in the codebook domain (function constant 13), so a
-    /// decode step never dequantizes the context. Same symbol as
-    /// `AttentionViaCache`.
-    AttentionViaCacheTq,
-    /// A one-row TurboQuant decode attention serving each KV head's 8 query heads together
-    /// (`attention_decode_gqa_tq_*`): its threadgroups count KV heads and `ATTN_SPLITS` key runs,
-    /// whatever TurboQuant heads the variant serves.
-    AttentionDecodeGqaTq,
-    /// [`Self::AttentionDecodeGqaTq`]'s second pass (`attention_via_cache_v2_combine_*`): merges
+    /// Int8 prefill: write a layer's cached K (or V) rows for the step's sequences into the
+    /// reused fp16 scratch, decoded and rotated back, right before that layer's prefill
+    /// attention; the step's writer filled the new rows. Maps to `kv_stage_{f16,bf16}` in
+    /// `attention.metallib`. The int8 store is the only persistent KV; the scratch holds one
+    /// layer's dense image for the attention read, then is reused.
+    KvStage,
+    /// The decode attention reading the int8 store, a KV head's query heads together
+    /// (`attention_decode_gqa_int8_*`): its threadgroups count the query-head groups and
+    /// `ATTN_SPLITS` key runs.
+    AttentionDecodeInt8,
+    /// [`Self::AttentionDecodeInt8`]'s second pass (`attention_via_cache_v2_combine_*`): merges
     /// each query head's partials into its output.
     AttentionDecodeCombine,
     /// A verify step's lanes' query rows packed a KV head's group to a 64-row tile
@@ -555,12 +520,7 @@ impl KernelId {
         match self {
             Self::RopeOnceNax
             | Self::RopeOnceSteel
-            | Self::RopeOnceGqaShared
-            | Self::AttnGatherKRope
-            | Self::AttnGatherVCopyT
-            | Self::AttnCausalSoftmax
-            | Self::AttnGemmQk
-            | Self::AttnGemmPv => SeqScope::RowZero,
+            | Self::RopeOnceGqaShared => SeqScope::RowZero,
             Self::Embed
             | Self::RmsNorm
             | Self::RmsNormUnit
@@ -574,8 +534,6 @@ impl KernelId {
             | Self::KvAppend
             | Self::AttentionViaCache
             | Self::AttentionPrefillSdpaPaged
-            | Self::AttnQConvert
-            | Self::AttnOConvert
             | Self::ScalarMul
             | Self::TanhSoftCap
             | Self::Add
@@ -635,11 +593,9 @@ impl KernelId {
             | Self::LoadRows
             | Self::ConcatRows
             | Self::MmEmbedSplice
-            | Self::TqStageRotated
-            | Self::TqRotateRows
+            | Self::KvStage
             | Self::RowProgram
-            | Self::AttentionViaCacheTq
-            | Self::AttentionDecodeGqaTq
+            | Self::AttentionDecodeInt8
             | Self::AttentionDecodeCombine
             | Self::AttentionVerifyPack
             | Self::AttentionVerifySplit
@@ -772,12 +728,11 @@ pub enum RuntimeGate {
     /// without an lm_head (issue #361).
     OnlyIfEveryRowSampled,
     /// Run only on a decode step — every sequence contributes exactly one
-    /// token (`num_tokens == num_seqs`): a TurboQuant model's
-    /// `AttentionViaCacheTq`, reading the packed store directly.
+    /// token (`num_tokens == num_seqs`): an int8 model's `AttentionDecodeInt8`, reading the
+    /// store directly.
     OnlyIfDecodeStep,
-    /// Run unless this is a decode step: the attention an
-    /// `AttentionViaCacheTq` twin replaces there, and the rotated-domain K/V
-    /// staging and q/output rotation around it.
+    /// Run unless this is a decode step: the attention an `AttentionDecodeInt8` twin replaces
+    /// there, and the K/V staging ahead of it.
     UnlessDecodeStep,
     /// Run only on a step whose token count is in
     /// `quantized::SMALL_M_TOKENS`: the `AffineQmmSmallM` twin of a GEMM.
@@ -1007,11 +962,6 @@ pub enum Binding {
     /// and its attention run serially per layer, and the scratch is
     /// overwritten each layer (the cache stays the persistent artifact).
     RopedKScratch { binding_index: u8 },
-    /// The worker's shared hd512-unfused-attention scratch buffer — sized to
-    /// `LoweredMetalTape::attn_unfused_scratch_bytes`. Packs the q_head /
-    /// Kdense / Vdense_T / scores / out_head regions at baked byte `offset`s
-    /// (one buffer, serial commands per layer; overwritten each layer).
-    AttnUnfusedScratch { offset: u32, binding_index: u8 },
     /// A bound sub-region of the worker's shared MoE scratch buffer
     /// (sized to
     /// `LoweredMetalTape::moe_scratch_bytes`). Each lowered MoE
@@ -1517,28 +1467,21 @@ pub enum RuntimeBindingKind {
     /// u32 SigLIP positional-embedding indices read by `PosEmbed`
     /// (`[0..vision_num_positions]` per image). Gemma3-MM.
     VisionPositionIds,
-    /// TurboQuant per-layer PACKED key/value code store (canonical KV, ~4.7x
-    /// smaller than fp16). Source for `TqStageRotated` and
-    /// `AttentionViaCacheTq`, dest for an encoding KV writer. Worker resolves
-    /// to `tq_packed_k/v[layer]`.
-    TqPackedK {
+    /// The int8 store's per-layer key/value codes (the canonical KV). Source for `KvStage` and
+    /// `AttentionDecodeInt8`, dest for an encoding KV writer.
+    KvCodesK {
         layer: LayerId,
     },
-    TqPackedV {
+    KvCodesV {
         layer: LayerId,
     },
-    /// TurboQuant per-layer f32 norm store (one norm per quantized vector).
-    TqNormsK {
+    /// The int8 store's per-layer f32 row scales (one per coded row).
+    KvScalesK {
         layer: LayerId,
     },
-    TqNormsV {
+    KvScalesV {
         layer: LayerId,
     },
-    /// TurboQuant codebook buffers (shared across layers): the random ±1 sign
-    /// vector, the Lloyd-Max boundaries, and the N(0,1) centroids.
-    TqSigns,
-    TqBoundaries,
-    TqCentroids,
 }
 
 pub fn baked<T>(v: Vec<T>) -> &'static [T] {
@@ -2307,16 +2250,16 @@ impl RuntimeBindingKind {
             Self::GdnSsmLanes { layer } => Self::GdnSsmLanes {
                 layer: layer.advance(by),
             },
-            Self::TqPackedK { layer } => Self::TqPackedK {
+            Self::KvCodesK { layer } => Self::KvCodesK {
                 layer: layer.advance(by),
             },
-            Self::TqPackedV { layer } => Self::TqPackedV {
+            Self::KvCodesV { layer } => Self::KvCodesV {
                 layer: layer.advance(by),
             },
-            Self::TqNormsK { layer } => Self::TqNormsK {
+            Self::KvScalesK { layer } => Self::KvScalesK {
                 layer: layer.advance(by),
             },
-            Self::TqNormsV { layer } => Self::TqNormsV {
+            Self::KvScalesV { layer } => Self::KvScalesV {
                 layer: layer.advance(by),
             },
             Self::DraftRingKeys { layer } => Self::DraftRingKeys {
@@ -2352,10 +2295,7 @@ impl RuntimeBindingKind {
             | Self::VisionCuSeqlensWindow
             | Self::VisionWindowIndex
             | Self::VisionReverseIndices
-            | Self::VisionPositionIds
-            | Self::TqSigns
-            | Self::TqBoundaries
-            | Self::TqCentroids => self,
+            | Self::VisionPositionIds => self,
         }
     }
 }
@@ -2369,7 +2309,6 @@ impl Binding {
             | Self::Runtime { binding_index, .. }
             | Self::Scratch { binding_index }
             | Self::RopedKScratch { binding_index }
-            | Self::AttnUnfusedScratch { binding_index, .. }
             | Self::MoeScratch { binding_index, .. } => binding_index,
         }
     }
@@ -2396,10 +2335,6 @@ impl Binding {
             },
             Self::Scratch { .. } => Self::Scratch { binding_index },
             Self::RopedKScratch { .. } => Self::RopedKScratch { binding_index },
-            Self::AttnUnfusedScratch { offset, .. } => Self::AttnUnfusedScratch {
-                offset,
-                binding_index,
-            },
             Self::MoeScratch { byte_offset, .. } => Self::MoeScratch {
                 binding_index,
                 byte_offset,
@@ -2431,15 +2366,14 @@ impl Binding {
             Self::ArenaSlot { .. }
             | Self::Scratch { .. }
             | Self::RopedKScratch { .. }
-            | Self::AttnUnfusedScratch { .. }
             | Self::MoeScratch { .. } => self,
         }
     }
 
-    /// The rope-once and unfused-attention scratches hold one sequence's keys.
+    /// The rope-once scratch holds one sequence's keys.
     pub const fn seq_scope(self) -> SeqScope {
         match self {
-            Self::RopedKScratch { .. } | Self::AttnUnfusedScratch { .. } => SeqScope::RowZero,
+            Self::RopedKScratch { .. } => SeqScope::RowZero,
             Self::ArenaSlot { .. }
             | Self::Source { .. }
             | Self::Runtime { .. }
@@ -2484,16 +2418,14 @@ pub struct TapeLoop {
 pub enum ScratchKind {
     /// Split-K partial sums, reduced by the next command.
     SplitK,
-    /// MoE routing and expert rows, and the TurboQuant decode split's partials.
+    /// MoE routing and expert rows, and the int8 decode split's partials.
     Moe,
     /// The rope-once pre-roped K.
     RopedK,
-    /// The hd512 unfused attention's dense K/V, scores and per-head Q/O.
-    AttnUnfused,
 }
 
 impl ScratchKind {
-    pub const ALL: [Self; 4] = [Self::SplitK, Self::Moe, Self::RopedK, Self::AttnUnfused];
+    pub const ALL: [Self; 3] = [Self::SplitK, Self::Moe, Self::RopedK];
 
     /// What a worker's buffer of this kind is called in an allocation failure.
     pub const fn what(self) -> &'static str {
@@ -2501,7 +2433,6 @@ impl ScratchKind {
             Self::SplitK => "splitk scratch",
             Self::Moe => "moe scratch",
             Self::RopedK => "roped-K scratch",
-            Self::AttnUnfused => "attn-unfused scratch",
         }
     }
 
@@ -2510,14 +2441,13 @@ impl ScratchKind {
             Self::SplitK => 0,
             Self::Moe => 1,
             Self::RopedK => 2,
-            Self::AttnUnfused => 3,
         }
     }
 }
 
 /// One `T` per [`ScratchKind`], indexed by kind.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct PerScratch<T>([T; 4]);
+pub struct PerScratch<T>([T; 3]);
 
 impl<T> PerScratch<T> {
     pub fn from_fn(mut f: impl FnMut(ScratchKind) -> T) -> Self {
@@ -2526,8 +2456,8 @@ impl<T> PerScratch<T> {
 
     /// [`Self::from_fn`] for a fallible `f`: the first kind's error.
     pub fn try_from_fn<E>(mut f: impl FnMut(ScratchKind) -> Result<T, E>) -> Result<Self, E> {
-        let [a, b, c, d] = ScratchKind::ALL.map(&mut f);
-        Ok(Self([a?, b?, c?, d?]))
+        let [a, b, c] = ScratchKind::ALL.map(&mut f);
+        Ok(Self([a?, b?, c?]))
     }
 
     pub fn map<U>(self, f: impl FnMut(T) -> U) -> PerScratch<U> {
@@ -2568,7 +2498,6 @@ impl LoweredMetalTape {
             ScratchKind::SplitK => self.splitk_scratch_bytes,
             ScratchKind::Moe => self.moe_scratch_bytes.max(partials),
             ScratchKind::RopedK => self.roped_k_scratch_bytes,
-            ScratchKind::AttnUnfused => self.attn_unfused_scratch_bytes,
         })
     }
 
@@ -2679,7 +2608,7 @@ pub enum LogitsRows {
     Sampled { tile: RowTile },
 }
 
-/// The TurboQuant decode split's partials a tape's steps write at the MoE scratch's front: a row's
+/// The int8 decode split's partials a tape's steps write at the MoE scratch's front: a row's
 /// bytes, for the rows the steps that run the split bring ([`LoweredMetalTape::scratch_bytes`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize)]
 pub struct DecodePartials {
@@ -2688,7 +2617,7 @@ pub struct DecodePartials {
     pub steps: SplitSteps,
 }
 
-/// The steps a tape's TurboQuant decode split runs on, as its gate admits them.
+/// The steps a tape's int8 decode split runs on, as its gate admits them.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize)]
 pub enum SplitSteps {
     /// Decode steps alone ([`RuntimeGate::OnlyIfDecodeStep`]): a row a sequence, at most the
@@ -2842,7 +2771,7 @@ pub struct LoweredMetalTape {
     /// one bucket execute serially through the dispatch, so they can share
     /// scratch). Zero when no MoE instruction was lowered.
     pub moe_scratch_bytes: u32,
-    /// The TurboQuant decode split's partials at the MoE scratch's front: a decode-gated split's
+    /// The int8 decode split's partials at the MoE scratch's front: a decode-gated split's
     /// for the rows a decode step can bring, an every-step one's — a verify-sized bucket's, which
     /// a short prefill runs too — for the bucket's every row ([`Self::scratch_bytes`]).
     pub decode_partials: DecodePartials,
@@ -2855,11 +2784,6 @@ pub struct LoweredMetalTape {
     /// Zero when no NAX spans prefill was lowered (the binding never
     /// appears and the worker skips the allocation).
     pub roped_k_scratch_bytes: u32,
-    /// Byte size of the shared hd512-unfused-attention scratch
-    /// (`Binding::AttnUnfusedScratch`). Max across layers of the packed
-    /// q_head + Kdense + Vdense_T + scores + out_head regions. Zero when no
-    /// hd512-unfused attention was lowered.
-    pub attn_unfused_scratch_bytes: u32,
     /// The rows of the logits buffer (the terminal slot) the tape's commands write: what the
     /// buffer holds beyond the rows a step samples ([`Self::logits_slot_rows`]).
     pub logits_rows: LogitsRows,
@@ -2964,15 +2888,6 @@ pub enum LoweringError {
         body_len: u32,
         remaining: usize,
     },
-    /// A TurboQuant codec command could not bind the additive offset of the
-    /// KV operand it compresses — quantizing without removing it would let the
-    /// offset's norm, not the signal's, set the codec's error: a K bias, with no
-    /// rotary table to rotate it to each key (rope-on-read off).
-    TurboQuantOffsetUnbound { index: usize },
-    /// A TurboQuant-coded KV writer at tape index `index` that writes its K/V un-rotated
-    /// (`KvAppend`) with an additive offset: the codec's restores rotate a K bias to the key and
-    /// bind the writer's rotary table for either, and such a writer has none.
-    UnrotatedWriterOffset { index: usize },
     /// A step at tape index `index` binds the `slot`-th `kind` weight of its site, and its
     /// site holds no such source — the step records and the opcode lowering disagree.
     NoSource {
@@ -2984,13 +2899,6 @@ pub enum LoweringError {
     NoRotaryTable { index: usize },
     /// A gated row whose realization already gates its commands: one command, two gates.
     DoubleGate { index: usize },
-    /// A decode attention at tape index `index` that the TurboQuant split takes binds, past its
-    /// sinks, a buffer at `slot`: the split's partials slot, which that buffer would overlap.
-    SplitPartialsSlotTaken {
-        index: usize,
-        kernel: KernelId,
-        slot: u8,
-    },
     /// A command at tape index `index` writes a cache — KV, a recurrent state — and the row it
     /// lowers from is not one a cache-only forward runs: the liveness walk and the lowering
     /// disagree on what writes a cache.
@@ -2999,13 +2907,10 @@ pub enum LoweringError {
     /// step has no per-row twin re-roping span blocks, so some step with
     /// several sequences would run no attention, or row 0's for every sequence.
     RowZeroWithoutPerRowTwin { index: usize, kernel: KernelId },
-    /// The model's KV codec is TurboQuant, but its backbone binds the KV cache
-    /// without compressing any of it: the factory would provision packed stores
-    /// nothing writes, and the worker would stop growing a pool the tape reads.
-    TurboQuantCompressesNothing,
-    /// A KV codec step reached the lowering of a model whose KV codec is dense: the codec pass
-    /// runs only on a TurboQuant model.
-    CodecStepOnDenseModel,
+    /// The model's KV codec is int8, but its backbone binds the KV cache without compressing any
+    /// of it: the factory would provision stores nothing writes, and the worker would stop
+    /// growing a pool the tape reads.
+    Int8CompressesNothing,
     /// A one-row fold — a gated matvec, a matmul's ends in the matmul band, a decode attention
     /// running its KV writer — in a bucket of `bucket_m` rows: its kernel computes one row, and
     /// the fold applies to that bucket only.
@@ -3043,8 +2948,6 @@ pub enum LoweringError {
 pub enum RungScratch {
     /// The rope-once pre-roped K.
     RopedK,
-    /// The hd512 unfused attention's dense K/V, scores and per-head Q/O.
-    AttnUnfused,
 }
 
 impl std::fmt::Display for LoweringError {
@@ -3077,16 +2980,6 @@ impl std::fmt::Display for LoweringError {
                 "lowering: malformed Loop({count}, {body_len}) at tape index {index} \
                  — body extends past tape end (only {remaining} rows remain)"
             ),
-            Self::TurboQuantOffsetUnbound { index } => write!(
-                f,
-                "lowering: the TurboQuant command at tape index {index} cannot bind its KV \
-                 operand's additive offset (no rotary table rotates its K bias)"
-            ),
-            Self::UnrotatedWriterOffset { index } => write!(
-                f,
-                "lowering: the TurboQuant-coded un-rotated KV writer at tape index {index} \
-                 carries a projection bias the codec cannot restore"
-            ),
             Self::NoSource { index, kind, slot } => write!(
                 f,
                 "lowering: the step at tape index {index} binds {kind:?} weight #{slot} of its \
@@ -3102,15 +2995,6 @@ impl std::fmt::Display for LoweringError {
                 "lowering: the row at tape index {index} is gated, and its realization gates a \
                  command of its own"
             ),
-            Self::SplitPartialsSlotTaken {
-                index,
-                kernel,
-                slot,
-            } => write!(
-                f,
-                "lowering: the {kernel:?} at tape index {index} binds a buffer at slot {slot}, \
-                 the TurboQuant decode split's partials slot"
-            ),
             Self::CacheWriterSkipped { index } => write!(
                 f,
                 "lowering: a command of the row at tape index {index} writes a cache, and a \
@@ -3122,12 +3006,9 @@ impl std::fmt::Display for LoweringError {
                  its step has no per-row twin re-roping span blocks for steps with \
                  several sequences"
             ),
-            Self::TurboQuantCompressesNothing => f.write_str(
-                "lowering: the model's KV codec is TurboQuant, but no KV writer in its \
+            Self::Int8CompressesNothing => f.write_str(
+                "lowering: the model's KV codec is int8, but no KV writer in its \
                  backbone is one the codec compresses",
-            ),
-            Self::CodecStepOnDenseModel => f.write_str(
-                "lowering: a KV codec step in the tape of a model whose KV cache is dense",
             ),
             Self::OneRowFold { bucket_m } => {
                 write!(f, "lowering: a one-row fold in the {bucket_m}-row bucket")
@@ -3241,7 +3122,7 @@ pub enum KvAddressing {
 }
 
 /// One baked tape rung: the full [`LoweredMetalTape`] lowered at expansion for a
-/// `(generation class, KV addressing, KV cap, TurboQuant decode heads)` point, every fact of
+/// `(generation class, KV addressing, KV cap)` point, every fact of
 /// it a constant. The pool picks the rung for its device, workload and KV capacity at load —
 /// selection only, no analysis, no substitution.
 #[derive(Clone, Copy, PartialEq, serde::Serialize)]
@@ -3251,33 +3132,27 @@ pub struct ClassedTape {
     /// The KV cap rung: the blocks per sequence the tape's block-table stride, scratch sizes and
     /// dispatches are baked for. It serves every capacity up to it.
     pub cap: MaxBlocksPerSeq,
-    /// The query heads each TurboQuant decode threadgroup serves, baked into the tape; `None` when
-    /// the tape has no TurboQuant decode attention (it serves every device alike).
-    pub tq_heads: Option<TqDecodeHeads>,
     pub tape: LoweredMetalTape,
 }
 
 impl ClassedTape {
-    /// The rung `(gen_class, addressing, cap, tq_heads)` of `body`, the tape its rungs share, with
-    /// the roped-K and unfused-attention scratch bytes its cap sizes.
+    /// The rung `(gen_class, addressing, cap)` of `body`, the tape its rungs share, with
+    /// the roped-K scratch bytes its cap sizes.
     pub const fn rung(
         body: LoweredMetalTape,
         gen_class: GenClass,
         addressing: KvAddressing,
         cap: MaxBlocksPerSeq,
-        tq_heads: Option<TqDecodeHeads>,
-        [roped_k_scratch_bytes, attn_unfused_scratch_bytes]: [u32; 2],
+        roped_k_scratch_bytes: u32,
     ) -> Self {
         let tape = LoweredMetalTape {
             roped_k_scratch_bytes,
-            attn_unfused_scratch_bytes,
             ..body
         };
         Self {
             gen_class,
             addressing,
             cap,
-            tq_heads,
             tape,
         }
     }

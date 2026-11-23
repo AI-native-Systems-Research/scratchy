@@ -127,8 +127,8 @@ pub trait Worker: Send {
     /// Bytes one block of `block` tokens costs in this worker's KV pool,
     /// when that is not the dense row the engine derives from the HF config
     /// (`layers × 2 × kv_heads × head_dim × dtype`): a model built with
-    /// TurboQuant stores packed codes, and a hybrid-SWA model's block is a page
-    /// in each group-shared tensor plus its TurboQuant global store. The engine
+    /// int8 stores codes, and a hybrid-SWA model's block is a page
+    /// in each group-shared tensor plus its int8 global store. The engine
     /// sizes `num_gpu_blocks` from the memory budget by this instead. `None` =
     /// the dense row. Valid after `load_model`.
     ///

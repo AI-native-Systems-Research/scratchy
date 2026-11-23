@@ -51,30 +51,14 @@ SCRATCHY_CONSTANT_OPTIONAL(uint, GEMM_M, 0);
 SCRATCHY_CONSTANT_OPTIONAL(uint, GEMM_N, 1);
 SCRATCHY_CONSTANT_OPTIONAL(uint, GEMM_K, 2);
 
-// Block-diagonal span attention for the hd512 unfused QKᵀ: granularity of the
-// per-position span-label buffer (== metal KV block size). The bound only fires
-// where span_ids is non-zero, so non-span tiles keep the full causal range and
-// the dense path stays byte-identical. Unset → 0 (disabled).
-SCRATCHY_CONSTANT_OPTIONAL(uint, QK_SPAN_BLOCK, 3);
-
-// The PV's V^T row stride: the STATIC max_kv, sized from the block capacity at load.
-SCRATCHY_CONSTANT_OPTIONAL(uint, GEMM_PV_W_LD, 4);
-
 // Shared C = A @ B^T body (A:[M,K], B:[N,K], C:[M,N]) with M/N/K passed
-// explicitly. The dense kernel passes the baked GEMM_M/N/K; the hd512 unfused
-// attention variants substitute a runtime kv_len (from seq_used) for N (QKᵀ) or
-// K (PV) while the tape bakes the grid at the max — tiles past the live N/K
-// early-return. This is the pre-M5 (non-NAX) counterpart of gemm_nax_bf16_qk/pv
-// and uses the identical [M,N,K] convention, so its output matches bit-for-bit
-// modulo accumulation order.
+// explicitly: the dense kernels pass the baked GEMM_M/N/K.
 inline void gemm_t_bf16_body(
     device bfloat*       output,
     device const bfloat* input,
     device const bfloat* weight,
     uint M, uint N, uint K,
-    uint w_ld,           // weight (B) ROW stride; == K for dense/QKᵀ, but for PV
-                         // the V^T dense buffer is strided by static max_kv while
-                         // the contraction K = kv_len — they MUST be decoupled.
+    uint w_ld,           // weight (B) ROW stride
     threadgroup bfloat*  a_pad,
     threadgroup bfloat*  b_pad,
     threadgroup float*   c_scratch,
@@ -111,8 +95,7 @@ inline void gemm_t_bf16_body(
         }
 
         // weight is [N, K] with ROW stride w_ld; compute C = A @ W^T → load B
-        // with transpose=true. Row stride is w_ld (not K) so PV can read the
-        // max_kv-strided V^T while contracting only kv_len columns.
+        // with transpose=true.
         if (n_full && k_full) {
             simdgroup_load(B, weight + n_base * w_ld + k_base, w_ld, ulong2(0, 0), true);
         } else {
@@ -272,13 +255,13 @@ kernel void gemm_f16_specialized(
 }
 #endif
 
-// ── Blocked simdgroup GEMM: the hd512 unfused attention (pre-M5), bf16 dense ─
+// ── Blocked simdgroup GEMM: bf16 dense ─────────────────────────────────────
 // C = A[M,K] @ B[N,K]^T. 32×32 output tile, 4 simdgroups (WM=WN=2), BK=16,
 // register-cached 8×8 frags, shared A/B — a single-output adaptation of the MoE
 // steel GEMM (`fused_gate_up_silu_mul_gemm_steel`). Far higher reuse than the
 // 8×8 reference body (which re-streamed K per output tile). Handles M/N tails
-// AND a K-tail (kv_len need NOT be a multiple of 16 — guarded cooperative load).
-// `w_ld` decouples the B (V^T) row stride from the contraction K.
+// AND a K-tail (K need NOT be a multiple of 16 — guarded cooperative load).
+// `w_ld` is the B row stride.
 #define ATTN_BM 32
 #define ATTN_BN 32
 #define ATTN_BK 16
@@ -377,79 +360,6 @@ inline void gemm_t_bf16_blocked(
         }
     }
 }
-
-// hd512 unfused attention (non-NAX / pre-M5) QKᵀ: N = kv_len from seq_used,
-// M = GEMM_M (Lq), K = GEMM_K (hd). Output scores [Lq, kv_len].
-#if SCRATCHY_COMPILES(gemm_bf16_qk)
-kernel void gemm_bf16_qk(
-    device       bfloat* output   [[buffer(0)]],   // scores [M=Lq, N=kv_len]
-    device const bfloat* input    [[buffer(1)]],   // Q head [M=Lq, K=hd]
-    device const bfloat* weight   [[buffer(2)]],   // K dense [N=kv_len, K=hd]
-    device const uint*   seq_used     [[buffer(3)]],   // [1] kv_len
-    device const uint*   span_ids     [[buffer(4)]],   // per-block span label; 0 = no span
-    device const uint*   cu_seqlens_q [[buffer(5)]],   // new-query span (ACTUAL, not bucket)
-    uint  simd_group_id [[simdgroup_index_in_threadgroup]],
-    uint  simd_lane_id  [[thread_index_in_simdgroup]],
-    uint3 tgid          [[threadgroup_position_in_grid]])
-{
-    const uint M = GEMM_M;
-    const uint N = seq_used[0];
-    const uint c_row = tgid.y * ATTN_BM;  // query-tile
-    const uint c_col = tgid.x * ATTN_BN;  // key-tile
-    // Block-diagonal span bound: a span-uniform query-tile attends only its own
-    // span's keys [span_lo, causal]. Skip both bands BEFORE the hd contraction
-    // (real FLOP cut, mirroring steel's kb_start). span_ids 0 or a tile that
-    // straddles a span boundary → full causal range (byte-identical).
-    if (QK_SPAN_BLOCK != 0u) {
-        // Causal offset from the ACTUAL new-query count (cu_seqlens), NOT GEMM_M:
-        // GEMM_M is the over-sized prefill bucket (bucket_m can exceed kv_len), so
-        // N - GEMM_M underflows. lq_actual ≤ kv_len ⇒ no underflow. Query gemm-row
-        // r → absolute key position (kv_len - lq_actual) + r.
-        const uint lq_actual = cu_seqlens_q[1] - cu_seqlens_q[0];
-        const uint causal_off = N - lq_actual;
-        const uint sf = span_ids[causal_off + c_row]; // per-TOKEN index
-        const uint sl = span_ids[causal_off + c_row + ATTN_BM - 1u];
-        if (sf != 0u && sf == sl) {
-            // causal upper: key-tile entirely past the last query's causal key
-            if (c_col >= causal_off + c_row + ATTN_BM) {
-                return;
-            }
-            // span lower: key-tile entirely before the span's first token
-            const uint span_lo = sf - 1u; // label-1 IS the span's first TOKEN (exact)
-            if (c_col + ATTN_BN <= span_lo) {
-                return;
-            }
-        }
-    }
-    threadgroup bfloat As[ATTN_BM * ATTN_LD];
-    threadgroup bfloat Bs[ATTN_BN * ATTN_LD];
-    threadgroup float  c_scratch[ATTN_BM * ATTN_BN];
-    // QKᵀ: N=kv_len dynamic; kdense row stride == hd == GEMM_K.
-    gemm_t_bf16_blocked(output, input, weight, M, N, GEMM_K, GEMM_K,
-                        As, Bs, c_scratch, simd_group_id, simd_lane_id, tgid);
-}
-#endif
-
-// hd512 unfused attention (non-NAX / pre-M5) PV: K = kv_len from seq_used,
-// M = GEMM_M (Lq), N = GEMM_N (hd), and the V^T dense weight is strided by the
-// STATIC max_kv, GEMM_PV_W_LD (decoupled from the kv_len contraction).
-#if SCRATCHY_COMPILES(gemm_bf16_pv)
-kernel void gemm_bf16_pv(
-    device       bfloat* output   [[buffer(0)]],   // out head [M=Lq, N=hd]
-    device const bfloat* input    [[buffer(1)]],   // probs [M=Lq, K=kv_len]
-    device const bfloat* weight   [[buffer(2)]],   // V^T dense [N=hd, rows strided by max_kv]
-    device const uint*   seq_used [[buffer(3)]],   // [1] kv_len
-    uint  simd_group_id [[simdgroup_index_in_threadgroup]],
-    uint  simd_lane_id  [[thread_index_in_simdgroup]],
-    uint3 tgid          [[threadgroup_position_in_grid]])
-{
-    threadgroup bfloat As[ATTN_BM * ATTN_LD];
-    threadgroup bfloat Bs[ATTN_BN * ATTN_LD];
-    threadgroup float  c_scratch[ATTN_BM * ATTN_BN];
-    gemm_t_bf16_blocked(output, input, weight, GEMM_M, GEMM_N, seq_used[0], GEMM_PV_W_LD,
-                        As, Bs, c_scratch, simd_group_id, simd_lane_id, tgid);
-}
-#endif
 
 // Dense bf16 from `GEMM_BLOCKED_ROWS` rows: `gemm_bf16_specialized`'s MMAs in its order, its bits.
 #if SCRATCHY_COMPILES(gemm_bf16_blocked)

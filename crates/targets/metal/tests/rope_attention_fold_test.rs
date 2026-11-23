@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 //! A one-row decode attention that runs its KV writer (`ATTN_FOLD`, `MetalFusion::RopedAttention`)
 //! leaves the same bits as the writer then the attention: the output, the roped query, the cache
-//! and the packed store. The attention alone (no writer) leaves another output — the step's own
-//! key matters — so the match is not vacuous. `attention_decode_gqa_tq` (a KV head's 8 query heads
+//! and the int8 store. The attention alone (no writer) leaves another output — the step's own
+//! key matters — so the match is not vacuous. `attention_decode_gqa_int8` (a KV head's query heads
 //! together, its partials merged by `attention_via_cache_v2_combine`) leaves the query unroped.
 //!
 //! GPU tests — run with `--test-threads=1` (standing rule).
 
 use half::{bf16, f16};
 use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions, MTLSize};
-use scratchy_layers::turboquant::{PolarQuantizer, packed_dim};
 use scratchy_target_metal::aot::baked_build;
 use scratchy_target_metal::detect_device;
 use scratchy_target_metal::mtl4_dispatch::Mtl4DispatchBatch;
@@ -17,17 +16,13 @@ use scratchy_target_metal::specialized_pipeline_cache::{
     ConstantValue, PipelineKey, SpecializedPipelineCache,
 };
 use scratchy_target_metal::tape::ids::{
-    BlockSize, BlocksPerChunk, HeadDim, NumKvHeads, NumQHeads, RopePairOff, RotDim, TqCodeBits,
+    BlockSize, BlocksPerChunk, HeadDim, NumKvHeads, NumQHeads, RopePairOff, RotDim,
 };
-use scratchy_target_metal::tape::kernel_constants::{
-    RopeAppendConstants, RopeTqConstants, TqOffset,
-};
+use scratchy_target_metal::tape::kernel_constants::{KvInt8Constants, RopeAppendConstants};
 
 type Device = objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn MTLDevice>>;
 type Buffer = objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn MTLBuffer>>;
 
-/// The production codebook seed (`build_tq_provision(.., 42)`).
-const SEED: u64 = 42;
 const N_BLOCKS: usize = 12;
 const BLOCK_SIZE: usize = 16;
 const MAX_POS: usize = 256;
@@ -62,12 +57,9 @@ struct Case {
     num_kv_heads: usize,
     rot_dim: usize,
     pair_off: usize,
-    /// The TurboQuant code width; `None`: a dense cache.
-    bits: Option<u32>,
-    /// Query heads per TurboQuant decode threadgroup.
-    heads: usize,
-    /// Qwen2's K/V projection biases, removed before encoding.
-    biased: bool,
+    /// The int8 store, read by `attention_decode_gqa_int8` over this many threadgroups a KV head;
+    /// `None`: a dense cache, read by `attention_via_cache_v2`.
+    int8: Option<usize>,
     /// Spans: the step's block holds K unrotated.
     spans: bool,
     /// The step's slot is the write-skip sentinel: the writer writes nothing.
@@ -75,8 +67,6 @@ struct Case {
     /// Keys including the step's own.
     ctx: usize,
     blocks_per_chunk: usize,
-    /// `attention_decode_gqa_tq` over this many threadgroups a KV head.
-    gqa: Option<usize>,
     /// RoPE base (theta). GLM-4.5 uses 1e6, not the 10000 default.
     theta: f32,
 }
@@ -148,10 +138,10 @@ struct Left {
     q: Vec<u16>,
     pool_k: Vec<u16>,
     pool_v: Vec<u16>,
-    packed_k: Vec<u32>,
-    packed_v: Vec<u32>,
-    norms_k: Vec<u32>,
-    norms_v: Vec<u32>,
+    codes_k: Vec<u8>,
+    codes_v: Vec<u8>,
+    scales_k: Vec<u32>,
+    scales_v: Vec<u32>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -195,10 +185,6 @@ fn run(c: &Case, how: Run) -> Option<Left> {
     let q = shared(&device, &dt(nq * hd, 2.0));
     let k = shared(&device, &dt(nkv * hd, 2.0));
     let v = shared(&device, &dt(nkv * hd, 2.0));
-    let (kb, vb) = (
-        shared(&device, &dt(nkv * hd, 6.0)),
-        shared(&device, &dt(nkv * hd, 6.0)),
-    );
     let half_rot = c.rot_dim / 2;
     let cos_sin: Vec<u16> = (0..MAX_POS)
         .flat_map(|p| {
@@ -220,33 +206,21 @@ fn run(c: &Case, how: Run) -> Option<Left> {
     let block_table = shared(&device, &block_table);
     let (pool_k, pool_v) = (Pool::new(&device, c, 21), Pool::new(&device, c, 22));
 
-    let bits = c.bits.unwrap_or(4);
-    let quant = PolarQuantizer::new(hd, bits, SEED);
-    let boundaries: Vec<f32> = quant
-        .centroids()
-        .windows(2)
-        .map(|w| (w[0] + w[1]) / 2.0)
-        .collect();
-    let (signs, centroids, bounds) = (
-        shared(&device, quant.signs()),
-        shared(&device, quant.centroids()),
-        shared(&device, &boundaries),
-    );
     let n_rows = N_BLOCKS * BLOCK_SIZE * nkv;
-    let pdim = packed_dim(hd, bits);
-    // Earlier keys' codes and norms: any bits, the same in every run.
-    let stale: Vec<u32> = (0..n_rows * pdim)
-        .map(|i| (i as u32).wrapping_mul(2654435761))
+    // Earlier keys' codes and scales: any bits, the same in every run.
+    let stale: Vec<u8> = (0..n_rows * hd)
+        .map(|i| (i as u32).wrapping_mul(2654435761) as u8)
         .collect();
-    let stale_norms: Vec<f32> = (0..n_rows).map(|i| 0.5 + (i % 7) as f32 / 4.0).collect();
-    let (packed_k, packed_v) = (shared(&device, &stale), shared(&device, &stale));
-    let (norms_k, norms_v) = (shared(&device, &stale_norms), shared(&device, &stale_norms));
+    let stale_scales: Vec<f32> = (0..n_rows)
+        .map(|i| (0.5 + (i % 7) as f32 / 4.0) / 64.0)
+        .collect();
+    let (codes_k, codes_v) = (shared(&device, &stale), shared(&device, &stale));
+    let (scales_k, scales_v) = (
+        shared(&device, &stale_scales),
+        shared(&device, &stale_scales),
+    );
     let out = shared(&device, &vec![0u16; nq * hd]);
 
-    let (k_offset, v_offset) = match c.biased {
-        true => (TqOffset::RotatedBias, TqOffset::Bias),
-        false => (TqOffset::None, TqOffset::None),
-    };
     let writer_constants: Vec<ConstantValue> = RopeAppendConstants {
         head_dim: HeadDim(hd as u32),
         num_q_heads: NumQHeads(nq as u32),
@@ -256,11 +230,7 @@ fn run(c: &Case, how: Run) -> Option<Left> {
         blocks_per_chunk: BlocksPerChunk(c.blocks_per_chunk as u32),
         pair_off: RopePairOff(c.pair_off as u32),
         rope_on_read: c.spans.then_some(1),
-        tq: c.bits.map(|b| RopeTqConstants {
-            bits: TqCodeBits(b),
-            k_offset,
-            v_offset,
-        }),
+        int8: c.int8.map(|_| KvInt8Constants),
         query_only: false,
     }
     .into();
@@ -289,23 +259,27 @@ fn run(c: &Case, how: Run) -> Option<Left> {
             ConstantValue::uint(10, 1),
         ]);
     }
-    let heads = match (c.bits, c.gqa) {
-        (Some(b), Some(splits)) => {
+    // The query heads a threadgroup serves: the dense kernel's one, the int8 split's largest
+    // divisor of the group the fragment's 8 rows hold.
+    let group = nq / nkv;
+    let heads = match c.int8 {
+        Some(splits) => {
+            let rows = (1..=group.min(8))
+                .filter(|r| group.is_multiple_of(*r))
+                .max()
+                .unwrap_or(1);
             attn_constants.extend([
-                ConstantValue::uint(13, b),
+                ConstantValue::uint(13, 1),
+                ConstantValue::uint(16, rows as u32),
+                ConstantValue::uint(
+                    24,
+                    scratchy_target_metal::kv_int8::decode_key_group(hd as u32),
+                ),
                 ConstantValue::uint(18, splits as u32),
             ]);
-            1
+            rows
         }
-        (Some(b), None) => {
-            attn_constants.push(ConstantValue::uint(13, b));
-            if c.biased {
-                attn_constants.extend([ConstantValue::uint(14, 1), ConstantValue::uint(15, 1)]);
-            }
-            attn_constants.push(ConstantValue::uint(16, c.heads as u32));
-            c.heads
-        }
-        (None, _) => 1,
+        None => 1,
     };
     if how == Run::Fold {
         attn_constants.extend([
@@ -313,8 +287,8 @@ fn run(c: &Case, how: Run) -> Option<Left> {
             ConstantValue::uint(20, c.pair_off as u32),
         ]);
     }
-    let kernel = match c.gqa {
-        Some(_) => "attention_decode_gqa_tq",
+    let kernel = match c.int8 {
+        Some(_) => "attention_decode_gqa_int8",
         None => "attention_via_cache_v2",
     };
     let leak = |name: String| -> &'static str { Box::leak(name.into_boxed_str()) };
@@ -323,9 +297,16 @@ fn run(c: &Case, how: Run) -> Option<Left> {
         "attention_via_cache_v2_combine_{}_specialized",
         c.dtype.tag()
     ));
+    let combine_groups = scratchy_target_metal::kv_int8::combine_groups(hd as u32);
+    let combine_threads = 32 * combine_groups as usize;
+    let combine_constants = [
+        attn_constants.clone(),
+        vec![ConstantValue::uint(25, combine_groups)],
+    ]
+    .concat();
     let combine = baked_build(
         &cache,
-        &PipelineKey::new("attention", combine_name, attn_constants.clone()),
+        &PipelineKey::new("attention", combine_name, combine_constants),
     )
     .expect("combine");
     let attention = baked_build(
@@ -334,7 +315,10 @@ fn run(c: &Case, how: Run) -> Option<Left> {
     )
     .expect("attention");
     // NaN: the combine reads only the partials the attention stored.
-    let partials = shared(&device, &vec![f32::NAN; nq * c.gqa.unwrap_or(1) * (hd + 2)]);
+    let partials = shared(
+        &device,
+        &vec![f32::NAN; nq * c.int8.unwrap_or(1) * (hd + 2)],
+    );
 
     let resident = [&pool_k.data, &pool_v.data];
     let mut batch = Mtl4DispatchBatch::begin(&device)?;
@@ -349,17 +333,12 @@ fn run(c: &Case, how: Run) -> Option<Left> {
             (&pool_k.table, 6),
             (&pool_v.table, 7),
         ];
-        if c.bits.is_some() {
+        if c.int8.is_some() {
             binds.extend([
-                (&signs, 16),
-                (&bounds, 17),
-                (&packed_k, 18),
-                (&norms_k, 19),
-                (&packed_v, 20),
-                (&norms_v, 21),
-                (&kb, 22),
-                (&vb, 23),
-                (&cos_sin, 24),
+                (&codes_k, 16),
+                (&scales_k, 17),
+                (&codes_v, 18),
+                (&scales_v, 19),
             ]);
         }
         batch.encode(&writer, &binds, &[], &[], &resident, tg(1, nq), tg(hd, 1));
@@ -373,39 +352,36 @@ fn run(c: &Case, how: Run) -> Option<Left> {
         (&pool_k.table, 4),
         (&pool_v.table, 5),
         (&cos_sin, 6),
-        (&packed_k, 7),
-        (&packed_v, 8),
-        (&norms_k, 9),
-        (&norms_v, 10),
-        (&signs, 11),
-        (&centroids, 12),
+        (&codes_k, 7),
+        (&codes_v, 8),
+        (&scales_k, 9),
+        (&scales_v, 10),
         (&slots, 13),
-        (&kb, 14),
-        (&vb, 15),
         (&partials, 16),
     ];
     if how == Run::Fold {
-        binds.extend([
-            (&k, 17),
-            (&v, 18),
-            (&positions, 19),
-            (&bounds, 20),
-            (&cos_sin, 21),
-            (&cos_sin, 22),
-        ]);
+        binds.extend([(&k, 17), (&v, 18), (&positions, 19), (&cos_sin, 21)]);
     }
-    match c.gqa {
+    match c.int8 {
         Some(splits) => {
             // Running its writer, one threadgroup past the splits writes and encodes the row.
             let grid = MTLSize {
                 width: 1,
-                height: nkv,
+                height: nq / heads,
                 depth: splits + usize::from(how == Run::Fold),
             };
             batch.encode(&attention, &binds, &[], &[], &resident, grid, tg(hd, 1));
             batch.barrier();
-            let binds = [(&out, 0), (&signs, 11), (&partials, 16)];
-            batch.encode(&combine, &binds, &[], &[], &[], tg(1, nq), tg(128, 1));
+            let binds = [(&out, 0), (&partials, 16)];
+            batch.encode(
+                &combine,
+                &binds,
+                &[],
+                &[],
+                &[],
+                tg(1, nq),
+                tg(combine_threads, 1),
+            );
         }
         None => batch.encode(
             &attention,
@@ -425,10 +401,10 @@ fn run(c: &Case, how: Run) -> Option<Left> {
         q: read(&q, nq * hd),
         pool_k: read(&pool_k.data, pool_elems),
         pool_v: read(&pool_v.data, pool_elems),
-        packed_k: read(&packed_k, n_rows * pdim),
-        packed_v: read(&packed_v, n_rows * pdim),
-        norms_k: read(&norms_k, n_rows),
-        norms_v: read(&norms_v, n_rows),
+        codes_k: read(&codes_k, n_rows * hd),
+        codes_v: read(&codes_v, n_rows * hd),
+        scales_k: read(&scales_k, n_rows),
+        scales_v: read(&scales_v, n_rows),
     })
 }
 
@@ -447,21 +423,21 @@ fn check(name: &str, c: Case) {
         writer.out, alone.out,
         "{name}: the step's own key changes nothing"
     );
-    match c.gqa {
+    match c.int8 {
         None => assert_eq!(fold.q, writer.q, "{name}: roped query"),
         Some(_) => assert_eq!(fold.q, alone.q, "{name}: the query left unroped"),
     }
     assert_eq!(fold.pool_k, writer.pool_k, "{name}: K cache");
     assert_eq!(fold.pool_v, writer.pool_v, "{name}: V cache");
-    assert_eq!(fold.packed_k, writer.packed_k, "{name}: packed K");
-    assert_eq!(fold.packed_v, writer.packed_v, "{name}: packed V");
-    assert_eq!(fold.norms_k, writer.norms_k, "{name}: K norms");
-    assert_eq!(fold.norms_v, writer.norms_v, "{name}: V norms");
+    assert_eq!(fold.codes_k, writer.codes_k, "{name}: K codes");
+    assert_eq!(fold.codes_v, writer.codes_v, "{name}: V codes");
+    assert_eq!(fold.scales_k, writer.scales_k, "{name}: K scales");
+    assert_eq!(fold.scales_v, writer.scales_v, "{name}: V scales");
     assert_eq!(fold.out, writer.out, "{name}: output");
 }
 
 /// Llama 3.2 3B's attention geometry.
-fn llama(dtype: Dtype, bits: Option<u32>, heads: usize) -> Case {
+fn llama(dtype: Dtype, int8: Option<usize>) -> Case {
     Case {
         dtype,
         head_dim: 128,
@@ -469,51 +445,50 @@ fn llama(dtype: Dtype, bits: Option<u32>, heads: usize) -> Case {
         num_kv_heads: 8,
         rot_dim: 128,
         pair_off: 64,
-        bits,
-        heads,
-        biased: false,
+        int8,
         spans: false,
         write_skipped: false,
         ctx: 41,
         blocks_per_chunk: 4,
-        gqa: None,
         theta: 10000.0,
     }
 }
 
 #[test]
 fn llama_dense_bf16() {
-    check("llama dense bf16", llama(Dtype::Bf16, None, 1));
+    check("llama dense bf16", llama(Dtype::Bf16, None));
 }
 
 #[test]
 fn llama_dense_f16() {
-    check("llama dense f16", llama(Dtype::F16, None, 1));
+    check("llama dense f16", llama(Dtype::F16, None));
 }
 
+/// Llama's group of 3, and a KV head's 8 query heads together (Qwen2.5-3B's 16 over 2), each
+/// whole and over 3 threadgroups: the step's own key (the 41st) falls to the last, which reads it
+/// from its own copy of the row while the writer's threadgroup writes it to the cache and the
+/// int8 store.
 #[test]
-fn llama_turboquant_every_head_count() {
-    for heads in [1, 3] {
-        for bits in [3, 4] {
-            check(
-                "llama turboquant bf16",
-                llama(Dtype::Bf16, Some(bits), heads),
-            );
-        }
+fn int8_every_group_and_split() {
+    for splits in [1, 3] {
+        check("llama int8", llama(Dtype::Bf16, Some(splits)));
+        check(
+            "qwen2.5 int8",
+            Case {
+                num_q_heads: 16,
+                num_kv_heads: 2,
+                ..llama(Dtype::Bf16, Some(splits))
+            },
+        );
+        check(
+            "nemotron int8 (16 a KV head)",
+            Case {
+                num_q_heads: 32,
+                num_kv_heads: 2,
+                ..llama(Dtype::Bf16, Some(splits))
+            },
+        );
     }
-}
-
-#[test]
-fn qwen2_biased_turboquant() {
-    // Qwen2.5 3B: 16 query heads over 2 KV heads, K/V biased.
-    let c = Case {
-        num_q_heads: 16,
-        num_kv_heads: 2,
-        biased: true,
-        ..llama(Dtype::Bf16, Some(4), 8)
-    };
-    check("qwen2 biased turboquant", c);
-    check("qwen2 biased turboquant, 2 heads", Case { heads: 2, ..c });
 }
 
 #[test]
@@ -522,14 +497,14 @@ fn spans_tail_stored_unrotated() {
         "spans dense",
         Case {
             spans: true,
-            ..llama(Dtype::F16, None, 1)
+            ..llama(Dtype::F16, None)
         },
     );
     check(
-        "spans turboquant",
+        "spans int8",
         Case {
             spans: true,
-            ..llama(Dtype::Bf16, Some(4), 3)
+            ..llama(Dtype::Bf16, Some(3))
         },
     );
 }
@@ -540,46 +515,16 @@ fn write_skipped_tail() {
         "skipped dense",
         Case {
             write_skipped: true,
-            ..llama(Dtype::Bf16, None, 1)
+            ..llama(Dtype::Bf16, None)
         },
     );
     check(
-        "skipped turboquant",
+        "skipped int8",
         Case {
             write_skipped: true,
-            ..llama(Dtype::Bf16, Some(4), 3)
+            ..llama(Dtype::Bf16, Some(3))
         },
     );
-}
-
-/// A KV head's 8 query heads together (`attention_decode_gqa_tq`), whole and over 3 threadgroups:
-/// the step's own key (the 41st) falls to the last, which reads it from its own copy of the row
-/// while the first writes it to the cache and the packed store.
-#[test]
-fn gqa_turboquant() {
-    let gqa = |splits| Case {
-        num_q_heads: 16,
-        num_kv_heads: 2,
-        gqa: Some(splits),
-        ..llama(Dtype::Bf16, Some(4), 1)
-    };
-    for splits in [1, 3] {
-        check("gqa turboquant", gqa(splits));
-        check(
-            "gqa spans turboquant",
-            Case {
-                spans: true,
-                ..gqa(splits)
-            },
-        );
-        check(
-            "gqa skipped turboquant",
-            Case {
-                write_skipped: true,
-                ..gqa(splits)
-            },
-        );
-    }
 }
 
 #[test]
@@ -591,7 +536,7 @@ fn partial_rope_at_a_block_edge() {
             rot_dim: 64,
             pair_off: 32,
             ctx: 33,
-            ..llama(Dtype::Bf16, Some(4), 3)
+            ..llama(Dtype::Bf16, Some(3))
         },
     );
 }
@@ -616,7 +561,7 @@ fn glm45_air_dense() {
                 theta: 1e6,
                 spans: true,
                 ctx,
-                ..llama(Dtype::Bf16, None, 1)
+                ..llama(Dtype::Bf16, None)
             },
         );
     }
@@ -634,7 +579,7 @@ fn glm45_air_dense_unbiased_no_spans() {
             rot_dim: 64,
             pair_off: 32,
             theta: 1e6,
-            ..llama(Dtype::Bf16, None, 1)
+            ..llama(Dtype::Bf16, None)
         },
     );
 }

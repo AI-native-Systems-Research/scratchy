@@ -9,12 +9,12 @@
 
 pub mod gdn_state;
 pub mod kv_cache;
+pub mod kv_int8;
 pub mod layers;
 pub mod layers_moe;
 pub mod load_time;
 pub mod loaders;
 pub mod rotary;
-pub mod turboquant;
 pub mod weights;
 
 // Neutral tensor-core *modules* re-exported so this crate can serve as the

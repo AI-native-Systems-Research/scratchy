@@ -30,7 +30,7 @@ pub struct GpuDevice {
     /// `MetalWorkerPool::for_buckets` picks its rung by.
     pub kv_addressing: crate::tape::lowered::KvAddressing,
     /// The most rows a decode or verify step brings — one a sequence of the serving engine's
-    /// `max_num_seqs`, a verify step's drafts too — stashed by the worker once resolved: the rows the TurboQuant decode split's
+    /// `max_num_seqs`, a verify step's drafts too — stashed by the worker once resolved: the rows the int8 decode split's
     /// partials are reserved for (`LoweredMetalTape::scratch_bytes`). `None`: a bucket's every
     /// row.
     pub max_decode_rows: Option<crate::tape::ids::DecodeRows>,

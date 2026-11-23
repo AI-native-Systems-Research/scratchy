@@ -4,8 +4,8 @@
 //! For one cached checkpoint per case, this loads the model through the same public entry points
 //! the metal worker uses (`GpuWeights::from_dir` → `scratchy_forward_compiler::try_load`), builds
 //! the KV pool the way `MetalWorker::initialize_cache` does (uniform, or vLLM's group-shared hybrid
-//! layout; a Gated-DeltaNet state pool when the arch has one; TurboQuant where the build compiled
-//! the model's KV codec as it — `--features turboquant`),
+//! layout; a Gated-DeltaNet state pool when the arch has one; int8 where the build compiled
+//! the model's KV codec as it),
 //! then runs ONE sequence at a time — a prefill over each fixed prompt, then greedy decode — and
 //! prints, per step, the greedy token and a SHA-256 of the full logits row the step produced (the
 //! terminal arena slot). Decoders hash the sampled row; encoders hash every row.
@@ -484,17 +484,16 @@ fn view<'a, T>(v: &'a [T], shape: &[usize], dtype: DType) -> TensorView<'a> {
 
 /// Run one step; return the terminal slot's `[n, width]` bytes (bf16/f16 raw) and `width`.
 fn run_step(l: &mut Loaded, path: ExecPath, s: &StepInputs) -> (Vec<u8>, usize) {
-    // TurboQuant's stores hold group 0's blocks: map them through the step's last, as
+    // the int8 stores hold every group's blocks: map them through the step's last, as
     // `MetalWorker::grow_metal_kv_to_cover` does before every forward.
-    let reach = s.block_tables[0]
-        .iter()
+    let reach = (s.block_tables.iter().flatten())
         .max()
         .map_or(1, |&b| b as usize + 1);
     let registry = l.gpu.allocator.sparse_kv.lock();
     let reached = registry
         .expect("sparse KV registry")
         .reach(reach, &l.mapper);
-    reached.expect("TurboQuant KV grow");
+    reached.expect("int8 KV grow");
     let n = s.ids.len();
     let stride = l.kv.max_blocks_per_seq;
     let u32t = DType::U32;

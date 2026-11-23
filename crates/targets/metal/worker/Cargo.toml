@@ -13,8 +13,6 @@ forward-telemetry = ["scratchy-target-metal/forward-telemetry", "scratchy-core-c
 sampler-telemetry = ["scratchy-target-metal/sampler-telemetry", "scratchy-core-common/sampler-telemetry"]
 # Multimodal capability, forwarded from `scr`'s `multimodal` feature.
 vision = ["scratchy-target-metal/vision", "scratchy-target-metal-models/vision"]
-# TurboQuant KV compression for every model whose geometry the codec takes.
-turboquant = ["scratchy-target-metal-models/turboquant"]
 guided-decoding = ["scratchy-serving-engine/guided-decoding", "scratchy-serving-worker/guided-decoding"]
 
 [dependencies]

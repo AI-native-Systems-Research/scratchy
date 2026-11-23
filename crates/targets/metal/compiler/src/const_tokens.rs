@@ -63,10 +63,10 @@ fn module_of(ty: &str) -> Result<TokenStream, Error> {
         "BucketM" | "LayerId" | "SourceIx" | "ArenaSlotIdx" | "PhysicalBlockIdx"
         | "LogicalBlockIdx" | "SlotInBlock" | "SeqIdx" | "QTokenIdx" | "NumTokens"
         | "BindingIdx" | "HeadDim" | "NumQHeads" | "NumKvHeads" | "RotDim" | "RopePairOff"
-        | "BlockSize" | "BlocksPerChunk" | "MaxBlocksPerSeq" | "TqDecodeHeads" | "CommandIx"
-        | "PartIx" | "PartArray" | "QSize" | "IntermediateSize" | "HiddenSize" | "KDim"
-        | "NDim" | "SplitK" | "AttnDebugMode" | "AttnWindow" | "KDimI32" | "NDimI32"
-        | "MDimI32" | "KPartitionSizeI32" | "AttnScale" | "RmsNormEps" => {
+        | "BlockSize" | "BlocksPerChunk" | "MaxBlocksPerSeq" | "CommandIx" | "PartIx"
+        | "PartArray" | "QSize" | "IntermediateSize" | "HiddenSize" | "KDim" | "NDim"
+        | "SplitK" | "AttnDebugMode" | "AttnWindow" | "KDimI32" | "NDimI32" | "MDimI32"
+        | "KPartitionSizeI32" | "AttnScale" | "RmsNormEps" => {
             quote!(__ti)
         }
         "DraftOutput" => quote!(__td),

@@ -1751,7 +1751,7 @@ impl<K: Copy + PartialEq> Folder<'_, K> {
 mod tests {
     use super::*;
     use crate::fixtures::{
-        TURBOQUANT_SHAPED_CODEC, front_end_lowered, one_layer_attention, one_layer_input_shaped,
+        INT8_SHAPED_CODEC, front_end_lowered, one_layer_attention, one_layer_input_shaped,
     };
     use crate::handoff::{Expansion, ExpansionId};
     use crate::kv_codec::expand_kv_codec;
@@ -2967,7 +2967,7 @@ mod tests {
         let mut input = one_layer_input_shaped(256, 64, 512, 64);
         input.ops.iter_mut().for_each(|od| od.m = 1);
         let lowered = front_end_lowered(input);
-        let mut l = expand_kv_codec(&lowered, &TURBOQUANT_SHAPED_CODEC).expect("expands");
+        let mut l = expand_kv_codec(&lowered, &INT8_SHAPED_CODEC).expect("expands");
         let at = |name| l.input.ops.iter().position(|od| od.op.name() == name);
         let (rotate, writer) = (at("RopeRotate").unwrap(), at("RopeAppend").unwrap());
         let (k, v) = (writer + 1, writer + 2);
@@ -3043,7 +3043,7 @@ mod tests {
             for x in [0, 5, 6] {
                 input.sources[x].rows = m;
             }
-            expand_kv_codec(&front_end_lowered(input), &TURBOQUANT_SHAPED_CODEC).expect("expands")
+            expand_kv_codec(&front_end_lowered(input), &INT8_SHAPED_CODEC).expect("expands")
         };
         let l = coded(1);
         let at = |name| l.input.ops.iter().position(|od| od.op.name() == name);

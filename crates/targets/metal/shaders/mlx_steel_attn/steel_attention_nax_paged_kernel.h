@@ -1064,9 +1064,9 @@ void attention_nax_paged_wide(
 
 // A verify step's Q rows packed for the PACKED `attention_nax_paged_wide`: Qp[seq][kv_head][r][BD],
 // row r = hl * 8 + t holding query head kv_head * gqa + hl's token t of the sequence (zero past the
-// sequence's tokens, and past the group's heads up to the tile's 64 rows).
-// Grid: threadgroups (64, num_kv_heads, seqs), threads (BD, 1, 1).
-template <typename T, int BD>
+// sequence's tokens, and past the group's heads up to the tile's BQ rows).
+// Grid: threadgroups (BQ, num_kv_heads, seqs), threads (BD, 1, 1).
+template <typename T, int BD, int BQ>
 [[kernel, max_total_threads_per_threadgroup(BD)]]
 void attention_verify_pack_q(
     device T*          Qp           [[buffer(0)]],
@@ -1083,5 +1083,5 @@ void attention_verify_pack_q(
   if (hl < gqa && t < nq) {
     v = Q[((start + t) * NAXP_NUM_Q_HEADS + kvh * gqa + hl) * uint(BD) + d];
   }
-  Qp[((seq * NAXP_NUM_KV_HEADS + kvh) * 64u + r) * uint(BD) + d] = v;
+  Qp[((seq * NAXP_NUM_KV_HEADS + kvh) * uint(BQ) + r) * uint(BD) + d] = v;
 }

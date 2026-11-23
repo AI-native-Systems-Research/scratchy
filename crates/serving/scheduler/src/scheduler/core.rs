@@ -8510,7 +8510,7 @@ mod tests {
         // asked for, so its prompt sent again reused nothing. With every block allocated up front
         // it now reuses all but its last partial block under either layout. With blocks mapped as
         // the pool reaches them, the cache only lives in what is mapped: on the global-apart
-        // layout for Gemma 4 (`GlobalApart`), the TurboQuant store's last doubling holds the others' new
+        // layout for Gemma 4 (`GlobalApart`), the int8 store's last doubling holds the others' new
         // global blocks and the prompt is reused too. Shared, the others' growth needs the space
         // r1's cache holds, which is evicted before the pool maps more.
         for stores in BOTH_STORES {

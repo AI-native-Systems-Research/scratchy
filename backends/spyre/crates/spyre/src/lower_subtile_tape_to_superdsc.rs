@@ -4243,7 +4243,6 @@ pub fn numeric_gate<T: ktir_superdsc::collective::Tp, F: RopeForm>(
                 | SubOp::Mamba2 { .. }
                 | SubOp::KvEncode { .. }
                 | SubOp::KvStage { .. }
-                | SubOp::RotateRows { .. }
                 | SubOp::AttnPackedKv
                 | SubOp::SampleRowsGather
                 | SubOp::SampleRowsScatter

@@ -7391,10 +7391,7 @@ pub fn fuf_uses_rotary(fuf: &Fuf) -> bool {
 
 /// The layers whose ops read or write the paged KV cache, ascending: every layer of a uniform
 /// decoder, a recurrent hybrid's attention layers only (its Mamba / Gated-DeltaNet layers hold
-/// none), no layer of an encoder or a vision tower. The KV pool holds these layers' tensors. The
-/// TurboQuant threshold does NOT count them: its `num_layers` input stays `num_hidden_layers`,
-/// the input it was calibrated against — re-classifying existing models' codec is a policy
-/// change and belongs in its own PR, not a side effect of a new arch.
+/// none), no layer of an encoder or a vision tower. The KV pool holds these layers' tensors.
 #[derive(Default)]
 pub struct KvCacheLayers(Vec<u32>);
 
@@ -7432,40 +7429,35 @@ impl KvCacheLayers {
     }
 }
 
-/// The model's KV codec. TurboQuant on a target that compresses KV (`compress`), wherever
-/// `codec_for` takes its geometry; dense everywhere else. A model it would compress but can't is
-/// named in the build output. The geometry is the KV pool's: a head's KV is its target's
-/// capacity, a pool mirroring the target's blocks, so it is decided at the target's layer count
-/// (`target_num_hidden_layers`) — the target's codec.
+/// The model's KV codec. Int8 on a target whose kernels code its heads (`coded`), wherever
+/// `codec_for` takes its geometry; dense everywhere else. A model it would compress but can't is named in the
+/// build output.
 fn kv_codec_for(
     model: &ModelParams,
     head_dim: u32,
     global_head_dim: u32,
     kv_layers: &KvCacheLayers,
-    bits: scratchy_forward_compiler::TqBits,
-    compress: bool,
+    coded: Option<scratchy_ir::CodedHeads>,
 ) -> scratchy_forward_compiler::KvCodec {
-    use scratchy_ir::{DenseReason, KvGeometry, codec_for};
-    if !compress {
+    use scratchy_ir::{DenseReason, KvRows, codec_for};
+    let Some(coded) = coded else {
         return scratchy_forward_compiler::KvCodec::Dense;
-    }
-    let bound = |k: &str| *model.bounds.get(k).unwrap_or(&0) as usize;
-    let pool_layers = (model.bounds.get("target_num_hidden_layers"))
-        .map_or(model.text.layers.get(), |&n| n as usize);
-    let geometry = KvGeometry {
-        num_layers: pool_layers,
-        num_kv_heads: bound("num_key_value_heads"),
-        head_dim,
-        global_head_dim,
-        latent: bound("kv_lora_rank") > 0,
-        has_kv_cache: kv_layers.any(),
     };
-    match codec_for(geometry, bits) {
-        Ok(bits) => scratchy_forward_compiler::KvCodec::TurboQuant(bits),
+    let latent = model.bounds.get("kv_lora_rank").is_some_and(|&r| r > 0);
+    let rows = match (kv_layers.any(), latent) {
+        (false, _) => KvRows::None,
+        (true, true) => KvRows::Latent,
+        (true, false) => KvRows::Heads {
+            head_dim,
+            global_head_dim,
+        },
+    };
+    match codec_for(rows, coded) {
+        Ok(()) => scratchy_forward_compiler::KvCodec::Int8,
         Err(reason) => {
             if reason != DenseReason::NoKvCache {
                 println!(
-                    "cargo:warning=turboquant: {} keeps a dense KV cache: {reason}",
+                    "cargo:warning=int8 KV: {} keeps a dense KV cache: {reason}",
                     model.source_stem
                 );
             }
@@ -7618,12 +7610,7 @@ fn model_facts_tokens(f: scratchy_ir::model_facts::ModelFacts) -> TokenStream {
     }));
     let kv_codec = match f.kv_codec() {
         scratchy_ir::KvCodec::Dense => quote! { ::scratchy_forward_compiler::KvCodec::Dense },
-        scratchy_ir::KvCodec::TurboQuant(bits) => {
-            let b = u32_(bits.get());
-            quote! {
-                ::scratchy_forward_compiler::KvCodec::TurboQuant(::scratchy_forward_compiler::TqBits::new(#b))
-            }
-        }
+        scratchy_ir::KvCodec::Int8 => quote! { ::scratchy_forward_compiler::KvCodec::Int8 },
     };
     let act_dtype = match f.act_dtype() {
         scratchy_ir::model_facts::ActDtype::Bf16 => quote! { #m::ActDtype::Bf16 },
@@ -7761,8 +7748,8 @@ pub(crate) fn fill_canonical_params(
     // For a body that reads its target's hidden rows (a head), how its width stands to its
     // target's ([`target_width`]): the facts state its target then.
     target: Option<scratchy_ir::model_facts::TargetWidth>,
-    // Whether the target compresses a KV cache the codec takes (`TargetEmitter::compresses_kv`).
-    compress_kv: bool,
+    // The heads the target's kernels code as int8 KV (`TargetEmitter::coded_kv_heads`).
+    coded_kv: Option<scratchy_ir::CodedHeads>,
 ) -> (scratchy_ir::model_facts::ModelFacts, TokenStream) {
     let tp = tp_world_size as u32;
     let tp_us = tp_world_size as usize;
@@ -8088,25 +8075,7 @@ pub(crate) fn fill_canonical_params(
         is_bf16_scale || is_nvfp4
     };
 
-    // TurboQuant KV bit-width policy. 3-bit (~4.7x) is validated
-    // coherent for the Llama family; outlier-heavy KV (Qwen-class massive
-    // activations) degrades at 3-bit and needs 4-bit. Promote arches to 3 here
-    // as the validation sweep confirms them.
-    let tq_bits = {
-        let rides_3bit = model
-            .architectures
-            .iter()
-            .any(|a| a.starts_with("Llama") || a.contains("TinyLlama"));
-        scratchy_forward_compiler::TqBits::new(if rides_3bit { 3 } else { 4 })
-    };
-    let kv_codec = kv_codec_for(
-        model,
-        head_dim,
-        global_head_dim,
-        kv_layers,
-        tq_bits,
-        compress_kv,
-    );
+    let kv_codec = kv_codec_for(model, head_dim, global_head_dim, kv_layers, coded_kv);
 
     let num_hidden_layers = model.text.layers.get();
 
@@ -8552,7 +8521,7 @@ pub fn emit_model(
         fuf_uses_rotary(fuf),
         &KvCacheLayers::of(fuf),
         fuf_reads_target_hidden(fuf).then(|| target_width(program, inferred)),
-        emitter.compresses_kv(),
+        emitter.coded_kv_heads(),
     );
     let canonical_params_impl = emit_canonical_params_impl(model_facts, &mla_consts);
     let crate::target::ModelEmission { weights, items } = emitter.model(&crate::target::ModelCx {
@@ -8818,8 +8787,7 @@ mod tests {
             ) else {
                 continue;
             };
-            let facts =
-                fill_canonical_params(&model, 1, false, &every_layer(&model), None, false).0;
+            let facts = fill_canonical_params(&model, 1, false, &every_layer(&model), None, None).0;
             // A body with no decoder attention (a vision tower, a drafter head) states
             // no scale — the law is over the configs that do.
             let Some(attention) = facts.attention() else {
@@ -8926,7 +8894,7 @@ mod tests {
             "SCALE_DTYPE",
         ];
         let m = shard_test_model(32, 8, 128, 11008);
-        let (facts, mla) = fill_canonical_params(&m, 1, false, &every_layer(&m), None, false);
+        let (facts, mla) = fill_canonical_params(&m, 1, false, &every_layer(&m), None, None);
         let ts = emit_canonical_params_impl(facts, &mla).to_string();
         assert!(ts.contains("const FACTS"), "the impl states FACTS: {ts}");
         for name in DERIVED {
@@ -8942,7 +8910,7 @@ mod tests {
         // Llama-2-7B-ish numbers: 32 q heads, 32 kv heads,
         // head_dim=128, intermediate=11008.
         let m = shard_test_model(32, 32, 128, 11008);
-        let facts = fill_canonical_params(&m, 1, false, &every_layer(&m), None, false).0;
+        let facts = fill_canonical_params(&m, 1, false, &every_layer(&m), None, None).0;
         // Q size = 32 * 128 = 4096; KV size = 32 * 128 = 4096.
         assert!(
             raw::num_q_heads(facts) == 32,
@@ -8974,7 +8942,7 @@ mod tests {
     #[test]
     fn canonical_params_at_tp_eq_2_shards_column_parallel_dims() {
         let m = shard_test_model(32, 32, 128, 11008);
-        let facts = fill_canonical_params(&m, 2, false, &every_layer(&m), None, false).0;
+        let facts = fill_canonical_params(&m, 2, false, &every_layer(&m), None, None).0;
         assert!(
             raw::num_q_heads(facts) == 16,
             "tp=2 must shard NUM_Q_HEADS to 16; got {}",
@@ -9020,7 +8988,7 @@ mod tests {
         // Llama-3-8B-ish numbers: 32 q heads, 8 kv heads,
         // head_dim=128, intermediate=14336.
         let m = shard_test_model(32, 8, 128, 14336);
-        let facts = fill_canonical_params(&m, 8, false, &every_layer(&m), None, false).0;
+        let facts = fill_canonical_params(&m, 8, false, &every_layer(&m), None, None).0;
         // 32 / 8 = 4
         assert!(
             raw::num_q_heads(facts) == 4,
@@ -9879,23 +9847,16 @@ mod fingerprint_tests {
     }
 
     /// A recurrent hybrid holds KV in its attention layers only: its KV layers are exactly its
-    /// `attention_layers`, a proper subset the pool compacts to (`KV_CACHE_LAYERS`), and the
-    /// TurboQuant threshold reads their bytes — Nano's 6 and Super's 8 attention layers of 2 KV
-    /// heads x 128 are 6 and 8 KiB/token, below `MIN_KV_BYTES_PER_TOKEN`, where every one of
-    /// their 52 / 88 layers would read as 52 / 88 KiB. Layers that all hold KV are no subset.
+    /// `attention_layers`, a proper subset the pool compacts to (`KV_CACHE_LAYERS`). Layers that
+    /// all hold KV are no subset.
     #[test]
     fn a_recurrent_hybrids_kv_layers_are_its_attention_layers() {
-        use scratchy_ir::{DenseReason, KvGeometry, TqBits, codec_for};
         let preset = "mlx-affine-b4-g64-qembed";
-        for (arch, stem, kib) in [
-            ("nemotron-h", "nemotron-3-nano-30b-a3b", Some(6)),
-            ("nemotron-h-latent", "nemotron-3-super-120b-a12b", Some(8)),
-            ("nemotron-h", "nemotron-3-nano-30b-a3b-parity-tiny", None),
-            (
-                "nemotron-h",
-                "nemotron-3-nano-30b-a3b-mamba-parity-tiny",
-                None,
-            ),
+        for (arch, stem) in [
+            ("nemotron-h", "nemotron-3-nano-30b-a3b"),
+            ("nemotron-h-latent", "nemotron-3-super-120b-a12b"),
+            ("nemotron-h", "nemotron-3-nano-30b-a3b-parity-tiny"),
+            ("nemotron-h", "nemotron-3-nano-30b-a3b-mamba-parity-tiny"),
         ] {
             let Some(model) = variant_of(arch, stem, preset) else {
                 continue;
@@ -9914,23 +9875,6 @@ mod fingerprint_tests {
                 Some(attention.as_slice()),
                 "{stem}"
             );
-            if let Some(kib) = kib {
-                let geometry = KvGeometry {
-                    num_layers: kv.count(),
-                    num_kv_heads: model.bounds["num_key_value_heads"] as usize,
-                    head_dim: model.bounds["head_dim"] as u32,
-                    global_head_dim: model.bounds["head_dim"] as u32,
-                    latent: false,
-                    has_kv_cache: kv.any(),
-                };
-                assert_eq!(
-                    codec_for(geometry, TqBits::new(4)),
-                    Err(DenseReason::SmallKv {
-                        bytes_per_token: kib * 1024
-                    }),
-                    "{stem}"
-                );
-            }
             assert_eq!(
                 kv.proper_subset(kv.count()),
                 None,

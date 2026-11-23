@@ -35,3 +35,11 @@
   SCRATCHY_KERNEL(rope_once_steel_##dt_tag##_bd##bd##_bs16, rope_once_steel_kernel<dt_type, bd, 16>)
 
 #include "attention_steel_paged_instantiations.h"
+
+// The tile from the bake's constants (`SteelTile`).
+#define INST_STEEL_PAGED_TILED(dt_tag, dt_type) \
+  SCRATCHY_KERNEL(attention_steel_paged_##dt_tag, attention_paged<dt_type, STEEL_TILE_BQ, STEEL_TILE_BK, ATTN_PAGED_HEAD_DIM, STEEL_TILE_WM, STEEL_TILE_WN, ATTN_PAGED_BLOCK_SIZE, float>) \
+  SCRATCHY_KERNEL(rope_once_steel_##dt_tag, rope_once_steel_kernel<dt_type, ATTN_PAGED_HEAD_DIM, ATTN_PAGED_BLOCK_SIZE>)
+
+INST_STEEL_PAGED_TILED(f16, half)
+INST_STEEL_PAGED_TILED(bf16, bfloat)

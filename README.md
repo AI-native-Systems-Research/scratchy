@@ -98,11 +98,11 @@ Note the convention for selecting models and quants:
   this build can actually run (`scr completions zsh --install`). **On by default**;
   it resolves that list against huggingface.co at build time, so an air-gapped
   build wants `--no-default-features`. See [`docs/BUILD.md`](docs/BUILD.md).
-- TurboQuant KV-cache compression is **on in `scr`**, for every model
-  whose geometry takes it (the build names the ones that stay dense); off for
-  spyre, and fixed at build time: `--kv-cache-dtype` can only assert
-  it. `--no-default-features --features chat` builds the same engine with a
-  dense KV cache and no MTP heads (add `model/mtp-heads` to keep MTP).
+- The metal KV cache is **int8** for every model whose geometry takes it (the
+  build names the ones that stay dense), fixed at build time:
+  `--kv-cache-dtype` can only assert it. `--no-default-features --features
+  chat` builds the same engine with no MTP heads (add `model/mtp-heads` to keep
+  MTP).
 
 ### Prebuilt binary (Homebrew)
 

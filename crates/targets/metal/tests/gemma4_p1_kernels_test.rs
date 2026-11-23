@@ -739,10 +739,11 @@ fn steel_nax_paged_bd128_matches_ref() {
     consts[6] = ConstantValue::uint(6, 128); // BLOCKS_PER_CHUNK >= num_blocks
     consts.push(ConstantValue::uint(99, 0)); // (unused by nax kernel)
 
+    let tile = scratchy_target_metal::steel_paged::NaxTile::of(128, 16).expect("NAX bd128");
     let key = PipelineKey::new(
         "attention_steel_nax_paged",
-        "attention_steel_nax_paged_f16_bq64_bk32_bd128_wm4_wn1_bs16",
-        consts,
+        tile.symbol("f16"),
+        [consts.clone(), tile.constants().to_vec()].concat(),
     );
     let pipeline = baked_build(&cache, &key).expect("steel_nax_paged pipeline");
 
@@ -840,10 +841,11 @@ fn steel_nax_paged_limiter_bench() {
     let mut consts = attn_constants(&case, block_size, num_blocks);
     consts[6] = ConstantValue::uint(6, 128);
     consts.push(ConstantValue::uint(99, 0));
+    let tile = scratchy_target_metal::steel_paged::NaxTile::of(128, 16).expect("NAX bd128");
     let key = PipelineKey::new(
         "attention_steel_nax_paged",
-        "attention_steel_nax_paged_f16_bq64_bk32_bd128_wm4_wn1_bs16",
-        consts,
+        tile.symbol("f16"),
+        [consts.clone(), tile.constants().to_vec()].concat(),
     );
     let pipeline = baked_build(&cache, &key).expect("steel_nax_paged pipeline");
 
@@ -1002,24 +1004,19 @@ fn run_rope_on_read_nax_case(case: NaxRopeCase) {
     ];
     // Rope-once kernel reads constants 1,2,5,6,8,9 + the cache; instantiated
     // per (dtype, head_dim) like the attention kernel.
-    let rope_symbol = scratchy_target_metal::steel_paged::rope_once_nax_symbol(
-        "f16",
-        head_dim as u32,
-        block_size as u32,
-    )
-    .expect("rope_once_nax instance");
+    let rope_symbol = scratchy_target_metal::steel_paged::NaxTile::rope_once_symbol("f16");
     let rope_pipe = baked_build(
         &cache,
         &PipelineKey::new("attention_steel_nax_paged", rope_symbol, consts.clone()),
     )
     .expect("rope_once_nax pipeline");
-    let nax = scratchy_target_metal::steel_paged::nax_paged_kernel(
-        "f16",
-        head_dim as u32,
-        block_size as u32,
-    )
-    .expect("NAX instance");
-    let key = PipelineKey::new("attention_steel_nax_paged", nax.symbol, consts);
+    let nax = scratchy_target_metal::steel_paged::NaxTile::of(head_dim as u32, block_size as u32)
+        .expect("NAX tile");
+    let key = PipelineKey::new(
+        "attention_steel_nax_paged",
+        nax.symbol("f16"),
+        [consts, nax.constants().to_vec()].concat(),
+    );
     let pipeline = baked_build(&cache, &key).expect("steel_nax_paged pipeline");
 
     // ── Pass 1: rope K ONCE into the scratch (k_buf read via k_tab). ──
@@ -1052,7 +1049,7 @@ fn run_rope_on_read_nax_case(case: NaxRopeCase) {
     // ── Pass 2: attention reads PRE-ROPED K from the scratch (v_buf via
     // v_tab). A prior dispatch fully completes before the next, so the
     // roped scratch is visible to this pass.
-    let nq_blocks = total_q.div_ceil(nax.bq as usize);
+    let nq_blocks = total_q.div_ceil(nax.bq() as usize);
     if !common::dispatch_threadgroups(
         &device,
         &pipeline,
@@ -1073,7 +1070,7 @@ fn run_rope_on_read_nax_case(case: NaxRopeCase) {
             depth: 1,
         },
         MTLSize {
-            width: nax.threads as usize,
+            width: nax.threads() as usize,
             height: 1,
             depth: 1,
         },
@@ -1200,6 +1197,12 @@ fn rope_on_read_nax_gqa4_hd128() {
 /// cache-source run exactly.
 #[test]
 fn steel_wide_paged_bd512_matches_ref() {
+    for block_size in [16, 32] {
+        steel_wide_paged_bd512_case(block_size);
+    }
+}
+
+fn steel_wide_paged_bd512_case(block_size: usize) {
     let Some(di) = detect_device() else {
         eprintln!("skipping: no Metal device");
         return;
@@ -1214,7 +1217,6 @@ fn steel_wide_paged_bd512_matches_ref() {
         kv_len: 300,
         window: 0,
     };
-    let block_size = 32usize;
     let num_blocks = case.kv_len.div_ceil(block_size);
     let kv_elems = num_blocks * case.num_kv_heads * block_size * case.head_dim;
 
@@ -1251,10 +1253,12 @@ fn steel_wide_paged_bd512_matches_ref() {
     };
 
     let run = |consts: Vec<ConstantValue>, extra: &[&Buffer]| -> Option<Vec<f32>> {
+        let tile = scratchy_target_metal::steel_paged::SteelWideTile::of(512, block_size as u32)
+            .expect("wide bd512");
         let key = PipelineKey::new(
             "attention_steel_wide_paged",
-            "attention_steel_wide_paged_f16_bq32_bk32_bd512_wm2_wn8_bs32",
-            consts,
+            scratchy_target_metal::steel_paged::SteelWideTile::symbol("f16"),
+            [consts, tile.constants().to_vec()].concat(),
         );
         let pipeline = baked_build(&cache, &key).expect("steel wide paged pipeline");
         let nq_blocks = total_q.div_ceil(32);
@@ -1376,10 +1380,11 @@ fn steel_wide_paged_limiter_bench() {
     let mut consts = attn_constants(&case, block_size, num_blocks);
     consts[6] = ConstantValue::uint(6, 128);
     consts.push(ConstantValue::uint(99, 0));
+    let tile = scratchy_target_metal::steel_paged::SteelWideTile::of(512, 32).expect("wide bd512");
     let key = PipelineKey::new(
         "attention_steel_wide_paged",
-        "attention_steel_wide_paged_f16_bq32_bk32_bd512_wm2_wn8_bs32",
-        consts,
+        scratchy_target_metal::steel_paged::SteelWideTile::symbol("f16"),
+        [consts.clone(), tile.constants().to_vec()].concat(),
     );
     let pipeline = baked_build(&cache, &key).expect("pipeline");
 
@@ -3603,6 +3608,12 @@ fn steel_nax_paged_bd256_matches_ref_and_vs_steel() {
         let seq_used = buf_u32(&device, &[case.kv_len as u32]);
         let mut consts = attn_constants(case, block_size, num_blocks);
         consts[6] = ConstantValue::uint(6, num_blocks.next_power_of_two() as u32);
+        // The NAX kernel's tile (the steel kernel reads none of its slots).
+        consts.extend(
+            scratchy_target_metal::steel_paged::NaxTile::of(256, 16)
+                .expect("NAX bd256")
+                .constants(),
+        );
         let pipeline =
             baked_build(&cache, &PipelineKey::new(library, symbol, consts)).expect("pipeline");
         let bufs = [
@@ -3642,9 +3653,9 @@ fn steel_nax_paged_bd256_matches_ref_and_vs_steel() {
         };
         (out, secs, r(&q_host), r(&k_host), r(&v_host))
     };
-    let nax = scratchy_target_metal::steel_paged::nax_paged_kernel("f16", 256, 16)
+    let nax = scratchy_target_metal::steel_paged::NaxTile::of(256, 16)
         .expect("NAX bd256")
-        .symbol;
+        .symbol("f16");
     let steel =
         scratchy_target_metal::steel_paged::steel_paged_symbol("f16", 256).expect("steel bd256");
 
@@ -3713,7 +3724,7 @@ fn steel_nax_paged_ignores_rows_past_kv_len() {
     };
     let device = di.device.clone();
     let cache = SpecializedPipelineCache::new(device.clone(), &[]).expect("shaders");
-    for (head_dim, block_size) in [(256usize, 16usize), (512, 32)] {
+    for (head_dim, block_size) in [(256usize, 16usize), (512, 16), (512, 32)] {
         let case = AttnCase {
             num_q_heads: 16,
             num_kv_heads: 2,
@@ -3746,13 +3757,14 @@ fn steel_nax_paged_ignores_rows_past_kv_len() {
         let seq_used = buf_u32(&device, &[case.kv_len as u32]);
         let mut consts = attn_constants(&case, block_size, num_blocks);
         consts[6] = ConstantValue::uint(6, num_blocks.next_power_of_two() as u32);
-        let nax = scratchy_target_metal::steel_paged::nax_paged_kernel(
-            "f16",
-            head_dim as u32,
-            block_size as u32,
-        )
-        .expect("NAX instance");
-        let key = PipelineKey::new("attention_steel_nax_paged", nax.symbol, consts);
+        let nax =
+            scratchy_target_metal::steel_paged::NaxTile::of(head_dim as u32, block_size as u32)
+                .expect("NAX tile");
+        let key = PipelineKey::new(
+            "attention_steel_nax_paged",
+            nax.symbol("f16"),
+            [consts, nax.constants().to_vec()].concat(),
+        );
         let pipeline = baked_build(&cache, &key).expect("NAX pipeline");
         assert!(common::dispatch_threadgroups(
             &device,
@@ -3769,12 +3781,12 @@ fn steel_nax_paged_ignores_rows_past_kv_len() {
                 &v_buf,
             ],
             MTLSize {
-                width: total_q.div_ceil(nax.bq as usize),
+                width: total_q.div_ceil(nax.bq() as usize),
                 height: case.num_q_heads,
                 depth: 1,
             },
             MTLSize {
-                width: nax.threads as usize,
+                width: nax.threads() as usize,
                 height: 1,
                 depth: 1,
             },

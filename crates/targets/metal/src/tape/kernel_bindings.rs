@@ -209,11 +209,8 @@ pub struct AttentionViaCacheBindingSet {
     /// ABI, exactly as before.
     pub rope_on_read: Option<SourceIx>,
     /// gpt-oss attention sinks: `Some(ix)` binds the layer's
-    /// `[num_heads]` sink-logit tensor (slot 16 — free between the TQ
-    /// projection biases 14/15 and the fold buffers 17..22, so a
-    /// TurboQuant dispatch carrying sinks can't collide with
-    /// `TqAttentionBindingSet`'s slots 7..=13); `None` → sinks-off,
-    /// byte-identical to the pre-sinks ABI.
+    /// `[num_heads]` sink-logit tensor (slot 16, below the fold buffers 17..23 and past
+    /// `Int8AttentionBindingSet`'s slots 7..=10 and 13); `None` → sinks-off.
     pub sinks: Option<SourceIx>,
     /// Per-token rows read their sequences from `cu_seqlens_q` (slot 23).
     pub query_rows: super::kernel_constants::QueryRows,
@@ -269,71 +266,113 @@ impl From<AttentionViaCacheBindingSet> for Vec<Binding> {
     }
 }
 
-/// `KernelId::AttentionViaCacheTq`: the bindings its `AttentionViaCache`
-/// twin's set gains — the layer's packed K/V codes + norms, the shared
-/// signs/codebook, and `slot_mapping` (slots 7..=13).
-pub struct TqAttentionBindingSet {
-    pub kv_layer: LayerId,
-}
+/// Where `attention_decode_gqa_int8` stores its splits' partials, the op scratch's front, and
+/// `attention_via_cache_v2_combine` reads them.
+pub const DECODE_PARTIALS_SLOT: u8 = 16;
 
-impl From<TqAttentionBindingSet> for Vec<Binding> {
-    fn from(s: TqAttentionBindingSet) -> Vec<Binding> {
-        let layer = s.kv_layer;
-        [
-            RuntimeBindingKind::TqPackedK { layer },
-            RuntimeBindingKind::TqPackedV { layer },
-            RuntimeBindingKind::TqNormsK { layer },
-            RuntimeBindingKind::TqNormsV { layer },
-            RuntimeBindingKind::TqSigns,
-            RuntimeBindingKind::TqCentroids,
-            RuntimeBindingKind::SlotMapping { layer },
-        ]
-        .into_iter()
-        .zip(7u8..)
-        .map(|(kind, binding_index)| Binding::Runtime {
-            kind,
-            binding_index,
-        })
-        .collect()
+/// The op scratch's front at [`DECODE_PARTIALS_SLOT`].
+fn decode_partials() -> Binding {
+    Binding::MoeScratch {
+        binding_index: DECODE_PARTIALS_SLOT,
+        byte_offset: 0,
     }
 }
 
-/// `KernelId::TqStageRotated`: the layer's K (or V) scratch, the step's
-/// addressing, the layer's packed codes + norms, the codebook, and — for K
-/// under rope-on-read — the class-resolved cos_sin (slot 9).
-pub struct TqStageBindingSet {
+/// `KernelId::AttentionDecodeInt8`: the query and the layer's paged cache as the one-pass decode
+/// binds them (slots 0..=6 and 23, no sinks — the combine's), the layer's int8 K/V codes and
+/// scales (slots 7..=10), `slot_mapping` (slot 13) and the partials ([`DECODE_PARTIALS_SLOT`]).
+pub struct AttentionDecodeInt8BindingSet {
+    pub output: ArenaSlotIdx,
+    pub q: ArenaSlotIdx,
     pub kv_layer: LayerId,
-    pub is_v: bool,
-    /// The layer class's rotary table, for K under rope-on-read.
     pub rope_on_read: Option<SourceIx>,
+    pub query_rows: super::kernel_constants::QueryRows,
 }
 
-impl From<TqStageBindingSet> for Vec<Binding> {
-    fn from(s: TqStageBindingSet) -> Vec<Binding> {
+impl From<AttentionDecodeInt8BindingSet> for Vec<Binding> {
+    fn from(s: AttentionDecodeInt8BindingSet) -> Vec<Binding> {
         let layer = s.kv_layer;
-        let (cache, packed, norms) = if s.is_v {
-            (
-                RuntimeBindingKind::KvCacheV { layer },
-                RuntimeBindingKind::TqPackedV { layer },
-                RuntimeBindingKind::TqNormsV { layer },
-            )
-        } else {
-            (
-                RuntimeBindingKind::KvCacheK { layer },
-                RuntimeBindingKind::TqPackedK { layer },
-                RuntimeBindingKind::TqNormsK { layer },
-            )
+        let mut v = Vec::from(AttentionViaCacheBindingSet {
+            output: s.output,
+            q: s.q,
+            kv_layer: layer,
+            rope_on_read: s.rope_on_read,
+            sinks: None,
+            query_rows: s.query_rows,
+        });
+        v.extend(
+            [
+                (RuntimeBindingKind::KvCodesK { layer }, 7),
+                (RuntimeBindingKind::KvCodesV { layer }, 8),
+                (RuntimeBindingKind::KvScalesK { layer }, 9),
+                (RuntimeBindingKind::KvScalesV { layer }, 10),
+                (RuntimeBindingKind::SlotMapping { layer }, 13),
+            ]
+            .into_iter()
+            .map(|(kind, binding_index)| Binding::Runtime {
+                kind,
+                binding_index,
+            }),
+        );
+        v.push(decode_partials());
+        v
+    }
+}
+
+/// `KernelId::AttentionDecodeCombine`: the output (slot 0), the partials
+/// ([`DECODE_PARTIALS_SLOT`]) and a sinks layer's sink logits ([`COMBINE_SINKS_SLOT`]).
+pub struct AttentionDecodeCombineBindingSet {
+    pub output: ArenaSlotIdx,
+    pub kv_layer: LayerId,
+    pub sinks: Option<SourceIx>,
+}
+
+impl From<AttentionDecodeCombineBindingSet> for Vec<Binding> {
+    fn from(s: AttentionDecodeCombineBindingSet) -> Vec<Binding> {
+        let output = Binding::ArenaSlot {
+            slot: s.output.get(),
+            binding_index: 0,
         };
-        let mut v: Vec<Binding> = [
+        let sinks = (s.sinks.into_iter())
+            .map(|ix| source(ix, WeightTensor::Weight, s.kv_layer, COMBINE_SINKS_SLOT));
+        [output, decode_partials()]
+            .into_iter()
+            .chain(sinks)
+            .collect()
+    }
+}
+
+/// `KernelId::KvStage`: the layer's K (or V) scratch, the step's addressing, and the layer's
+/// codes and scales of that operand.
+pub struct KvStageBindingSet {
+    pub kv_layer: LayerId,
+    pub operand: scratchy_subtile::subtile_ir::KvOperand,
+}
+
+impl From<KvStageBindingSet> for Vec<Binding> {
+    fn from(s: KvStageBindingSet) -> Vec<Binding> {
+        use scratchy_subtile::subtile_ir::KvOperand;
+        let layer = s.kv_layer;
+        let (cache, codes, scales) = match s.operand {
+            KvOperand::K => (
+                RuntimeBindingKind::KvCacheK { layer },
+                RuntimeBindingKind::KvCodesK { layer },
+                RuntimeBindingKind::KvScalesK { layer },
+            ),
+            KvOperand::V => (
+                RuntimeBindingKind::KvCacheV { layer },
+                RuntimeBindingKind::KvCodesV { layer },
+                RuntimeBindingKind::KvScalesV { layer },
+            ),
+        };
+        [
             cache,
             RuntimeBindingKind::BlockTable { layer },
             RuntimeBindingKind::SeqUsedK,
             RuntimeBindingKind::CuSeqlensQ,
             RuntimeBindingKind::SlotMapping { layer },
-            packed,
-            norms,
-            RuntimeBindingKind::TqSigns,
-            RuntimeBindingKind::TqCentroids,
+            codes,
+            scales,
         ]
         .into_iter()
         .zip(0u8..)
@@ -341,31 +380,7 @@ impl From<TqStageBindingSet> for Vec<Binding> {
             kind,
             binding_index,
         })
-        .collect();
-        if let Some(table) = s.rope_on_read {
-            push_rope_on_read_bindings(&mut v, layer, table, 9);
-        }
-        v
-    }
-}
-
-/// `KernelId::TqRotateRows`: the rows (in/out, arena) and the codebook signs.
-pub struct TqRotateRowsBindingSet {
-    pub rows: ArenaSlotIdx,
-}
-
-impl From<TqRotateRowsBindingSet> for Vec<Binding> {
-    fn from(s: TqRotateRowsBindingSet) -> Vec<Binding> {
-        vec![
-            Binding::ArenaSlot {
-                slot: s.rows.get(),
-                binding_index: 0,
-            },
-            Binding::Runtime {
-                kind: RuntimeBindingKind::TqSigns,
-                binding_index: 1,
-            },
-        ]
+        .collect()
     }
 }
 

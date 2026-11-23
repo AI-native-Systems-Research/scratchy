@@ -28,19 +28,15 @@ use super::lowered::RuntimeBindingKind;
 /// payload on the matching [`RuntimeBindingKind`] variant). The
 /// constructor walks model meta + bucket layout to size every field
 /// for the worker's largest bucket; the worker itself only borrows.
-/// TurboQuant per-forward buffers (packed canonical KV stores + codebook).
-/// `packed_*`/`norms_*` are `[num_layers]`; codebook buffers are shared.
+/// The int8 KV store's buffers (the canonical KV, `crate::kv_int8`): each `[num_layers]`.
 #[derive(Clone)]
-pub struct TqRuntimeBuffers {
-    pub packed_k: Vec<Buffer>,
-    pub packed_v: Vec<Buffer>,
-    pub norms_k: Vec<Buffer>,
-    pub norms_v: Vec<Buffer>,
-    pub signs: Buffer,
-    pub boundaries: Buffer,
-    pub centroids: Buffer,
-    /// The reused per-layer fp16 scratch ([`TqScratch`]).
-    pub scratch: TqScratch,
+pub struct Int8KvBuffers {
+    pub codes_k: Vec<Buffer>,
+    pub codes_v: Vec<Buffer>,
+    pub scales_k: Vec<Buffer>,
+    pub scales_v: Vec<Buffer>,
+    /// The reused per-layer fp16 scratch ([`KvScratch`]).
+    pub scratch: KvScratch,
     /// The group-0 blocks every store above is mapped through (`SparseStores::mapped`).
     pub mapped: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
@@ -73,13 +69,13 @@ impl DraftRuntimeBuffers {
     }
 }
 
-/// A TurboQuant pool's fp16 scratch: one layer's K and V at the pool's capacity, reused by every
+/// An int8 pool's fp16 scratch: one layer's K and V at the pool's capacity, reused by every
 /// coded layer of a forward — chunk tables (bound at each layer's `kv_cache_k/v` slot: attention,
 /// rope, dequant and quantize all use it) and their backing data (kept alive and resident here).
 /// Its contents live within one layer of one forward, so a model whose forwards never overlap this
 /// one's stages through it too ([`super::worker::HostArena`]) when its geometry is the same.
 #[derive(Clone)]
-pub struct TqScratch {
+pub struct KvScratch {
     pub k_table: Buffer,
     pub v_table: Buffer,
     pub k_data: Buffer,
@@ -125,11 +121,10 @@ pub struct RuntimeBindings {
     /// forward; on every other arch it is a one-element placeholder that
     /// is never bound (so non-spans pays nothing).
     pub block_unrotated_flags: Vec<Buffer>,
-    /// TurboQuant runtime buffers — `Some` exactly when the model's
-    /// `KV_CODEC` is TurboQuant, the only models whose tapes bind them.
-    /// The packed code stores are the canonical KV (~4.7x smaller); the per-layer
-    /// dequant fills the (reused) `kv_cache_k/v` scratch before each attention.
-    pub tq: Option<TqRuntimeBuffers>,
+    /// The int8 KV store — `Some` exactly when the model's `KV_CODEC` is int8, the only models
+    /// whose tapes bind it. The codes are the canonical KV; the per-layer staging fills the
+    /// (reused) `kv_cache_k/v` scratch before each prefill attention.
+    pub int8: Option<Int8KvBuffers>,
     /// `[1]` u32 — the in-flight forward's `num_tokens`, which the pool writes at the start of
     /// every `forward()`: the MoE sort's live-pair count reads it.
     pub num_tokens_u32: Buffer,
@@ -360,13 +355,13 @@ impl RuntimeBindings {
             .expect("a drafter's binding in the tape of a model that is no drafter")
     }
 
-    /// The TurboQuant buffers a `Tq*` binding resolves to. Only a TurboQuant
-    /// model's tape binds them, and its factory always provisions them, so a
-    /// miss is a model-meta bug like an out-of-range `KvCache*` layer.
-    fn tq(&self) -> &TqRuntimeBuffers {
-        self.tq
+    /// The int8 store a `KvCodes*` / `KvScales*` binding resolves to. Only an int8 model's tape
+    /// binds them, and its factory always provisions them, so a miss is a model-meta bug like an
+    /// out-of-range `KvCache*` layer.
+    fn int8(&self) -> &Int8KvBuffers {
+        self.int8
             .as_ref()
-            .expect("a TurboQuant binding in the tape of a model whose KV codec is dense")
+            .expect("an int8 KV binding in the tape of a model whose KV codec is dense")
     }
 
     /// Resolve a [`RuntimeBindingKind`] to the buffer the worker
@@ -387,13 +382,10 @@ impl RuntimeBindings {
             RuntimeBindingKind::BlockUnrotatedFlags { layer } => {
                 &self.block_unrotated_flags[layer.get() as usize]
             }
-            RuntimeBindingKind::TqPackedK { layer } => &self.tq().packed_k[layer.get() as usize],
-            RuntimeBindingKind::TqPackedV { layer } => &self.tq().packed_v[layer.get() as usize],
-            RuntimeBindingKind::TqNormsK { layer } => &self.tq().norms_k[layer.get() as usize],
-            RuntimeBindingKind::TqNormsV { layer } => &self.tq().norms_v[layer.get() as usize],
-            RuntimeBindingKind::TqSigns => &self.tq().signs,
-            RuntimeBindingKind::TqBoundaries => &self.tq().boundaries,
-            RuntimeBindingKind::TqCentroids => &self.tq().centroids,
+            RuntimeBindingKind::KvCodesK { layer } => &self.int8().codes_k[layer.get() as usize],
+            RuntimeBindingKind::KvCodesV { layer } => &self.int8().codes_v[layer.get() as usize],
+            RuntimeBindingKind::KvScalesK { layer } => &self.int8().scales_k[layer.get() as usize],
+            RuntimeBindingKind::KvScalesV { layer } => &self.int8().scales_v[layer.get() as usize],
             RuntimeBindingKind::NumTokensU32 => &self.num_tokens_u32,
             RuntimeBindingKind::NumSampleRowsU32 => &self.num_sample_rows_u32,
             RuntimeBindingKind::SampleIndices => &self.sample_indices,

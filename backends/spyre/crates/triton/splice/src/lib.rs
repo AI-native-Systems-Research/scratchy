@@ -441,7 +441,6 @@ pub fn row<F: scratchy_subtile::subtile_ir::RopeForm>(op: &SubOp<F>) -> TritonKe
         // worklist); the rest have their own `lower_one_node` arms.
         | SubOp::KvEncode { .. }
         | SubOp::KvStage { .. }
-        | SubOp::RotateRows { .. }
         | SubOp::AttnPackedKv
         | SubOp::RouteSigmoidBias { .. }
         | SubOp::RouteBias { .. }

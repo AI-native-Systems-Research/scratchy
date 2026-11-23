@@ -19,10 +19,10 @@
 use crate::tape::constants::{ConstSlot, ConstantValue};
 
 use crate::tape::ids::{
-    AttnDebugMode, AttnScale, AttnWindow, BlockSize, BlocksPerChunk, BucketM, ElementCount,
-    HeadDim, HiddenSize, IntermediateSize, KDim, KDimI32, KPartitionSizeI32, MDimI32, NDim,
-    NDimI32, NumExperts, NumKvHeads, NumQHeads, QSize, RmsNormEps, RopePairOff, RotDim, RowStride,
-    SplitK, StagedHeadDim, TopK, TqCodeBits, TqDecodeHeads,
+    AttnDebugMode, AttnScale, AttnWindow, BlockSize, BlocksPerChunk, BucketM, DecodeHeads,
+    ElementCount, HeadDim, HiddenSize, IntermediateSize, KDim, KDimI32, KPartitionSizeI32, MDimI32,
+    NDim, NDimI32, NumExperts, NumKvHeads, NumQHeads, QSize, RmsNormEps, RopePairOff, RotDim,
+    RowStride, SplitK, StagedHeadDim, TopK,
 };
 use crate::tape::lowered::ActivationWidth;
 
@@ -217,33 +217,18 @@ pub struct RopeAppendNormedConstants {
     /// for blocks flagged unrotated (store normed-but-unrotated). `None`
     /// → byte-identical emitted Vec (rope.metal folds the gate away).
     pub rope_on_read: Option<u32>,
-    /// The TurboQuant encode folded in (slots 10..=14), if the writer writes the packed store.
-    pub tq: Option<RopeTqConstants>,
+    /// The int8 encode folded in (slot 10), if the writer writes the int8 store.
+    pub int8: Option<KvInt8Constants>,
 }
 
-/// A KV writer's folded-in TurboQuant encode (`rope.metal`'s `ROPE_TQ_*`): the codebook's bits,
-/// the packing from them as [`TqCompressConstants`] takes it, and each operand's offset.
+/// A KV writer's folded-in int8 encode (`rope.metal`'s `ROPE_KV_INT8`, `kv_append.metal`'s
+/// `KVA_KV_INT8`, slot 10): the writer also encodes its rows into the layer's int8 store.
 #[derive(Clone, Copy)]
-pub struct RopeTqConstants {
-    pub bits: TqCodeBits,
-    pub k_offset: TqOffset,
-    pub v_offset: TqOffset,
-}
+pub struct KvInt8Constants;
 
-impl RopeTqConstants {
-    fn push(tq: Option<Self>, head_dim: HeadDim, v: &mut Vec<ConstantValue>) {
-        use scratchy_layers::turboquant::{packed_dim, vals_per_word};
-        let Some(t) = tq else {
-            return;
-        };
-        let (dim, bits) = (head_dim.get() as usize, t.bits.get());
-        v.extend([
-            ConstantValue::uint(ConstSlot(10), bits),
-            ConstantValue::uint(ConstSlot(11), vals_per_word(bits) as u32),
-            ConstantValue::uint(ConstSlot(12), packed_dim(dim, bits) as u32),
-            ConstantValue::uint(ConstSlot(13), t.k_offset as u32),
-            ConstantValue::uint(ConstSlot(14), t.v_offset as u32),
-        ]);
+impl KvInt8Constants {
+    fn push(int8: Option<Self>, v: &mut Vec<ConstantValue>) {
+        v.extend(int8.map(|_| ConstantValue::uint(ConstSlot(10), 1)));
     }
 }
 
@@ -263,7 +248,7 @@ impl From<RopeAppendNormedConstants> for Vec<ConstantValue> {
         if let Some(ror) = c.rope_on_read {
             v.push(ConstantValue::uint(ConstSlot(9), ror));
         }
-        RopeTqConstants::push(c.tq, c.head_dim.head_dim(), &mut v);
+        KvInt8Constants::push(c.int8, &mut v);
         v
     }
 }
@@ -283,8 +268,8 @@ pub struct RopeAppendConstants {
     pub pair_off: RopePairOff,
     /// Spans rope-on-read (slot 9): see [`RopeAppendNormedConstants`].
     pub rope_on_read: Option<u32>,
-    /// The TurboQuant encode folded in: see [`RopeAppendNormedConstants`].
-    pub tq: Option<RopeTqConstants>,
+    /// The int8 encode folded in: see [`RopeAppendNormedConstants`].
+    pub int8: Option<KvInt8Constants>,
     /// The query alone (slot 15, `ROPE_Q_ONLY`): no K/V rotation or cache write.
     pub query_only: bool,
 }
@@ -303,7 +288,7 @@ impl From<RopeAppendConstants> for Vec<ConstantValue> {
         if let Some(ror) = c.rope_on_read {
             v.push(ConstantValue::uint(ConstSlot(9), ror));
         }
-        RopeTqConstants::push(c.tq, c.head_dim, &mut v);
+        KvInt8Constants::push(c.int8, &mut v);
         if c.query_only {
             v.push(ConstantValue::uint(ConstSlot(15), 1));
         }
@@ -317,8 +302,8 @@ pub struct KvAppendConstants {
     pub num_kv_heads: NumKvHeads,
     pub block_size: BlockSize,
     pub blocks_per_chunk: BlocksPerChunk,
-    /// The folded-in TurboQuant encode, at the rope writer's slots 10-14.
-    pub tq: Option<RopeTqConstants>,
+    /// The folded-in int8 encode, at the rope writer's slot 10.
+    pub int8: Option<KvInt8Constants>,
 }
 
 impl From<KvAppendConstants> for Vec<ConstantValue> {
@@ -329,7 +314,7 @@ impl From<KvAppendConstants> for Vec<ConstantValue> {
             ConstantValue::uint(ConstSlot(2), c.block_size.get()),
             ConstantValue::uint(ConstSlot(3), c.blocks_per_chunk.get()),
         ];
-        RopeTqConstants::push(c.tq, c.head_dim, &mut v);
+        KvInt8Constants::push(c.int8, &mut v);
         v
     }
 }
@@ -339,46 +324,14 @@ impl From<KvAppendConstants> for Vec<ConstantValue> {
 /// `KernelId::AttentionViaCache`
 /// (`attention_via_cache_v2_<dtype>_specialized`).
 pub struct AttentionViaCacheConstants {
-    pub head_dim: HeadDim,
-    pub num_q_heads: NumQHeads,
-    pub num_kv_heads: NumKvHeads,
-    pub attn_scale: AttnScale,
-    pub block_size: BlockSize,
-    pub blocks_per_chunk: BlocksPerChunk,
-    /// Sliding-window width (`ATTN_WINDOW`, slot 7). `0` = disabled
-    /// (full attention); the sliding lowering arm passes
-    /// `W::SLIDING_WINDOW`.
-    pub window: AttnWindow,
-    /// Spans rope-on-read (slots 8/9/10): rotary dim, NeoX pairing
-    /// offset, and the master 0/1 switch. `None` on every non-spans
-    /// dispatch → the emitted Vec is byte-identical to today (8 consts)
-    /// and the in-shader `is_function_constant_defined` guard folds the
-    /// rotation away. `Some` only when `W::ROPE_ON_READ`.
-    pub rot_dim: Option<RotDim>,
-    pub pair_off: Option<RopePairOff>,
-    pub rope_on_read: Option<u32>,
-    /// Co-resident NeoX-pair lane layout for the decode rope-on-read path
-    /// (slot 12, `ATTN_PAIR_CORESIDENT`). When `Some(1)` each lane owns its
-    /// NeoX pairs `{d, d+half_dim}` so the on-read rope is in-lane (no
-    /// `simd_shuffle`, no `k_pair[]` staging array). Only valid for full
-    /// NeoX rope (`rot_dim == head_dim`); the lowering sets it only then.
-    /// `None` (every non-spans dispatch) → byte-identical emitted Vec and the
-    /// shader keeps the contiguous-slice + shuffle path.
-    pub pair_coresident: Option<u32>,
-    /// gpt-oss attention sinks (slot 21, `ATTN_SINKS`): the layer's
-    /// per-head sink logits are an extra softmax column, added UNSCALED
-    /// after qk·sm_scale and dropped before ·V. `Some(1)` binds the
-    /// `[num_heads]` tensor (buffer 16) and turns the kernel's sink math
-    /// on; `None` on every non-sink dispatch → the emitted Vec is
-    /// byte-identical (no slot 21) and the shader const-folds the column
-    /// away.
-    pub sinks: Option<u32>,
-    /// Query heads one threadgroup serves (`ATTN_TQ_HEADS`, slot 16, as a
-    /// baked uint — the TurboQuant twin's entry is variant-bound instead):
-    /// the largest divisor of the GQA group that fits the per-lane state, so
-    /// the walk reads each key once for the whole group. The dispatch counts
-    /// `num_q_heads / heads` threadgroups.
-    pub heads: TqDecodeHeads,
+    pub cache: DecodeCache,
+    /// gpt-oss attention sinks (slot 21, `ATTN_SINKS`): the layer's per-head sink logits are an
+    /// extra softmax column, bound at buffer 16.
+    pub sinks: SinkColumn,
+    /// Query heads one threadgroup serves (`ATTN_DECODE_HEADS`, slot 16): the largest divisor of
+    /// the GQA group that fits the per-lane state, so the walk reads each key once for the whole
+    /// group. The dispatch counts `num_q_heads / heads` threadgroups.
+    pub heads: DecodeHeads,
     /// What a threadgroup row queries (slot 22, `ATTN_ROW_QUERIES`).
     pub query_rows: QueryRows,
 }
@@ -386,6 +339,10 @@ pub struct AttentionViaCacheConstants {
 impl AttentionViaCacheConstants {
     /// `ATTN_SINKS` (slot 21): the sink column's switch ([`Self::sinks`]).
     pub const SINKS: ConstSlot = ConstSlot(21);
+    /// `ATTN_DECODE_HEADS` (slot 16): the query heads one threadgroup serves ([`Self::heads`]).
+    pub const HEADS: ConstSlot = ConstSlot(16);
+    /// `ATTN_KV_INT8` (slot 13): the command reads the layer's int8 store.
+    pub const INT8: ConstSlot = ConstSlot(13);
 }
 
 /// What the decode attention's threadgroup rows query.
@@ -411,181 +368,162 @@ impl QueryRows {
 
 impl From<AttentionViaCacheConstants> for Vec<ConstantValue> {
     fn from(c: AttentionViaCacheConstants) -> Self {
-        let mut v = vec![
+        let mut v = Vec::new();
+        c.cache.push(&mut v);
+        if c.sinks == SinkColumn::Present {
+            v.push(ConstantValue::uint(AttentionViaCacheConstants::SINKS, 1));
+        }
+        v.push(ConstantValue::uint(
+            AttentionViaCacheConstants::HEADS,
+            c.heads.get(),
+        ));
+        push_query_rows(&mut v, c.query_rows);
+        v
+    }
+}
+
+/// How a decode lane holds the rope pairs it re-ropes on read (`ATTN_PAIR_CORESIDENT`, slot 12).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PairLanes {
+    /// Each lane owns its pairs `{d, d + head_dim / 2}`: the rope is in-lane.
+    Coresident,
+    /// A lane's elements are a contiguous slice, its pairs met by shuffles.
+    Shuffled,
+}
+
+/// A spans model's rope on read (slots 8/9/10, and 12): the class's rotated dims, its pairs'
+/// offset and how a decode lane holds them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RopeOnRead {
+    pub rot_dim: RotDim,
+    pub pair_off: RopePairOff,
+    pub lanes: PairLanes,
+}
+
+/// What a decode attention reads of one class's paged cache (slots 0..=12): the class's
+/// geometry, its window, the pool's chunking, and the rope it re-applies on read.
+#[derive(Clone, Copy, Debug)]
+pub struct DecodeCache {
+    pub head_dim: HeadDim,
+    pub num_q_heads: NumQHeads,
+    pub num_kv_heads: NumKvHeads,
+    pub attn_scale: AttnScale,
+    pub block_size: BlockSize,
+    pub blocks_per_chunk: BlocksPerChunk,
+    /// `ATTN_WINDOW` (slot 7): the class's sliding window, `0` for a full class.
+    pub window: AttnWindow,
+    pub rope_on_read: Option<RopeOnRead>,
+}
+
+impl DecodeCache {
+    fn push(self, v: &mut Vec<ConstantValue>) {
+        v.extend([
+            ConstantValue::uint(ConstSlot(0), self.head_dim.get()),
+            ConstantValue::uint(ConstSlot(1), self.num_q_heads.get()),
+            ConstantValue::uint(ConstSlot(2), self.num_kv_heads.get()),
+            ConstantValue::float(ConstSlot(3), self.attn_scale.get()),
+            ConstantValue::uint(ConstSlot(4), self.block_size.get()),
+            ConstantValue::kv_cap(ConstSlot(5)),
+            ConstantValue::uint(ConstSlot(6), self.blocks_per_chunk.get()),
+            ConstantValue::int(ConstSlot(7), self.window.get()),
+        ]);
+        if let Some(r) = self.rope_on_read {
+            push_rope_on_read_consts(v, Some(r.rot_dim), Some(r.pair_off), Some(1));
+            if r.lanes == PairLanes::Coresident {
+                v.push(ConstantValue::uint(ConstSlot(12), 1));
+            }
+        }
+    }
+}
+
+/// `ATTN_ROW_QUERIES` (slot 22), set for a bucket whose rows are tokens.
+fn push_query_rows(v: &mut Vec<ConstantValue>, rows: QueryRows) {
+    if rows == QueryRows::PerToken {
+        v.push(ConstantValue::uint(ConstSlot(22), 1));
+    }
+}
+
+/// `ATTN_KV_INT8` (13), `ATTN_SPLITS` (18) and `ATTN_COMBINE_GROUPS` (25): the int8 decode's and
+/// its combine's shared part of the shape.
+fn push_int8_split(v: &mut Vec<ConstantValue>, shape: crate::kv_int8::Int8DecodeShape) {
+    v.extend([
+        ConstantValue::uint(AttentionViaCacheConstants::INT8, 1),
+        ConstantValue::uint(ConstSlot(18), shape.splits()),
+        ConstantValue::uint(ConstSlot(25), shape.combine_groups()),
+    ]);
+}
+
+/// `KernelId::AttentionDecodeInt8` (`attention_decode_gqa_int8`): one split of a KV head's
+/// query-head group's int8 decode.
+pub struct AttentionDecodeInt8Constants {
+    pub cache: DecodeCache,
+    pub query_rows: QueryRows,
+    pub shape: crate::kv_int8::Int8DecodeShape,
+}
+
+impl From<AttentionDecodeInt8Constants> for Vec<ConstantValue> {
+    fn from(c: AttentionDecodeInt8Constants) -> Self {
+        let mut v = Vec::new();
+        c.cache.push(&mut v);
+        push_query_rows(&mut v, c.query_rows);
+        push_int8_split(&mut v, c.shape);
+        v.extend([
+            ConstantValue::uint(AttentionViaCacheConstants::HEADS, c.shape.heads()),
+            ConstantValue::uint(ConstSlot(24), c.shape.key_group()),
+        ]);
+        v
+    }
+}
+
+/// `KernelId::AttentionDecodeCombine` (`attention_via_cache_v2_combine`): the merge of an int8
+/// decode's splits, the sink column (`ATTN_SINKS`, slot 21) with them on a sinks layer.
+pub struct AttentionDecodeCombineConstants {
+    pub cache: DecodeCache,
+    pub query_rows: QueryRows,
+    pub shape: crate::kv_int8::Int8DecodeShape,
+    pub sinks: SinkColumn,
+}
+
+/// Whether a layer's softmax carries an attention-sinks column (gpt-oss).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SinkColumn {
+    Absent,
+    Present,
+}
+
+impl From<AttentionDecodeCombineConstants> for Vec<ConstantValue> {
+    fn from(c: AttentionDecodeCombineConstants) -> Self {
+        let mut v = Vec::new();
+        c.cache.push(&mut v);
+        if c.sinks == SinkColumn::Present {
+            v.push(ConstantValue::uint(AttentionViaCacheConstants::SINKS, 1));
+        }
+        push_query_rows(&mut v, c.query_rows);
+        push_int8_split(&mut v, c.shape);
+        v
+    }
+}
+
+/// `KernelId::KvStage` (`kv_stage_<dtype>`, attention.metal slots): the layer's KV geometry.
+pub struct KvStageConstants {
+    pub head_dim: HeadDim,
+    pub num_kv_heads: NumKvHeads,
+    pub block_size: BlockSize,
+    pub blocks_per_chunk: BlocksPerChunk,
+    /// The layer's sliding window (`ATTN_WINDOW`, slot 7): 0 for a full-attention layer.
+    pub window: AttnWindow,
+}
+
+impl From<KvStageConstants> for Vec<ConstantValue> {
+    fn from(c: KvStageConstants) -> Self {
+        vec![
             ConstantValue::uint(ConstSlot(0), c.head_dim.get()),
-            ConstantValue::uint(ConstSlot(1), c.num_q_heads.get()),
             ConstantValue::uint(ConstSlot(2), c.num_kv_heads.get()),
-            ConstantValue::float(ConstSlot(3), c.attn_scale.get()),
             ConstantValue::uint(ConstSlot(4), c.block_size.get()),
             ConstantValue::kv_cap(ConstSlot(5)),
             ConstantValue::uint(ConstSlot(6), c.blocks_per_chunk.get()),
             ConstantValue::int(ConstSlot(7), c.window.get()),
-        ];
-        push_rope_on_read_consts(&mut v, c.rot_dim, c.pair_off, c.rope_on_read);
-        if let Some(pc) = c.pair_coresident {
-            v.push(ConstantValue::uint(ConstSlot(12), pc));
-        }
-        if let Some(sinks) = c.sinks {
-            v.push(ConstantValue::uint(
-                AttentionViaCacheConstants::SINKS,
-                sinks,
-            ));
-        }
-        v.push(ConstantValue::uint(
-            AttentionViaCacheTqConstants::HEADS,
-            c.heads.get(),
-        ));
-        if c.query_rows == QueryRows::PerToken {
-            v.push(ConstantValue::uint(ConstSlot(22), 1));
-        }
-        v
-    }
-}
-
-/// `KernelId::AttentionViaCacheTq`: the constants its `AttentionViaCache`
-/// twin's set gains — `ATTN_TQ_BITS` (slot 13), which switches the kernel to
-/// reading the TurboQuant packed store, and `ATTN_TQ_K_BIAS` /
-/// `ATTN_TQ_V_BIAS` (slots 14 / 15), set when the codes hold that operand
-/// minus its projection bias (bound at buffers 14 / 15).
-pub struct AttentionViaCacheTqConstants {
-    pub bits: TqCodeBits,
-    pub k_bias: bool,
-    pub v_bias: bool,
-}
-
-impl AttentionViaCacheTqConstants {
-    /// `ATTN_TQ_HEADS` (slot 16): the query heads one threadgroup serves —
-    /// the twin's variant-bound value, or the plain `AttentionViaCache`
-    /// set's baked one.
-    pub const HEADS: ConstSlot = ConstSlot(16);
-}
-
-impl From<AttentionViaCacheTqConstants> for Vec<ConstantValue> {
-    fn from(c: AttentionViaCacheTqConstants) -> Self {
-        let mut v = vec![ConstantValue::uint(ConstSlot(13), c.bits.get())];
-        v.extend(c.k_bias.then(|| ConstantValue::uint(ConstSlot(14), 1)));
-        v.extend(c.v_bias.then(|| ConstantValue::uint(ConstSlot(15), 1)));
-        v.push(ConstantValue::tq_heads(AttentionViaCacheTqConstants::HEADS));
-        v
-    }
-}
-
-/// `KernelId::TqStageRotated` (`tq_stage_rotated_<dtype>`, attention.metal
-/// slots): the layer's KV geometry, the codebook width, and — for K under
-/// rope-on-read — the span re-rope geometry (slots 8/9/10).
-pub struct TqStageConstants {
-    pub head_dim: HeadDim,
-    pub num_kv_heads: NumKvHeads,
-    pub block_size: BlockSize,
-    pub blocks_per_chunk: BlocksPerChunk,
-    pub bits: TqCodeBits,
-    pub rot_dim: Option<RotDim>,
-    pub pair_off: Option<RopePairOff>,
-    pub rope_on_read: Option<u32>,
-    /// `ATTN_TQ_K_BIAS` / `ATTN_TQ_V_BIAS` (slots 14 / 15): the staged
-    /// operand's codes hold it minus its projection bias (bound at buffer 10).
-    pub k_bias: bool,
-    pub v_bias: bool,
-    /// `ATTN_TQ_STAGE_PASS` (slot 17): which rows this dispatch stages.
-    pub pass: TqStagePass,
-}
-
-/// The rows one `tq_stage_rotated` dispatch stages. A step stages its new rows,
-/// then its cached ones: a row new for one sequence can be a prefix-cache hit
-/// for another in the same step, and both rewrite it in place.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TqStagePass {
-    /// The step's new rows, read from the cache their writer just filled.
-    New = 1,
-    /// Cached rows, decoded from the packed store.
-    Cached = 2,
-}
-
-impl From<TqStageConstants> for Vec<ConstantValue> {
-    fn from(c: TqStageConstants) -> Self {
-        let mut v = vec![
-            ConstantValue::uint(ConstSlot(0), c.head_dim.get()),
-            ConstantValue::uint(ConstSlot(2), c.num_kv_heads.get()),
-            ConstantValue::uint(ConstSlot(4), c.block_size.get()),
-            ConstantValue::kv_cap(ConstSlot(5)),
-            ConstantValue::uint(ConstSlot(6), c.blocks_per_chunk.get()),
-        ];
-        push_rope_on_read_consts(&mut v, c.rot_dim, c.pair_off, c.rope_on_read);
-        v.push(ConstantValue::uint(ConstSlot(13), c.bits.get()));
-        v.extend(c.k_bias.then(|| ConstantValue::uint(ConstSlot(14), 1)));
-        v.extend(c.v_bias.then(|| ConstantValue::uint(ConstSlot(15), 1)));
-        v.push(ConstantValue::uint(ConstSlot(17), c.pass as u32));
-        v
-    }
-}
-
-/// `tq_compress_paged[_bf16]` (turboquant.metal), the standalone encode the kernel tests fill
-/// packed stores with: the KV geometry of the layer it quantizes, the codebook width (and from it
-/// the packing), and the offset it removes first.
-pub struct TqCompressConstants {
-    pub head_dim: HeadDim,
-    pub bits: TqCodeBits,
-    pub num_kv_heads: NumKvHeads,
-    pub block_size: BlockSize,
-    pub blocks_per_chunk: BlocksPerChunk,
-    pub writeback: TqWriteback,
-    pub offset: TqOffset,
-    /// The rotated offset's rope geometry ([`TqOffset::RotatedBias`]); zero otherwise.
-    pub rot_dim: RotDim,
-    pub pair_off: RopePairOff,
-}
-
-/// Whether `tq_compress_paged` writes its lossy dequant back into the pool.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TqWriteback {
-    /// The pool keeps the raw vector.
-    Raw = 0,
-    Dequantized = 1,
-}
-
-/// The offset `tq_compress_paged` removes before quantizing (`turboquant_offset.h`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TqOffset {
-    None = 0,
-    /// The operand's projection bias.
-    Bias = 1,
-    /// The bias rotated to the key's position.
-    RotatedBias = 2,
-}
-
-impl From<TqCompressConstants> for Vec<ConstantValue> {
-    fn from(c: TqCompressConstants) -> Self {
-        use scratchy_layers::turboquant::{packed_dim, vals_per_word};
-        let (dim, bits) = (c.head_dim.get(), c.bits.get());
-        vec![
-            ConstantValue::uint(ConstSlot(0), dim),
-            ConstantValue::uint(ConstSlot(1), bits),
-            ConstantValue::uint(ConstSlot(2), vals_per_word(bits) as u32),
-            ConstantValue::uint(ConstSlot(3), packed_dim(dim as usize, bits) as u32),
-            ConstantValue::uint(ConstSlot(4), 1 << bits),
-            ConstantValue::float(ConstSlot(5), 1.0 / (dim as f32).sqrt()),
-            ConstantValue::uint(ConstSlot(6), c.num_kv_heads.get()),
-            ConstantValue::uint(ConstSlot(7), c.block_size.get()),
-            ConstantValue::uint(ConstSlot(8), c.blocks_per_chunk.get()),
-            ConstantValue::uint(ConstSlot(9), c.writeback as u32),
-            ConstantValue::uint(ConstSlot(10), c.offset as u32),
-            ConstantValue::uint(ConstSlot(11), c.rot_dim.get()),
-            ConstantValue::uint(ConstSlot(12), c.pair_off.get()),
-        ]
-    }
-}
-
-/// `KernelId::TqRotateRows` (`tq_{rotate,unrotate}_rows_<dtype>`).
-pub struct TqRotateRowsConstants {
-    pub head_dim: HeadDim,
-    pub num_q_heads: NumQHeads,
-}
-
-impl From<TqRotateRowsConstants> for Vec<ConstantValue> {
-    fn from(c: TqRotateRowsConstants) -> Self {
-        vec![
-            ConstantValue::uint(ConstSlot(0), c.head_dim.get()),
-            ConstantValue::uint(ConstSlot(1), c.num_q_heads.get()),
+            ConstantValue::uint(AttentionViaCacheConstants::INT8, 1),
         ]
     }
 }

@@ -103,7 +103,7 @@ they depend unconditionally on Apple-only `objc2` — the
 CLI, compiler, models and worker crates via their own edges to scratchy-target-metal — and `--workspace`
 builds every member as a root regardless of `--features`, so excluding only
 some of them still drags `objc2` onto Linux); the **macOS** job
-runs `cargo clippy -p scratchy-target-metal-models --features scratchy-models/all,scratchy-models/mtp,turboquant,vision -- -D warnings`
+runs `cargo clippy -p scratchy-target-metal-models --features scratchy-models/all,scratchy-models/mtp,vision -- -D warnings`
 + kernel tests (`mtp` adds the multi-token-prediction head of every model whose
 checkpoint carries one: heads have no configs of their own, so `all` alone
 compiles none). The macOS `all` run is the full-scope case —

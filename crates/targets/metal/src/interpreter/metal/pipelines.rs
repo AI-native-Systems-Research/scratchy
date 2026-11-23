@@ -62,7 +62,7 @@ use crate::stream::MetalStreamError;
 use scratchy_ir::CanonicalParams;
 
 use super::lowered::{DispatchShape, GemmDims, KernelId, LoweredCommand, MetalDtype};
-use crate::tape::constants::{TapeVariant, UnboundConstant};
+use crate::tape::constants::TapeVariant;
 
 /// Outputs one threadgroup of the dense GEMV computes (MLX's `blockM`): the fewest a GEMV
 /// dispatch covers, its last threadgroup moving back to the last `GEMV_ROWS` rows.
@@ -184,8 +184,7 @@ impl SpecializedPipelines {
     ) -> Result<ComputePipelineState, PipelineLookupError> {
         let constants = (cmd.constants.iter())
             .map(|c| c.resolve(self.variant))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(PipelineLookupError::Unbound)?;
+            .collect();
         let key = PipelineKey::new(cmd.library, cmd.function, constants);
         self.cache
             .get_or_build(&key)
@@ -308,8 +307,6 @@ pub enum PipelineLookupError {
     /// pipeline state construction). The wrapped variant carries the
     /// underlying message verbatim.
     Build(MetalStreamError),
-    /// A command's constant is bound to a value the picked tape variant does not carry.
-    Unbound(UnboundConstant),
 }
 
 impl std::fmt::Display for PipelineLookupError {
@@ -330,7 +327,6 @@ impl std::fmt::Display for PipelineLookupError {
                 )
             }
             Self::Build(e) => write!(f, "specialized pipeline build: {e}"),
-            Self::Unbound(e) => write!(f, "specialized pipeline lookup: {e}"),
         }
     }
 }
@@ -436,10 +432,9 @@ mod tests {
         }
     }
 
-    /// The probes' tape variant: their `MAX_BLOCKS_PER_SEQ`, no TurboQuant decode attention.
+    /// The probes' tape variant: their `MAX_BLOCKS_PER_SEQ`.
     const PROBE_VARIANT: TapeVariant = TapeVariant {
         cap: crate::tape::ids::MaxBlocksPerSeq(128),
-        tq_heads: None,
     };
 
     // ── Test-only kernel→symbol/constants mapping ─────────────────
@@ -516,10 +511,10 @@ mod tests {
                 "attention_prefill_sdpa_v2_paged_bf16_specialized",
             ),
             (KernelId::RopeOnceNax, MetalDtype::F16) => {
-                ("attention_steel_nax_paged", "rope_once_nax_f16_bd128_bs16")
+                ("attention_steel_nax_paged", "rope_once_nax_f16")
             }
             (KernelId::RopeOnceNax, MetalDtype::Bf16) => {
-                ("attention_steel_nax_paged", "rope_once_nax_bf16_bd128_bs16")
+                ("attention_steel_nax_paged", "rope_once_nax_bf16")
             }
             // Production dispatch keys on cmd.library/function (baked at
             // lowering with the live head dim); this synthetic-helper arm
@@ -602,8 +597,7 @@ mod tests {
             | KernelId::RowProgram
             | KernelId::NormedGemv
             | KernelId::RopeAppendNormed
-            | KernelId::TqStageRotated
-            | KernelId::TqRotateRows
+            | KernelId::KvStage
             | KernelId::TanhSoftCap
             | KernelId::GatherSampledRows
             | KernelId::PutSampledRowsBack
@@ -633,19 +627,7 @@ mod tests {
             | KernelId::LoadRows
             | KernelId::ConcatRows
             | KernelId::MmEmbedSplice
-            // hd512 unfused attention kernels carry their library/function +
-            // constants explicitly on the LoweredCommand (NAX vs steel chosen by
-            // is_nax), so they dispatch via `pipeline_for_command(cmd)` — not this
-            // synthetic (kernel, dtype) → name helper.
-            | KernelId::AttnGatherKRope
-            | KernelId::AttnGatherVCopyT
-            | KernelId::AttnQConvert
-            | KernelId::AttnOConvert
-            | KernelId::AttnCausalSoftmax
-            | KernelId::AttnGemmQk
-            | KernelId::AttnGemmPv
-            | KernelId::AttentionViaCacheTq
-            | KernelId::AttentionDecodeGqaTq
+            | KernelId::AttentionDecodeInt8
             | KernelId::AttentionDecodeCombine
             | KernelId::AttentionVerifyPack
             | KernelId::AttentionVerifySplit
@@ -751,7 +733,7 @@ mod tests {
                 if matches!(kernel, KernelId::AttentionViaCache) {
                     v.push(ConstantValue::uint(
                         16,
-                        crate::tape::ids::TqDecodeHeads::largest_group(
+                        crate::tape::ids::DecodeHeads::largest_group(
                             crate::tape::ids::HeadDim(base().head_dim().get()),
                             crate::tape::ids::NumQHeads(base().q_heads().get()),
                             crate::tape::ids::NumKvHeads(base().kv_heads().get()),
@@ -814,8 +796,7 @@ mod tests {
             | KernelId::RowProgram
             | KernelId::NormedGemv
             | KernelId::RopeAppendNormed
-            | KernelId::TqStageRotated
-            | KernelId::TqRotateRows
+            | KernelId::KvStage
             | KernelId::TanhSoftCap
             | KernelId::GatherSampledRows
             | KernelId::PutSampledRowsBack
@@ -845,15 +826,7 @@ mod tests {
             | KernelId::LoadRows
             | KernelId::ConcatRows
             | KernelId::MmEmbedSplice
-            | KernelId::AttnGatherKRope
-            | KernelId::AttnGatherVCopyT
-            | KernelId::AttnQConvert
-            | KernelId::AttnOConvert
-            | KernelId::AttnCausalSoftmax
-            | KernelId::AttnGemmQk
-            | KernelId::AttnGemmPv
-            | KernelId::AttentionViaCacheTq
-            | KernelId::AttentionDecodeGqaTq
+            | KernelId::AttentionDecodeInt8
             | KernelId::AttentionDecodeCombine
             | KernelId::AttentionVerifyPack
             | KernelId::AttentionVerifySplit
@@ -919,7 +892,7 @@ mod tests {
     /// lowering's plain via-cache arm bakes.
     fn via_cache_groups(num_q: usize, head_dim: usize, num_kv: usize) -> usize {
         num_q
-            / crate::tape::ids::TqDecodeHeads::largest_group(
+            / crate::tape::ids::DecodeHeads::largest_group(
                 crate::tape::ids::HeadDim(head_dim as u32),
                 crate::tape::ids::NumQHeads(num_q as u32),
                 crate::tape::ids::NumKvHeads(num_kv as u32),

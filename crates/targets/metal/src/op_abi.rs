@@ -18,13 +18,13 @@
 use scratchy_ir::{BiasStorage, KvOffset, KvOffsets};
 use scratchy_subtile::handoff::{SourceBinding, WeightKind, accessor_slot};
 use scratchy_subtile::kv_codec::{
-    After, Before, CodecAround, CodecGuard, CodecHeadDims, GuardGates, Guarded, KvCodecFacts,
+    After, Before, CodecAround, CodecGuard, GuardGates, Guarded, KvCodecFacts,
 };
 use scratchy_subtile::lower::GemmWeightKind;
 use scratchy_subtile::ops::SubOpKind;
 use scratchy_subtile::sample_rows::SampleRowsFacts;
 use scratchy_subtile::subtile_ir::{
-    AttnMask, EwKind, ExpertBundle, ExpertProj, KvOperand, OpStage, RopeForm, RouterBundle, SubOp,
+    EwKind, ExpertBundle, ExpertProj, KvOperand, OpStage, RopeForm, RouterBundle, SubOp,
 };
 
 use crate::tape::lowered::{RuntimeGate, WeightTensor};
@@ -38,7 +38,7 @@ use scratchy_subtile::tape_steps::OperandIx;
 // ── The KV writer's weight site ─────────────────────────────────────
 //
 // Two declarations, adjacent: how the step records LAY OUT a `RopeAppend`'s
-// weight site, and where the TurboQuant lowering FINDS the biases on it.
+// weight site, and where the lowering FINDS the biases on it.
 // Slot 0 is the rotary table; an operand carrying a projection bias
 // ([`KvOffset::LinearBias`]) puts that projection's `LinearLayer` on the
 // same site, K's first.
@@ -187,10 +187,9 @@ pub fn metal_colour_rule<F: RopeForm, S: OpStage>(op: &SubOp<F, S>) -> ColourRul
         | L::ExpertGatedAct { .. }
         | L::ExpertAct { .. }
         | L::ExpertUnsort => FRESH.off_arena(),
-        // The codec's packed and staged K/V are runtime stores; a rotation turns its rows in place,
-        // and the packed twin writes the output of the attention it replaces.
+        // The codec's packed and staged K/V are runtime stores, and the packed twin writes the
+        // output of the attention it replaces.
         L::KvEncode { .. } | L::KvStage { .. } => FRESH.off_arena(),
-        L::RotateRows { .. } => FRESH.output(A::Operand(OperandIx(0))),
         L::AttnPackedKv => FRESH.output(A::Operand(OperandIx(1))),
         // The sampled rows move in place — the gather over the matmul's input (the embedded
         // hidden's colour 0 too), the scatter over its output — and the all-rows matmul writes the
@@ -210,12 +209,12 @@ pub const METAL_SAMPLE_ROWS: SampleRowsFacts = SampleRowsFacts {
     weights: &[GemmWeightKind::Affine, GemmWeightKind::Dense],
 };
 
-// ── The KV codec (TurboQuant) ───────────────────────────────────────
+// ── The KV codec (int8) ─────────────────────────────────────────────
 
-/// Metal's KV codec, TurboQuant: every layer coded on a uniform arch, the global class on a
-/// hybrid one, head dims the kernels' widened threadgroup arrays take. A writer's K and V are
-/// quantized after it; a decode attention yields to its packed-store twin, any other runs in the
-/// codebook's rotated domain (K/V staged, q rotated in, its output rotated back) off decode steps.
+/// Metal's KV codec, int8 (`scratchy_layers::kv_int8`): every layer coded, each at its class's
+/// geometry. A writer's K and V are encoded as it writes them; a decode
+/// attention yields to its int8 twin, any other reads the layer's cached K/V staged into the dense
+/// scratch off decode steps.
 pub const METAL_KV_CODEC: KvCodecFacts = {
     use CodecGuard::{Codec, CodecDecode, CodecNotDecode, UnlessCodecDecode};
     const fn g<S>(step: S, guard: CodecGuard) -> Guarded<S> {
@@ -223,8 +222,6 @@ pub const METAL_KV_CODEC: KvCodecFacts = {
     }
     const TWIN: Guarded<After> = g(After::PackedTwin, CodecDecode);
     KvCodecFacts {
-        head_dims: CodecHeadDims::PowerOfTwoAtMost(512),
-        coded_class: AttnMask::Causal,
         after_writer: &[g(KvOperand::K, Codec), g(KvOperand::V, Codec)],
         decode: CodecAround {
             before: &[],
@@ -235,10 +232,9 @@ pub const METAL_KV_CODEC: KvCodecFacts = {
             before: &[
                 g(Before::Stage(KvOperand::K), CodecNotDecode),
                 g(Before::Stage(KvOperand::V), CodecNotDecode),
-                g(Before::RotateQuery, CodecNotDecode),
             ],
             anchor: UnlessCodecDecode,
-            after: &[g(After::RotateOutput, CodecNotDecode), TWIN],
+            after: &[TWIN],
         },
     }
 };

@@ -67,11 +67,11 @@ using namespace mlx::steel;
 // unused in this body — both values are already baked as template
 // parameters (`BD` and `BLOCK_SIZE_`) at metallib-compile time,
 // which is strictly stronger constant folding.
-SCRATCHY_CONSTANT_OPTIONAL(uint, ATTN_PAGED_HEAD_DIM, 0);  // unused; ==BD
+SCRATCHY_CONSTANT_OPTIONAL(uint, ATTN_PAGED_HEAD_DIM, 0);
 SCRATCHY_CONSTANT_OPTIONAL(uint, ATTN_PAGED_NUM_Q_HEADS, 1);
 SCRATCHY_CONSTANT_OPTIONAL(uint, ATTN_PAGED_NUM_KV_HEADS, 2);
 SCRATCHY_CONSTANT_OPTIONAL(float, ATTN_PAGED_SCALE, 3);
-SCRATCHY_CONSTANT_OPTIONAL(uint, ATTN_PAGED_BLOCK_SIZE, 4);  // unused; ==BLOCK_SIZE_
+SCRATCHY_CONSTANT_OPTIONAL(uint, ATTN_PAGED_BLOCK_SIZE, 4);
 SCRATCHY_CONSTANT_OPTIONAL(uint, ATTN_PAGED_MAX_BLOCKS_PER_SEQ, 5);
 // Reactive (chunked) KV pool: k_cache/v_cache (buffers 5/6) are
 // per-layer chunk-address TABLES (device uint64 gpuAddresses), not the
@@ -129,6 +129,14 @@ constant uint  ATTN_PAGED_SELFONLY = ATTN_PAGED_SELFONLY_DEF ? ATTN_PAGED_SELFON
 //     the max/denominator as sink·log2(e) — converted, never sm_scale'd.
 //     Unset: the column folds away, non-sink pipelines byte-identical.
 SCRATCHY_CONSTANT_OPTIONAL(uint, ATTN_PAGED_SINKS, 21);
+
+// The tile a bake runs a steel paged attention at (`SteelTile` / `SteelWideTile`, the lowering's
+// laws): Q rows a threadgroup, keys a K-tile, warps along the Q rows and along the head dims. The
+// head dim and the page are ATTN_PAGED_HEAD_DIM / ATTN_PAGED_BLOCK_SIZE.
+SCRATCHY_CONSTANT_OPTIONAL(uint, STEEL_TILE_BQ, 30);
+SCRATCHY_CONSTANT_OPTIONAL(uint, STEEL_TILE_BK, 31);
+SCRATCHY_CONSTANT_OPTIONAL(uint, STEEL_TILE_WM, 32);
+SCRATCHY_CONSTANT_OPTIONAL(uint, STEEL_TILE_WN, 33);
 constant bool  ATTN_PAGED_SINKS_ON = ATTN_PAGED_SINKS_SET;
 
 // ── rope-once kernel (spans rope-on-read, simdgroup steel prefill) ──────────

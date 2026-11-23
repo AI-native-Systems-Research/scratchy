@@ -100,7 +100,7 @@ impl KvMapper {
 }
 
 /// Placement-sparse buffers that grow together, as one pool's stores do (each `(tensor, K/V)` of
-/// the fp16 pool, TurboQuant's packed codes, norms and scratch, or a recurrent model's conv and
+/// the fp16 pool, the int8 store's codes, scales and scratch, or a recurrent model's conv and
 /// ssm state per layer): ONE contiguous range each, so readers address any block off its base,
 /// whose pages are mapped only as the pool reaches them — each store through the tile its last
 /// block ends in, so a block need not fill whole tiles.
@@ -108,7 +108,7 @@ impl KvMapper {
 /// is committed in full when made resident (gemma-4-26b on a 64 GB Mac: ~19 GiB of KV at
 /// startup). Each step maps the next run of blocks of every buffer from ONE heap and at least
 /// doubles what is mapped, so a pool reached through `n` blocks holds O(log n) heaps — not one
-/// per buffer per chunk (~65k for granite-2b's TurboQuant stores on a 32 GB M5).
+/// per buffer per chunk (~65k for granite-2b's int8 stores on a 32 GB M5).
 pub struct SparseStores {
     device: Retained<ProtocolObject<dyn MTLDevice>>,
     residency: MetalResidencySet,

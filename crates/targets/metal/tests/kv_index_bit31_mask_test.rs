@@ -6,9 +6,8 @@
 //! of those tables AS AN INDEX must strip bit 31 (`& 0x7FFFFFFFu`, mirroring
 //! attention's `ATTN_BT_MASK`) BEFORE dividing/indexing. An unmasked read
 //! indexes ~2^31 elements out of bounds and silently corrupts the KV cache —
-//! but ONLY when spans are active, so it sails through ordinary tests. This bug
-//! has now bitten two kernels (the TurboQuant compress/dequant kernels and the
-//! fused-QKV V-head); this test makes the next one a CI failure instead.
+//! but ONLY when spans are active, so it sails through ordinary tests; this test
+//! makes such a read a CI failure instead.
 //!
 //! Why a source scan, not a GPU test: the OOB only fires with spans enabled AND
 //! a Metal device, neither present in normal CI. Per the project rule "every
@@ -25,11 +24,8 @@
 /// Add new such shaders here.
 const SHADERS: &[(&str, &str)] = &[
     (
-        "turboquant.metal",
-        include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/shaders/turboquant.metal"
-        )),
+        "kv_writer.h",
+        include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/shaders/kv_writer.h")),
     ),
     (
         "kv_append.metal",
@@ -99,11 +95,11 @@ fn kv_kernels_strip_bit31_from_tagged_index_tables() {
 
     // Anti-vacuity: the guard must actually be seeing masked tagged reads, so a
     // future refactor that removes/renames the tagged reads can't make this test
-    // pass by having nothing to check. turboquant.metal carries 3 (its slot and
-    // logical-slot strips, and the contract line at its head).
+    // pass by having nothing to check: the int8 row store (kv_writer.h) and the un-rotated writer
+    // (kv_append.metal) each strip a tagged slot once.
     assert!(
-        total_masks >= 3,
-        "expected >= 3 bit-31 strips across the KV kernels; found {total_masks}. \
+        total_masks >= 2,
+        "expected >= 2 bit-31 strips across the KV kernels; found {total_masks}. \
          Did a tagged-table read get removed/renamed without updating this guard?"
     );
 }
