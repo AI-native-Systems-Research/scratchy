@@ -38,7 +38,7 @@ pub(crate) fn alias_preamble() -> TokenStream {
         use ::scratchy_target_metal::tape::constants as __tc;
         use ::scratchy_target_metal::tape::ids as __ti;
         use ::scratchy_target_metal::dflash2 as __td;
-        use ::scratchy_target_metal::tape::codes as __tq;
+        use ::scratchy_target_metal::tape::codes as __codes;
     }
 }
 
@@ -71,7 +71,7 @@ fn module_of(ty: &str) -> Result<TokenStream, Error> {
             quote!(__ti)
         }
         "DraftOutput" => quote!(__td),
-        "AffineCodesTable" => quote!(__tq),
+        "AffineCodesTable" => quote!(__codes),
         other => return Err(Error(format!("const_tokens: unmapped type `{other}`"))),
     };
     Ok(m)

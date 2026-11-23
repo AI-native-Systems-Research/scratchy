@@ -1328,8 +1328,8 @@ fn codes_tokens(tables: &[&'static AffineCodesTable]) -> Result<TokenStream, Bak
     use proc_macro2::Literal;
     use scratchy_target_metal::tape::codes::{AffineCodes, RowCodes};
     let row = |r: RowCodes| match r {
-        RowCodes::AsWritten => quote!(__tq::RowCodes::AsWritten),
-        RowCodes::Offset8 => quote!(__tq::RowCodes::Offset8),
+        RowCodes::AsWritten => quote!(__codes::RowCodes::AsWritten),
+        RowCodes::Offset8 => quote!(__codes::RowCodes::Offset8),
     };
     let statics = tables.iter().enumerate().map(|(i, table)| {
         let ident = quote::format_ident!("CODES_{i}");
@@ -1343,15 +1343,15 @@ fn codes_tokens(tables: &[&'static AffineCodesTable]) -> Result<TokenStream, Bak
             let codes = match e.codes {
                 AffineCodes::Rows(r) => {
                     let r = row(r);
-                    quote!(__tq::AffineCodes::Rows(#r))
+                    quote!(__codes::AffineCodes::Rows(#r))
                 }
                 AffineCodes::Planes { k } => {
                     let k = Literal::u32_unsuffixed(k.get());
-                    quote!(__tq::AffineCodes::Planes { k: __tq::PlanesK::of(#k) })
+                    quote!(__codes::AffineCodes::Planes { k: __codes::PlanesK::of(#k) })
                 }
             };
             Ok(quote! {
-                __tq::CodesEntry {
+                __codes::CodesEntry {
                     ix: __ti::SourceIx(#ix),
                     which: #which,
                     layer: __ti::LayerId(#layer),
@@ -1361,8 +1361,8 @@ fn codes_tokens(tables: &[&'static AffineCodesTable]) -> Result<TokenStream, Bak
         });
         let entries = entries.collect::<Result<Vec<_>, BakeDefect>>()?;
         Ok(quote! {
-            pub(super) static #ident: __tq::AffineCodesTable =
-                __tq::AffineCodesTable { entries: &[ #(#entries),* ] };
+            pub(super) static #ident: __codes::AffineCodesTable =
+                __codes::AffineCodesTable { entries: &[ #(#entries),* ] };
         })
     });
     let statics = statics.collect::<Result<Vec<_>, BakeDefect>>()?;
