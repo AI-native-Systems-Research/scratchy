@@ -4898,8 +4898,9 @@ fn vocab_suffix_draft(
         ));
     }
     let allocator = &gpu_device.allocator;
-    // The same range, read the same way, as the target's lm_head: the allocator hands back the
-    // target's own binding.
+    // The head's codes, read the way the device stores them — the head family's as-stored vote,
+    // the same one the target's tapes baked (`MetalStepTape::as_stored_sources`): the allocator
+    // hands back the target's own binding of the range.
     let codes_read = allocator.affine_codes(suffix.bits);
     let (buffer, offset) =
         (allocator.bind_affine_codes(codes.raw_ptr(), codes.size_bytes(), codes_read))

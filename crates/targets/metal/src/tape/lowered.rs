@@ -1017,25 +1017,45 @@ pub enum SourceRef<'w> {
     GatedDeltaNet(&'w scratchy_layers::GatedDeltaNetLayer),
 }
 
+/// The `which` tensors of a `kind` family that are MLX-affine packed codes — what a kernel
+/// reads as written or offset-8 ([`crate::tape::kernel_constants::AffineCodes`]). The one
+/// statement of which tensors of a family carry codes: [`SourceRef::is_affine_codes`] routes
+/// every arm through it, adding only the bundle's own affine-ness (a dense `Linear` holds no
+/// codes; the tape's coarse `WeightKind` cannot tell, its sites do — dense linears lower to
+/// GEMMs, which name no codes).
+pub fn codes_tensor(kind: &scratchy_subtile::handoff::WeightKind, which: WeightTensor) -> bool {
+    use WeightTensor as T;
+    use scratchy_subtile::handoff::WeightKind as K;
+    match kind {
+        K::Linear | K::AffineQuantEmbedding => which == T::Weight,
+        K::FusedMoe | K::SharedFusedMoe | K::GemmaSwitchGlu | K::GptOssMoe => matches!(
+            which,
+            T::MoeExpertGateW
+                | T::MoeExpertUpW
+                | T::MoeExpertDownW
+                | T::MoeSharedGateUpW
+                | T::MoeSharedDownW
+        ),
+        _ => false,
+    }
+}
+
 impl SourceRef<'_> {
     /// Whether the `which` tensor of this bundle is MLX-affine packed codes — what a kernel reads
-    /// as written or offset-8 ([`crate::tape::kernel_constants::AffineCodes`]).
+    /// as written or offset-8 ([`crate::tape::kernel_constants::AffineCodes`]). The bundle holds
+    /// the layer, so it separates a dense from an affine `Linear`; which tensors are codes is
+    /// [`codes_tensor`]'s one statement.
     pub fn is_affine_codes(self, which: WeightTensor) -> bool {
-        use WeightTensor as T;
+        use scratchy_subtile::handoff::WeightKind as K;
         match self {
-            Self::Linear(scratchy_layers::LinearLayer::AffineQuant(_))
-            | Self::AffineQuantEmbedding(_) => which == T::Weight,
-            Self::FusedMoe(_)
-            | Self::SharedFusedMoe(_)
-            | Self::GemmaSwitchGlu(_)
-            | Self::GptOssMoe(_) => matches!(
-                which,
-                T::MoeExpertGateW
-                    | T::MoeExpertUpW
-                    | T::MoeExpertDownW
-                    | T::MoeSharedGateUpW
-                    | T::MoeSharedDownW
-            ),
+            Self::Linear(scratchy_layers::LinearLayer::AffineQuant(_)) => {
+                codes_tensor(&K::Linear, which)
+            }
+            Self::AffineQuantEmbedding(_) => codes_tensor(&K::AffineQuantEmbedding, which),
+            Self::FusedMoe(_) => codes_tensor(&K::FusedMoe, which),
+            Self::SharedFusedMoe(_) => codes_tensor(&K::SharedFusedMoe, which),
+            Self::GemmaSwitchGlu(_) => codes_tensor(&K::GemmaSwitchGlu, which),
+            Self::GptOssMoe(_) => codes_tensor(&K::GptOssMoe, which),
             _ => false,
         }
     }
