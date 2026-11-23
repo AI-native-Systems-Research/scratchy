@@ -112,6 +112,15 @@ impl SourceManifest {
         SourceIx(at as u32)
     }
 
+    /// `family`'s index when a row has already interned it, `None` when no row of any canonical
+    /// reads through it. A lookup, never an intern: a family nothing binds must not take an index.
+    pub fn family(&self, family: &WeightSlot) -> Option<SourceIx> {
+        self.families
+            .iter()
+            .position(|f| f == family)
+            .map(|at| SourceIx(at as u32))
+    }
+
     /// A row's reads, each with the family of the site it reads through. A read through no site
     /// the manifest interned names no family a command binds, so none is kept.
     fn reads(&self, reads: &[WeightRead]) -> Vec<(SourceIx, u32)> {
@@ -303,10 +312,12 @@ pub struct MetalStepFacts<'a> {
     pub embed_base: &'a str,
     /// The embedding's MLX-affine storage; `None` = dense.
     pub embed_quant: Option<(AffineGroupSize, AffineBits)>,
-    /// The tied lm_head's `WeightId`, when the model ties its logits to its embedding table
-    /// (`tie_word_embeddings`): the table's codes are the head's, so the families reading this
-    /// weight vote the table's as-stored way (`MetalStepTape::embed_table_readers`).
-    pub tied_lm_head: Option<u32>,
+    /// The role a tied lm_head reads (`LM_HEAD_ROLE`), when the model ties its logits to its
+    /// embedding table (`tie_word_embeddings`): the table's codes are the head's, so the family
+    /// reading the role votes the table's as-stored way (`MetalStepTape::embed_table_readers`).
+    /// A role, not a weight id: every canonical interns the family its rows read through — the
+    /// row-program band records no weight ids — so the family is the one key present everywhere.
+    pub tied_lm_head: Option<&'a str>,
     pub mlp: MlpForm,
     /// A MoE layer's routed-expert projection widths, gate/up/down (`None` = the op's own).
     /// `None` altogether for an unquantized model: its MoE bits are never repacked.
@@ -662,38 +673,43 @@ pub fn lower_canonical(
         result.index(),
         barriers,
     );
+    // Intern the rows' sites first: the tie lookup below reads the manifest those interning
+    // calls build (`SourceManifest::row` interns each family), and the first canonical lowered
+    // for a model starts from an empty manifest.
+    let backbone_sources: Vec<_> = backbone_sites
+        .iter()
+        .map(|s| sources.row(s, facts.embed_base))
+        .collect();
+    let lm_head_sources: Vec<_> = rolled
+        .lm_sites
+        .iter()
+        .map(|s| sources.row(s, facts.embed_base))
+        .collect();
     // One weight, one vote: the families that read the embedding table's weight besides its own
     // gather — the tied lm_head's. The table's gather reads each row's codes whole, as the device
     // stores them, so the bake votes these families' matmuls the same way
     // (`tape::lowering::codes_for`); without this the backbone's lm_head matmul would vote planes
     // on a wide M5 while the gather it shares a weight with votes as-stored, and the two readers
     // would refuse the load.
-    let mut embed_table_readers = Vec::new();
-    if let Some(tied) = facts.tied_lm_head {
-        for (ix, id) in
-            (backbone_weights.iter().chain(rolled.lm_weights.iter())).flat_map(|r| sources.reads(r))
-        {
-            if id == tied && !embed_table_readers.contains(&ix) {
-                embed_table_readers.push(ix);
-            }
-        }
-    }
+    let embed_table_readers = facts
+        .tied_lm_head
+        .and_then(|role| {
+            sources.family(&WeightSlot {
+                kind: WeightKind::Linear,
+                base: role.to_string(),
+            })
+        })
+        .into_iter()
+        .collect();
     Ok(MetalCanonical {
         steps: MetalStepTape {
             backbone,
             backbone_barriers,
-            backbone_sources: backbone_sites
-                .iter()
-                .map(|s| sources.row(s, facts.embed_base))
-                .collect(),
+            backbone_sources,
             backbone_live,
             lm_head: rolled.lm_rows,
             lm_head_barriers,
-            lm_head_sources: rolled
-                .lm_sites
-                .iter()
-                .map(|s| sources.row(s, facts.embed_base))
-                .collect(),
+            lm_head_sources,
             lm_head_live,
             embed_table_readers,
         },
