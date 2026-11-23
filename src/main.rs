@@ -3,7 +3,7 @@
 //!   /                   the landing page
 //!   /architectures.html every model architecture's DSL, diffable
 //!   /book/              docs/*.md + CONTRIBUTING.md, rendered client-side by zero-md
-//!   /metal.html         Metal benchmark runs from data/metal/, gzipped JSON
+//!   /metal.html         Metal benchmark runs from data/metal/<machine>/, gzipped JSON
 //!   /spyre.html         Spyre A/B sweeps from data/spyre/, gzipped JSON
 //!
 //! The site lives on the repo's `site` branch, apart from main, and is built

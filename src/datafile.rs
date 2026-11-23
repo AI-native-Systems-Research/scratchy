@@ -15,6 +15,22 @@ pub fn named(stem: &str) -> String {
     format!("{stem}{EXT}")
 }
 
+/// A data file's name in a folder of its own, from the folder's name and the file's stem:
+/// `<folder>/<stem>.json.gz`.
+pub fn named_in(folder: &str, stem: &str) -> String {
+    format!("{folder}/{}", named(stem))
+}
+
+/// The folders directly in `dir`, sorted. Fails only when `dir` cannot be read.
+pub fn folders(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
+    let mut dirs: Vec<PathBuf> = fs::read_dir(dir)?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.is_dir())
+        .collect();
+    dirs.sort();
+    Ok(dirs)
+}
+
 /// The data files directly in `dir`, sorted: each `*.json.gz` as its path, and
 /// each file that looks like data but is not one (a plain `*.json`, a `*.gz`
 /// that is not `*.json.gz`) as an error naming it, so a forgotten gzip fails
@@ -69,5 +85,23 @@ mod tests {
         assert_eq!(super::read_json_gz(&path).unwrap(), r#"{"a": 1}"#);
         let listed = super::list(&dir).unwrap();
         assert_eq!(listed, vec![Ok(path)]);
+    }
+
+    #[test]
+    fn a_name_in_a_folder_is_the_folder_then_the_name() {
+        assert_eq!(super::named_in("m", "x"), "m/x.json.gz");
+    }
+
+    #[test]
+    fn folders_lists_only_the_folders() {
+        let dir = std::env::temp_dir().join(format!("datafile-{}-folders", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("b")).unwrap();
+        std::fs::create_dir_all(dir.join("a")).unwrap();
+        std::fs::write(dir.join(super::named("x")), b"").unwrap();
+        assert_eq!(
+            super::folders(&dir).unwrap(),
+            [dir.join("a"), dir.join("b")]
+        );
     }
 }
