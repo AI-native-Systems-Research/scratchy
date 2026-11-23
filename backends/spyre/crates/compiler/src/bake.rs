@@ -7,7 +7,6 @@ use std::collections::BTreeMap;
 
 use quote::quote;
 use scratchy_forward_compiler_frontend::classified::{OpKind, Program, WeightId};
-use scratchy_forward_compiler_macro::codegen::tie_word_embeddings;
 use scratchy_forward_compiler_macro::config::ModelParams;
 use scratchy_forward_compiler_macro::fuf::{Fuf, FufInput, TileId};
 
@@ -122,7 +121,7 @@ fn chained_row_gathers(
     model: &ModelParams,
     decode: bool,
 ) -> Vec<scratchy_subtile::tensor_parallel::RowGather> {
-    if !(decode && tie_word_embeddings(model)) {
+    if !(decode && model.tie_word_embeddings) {
         return Vec::new();
     }
     match lwd.input.vocab_table() {
@@ -3007,7 +3006,7 @@ pub(crate) fn dump_wavefront_mega(
                 // widen walk cannot read. Non-admitting tails return None and touch
                 // nothing; every admitting bundle of a tied model reserves the same
                 // widened bytes (the weight-segment parity ledger's law).
-                let tied = tie_word_embeddings(model);
+                let tied = model.tie_word_embeddings;
                 let widen = if tied {
                     scratchy_subtile::subtile_ir::widen_tied_embed_weight(&mut krg)
                 } else {

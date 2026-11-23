@@ -1816,9 +1816,7 @@ impl ResolvedSources {
                     .source(ix, layer)
                     .ok_or(miss(SourceMiss::NoFamily))?;
                 // MLX-affine packed codes bind stored the way each reading command's kernel
-                // reads them — the family's one vote, stated once per model at the bake
-                // (`tape::lowering::codes_for`), so every reader of a weight binds it the
-                // same way and the first binding serves them all.
+                // reads them — every reader, so two that disagree refuse the load.
                 if bundle.is_affine_codes(which) {
                     let tensor = bundle.tensor(which).ok_or(miss(SourceMiss::NoTensor))?;
                     let codes = crate::tape::kernel_constants::AffineCodes::of_constants(constants);
