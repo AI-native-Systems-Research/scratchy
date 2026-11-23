@@ -1412,15 +1412,16 @@ fn route_gdn(
 /// ([`super::kernel_constants::DecodeCache`]), and the class's rotary table on a spans model.
 fn decode_cache(
     p: &ModelFacts,
-    mask: AttnMask,
+    of: scratchy_ir::model_facts::AttnClass,
     chunked: bool,
     w: RowSources<'_>,
 ) -> Result<(super::kernel_constants::DecodeCache, Option<SourceIx>), LoweringError> {
     use super::kernel_constants::{DecodeCache, PairLanes, RopeOnRead};
-    let class = masked(p, mask)?;
-    let (window, is_global) = match mask {
-        AttnMask::Causal => (0, true),
-        AttnMask::SlidingWindow { .. } => (kernel_window(p)?, false),
+    use scratchy_ir::model_facts::AttnClass;
+    let class = self::class(p, of)?;
+    let (window, is_global) = match of {
+        AttnClass::Full => (0, true),
+        AttnClass::Sliding => (kernel_window(p)?, false),
     };
     let (rot_dim, pair_off, on, table) = rope_on_read_params(p, is_global);
     let hd = class.head_dim().get();
@@ -1494,7 +1495,7 @@ fn int8_decode_commands(
     };
     let (class, shape) = int8_decode_shape(p, mask, block_cap)?;
     let hd = class.head_dim().get();
-    let (cache, rope_on_read) = decode_cache(p, mask, chunked, w)?;
+    let (cache, rope_on_read) = decode_cache(p, mask.class(), chunked, w)?;
     let query_rows = QueryRows::for_bucket(bucket_m);
     let (sinks, kv_layer) = (w.sinks(), super::ids::LayerId(layer));
     let symbol = |f16, bf16| pick_specialized_symbol(f16, bf16, p.act_dtype());
@@ -4793,7 +4794,8 @@ fn lower_one(
         // ── Decode-bucket attention (single query token / seq) ─────
         I::AttentionViaCache(Slot(q_slot), Slot(out_slot), LayerId(layer), _pairing) => {
             // Spans rope-on-read (GLOBAL class). All-None when !ROPE_ON_READ.
-            let (ror_rd, ror_po, ror_on, ror_bind) = rope_on_read_params(p, true);
+            let (cache, rope_table) =
+                decode_cache(p, scratchy_ir::model_facts::AttnClass::Full, chunked, w)?;
             // 2D dispatch: (batch, num_q_heads). Each threadgroup
             // computes one head's attention output for one sequence.
             // `bucket_m == batch` for decode buckets.
@@ -4825,35 +4827,11 @@ fn lower_one(
                     p.act_dtype(),
                 ),
                 constants: super::kernel_constants::AttentionViaCacheConstants {
-                    // `attention()` tiles are the GLOBAL class on
-                    // hybrid sliding/global arches (Gemma4: 512×1kv);
-                    // GLOBAL_* default to the base values on uniform
-                    // models, so this is identity for Llama/Qwen.
-                    head_dim: super::ids::HeadDim(global(p)?.head_dim().get()),
-                    num_q_heads: super::ids::NumQHeads(q_heads(p)?),
-                    num_kv_heads: super::ids::NumKvHeads(global(p)?.kv_heads().get()),
-                    attn_scale: super::ids::AttnScale(attention(p)?.scale().get()),
-                    // GLOBAL class block size — vLLM page-unifies the full
-                    // class UP to the sliding page (Gemma4: 32 vs sliding 16).
-                    // Defaults to BLOCK_SIZE on uniform arches.
-                    block_size: super::ids::BlockSize(global(p)?.page().get()),
-                    blocks_per_chunk: super::ids::BlocksPerChunk(attention_blocks_per_chunk(
-                        chunked,
-                    )),
-                    // Full attention: window disabled.
-                    window: super::ids::AttnWindow(0),
-                    rot_dim: ror_rd,
-                    pair_off: ror_po,
-                    rope_on_read: ror_on,
-                    pair_coresident: pair_coresident_param(
-                        ror_rd,
-                        ror_po,
-                        ror_on,
-                        global(p)?.head_dim().get(),
-                    ),
-                    // gpt-oss sinks: the const mirrors the binding's presence
-                    // (the 0/1 master switch the shader gates its column on).
-                    sinks: w.sinks().map(|_| 1),
+                    cache,
+                    sinks: match w.sinks() {
+                        Some(_) => super::kernel_constants::SinkColumn::Present,
+                        None => super::kernel_constants::SinkColumn::Absent,
+                    },
                     heads: served,
                     query_rows: QueryRows::for_bucket(bucket_m),
                 }
@@ -4874,7 +4852,7 @@ fn lower_one(
                     output: super::ids::ArenaSlotIdx(*out_slot),
                     q: super::ids::ArenaSlotIdx(*q_slot),
                     kv_layer: super::ids::LayerId(*layer + layer_offset),
-                    rope_on_read: w.rotary(ror_bind)?,
+                    rope_on_read: rope_table,
                     sinks: w.sinks(),
                     query_rows: QueryRows::for_bucket(bucket_m),
                 }
@@ -5408,7 +5386,8 @@ fn lower_one(
         // (the decode kernel skips keys with `kv_len-1 - k >= window`).
         I::SlidingAttentionViaCache(Slot(q_slot), Slot(out_slot), LayerId(layer), _pairing) => {
             // Spans rope-on-read (SLIDING class). All-None when !ROPE_ON_READ.
-            let (ror_rd, ror_po, ror_on, ror_bind) = rope_on_read_params(p, false);
+            let (cache, rope_table) =
+                decode_cache(p, scratchy_ir::model_facts::AttnClass::Sliding, chunked, w)?;
             let n_q_heads = q_heads(p)?;
             // The sliding class serves its own GQA group per threadgroup
             // (the global arm's note), on the sliding geometry.
@@ -5426,26 +5405,11 @@ fn lower_one(
                     p.act_dtype(),
                 ),
                 constants: super::kernel_constants::AttentionViaCacheConstants {
-                    head_dim: super::ids::HeadDim(base(p)?.head_dim().get()),
-                    num_q_heads: super::ids::NumQHeads(q_heads(p)?),
-                    num_kv_heads: super::ids::NumKvHeads(base(p)?.kv_heads().get()),
-                    attn_scale: super::ids::AttnScale(attention(p)?.scale().get()),
-                    block_size: super::ids::BlockSize(base(p)?.page().get()),
-                    blocks_per_chunk: super::ids::BlocksPerChunk(attention_blocks_per_chunk(
-                        chunked,
-                    )),
-                    window: super::ids::AttnWindow(kernel_window(p)?),
-                    rot_dim: ror_rd,
-                    pair_off: ror_po,
-                    rope_on_read: ror_on,
-                    pair_coresident: pair_coresident_param(
-                        ror_rd,
-                        ror_po,
-                        ror_on,
-                        base(p)?.head_dim().get(),
-                    ),
-                    // gpt-oss sinks: the const mirrors the binding's presence.
-                    sinks: w.sinks().map(|_| 1),
+                    cache,
+                    sinks: match w.sinks() {
+                        Some(_) => super::kernel_constants::SinkColumn::Present,
+                        None => super::kernel_constants::SinkColumn::Absent,
+                    },
                     heads: served,
                     query_rows: QueryRows::for_bucket(bucket_m),
                 }
@@ -5463,7 +5427,7 @@ fn lower_one(
                     output: super::ids::ArenaSlotIdx(*out_slot),
                     q: super::ids::ArenaSlotIdx(*q_slot),
                     kv_layer: super::ids::LayerId(*layer + layer_offset),
-                    rope_on_read: w.rotary(ror_bind)?,
+                    rope_on_read: rope_table,
                     sinks: w.sinks(),
                     query_rows: QueryRows::for_bucket(bucket_m),
                 }

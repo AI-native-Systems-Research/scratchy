@@ -324,40 +324,10 @@ impl From<KvAppendConstants> for Vec<ConstantValue> {
 /// `KernelId::AttentionViaCache`
 /// (`attention_via_cache_v2_<dtype>_specialized`).
 pub struct AttentionViaCacheConstants {
-    pub head_dim: HeadDim,
-    pub num_q_heads: NumQHeads,
-    pub num_kv_heads: NumKvHeads,
-    pub attn_scale: AttnScale,
-    pub block_size: BlockSize,
-    pub blocks_per_chunk: BlocksPerChunk,
-    /// Sliding-window width (`ATTN_WINDOW`, slot 7). `0` = disabled
-    /// (full attention); the sliding lowering arm passes
-    /// `W::SLIDING_WINDOW`.
-    pub window: AttnWindow,
-    /// Spans rope-on-read (slots 8/9/10): rotary dim, NeoX pairing
-    /// offset, and the master 0/1 switch. `None` on every non-spans
-    /// dispatch → the emitted Vec is byte-identical to today (8 consts)
-    /// and the in-shader `is_function_constant_defined` guard folds the
-    /// rotation away. `Some` only when `W::ROPE_ON_READ`.
-    pub rot_dim: Option<RotDim>,
-    pub pair_off: Option<RopePairOff>,
-    pub rope_on_read: Option<u32>,
-    /// Co-resident NeoX-pair lane layout for the decode rope-on-read path
-    /// (slot 12, `ATTN_PAIR_CORESIDENT`). When `Some(1)` each lane owns its
-    /// NeoX pairs `{d, d+half_dim}` so the on-read rope is in-lane (no
-    /// `simd_shuffle`, no `k_pair[]` staging array). Only valid for full
-    /// NeoX rope (`rot_dim == head_dim`); the lowering sets it only then.
-    /// `None` (every non-spans dispatch) → byte-identical emitted Vec and the
-    /// shader keeps the contiguous-slice + shuffle path.
-    pub pair_coresident: Option<u32>,
-    /// gpt-oss attention sinks (slot 21, `ATTN_SINKS`): the layer's
-    /// per-head sink logits are an extra softmax column, added UNSCALED
-    /// after qk·sm_scale and dropped before ·V. `Some(1)` binds the
-    /// `[num_heads]` tensor (buffer 16) and turns the kernel's sink math
-    /// on; `None` on every non-sink dispatch → the emitted Vec is
-    /// byte-identical (no slot 21) and the shader const-folds the column
-    /// away.
-    pub sinks: Option<u32>,
+    pub cache: DecodeCache,
+    /// gpt-oss attention sinks (slot 21, `ATTN_SINKS`): the layer's per-head sink logits are an
+    /// extra softmax column, bound at buffer 16.
+    pub sinks: SinkColumn,
     /// Query heads one threadgroup serves (`ATTN_DECODE_HEADS`, slot 16): the largest divisor of
     /// the GQA group that fits the per-lane state, so the walk reads each key once for the whole
     /// group. The dispatch counts `num_q_heads / heads` threadgroups.
@@ -398,33 +368,16 @@ impl QueryRows {
 
 impl From<AttentionViaCacheConstants> for Vec<ConstantValue> {
     fn from(c: AttentionViaCacheConstants) -> Self {
-        let mut v = vec![
-            ConstantValue::uint(ConstSlot(0), c.head_dim.get()),
-            ConstantValue::uint(ConstSlot(1), c.num_q_heads.get()),
-            ConstantValue::uint(ConstSlot(2), c.num_kv_heads.get()),
-            ConstantValue::float(ConstSlot(3), c.attn_scale.get()),
-            ConstantValue::uint(ConstSlot(4), c.block_size.get()),
-            ConstantValue::kv_cap(ConstSlot(5)),
-            ConstantValue::uint(ConstSlot(6), c.blocks_per_chunk.get()),
-            ConstantValue::int(ConstSlot(7), c.window.get()),
-        ];
-        push_rope_on_read_consts(&mut v, c.rot_dim, c.pair_off, c.rope_on_read);
-        if let Some(pc) = c.pair_coresident {
-            v.push(ConstantValue::uint(ConstSlot(12), pc));
-        }
-        if let Some(sinks) = c.sinks {
-            v.push(ConstantValue::uint(
-                AttentionViaCacheConstants::SINKS,
-                sinks,
-            ));
+        let mut v = Vec::new();
+        c.cache.push(&mut v);
+        if c.sinks == SinkColumn::Present {
+            v.push(ConstantValue::uint(AttentionViaCacheConstants::SINKS, 1));
         }
         v.push(ConstantValue::uint(
             AttentionViaCacheConstants::HEADS,
             c.heads.get(),
         ));
-        if c.query_rows == QueryRows::PerToken {
-            v.push(ConstantValue::uint(ConstSlot(22), 1));
-        }
+        push_query_rows(&mut v, c.query_rows);
         v
     }
 }
