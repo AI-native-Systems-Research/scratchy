@@ -581,7 +581,7 @@ pub enum Instruction {
     /// `(qkv_slot, z_slot, a_slot, b_slot, out_slot, layer)`. Reads the
     /// `linear_attn[layer]` weight bundle (`GatedDeltaNetLayer`) via
     /// `gated_delta_net_at` and the ambient conv/ssm state from
-    /// `ForwardCtx::{gdn_state, gdn_state_indices}` at `layer`. Output
+    /// `ForwardCtx::{recurrent_state, recurrent_state_indices}` at `layer`. Output
     /// `[T, value_dim]`.
     GatedDeltaNet(u32, u32, u32, u32, u32, u32),
     /// Qwen3.5 attention output-gate split. Args `(qg_slot, q_slot, gate_slot)`.

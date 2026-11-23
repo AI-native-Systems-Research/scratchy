@@ -1859,13 +1859,13 @@ pub(crate) fn emit(cx: &ModelCx<'_>) -> ModelEmission {
                 let kv_layer_to_group: ::std::vec::Vec<u32> =
                     ctx.kv_cache.layer_to_group_u32();
                 // GDN (Gated-DeltaNet) persistent state buffers, captured per
-                // (global) layer from `ctx.gdn_state` for hybrid arches; empty
+                // (global) layer from `ctx.recurrent_state` for hybrid arches; empty
                 // for non-hybrid. Non-linear layers reuse the first linear
                 // layer's buffer as a never-bound placeholder (the
                 // GatedDeltaNet lowering only emits GdnConvState/GdnSsmState on
                 // linear layers, so the placeholder is never read).
                 let (gdn_conv, gdn_ssm): (::std::vec::Vec<Buffer>, ::std::vec::Vec<Buffer>) =
-                    match ctx.gdn_state {
+                    match ctx.recurrent_state {
                         ::core::option::Option::Some(gp) => {
                             match (0..gp.num_layers).find(|&l| gp.is_linear(l)) {
                                 ::core::option::Option::Some(f0) => {
@@ -1900,7 +1900,7 @@ pub(crate) fn emit(cx: &ModelCx<'_>) -> ModelEmission {
                 let (gdn_lanes_conv, gdn_lanes_ssm): (
                     ::std::vec::Vec<Buffer>,
                     ::std::vec::Vec<Buffer>,
-                ) = match ctx.gdn_state {
+                ) = match ctx.recurrent_state {
                     ::core::option::Option::Some(gp) => {
                         let first = (0..gp.num_layers)
                             .find_map(|l| gp.conv_lanes_mem(l).zip(gp.ssm_lanes_mem(l)));
@@ -1921,8 +1921,8 @@ pub(crate) fn emit(cx: &ModelCx<'_>) -> ModelEmission {
                         (::std::vec::Vec::new(), ::std::vec::Vec::new())
                     }
                 };
-                // A DFlash2 drafter's rings, the pool `ctx` lends (the sibling of `gdn_state`):
-                // `Some` exactly for a drafter.
+                // A DFlash2 drafter's rings, the pool `ctx` lends (the sibling of
+                // `recurrent_state`): `Some` exactly for a drafter.
                 let __draft_rings: ::core::option::Option<(
                     ::std::vec::Vec<Buffer>,
                     ::std::vec::Vec<Buffer>,
@@ -2332,13 +2332,13 @@ pub(crate) fn emit(cx: &ModelCx<'_>) -> ModelEmission {
             // host-visible TensorViews (a `GdnSeqSlots` record — 6 i32s —
             // per seq, a step code per seq). `None` for non-hybrid arches
             // (ctx fields are None).
-            let gdn_state_indices = ctx.gdn_state_indices.map(|tv| {
+            let gdn_state_indices = ctx.recurrent_state_indices.map(|tv| {
                 ::std::slice::from_raw_parts(
                     tv.as_raw().raw_ptr() as *const i32,
                     tv.as_raw().numel(),
                 )
             });
-            let gdn_is_fresh = ctx.gdn_is_fresh.map(|tv| {
+            let gdn_is_fresh = ctx.recurrent_is_fresh.map(|tv| {
                 ::std::slice::from_raw_parts(
                     tv.as_raw().raw_ptr() as *const u32,
                     tv.as_raw().numel(),

@@ -12,7 +12,7 @@ use crate::spyre_forward::*;
 use crate::spyre_types::*;
 use crate::spyre_worker::*;
 use scratchy_serving_worker::error::ExecutorResult;
-use scratchy_serving_worker::worker::Worker;
+use scratchy_serving_worker::worker::{SequenceState, Worker};
 
 /// One scheduled token is a DECODE step when the row it runs is the prompt's FINAL
 /// row or beyond (`num_computed + 1 >= prompt_len`) — that row's logits sample the
@@ -82,6 +82,12 @@ impl Worker for SpyreWorker {
     /// accounts for it.
     fn supports_hybrid_swa_kv(&self) -> bool {
         false
+    }
+
+    /// KV only: the Spyre lowering has no kernel for a recurrent mixer (`GatedDeltaNet` and
+    /// `Mamba2` have no SuperDSC kernel), so no model this worker serves keeps a recurrent state.
+    fn sequence_state(&self) -> SequenceState {
+        SequenceState::Kv
     }
 
     fn init_device(&mut self) -> ExecutorResult<()> {

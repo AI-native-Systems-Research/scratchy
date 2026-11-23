@@ -20,6 +20,15 @@ use scratchy_serving_scheduler::scheduler::output::SchedulerOutput;
 
 use crate::error::ExecutorResult;
 
+/// What a model keeps for each sequence it serves ([`Worker::sequence_state`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SequenceState {
+    /// Its KV cache only, which a cached prefix restores.
+    Kv,
+    /// A recurrent (conv + ssm) state beside its KV: a Gated DeltaNet or Mamba-2 hybrid.
+    KvAndRecurrent,
+}
+
 // ---------------------------------------------------------------------------
 // Worker trait
 // ---------------------------------------------------------------------------
@@ -234,6 +243,13 @@ pub trait Worker: Send {
     fn snapshot_budget(&self) -> Option<SnapshotBudget> {
         None
     }
+
+    /// What this worker's model keeps for a sequence, as its compiled model states it: a Gated
+    /// DeltaNet or Mamba-2 hybrid keeps a recurrent (conv + ssm) state beside its KV, which a
+    /// cached KV prefix cannot rebuild, so a prefix hit on it is correct only where a snapshot of
+    /// that state ([`Self::snapshot_budget`]) is restored with it. Known at `load_model` time.
+    /// Every worker states it: a worker that serves a compiled model answers from that model.
+    fn sequence_state(&self) -> SequenceState;
 
     /// Every layer's KV geometry for a model with sliding-window layers — whether each slides
     /// (and its window), its KV heads and head dim — as the worker's compiled model states it.
@@ -496,6 +512,11 @@ impl Worker for NoopWorker {
     fn is_driver_worker(&self) -> bool {
         self.config.is_driver_worker
     }
+
+    /// It runs no model, so it keeps no recurrent state.
+    fn sequence_state(&self) -> SequenceState {
+        SequenceState::Kv
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -545,6 +566,10 @@ mod tests {
         }
         fn is_driver_worker(&self) -> bool {
             true
+        }
+        /// It runs no model.
+        fn sequence_state(&self) -> SequenceState {
+            SequenceState::Kv
         }
         fn max_num_seqs_override(&self) -> Option<usize> {
             self.width

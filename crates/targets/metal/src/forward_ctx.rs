@@ -65,18 +65,18 @@ pub struct ForwardCtx<'a> {
     /// Gated-DeltaNet recurrent-state pool for hybrid arches (Qwen3.5 /
     /// Qwen3-Next). The non-paged sibling of `kv_cache`: the
     /// `Instruction::GatedDeltaNet` eval arm reads/writes per-linear-layer
-    /// `conv_state`/`ssm_state` here, indexed by [`Self::gdn_state_indices`].
+    /// `conv_state`/`ssm_state` here, indexed by [`Self::recurrent_state_indices`].
     /// `None` for non-hybrid arches.
-    pub gdn_state: Option<&'a GdnStatePool<crate::PoolMem>>,
+    pub recurrent_state: Option<&'a GdnStatePool<crate::PoolMem>>,
     /// Per-sequence GDN state records, a
     /// [`GdnSeqSlots`](scratchy_state_decoder_gdn::pool::GdnSeqSlots) a sequence flattened to
     /// `GdnSeqSlots::WORDS` i32s (`[num_seqs * 6]` elements, read whole). `None` for non-hybrid
     /// arches.
-    pub gdn_state_indices: Option<TensorView<'a>>,
+    pub recurrent_state_indices: Option<TensorView<'a>>,
     /// Per-sequence GDN fresh flags, shape `[num_seqs]` u32 — 1 on a
     /// sequence's first (fresh) forward. `None` for non-hybrid arches.
-    pub gdn_is_fresh: Option<TensorView<'a>>,
-    /// A DFlash2 drafter's rings, the sibling of `gdn_state`. `None` for every other model.
+    pub recurrent_is_fresh: Option<TensorView<'a>>,
+    /// A DFlash2 drafter's rings, the sibling of `recurrent_state`. `None` for every other model.
     pub draft_ring: Option<&'a crate::dflash2::DraftRingPool>,
     /// A DFlash2 drafter's per-forward inputs. `None` for every other model's forward.
     pub draft: Option<crate::interpreter::metal::DraftInputs<'a>>,

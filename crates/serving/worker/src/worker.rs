@@ -56,4 +56,7 @@ impl Worker for StopRecordingWorker {
     fn is_driver_worker(&self) -> bool {
         self.0.is_driver_worker()
     }
+    fn sequence_state(&self) -> SequenceState {
+        self.0.sequence_state()
+    }
 }
