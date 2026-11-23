@@ -7405,7 +7405,7 @@ impl ColumnSlice {
 /// ceil(bucket_m/block) [scaled by num_tokens]; blocks past a sequence's end early out).
 fn recurrent_conv(
     p: &ModelFacts,
-    g: scratchy_ir::model_facts::Gdn,
+    g: scratchy_state_decoder_gdn::geometry::Gdn,
     input: Binding,
     conv_w: Binding,
     layer: super::ids::LayerId,
@@ -7507,7 +7507,7 @@ enum ScanForm {
 /// instantiation (all its I/O is f32 scratch). Both scans: grid Z = num_seqs.
 fn recurrent_scan(
     p: &ModelFacts,
-    g: scratchy_ir::model_facts::Gdn,
+    g: scratchy_state_decoder_gdn::geometry::Gdn,
     form: ScanForm,
     bucket_m: u32,
     (ix, layer): (SourceIx, super::ids::LayerId),
@@ -9228,10 +9228,10 @@ mod tests {
     use scratchy_ir::KvCodec;
 
     use scratchy_ir::model_facts::{
-        Attention, AttnScale, AttnWindow, BlockSize, ConvDim, ConvKernel, FactsParts, Gdn,
-        GdnHeadDim, GdnHeads, HeadDim, HeadGeometry, HiddenSize, KvHeads, KvRope, NumDrafts,
-        QueryHeads, Rope, RopePairing, RotDim, SoftCap,
+        Attention, AttnScale, AttnWindow, BlockSize, FactsParts, HeadDim, HeadGeometry, HiddenSize,
+        KvHeads, KvRope, NumDrafts, QueryHeads, Rope, RopePairing, RotDim, SoftCap,
     };
+    use scratchy_state_decoder_gdn::geometry::{ConvDim, ConvKernel, Gdn, GdnHeadDim, GdnHeads};
 
     /// The dispatch a test reads: a command expected to lower to one (a GEMM's test matches
     /// [`TapeCommand::Gemm`] instead).

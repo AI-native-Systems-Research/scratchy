@@ -1657,6 +1657,7 @@ dependencies = [
  "scratchy-forward-compiler",
  "scratchy-forward-compiler-frontend",
  "scratchy-ir",
+ "scratchy-state-decoder-gdn",
  "scratchy-subtile",
  "scratchy-tensors",
  "serde_json",
@@ -1685,6 +1686,7 @@ version = "0.1.0"
 dependencies = [
  "scratchy-layers",
  "scratchy-quantizations",
+ "scratchy-state-decoder-gdn",
  "scratchy-tensors",
  "scratchy-tp-world",
 ]

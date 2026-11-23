@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Golden tests for the Gated-DeltaNet Metal kernels, validated against
-//! reference math that mirrors `scratchy_forward_compiler::cpu_golden::gdn_*` (the
-//! canonical oracle, itself pinned to transformers + mlx-lm). The reference
-//! is inlined here because `cpu_golden` lives in `scratchy-forward-compiler`, which
-//! `scratchy-target-metal` cannot depend on (wrong direction), and the
-//! `scratchy-forward-compiler` lib-test target is independently pre-broken.
+//! reference math: the canonical oracle `scratchy_state_decoder_gdn::reference` (itself pinned
+//! to transformers + mlx-lm). The conv1d, gating and gated-norm references are that oracle called
+//! directly. The scan reference stays inlined
+//! (`recurrent_ref`) because it also rounds its state through the pool's slot dtype at step
+//! boundaries, which the oracle does not.
 //!
 //! Each kernel is dispatched standalone via `SpecializedPipelineCache` +
 //! `get_or_build` (the same path production uses through
@@ -16,11 +16,14 @@ mod common;
 
 use common::Dtype;
 use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions, MTLSize};
-use scratchy_target_metal::aot::{bake, baked_build};
 use scratchy_state_decoder_gdn::pool::{
     CheckpointRows, DraftLane, DraftLanes, GDN_SAVES, GdnSave, GdnSeqSlots, GdnSlot, GdnStart,
     GdnStateDims, GdnStep, RecordArea,
 };
+use scratchy_state_decoder_gdn::reference::{
+    GatingInputs, gdn_causal_conv1d, gdn_gating, gdn_rms_norm_gated,
+};
+use scratchy_target_metal::aot::{bake, baked_build};
 use scratchy_target_metal::detect_device;
 use scratchy_target_metal::gdn_state::GDN_SSM_STATE_DTYPE;
 use scratchy_target_metal::specialized_pipeline_cache::{
@@ -30,7 +33,7 @@ use scratchy_target_metal::specialized_pipeline_cache::{
 type Device = objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn MTLDevice>>;
 type Buffer = objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn MTLBuffer>>;
 
-/// Deterministic fill matching `cpu_golden`'s `fill(i) = sin(i*0.1)*0.5`.
+/// Deterministic fill matching the `reference` golden test's `fill(i) = sin(i*0.1)*0.5`.
 fn fill(n: usize) -> Vec<f32> {
     (0..n).map(|i| (i as f32 * 0.1).sin() * 0.5).collect()
 }
@@ -140,7 +143,7 @@ fn buf_u32(device: &Device, data: &[u32]) -> Buffer {
     buf
 }
 
-/// CPU reference mirroring `cpu_golden::gdn_recurrent` (single sequence, zero
+/// CPU reference mirroring `reference::gdn_recurrent` (single sequence, zero
 /// initial state). q/k: [T, nk*hk]; v/o: [T, nv*hv]; g/beta: [T, nv].
 /// `slot_after_rows` names the rows whose end is a step boundary the state crosses through the
 /// pool's f16 slot — a store, then the next step's load — so the reference rounds its state
@@ -306,8 +309,8 @@ fn dispatch_scan(
     Some(read_f32(&o_buf, num_tokens * value_dim))
 }
 
-/// CPU reference mirroring `cpu_golden::gdn_causal_conv1d` (single fresh seq,
-/// zero left-pad, +SiLU). `weight` is `[conv_dim, kernel]`.
+/// `reference::gdn_causal_conv1d` for a single fresh seq (zero left-pad, +SiLU). `weight` is
+/// `[conv_dim, kernel]`.
 fn conv1d_ref(
     x: &[f32],
     weight: &[f32],
@@ -316,23 +319,12 @@ fn conv1d_ref(
     num_tokens: usize,
 ) -> Vec<f32> {
     let mut out = vec![0f32; num_tokens * conv_dim];
-    for t in 0..num_tokens {
-        for c in 0..conv_dim {
-            let mut acc = 0.0f32;
-            for j in 0..kernel {
-                let ti = t as isize - (kernel as isize - 1) + j as isize;
-                if ti >= 0 {
-                    acc += weight[c * kernel + j] * x[ti as usize * conv_dim + c];
-                }
-            }
-            out[t * conv_dim + c] = acc / (1.0 + (-acc).exp());
-        }
-    }
+    gdn_causal_conv1d(x, weight, &mut out, conv_dim, kernel, num_tokens, true);
     out
 }
 
 /// `gdn_gating_f32` vs reference: g = -exp(A_log[h])*softplus(a+dt_bias[h]),
-/// beta = sigmoid(b). Tiny cpu_golden config nv=4, T=6.
+/// beta = sigmoid(b). Tiny reference config nv=4, T=6.
 #[test]
 fn gdn_gating_matches_reference() {
     let Some(di) = detect_device() else {
@@ -350,17 +342,17 @@ fn gdn_gating_matches_reference() {
     let a_log = fill(nv);
     let dt_bias = fill(nv);
 
-    // Reference (mirrors cpu_golden::gdn_gating).
-    let softplus = |x: f32| if x <= 20.0 { x.exp().ln_1p() } else { x };
     let mut g_ref = vec![0f32; n];
     let mut beta_ref = vec![0f32; n];
-    for ti in 0..t {
-        for h in 0..nv {
-            let idx = ti * nv + h;
-            g_ref[idx] = -(a_log[h].exp()) * softplus(a[idx] + dt_bias[h]);
-            beta_ref[idx] = 1.0 / (1.0 + (-b[idx]).exp());
-        }
-    }
+    let gating = GatingInputs {
+        a: &a,
+        b: &b,
+        a_log: &a_log,
+        dt_bias: &dt_bias,
+        num_heads: nv,
+        num_tokens: t,
+    };
+    gdn_gating(&gating, &mut g_ref, &mut beta_ref);
 
     let key = PipelineKey::new(
         "gdn_gating",
@@ -418,7 +410,7 @@ fn gdn_gating_matches_reference() {
 
 /// `gdn_rms_norm_gated_f32` vs reference: per value-head rmsnorm of the scan
 /// output `x`, times `weight`, times `SiLU(z)` (NOT plain sigmoid). Mirrors
-/// `cpu_golden::gdn_rms_norm_gated`. Tiny config d=hv=4, total_rows=t*nv=24.
+/// `reference::gdn_rms_norm_gated`. Tiny config d=hv=4, total_rows=t*nv=24.
 #[test]
 fn gdn_rms_norm_gated_matches_reference() {
     let Some(di) = detect_device() else {
@@ -435,18 +427,8 @@ fn gdn_rms_norm_gated_matches_reference() {
     let z = fill(total_rows * d);
     let weight = fill(d);
 
-    // Reference (mirrors cpu_golden::gdn_rms_norm_gated).
     let mut out_ref = vec![0f32; total_rows * d];
-    for r in 0..total_rows {
-        let row = &x[r * d..][..d];
-        let var = row.iter().map(|&v| v * v).sum::<f32>() / d as f32;
-        let inv = 1.0 / (var + eps).sqrt();
-        for i in 0..d {
-            let zi = z[r * d + i];
-            let silu_z = zi / (1.0 + (-zi).exp());
-            out_ref[r * d + i] = row[i] * inv * weight[i] * silu_z;
-        }
-    }
+    gdn_rms_norm_gated(&x, &z, &weight, &mut out_ref, d, total_rows, eps);
 
     let key = PipelineKey::new(
         "gdn_rms_norm_gated",
@@ -742,7 +724,7 @@ fn gdn_rms_norm_gated_simd_refuses_an_ineligible_width() {
 }
 
 /// `gdn_conv1d_varlen_f32`, single fresh sequence (is_fresh=1, zero left-pad):
-/// must match `cpu_golden::gdn_causal_conv1d`. Config conv_dim=32, kernel=4.
+/// must match `reference::gdn_causal_conv1d`. Config conv_dim=32, kernel=4.
 #[test]
 fn gdn_conv1d_varlen_matches_reference() {
     let Some(di) = detect_device() else {
@@ -816,7 +798,7 @@ fn gdn_conv1d_varlen_matches_reference() {
 /// Multi-step continuity for the conv_state ring: forward(6) then forward(1)
 /// as a *continuation* (is_fresh=0, sharing the same persistent state buffer)
 /// must equal token 6 of forward(7)-fresh. This exercises the ring carry-over
-/// that `cpu_golden::gdn_causal_conv1d` does not cover.
+/// that `reference::gdn_causal_conv1d` does not cover.
 #[test]
 fn gdn_conv1d_varlen_continuity() {
     let Some(di) = detect_device() else {
@@ -899,7 +881,7 @@ fn gdn_conv1d_varlen_continuity() {
     }
 }
 
-/// `gdn_scan_varlen_f32` vs `cpu_golden::gdn_recurrent` on the tiny config
+/// `gdn_scan_varlen_f32` vs `reference::gdn_recurrent` on the tiny config
 /// (nk=2, nv=4, hk=hv=4) — which exercises GVA (groups=2, key head = h/2).
 #[test]
 fn gdn_scan_varlen_matches_reference() {
