@@ -352,12 +352,6 @@ struct BoundAffineCodes {
 pub enum AffineCodesBindError {
     /// The range lies in none of this allocator's buffers.
     NotAllocated { addr: usize },
-    /// Two commands read one range differently.
-    ReadersDisagree {
-        addr: usize,
-        first: AffineCodes,
-        then: AffineCodes,
-    },
     /// The range partially overlaps one bound before it.
     Overlap {
         addr: usize,
@@ -376,12 +370,6 @@ impl std::fmt::Display for AffineCodesBindError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NotAllocated { addr } => write!(f, "affine codes {addr:#x} are in no arena"),
-            Self::ReadersDisagree { addr, first, then } => {
-                write!(
-                    f,
-                    "affine codes {addr:#x}: one command reads them {first:?}, another {then:?}"
-                )
-            }
             Self::Overlap {
                 addr,
                 len,
@@ -909,17 +897,11 @@ impl MetalAllocator {
             .range(..p + len.max(1))
             .next_back()
             .map(|(&a, &r)| (a, r));
+        // A range already bound is read the way it was first bound — one weight, one vote: the
+        // bake states the vote once per family (`tape::lowering::codes_for`), so every reader
+        // of the range binds the same codes and the first binding serves them all.
         let first = match prev {
-            Some((a, (l, first))) if a == p && l == len => {
-                if first != codes {
-                    return Err(AffineCodesBindError::ReadersDisagree {
-                        addr: p,
-                        first,
-                        then: codes,
-                    });
-                }
-                false
-            }
+            Some((a, (l, _))) if a == p && l == len => false,
             Some((a, (l, _))) if a + l > p => {
                 return Err(AffineCodesBindError::Overlap {
                     addr: p,
@@ -2416,8 +2398,9 @@ mod tests {
     }
 
     /// Codes in a weight arena are stored offset-8 once, however many
-    /// commands bind them; a reader that disagrees, a partially overlapping
-    /// range and a foreign pointer are refused; codes read as written stay.
+    /// commands bind them — one weight, one vote, the first binding serving
+    /// every reader; a partially overlapping range and a foreign pointer are
+    /// refused; codes read as written stay.
     #[test]
     fn affine_codes_store_offset8_once_in_a_weight_arena() {
         let Some(device) = try_device() else {
@@ -2442,10 +2425,14 @@ mod tests {
             );
             assert_eq!(read(a), flipped);
         }
-        assert!(matches!(
-            alloc.bind_affine_codes(a, codes.len(), AffineCodes::AsWritten),
-            Err(AffineCodesBindError::ReadersDisagree { .. })
-        ));
+        // The weight's first binding is its one vote: a later bind naming other codes reads
+        // that binding — the storage never flips under a reader.
+        assert!(
+            alloc
+                .bind_affine_codes(a, codes.len(), AffineCodes::AsWritten)
+                .is_ok()
+        );
+        assert_eq!(read(a), flipped);
         assert!(matches!(
             alloc.bind_affine_codes(a.wrapping_add(16), 16, AffineCodes::Offset8),
             Err(AffineCodesBindError::Overlap { .. })
@@ -2484,8 +2471,9 @@ mod tests {
         assert_eq!(sorted, codes, "a permutation of the bytes");
     }
 
-    /// A planes reader stores its range once, XOR 0x88 and regrouped; a reader of the same range
-    /// stored any other way refuses the bind.
+    /// A planes reader stores its range once, XOR 0x88 and regrouped; every later reader of the
+    /// same range reads that one binding — one weight, one vote, the storage never flipping
+    /// under a reader.
     #[test]
     fn affine_codes_store_planes_once_in_a_weight_arena() {
         let Some(device) = try_device() else {
@@ -2515,10 +2503,8 @@ mod tests {
             AffineCodes::AsWritten,
             AffineCodes::Planes { k: 64 },
         ] {
-            assert!(matches!(
-                alloc.bind_affine_codes(a, codes.len(), other),
-                Err(AffineCodesBindError::ReadersDisagree { .. })
-            ));
+            assert!(alloc.bind_affine_codes(a, codes.len(), other).is_ok());
+            assert_eq!(read(a), want);
         }
     }
 

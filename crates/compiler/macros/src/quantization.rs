@@ -1315,6 +1315,24 @@ pub fn embed_table_role(program: &Program, fuf: &Fuf) -> String {
         .unwrap_or_else(|| "embed_tokens".to_string())
 }
 
+/// Whether `role` is the head a model tying its logits to its embedding
+/// (`tie_word_embeddings`) reads: the `LM_HEAD_ROLE` role on a tying model. The one statement
+/// of the tie's predicate — the loader plan (`FieldLoad::LinearTiedToEmbedding`) and this
+/// resolver's tied-head arm both take it.
+pub fn is_tied_head(model: &crate::config::ModelParams, role: &str) -> bool {
+    role == crate::config::LM_HEAD_ROLE && model.tie_word_embeddings
+}
+
+/// The table role a tied head reads: the head's `weight_leaf_renames` entry when the arch
+/// renames it onto a table of its own (Gemma 4's drafter embeds with its target's lent table,
+/// its logits its own), else the embedding's role. The one statement of the tie's target.
+fn tied_table_role(program: &Program, embed_role: &str) -> String {
+    match program.rename_dotted(crate::config::LM_HEAD_ROLE) {
+        renamed if renamed != crate::config::LM_HEAD_ROLE => renamed,
+        _ => embed_role.to_string(),
+    }
+}
+
 /// Whether a per-module key (an exact on-disk path) or a `bits_overrides` suffix names the
 /// embedding table `role`: equal, or one ends with the other at a dotted-segment boundary.
 pub fn names_embed(key: &str, role: &str) -> bool {
@@ -1397,13 +1415,8 @@ pub fn storage_format_for_weight(
     // `LinearTiedToEmbedding { affine: Some((gs, bits)) }` arm
     // emits `LinearLayer::AffineQuant(...)` sharing the embed's
     // packed buffers.
-    if dotted == crate::config::LM_HEAD_ROLE && model.tie_word_embeddings {
-        // The table it shares: the embedding's, unless the arch renames the head onto a table of
-        // its own (Gemma 4's drafter embeds with its target's lent table, its logits its own).
-        let tied_role = match program.rename_dotted(crate::config::LM_HEAD_ROLE) {
-            renamed if renamed != crate::config::LM_HEAD_ROLE => renamed,
-            _ => embed_role.clone(),
-        };
+    if is_tied_head(model, &dotted) {
+        let tied_role = tied_table_role(program, &embed_role);
         if let QuantMethod::Affine {
             bits,
             group_size,
@@ -1512,7 +1525,7 @@ pub fn storage_format_for_weight(
     // `.qweight` and the model fails to load. Covers both AutoGPTQ
     // native and compressed-tensors INT4 (both fall through the
     // `QuantMethod::Gptq` arm regardless of on-disk layout).
-    if dotted == "lm_head" && matches!(qc.method, QuantMethod::Gptq { .. }) {
+    if dotted == crate::config::LM_HEAD_ROLE && matches!(qc.method, QuantMethod::Gptq { .. }) {
         return StorageFormat::Dense;
     }
 
@@ -1520,7 +1533,7 @@ pub fn storage_format_for_weight(
     // quantized. unsloth / official bitsandbytes checkpoints ship
     // `lm_head.weight` as plain bf16/fp16 alongside all the
     // 4-bit-packed decoder layers.
-    if dotted == "lm_head" && matches!(qc.method, QuantMethod::Bnb4 { .. }) {
+    if dotted == crate::config::LM_HEAD_ROLE && matches!(qc.method, QuantMethod::Bnb4 { .. }) {
         return StorageFormat::Dense;
     }
 
@@ -1529,7 +1542,7 @@ pub fn storage_format_for_weight(
     // alongside the FP8 decoder layers. Same rationale as GPTQ —
     // the output projection is tied or kept high-precision for
     // sampling quality.
-    if dotted == "lm_head" && matches!(qc.method, QuantMethod::Fp8 { .. }) {
+    if dotted == crate::config::LM_HEAD_ROLE && matches!(qc.method, QuantMethod::Fp8 { .. }) {
         return StorageFormat::Dense;
     }
 
@@ -1539,7 +1552,7 @@ pub fn storage_format_for_weight(
     // checkpoint omits it from the list. (embed_tokens needs no rule: it
     // only feeds an Embed op, which isn't a matmul consumer for NVFP4, so
     // it already falls through to Dense below.)
-    if dotted == "lm_head" && matches!(qc.method, QuantMethod::Nvfp4 { .. }) {
+    if dotted == crate::config::LM_HEAD_ROLE && matches!(qc.method, QuantMethod::Nvfp4 { .. }) {
         return StorageFormat::Dense;
     }
 
@@ -1547,7 +1560,7 @@ pub fn storage_format_for_weight(
     // dequantizes `output.weight` (lm_head) and ships it via
     // `take_gguf_dense`. The codegen FieldLoad arm for GGUF lm_head
     // uses the dense path, so the storage format must agree.
-    if dotted == "lm_head" && matches!(qc.method, QuantMethod::Ggml) {
+    if dotted == crate::config::LM_HEAD_ROLE && matches!(qc.method, QuantMethod::Ggml) {
         return StorageFormat::Dense;
     }
 
