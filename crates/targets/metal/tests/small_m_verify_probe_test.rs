@@ -24,7 +24,7 @@ use scratchy_target_metal::mtl4_dispatch::{Mtl4DispatchBatch, shared_slice, shar
 use scratchy_target_metal::specialized_pipeline_cache::{
     ConstantValue, PipelineKey, SpecializedPipelineCache,
 };
-use scratchy_target_metal::tape::kernel_constants::AffineCodes;
+use scratchy_target_metal::tape::kernel_constants::{AffineCodes, RowCodes};
 use scratchy_target_metal::tape::quantized::{
     DequantDtype, SMALL_M_SIMDGROUPS, SMALL_M_TILE_COLS, ScaleDtype, SmallMTile, W4a8Gemm,
     W4a8Rows, W4a8SplitK, W4a8Tile, small_m_kernel_static_name, w4a8_quant_static_name,
@@ -127,7 +127,7 @@ fn small_m_steps_in_a_w4a8_bucket_at_qwen38_27b_shapes() {
                 ConstantValue::int(1, n as i32),
                 ConstantValue::int(2, BUCKET as i32),
             ];
-            constants.extend(AffineCodes::Offset8.constant());
+            constants.extend(AffineCodes::Rows(RowCodes::Offset8).constant());
             let picked = W4a8Gemm::for_small_m(n, k, BUCKET);
             let mut cells = vec![Cell {
                 tag: "twin".into(),

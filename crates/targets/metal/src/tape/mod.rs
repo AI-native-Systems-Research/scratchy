@@ -5,6 +5,7 @@
 //! the same command construction the runtime uses, emitting the results
 //! as static literals: one implementation, called by the macro at
 //! expansion, with the runtime playing the emitted statics.
+pub mod codes;
 pub mod constants;
 pub mod continuation_witness;
 pub mod facts;

@@ -19,7 +19,7 @@ use scratchy_target_metal::aot::baked_pipeline;
 use scratchy_target_metal::device::detect_device;
 use scratchy_target_metal::quantized::{DequantDtype, ScaleDtype};
 use scratchy_target_metal::specialized_pipeline_cache::ConstantValue;
-use scratchy_target_metal::tape::kernel_constants::AffineCodes;
+use scratchy_target_metal::tape::kernel_constants::{AffineCodes, RowCodes};
 
 /// CPU reference: gather-then-dequant. Each output element is
 /// `scale[vocab_idx, group] * nibble + bias[vocab_idx, group]` with
@@ -340,7 +340,7 @@ fn run_kernel_f16(
         indices,
         (hidden_size, group_size),
         DequantDtype::F16,
-        AffineCodes::AsWritten,
+        AffineCodes::Rows(RowCodes::AsWritten),
     ) {
         Some(out_buf) => common::read_slice(&out_buf, n_out),
         None => Vec::new(),
@@ -363,7 +363,7 @@ fn run_kernel_bf16(
         indices,
         (hidden_size, group_size),
         DequantDtype::Bf16,
-        AffineCodes::AsWritten,
+        AffineCodes::Rows(RowCodes::AsWritten),
     ) {
         Some(out_buf) => common::read_slice(&out_buf, n_out),
         None => Vec::new(),
@@ -402,16 +402,19 @@ fn affine_embed_b4_offset8_codes_match_as_written() {
         )
         .map(|b| common::read_slice::<half::bf16>(&b, indices.len() * hidden_size as usize))
     };
-    let Some(as_written) = run(&packed, AffineCodes::AsWritten) else {
+    let Some(as_written) = run(&packed, AffineCodes::Rows(RowCodes::AsWritten)) else {
         eprintln!("skipping: no Metal 4 GPU");
         return;
     };
     let offset8: Vec<u8> = packed.iter().map(|b| b ^ 0x88).collect();
     assert_ne!(
-        run(&offset8, AffineCodes::AsWritten).as_ref(),
+        run(&offset8, AffineCodes::Rows(RowCodes::AsWritten)).as_ref(),
         Some(&as_written)
     );
-    assert_eq!(run(&offset8, AffineCodes::Offset8), Some(as_written));
+    assert_eq!(
+        run(&offset8, AffineCodes::Rows(RowCodes::Offset8)),
+        Some(as_written)
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────

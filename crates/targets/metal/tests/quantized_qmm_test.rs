@@ -31,7 +31,7 @@ use scratchy_target_metal::quantized::{
     qmm_t_kernel_name,
 };
 use scratchy_target_metal::specialized_pipeline_cache::ConstantValue;
-use scratchy_target_metal::tape::kernel_constants::AffineCodes;
+use scratchy_target_metal::tape::kernel_constants::{AffineCodes, RowCodes};
 
 mod common;
 
@@ -176,7 +176,7 @@ fn run_qmm_t_bf16(
         x,
         (m, n, k, group_size),
         expected_kernel,
-        AffineCodes::AsWritten,
+        AffineCodes::Rows(RowCodes::AsWritten),
     )
 }
 
@@ -778,7 +778,7 @@ fn affine_qmm_t_nax_b4_bf16_matches_cpu_reference() {
             4,
             DequantDtype::Bf16,
             ScaleDtype::F16,
-            AffineCodes::AsWritten,
+            AffineCodes::Rows(RowCodes::AsWritten),
         );
         let (tg, tpg) = qmm_t_dispatch_shape(kernel, m as u32, n as u32, 1);
         let threadgroups = objc2_metal::MTLSize {
@@ -906,15 +906,19 @@ fn affine_qmm_t_b4_offset8_codes_match_cpu_reference() {
         } else {
             1.0
         };
-        let (idx, mv, ev, err, allowed) =
-            worst_abs_error_vs_noise_floor(&run(&offset8, AffineCodes::Offset8), &expected, k, 0.5);
+        let (idx, mv, ev, err, allowed) = worst_abs_error_vs_noise_floor(
+            &run(&offset8, AffineCodes::Rows(RowCodes::Offset8)),
+            &expected,
+            k,
+            0.5,
+        );
         assert!(
             err <= allowed * slack,
             "{kernel:?} offset-8: abs_err={err:.5} at {idx} (allowed {:.5}; metal={mv}, cpu={ev})",
             allowed * slack
         );
         let (_, _, _, wrong, allowed) = worst_abs_error_vs_noise_floor(
-            &run(&offset8, AffineCodes::AsWritten),
+            &run(&offset8, AffineCodes::Rows(RowCodes::AsWritten)),
             &expected,
             k,
             0.5,
@@ -950,8 +954,8 @@ fn affine_qmm_t_nax_k_steps_and_tails_match_cpu_reference() {
         let offset8: Vec<u8> = packed.iter().map(|b| b ^ 0x88).collect();
         for (dequant, (codes, packed)) in NaxDequant::ALL.into_iter().flat_map(|d| {
             [
-                (AffineCodes::AsWritten, &packed),
-                (AffineCodes::Offset8, &offset8),
+                (AffineCodes::Rows(RowCodes::AsWritten), &packed),
+                (AffineCodes::Rows(RowCodes::Offset8), &offset8),
             ]
             .map(|c| (d, c))
         }) {

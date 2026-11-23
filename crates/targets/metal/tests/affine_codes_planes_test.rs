@@ -18,7 +18,9 @@ use scratchy_target_metal::mtl4_dispatch::{
 use scratchy_target_metal::specialized_pipeline_cache::{
     ConstantValue, PipelineKey, SpecializedPipelineCache,
 };
-use scratchy_target_metal::tape::kernel_constants::{AFFINE_PLANE_ROW_BYTES, AffineCodes};
+use scratchy_target_metal::tape::kernel_constants::{
+    AFFINE_PLANE_ROW_BYTES, AffineCodes, PlanesK, RowCodes,
+};
 use scratchy_target_metal::tape::quantized::{
     W4a8Rows, W4a8SplitK, w4a8_quant_static_name, w4a8_scratch_bytes,
 };
@@ -148,8 +150,8 @@ fn every_planes_reader_matches_its_rows_twin_bit_for_bit() {
     for (n, k) in [(1024u32, 5120u32), (5120, 6144)] {
         let w = weight(&device, n, k, n as u64);
         let u = weight(&device, n, k, 7 + n as u64);
-        let rows_codes = AffineCodes::Offset8;
-        let planes_codes = AffineCodes::Planes { k };
+        let rows_codes = AffineCodes::Rows(RowCodes::Offset8);
+        let planes_codes = AffineCodes::Planes { k: PlanesK::of(k) };
         let (nu, ku) = (n as usize, k as usize);
         for m in [1u32, 8, 16, 64] {
             let mu = m as usize;
@@ -321,7 +323,7 @@ fn every_planes_reader_matches_its_rows_twin_bit_for_bit() {
                 let pre: Vec<PrePass<'_>> = match quant_rows {
                     Some(rows) => {
                         let mut qc = vec![int(0, k), int(2, rows)];
-                        qc.extend(AffineCodes::Offset8.constant());
+                        qc.extend(AffineCodes::Rows(RowCodes::Offset8).constant());
                         vec![(
                             w4a8_quant_static_name(
                                 W4a8Rows::Dense,

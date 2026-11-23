@@ -32,8 +32,8 @@ use scratchy_target_metal::op_abi::{
 use scratchy_target_metal::tape::ids::{ArenaSlotIdx, SourceIx};
 use scratchy_target_metal::tape::lowered::Fence;
 use scratchy_target_metal::tape::step::{
-    AffineBits, AffineGroupSize, HiddenSize, IntermediateSize, LayerId, MetalStep, MetalStepTape,
-    RotaryTables, RowSource, StepRow,
+    AffineBits, AffineGroupSize, HiddenSize, IntermediateSize, LayerId, MetalStepTape,
+    RotaryTables, RowSource,
 };
 
 use scratchy_target_metal::tape::lowering::TapeHalf;
@@ -315,11 +315,17 @@ pub struct MetalStepFacts<'a> {
     pub embed_quant: Option<(AffineGroupSize, AffineBits)>,
     /// The head weight the model's logits read (`codegen::head_weight`: a decoder's terminal
     /// gemm), `None` for an encoder. The head is the one weight a drafter borrows of its target
-    /// (`LentWeight::LmHead`), reading its codes as the device stores them — and a tied head is
-    /// the table's weight under another name — so the family reading it votes as-stored
-    /// (`MetalStepTape::as_stored_sources`), whichever half reads it. A weight id, not a role:
-    /// the rows' recordings name the ids they read, so the family resolves from them.
+    /// (`LentWeight::LmHead`), reading its codes a row at a time — and a tied head is the table's
+    /// weight under another name — so its family's codes are the head's
+    /// (`MetalStepTape::head`, `CodesRole::Head`), whichever half reads it. A weight id, not a
+    /// role: the rows' recordings name the ids they read, so the family resolves from them.
     pub head_weight: Option<WeightId>,
+    /// The embedding table the gather reads (the model's `Embed` op's weight), which it reads
+    /// through no operand (`ModelNamed::Embedding`): the DSL weight its codes are.
+    pub embed_weight: Option<WeightId>,
+    /// A tied head's table (`quantization::is_tied_head`, `tied_table_role`): the DSL weight the
+    /// head is under another name, whose codes the head's are. `None` for an untied head.
+    pub tied_table: Option<WeightId>,
     pub mlp: MlpForm,
     /// A MoE layer's routed-expert projection widths, gate/up/down (`None` = the op's own).
     /// `None` altogether for an unquantized model: its MoE bits are never repacked.
@@ -379,6 +385,10 @@ pub struct StepOperands {
     /// of the site it reads it through (`Recording::read`).
     pub backbone_weights: Vec<Vec<(SourceIx, u32)>>,
     pub lm_head_weights: Vec<Vec<(SourceIx, u32)>>,
+    /// The embedding table's DSL weight ([`MetalStepFacts::embed_weight`]).
+    pub embed_weight: Option<u32>,
+    /// A tied head's DSL weight and its table's ([`MetalStepFacts::tied_table`]).
+    pub tie: Option<(u32, u32)>,
 }
 
 impl StepOperands {
@@ -398,6 +408,32 @@ impl StepOperands {
             TapeHalf::LmHead => &self.lm_head_weights,
         };
         rows.get(row as usize).map_or(&[], Vec::as_slice)
+    }
+
+    /// The DSL weight the codes row `row` of `half` reads through family `ix` (a site of `kind`)
+    /// are — one tensor whichever families bind it (`codes::CodesRead::of`): the one weight its op
+    /// reads through `ix`; the embedding table for the gather, which reads it through no operand;
+    /// a tied head's table for the head. `None` where the row records no one weight.
+    pub fn codes_weight(
+        &self,
+        half: TapeHalf,
+        row: u32,
+        ix: SourceIx,
+        kind: &WeightKind,
+    ) -> Option<scratchy_target_metal::tape::codes::CodesWeight> {
+        let mut ids =
+            (self.weights(half, row).iter()).filter_map(|&(at, id)| (at == ix).then_some(id));
+        let id = match (ids.next(), kind) {
+            (Some(id), _) if ids.all(|other| other == id) => Some(id),
+            (Some(_), _) => None,
+            (None, WeightKind::AffineQuantEmbedding) => self.embed_weight,
+            (None, _) => None,
+        }?;
+        let id = match self.tie {
+            Some((head, table)) if id == head => table,
+            _ => id,
+        };
+        Some(scratchy_target_metal::tape::codes::CodesWeight(id))
     }
 }
 
@@ -687,32 +723,14 @@ pub fn lower_canonical(
         .iter()
         .map(|s| sources.row(s, facts.embed_base))
         .collect();
-    // One weight, one vote: the source families whose codes some reader reads as the device
-    // stores them, never planes — the head (a drafter borrows it of its target, reading
-    // as-stored; a tied head is the table's weight under another name) and the embedding tables
-    // this band's gathers read row-whole. Resolved from the model's own facts — the head's
-    // weight id, matched against the rows' recorded reads; the tables, against the gather rows'
-    // sites — never from where a reader sits: every band and bucket resolves the same families
-    // for the same weights, so every command's vote (`tape::lowering::codes_for`) reads one
-    // weight one way. A head no read names is a head no row binds: the family and the id come
-    // from the same recording, so a miss means this band votes no head family at all.
+    // The head family: the head's weight id matched against the rows' recorded reads. A head no
+    // read names is a head no row binds: the family and the id come from the same recording.
     let head = facts.head_weight.and_then(|head| {
         (backbone_weights.iter().chain(&rolled.lm_weights))
             .flat_map(|r| r.iter())
             .find(|(_, id)| *id == head.0)
             .and_then(|(slot, _)| sources.family(slot))
     });
-    let mut as_stored_sources = head.into_iter().collect::<Vec<SourceIx>>();
-    for (row, sources_of_row) in backbone.iter().zip(&backbone_sources) {
-        if matches!(row, StepRow::Step(MetalStep::AffineEmbed(..), _)) {
-            as_stored_sources.extend(
-                sources_of_row
-                    .iter()
-                    .filter(|s| s.kind == WeightKind::AffineQuantEmbedding)
-                    .map(|s| s.ix),
-            );
-        }
-    }
     Ok(MetalCanonical {
         steps: MetalStepTape {
             backbone,
@@ -723,13 +741,15 @@ pub fn lower_canonical(
             lm_head_barriers,
             lm_head_sources,
             lm_head_live,
-            as_stored_sources,
+            head,
         },
         operands: StepOperands {
             backbone: backbone_operands,
             lm_head: rolled.lm_operands,
             backbone_weights: backbone_weights.iter().map(|r| sources.reads(r)).collect(),
             lm_head_weights: rolled.lm_weights.iter().map(|r| sources.reads(r)).collect(),
+            embed_weight: facts.embed_weight.map(|w| w.0),
+            tie: (facts.head_weight.zip(facts.tied_table)).map(|(head, table)| (head.0, table.0)),
         },
         colours: colour_count,
         result,

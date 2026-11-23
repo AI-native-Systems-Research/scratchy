@@ -691,19 +691,77 @@ impl From<AttentionPrefillPagedConstants> for Vec<ConstantValue> {
 
 // ── MLX-affine code storage ──────────────────────────────────────
 
-/// How the MLX-affine packed codes a command reads are stored. On a
-/// [`GenClass::stores_affine_b4_offset8`](crate::tape::lowered::GenClass::stores_affine_b4_offset8)
-/// target every 4-bit weight's codes are stored XOR 0x88; every kernel
-/// that reads them carries this, and on `Offset8` gets `AFFINE_CODES_OFFSET8`
-/// (slot 5) to XOR them back. `Planes` is offset-8 codes regrouped a 64-input chunk at a
-/// time (`affine_codes.h`: chunk `c`'s 32 bytes of every row, row after row), which a kernel
-/// reads under `AFFINE_CODES_PLANES` (slot 24) as well; `k` is the rows' input count, which
-/// the store needs to regroup them.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+/// How the MLX-affine packed codes of one weight are stored, and so how every kernel reading them
+/// reads them: decided once per weight at the bake ([`crate::tape::codes::decide`]), carried by
+/// the tape's codes table ([`crate::tape::codes::AffineCodesTable`]), stored that way once at load,
+/// and baked into each reading command's constants from the same entry.
+///
+/// - [`AffineCodes::Rows`]: row after row, each row whole — as written, or offset-8
+///   ([`RowCodes`]).
+/// - [`AffineCodes::Planes`]: offset-8 codes regrouped a 64-input chunk at a time
+///   (`affine_codes.h`: chunk `c`'s 32 bytes of every row, row after row), which a kernel reads
+///   under `AFFINE_CODES_PLANES` (slot 24) as well; `k` is the rows' input count, which the store
+///   needs to regroup them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize)]
 pub enum AffineCodes {
+    Rows(RowCodes),
+    Planes { k: PlanesK },
+}
+
+/// Codes stored row after row, each row whole: what a reader needing a whole row reads (a row
+/// gather, a vocabulary suffix past a head's prefix, an expert bank). On a
+/// [`GenClass::stores_affine_b4_offset8`](crate::tape::lowered::GenClass::stores_affine_b4_offset8)
+/// class every 4-bit weight's codes are stored XOR 0x88, and every kernel reading them gets
+/// `AFFINE_CODES_OFFSET8` (slot 5) to XOR them back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize)]
+pub enum RowCodes {
     AsWritten,
     Offset8,
-    Planes { k: u32 },
+}
+
+impl RowCodes {
+    /// How `class` stores `bits`-bit codes row-whole: offset-8 for 4-bit codes on a class that
+    /// stores them so, as written otherwise. The one law of row-whole storage.
+    pub const fn of(
+        class: crate::tape::lowered::GenClass,
+        bits: crate::tape::ids::AffineBits,
+    ) -> Self {
+        match class.stores_affine_b4_offset8() && bits.get() == 4 {
+            true => RowCodes::Offset8,
+            false => RowCodes::AsWritten,
+        }
+    }
+}
+
+/// The input count of a weight whose codes are stored as planes: whole 64-input chunks only, the
+/// unit a plane regroups.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize)]
+pub struct PlanesK(u32);
+
+impl PlanesK {
+    /// The inputs of one plane's chunk.
+    pub const CHUNK: u32 = 64;
+
+    /// `k` inputs as planes take them; `None` for a `k` of no whole chunk count.
+    pub const fn new(k: u32) -> Option<Self> {
+        match k > 0 && k.is_multiple_of(Self::CHUNK) {
+            true => Some(Self(k)),
+            false => None,
+        }
+    }
+
+    /// `k` as [`Self::new`] takes it, in a const context: a `k` of no whole chunk count fails the
+    /// build there.
+    pub const fn of(k: u32) -> Self {
+        match Self::new(k) {
+            Some(k) => k,
+            None => panic!("planes take whole 64-input chunks"),
+        }
+    }
+
+    pub const fn get(self) -> u32 {
+        self.0
+    }
 }
 
 /// The bytes of a 64-input chunk of one 4-bit row: the unit [`AffineCodes::Planes`] regroups.
@@ -712,19 +770,20 @@ pub const AFFINE_PLANE_ROW_BYTES: usize = 32;
 /// `AFFINE_CODES_PLANES`' constant slot (`affine_codes.h`).
 pub const AFFINE_CODES_PLANES_SLOT: ConstSlot = ConstSlot(24);
 
-impl AffineCodes {
-    pub fn of(profile: Option<&crate::targets::MetalTargetProfile>, bits: u32) -> Self {
-        AffineCodesTarget::of(profile).for_bits(bits)
-    }
+/// `AFFINE_CODES_OFFSET8`'s constant slot (`affine_codes.h`).
+pub const AFFINE_CODES_OFFSET8_SLOT: ConstSlot = ConstSlot(5);
 
-    /// Slot 5, set on `Offset8` and `Planes`, so every other pipeline keeps its key.
+impl From<RowCodes> for AffineCodes {
+    fn from(rows: RowCodes) -> Self {
+        AffineCodes::Rows(rows)
+    }
+}
+
+impl AffineCodes {
+    /// Slot 5, set on offset-8 rows and on planes, so every other pipeline keeps its key.
     pub fn constant(self) -> Option<ConstantValue> {
-        match self {
-            AffineCodes::Offset8 | AffineCodes::Planes { .. } => {
-                Some(ConstantValue::boolean(ConstSlot(5), true))
-            }
-            AffineCodes::AsWritten => None,
-        }
+        self.signed()
+            .then(|| ConstantValue::boolean(AFFINE_CODES_OFFSET8_SLOT, true))
     }
 
     /// Every constant a kernel reading codes stored this way takes: slot 5 on offset-8 storage,
@@ -737,59 +796,10 @@ impl AffineCodes {
 
     /// Signed (q - 8) codes: offset-8, as planes or not — what the matrix-unit kernels read.
     pub fn signed(self) -> bool {
-        matches!(self, AffineCodes::Offset8 | AffineCodes::Planes { .. })
-    }
-
-    /// The same codes regrouped into planes, for rows of `k` inputs: offset-8 storage only
-    /// (the planes kernels read signed codes), whole 64-input chunks only.
-    pub fn planes(self, k: u32) -> Self {
-        match self {
-            AffineCodes::Offset8 if k.is_multiple_of(64) => AffineCodes::Planes { k },
-            codes => codes,
-        }
-    }
-
-    /// What a command whose kernel reads codes declares, from its baked
-    /// constants (slot 5 is `bool` only on such kernels; slot 24 likewise, with its input
-    /// count at slot 0, `QMM_K` / `IN_VEC_SIZE`).
-    pub fn of_constants(constants: &[ConstantValue]) -> Self {
-        let has = |c: ConstantValue| constants.contains(&c);
-        let planes = ConstantValue::boolean(AFFINE_CODES_PLANES_SLOT, true);
-        match AffineCodes::Offset8.constant() {
-            Some(c) if has(c) && has(planes) => {
-                let k = (constants.iter()).find(|v| v.index == 0).map(|v| v.bits);
-                AffineCodes::Planes {
-                    k: k.expect("a planes reader names its input count at slot 0"),
-                }
-            }
-            Some(c) if has(c) => AffineCodes::Offset8,
-            _ => AffineCodes::AsWritten,
-        }
-    }
-}
-
-/// A target's code storage, before a weight's width picks its [`AffineCodes`]
-/// (only 4-bit codes are ever stored offset-8).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct AffineCodesTarget {
-    offset8_b4: bool,
-}
-
-impl AffineCodesTarget {
-    pub fn of(profile: Option<&crate::targets::MetalTargetProfile>) -> Self {
-        Self {
-            offset8_b4: profile.is_some_and(|t| {
-                crate::tape::lowered::GenClass::of(t.generation).stores_affine_b4_offset8()
-            }),
-        }
-    }
-
-    pub fn for_bits(self, bits: u32) -> AffineCodes {
-        if self.offset8_b4 && bits == 4 {
-            AffineCodes::Offset8
-        } else {
-            AffineCodes::AsWritten
-        }
+        matches!(
+            self,
+            AffineCodes::Rows(RowCodes::Offset8) | AffineCodes::Planes { .. }
+        )
     }
 }
 

@@ -15,6 +15,7 @@
 
 use proc_macro2::TokenStream;
 use quote::quote;
+use scratchy_target_metal::tape::codes::AffineCodesTable;
 use scratchy_target_metal::tape::ids::{
     BlockSize, HeadDim, MaxBlocksPerSeq, MaxPositions, NumKvHeads, NumQHeads, SourceIx,
     TqDecodeHeads,
@@ -26,7 +27,7 @@ use scratchy_target_metal::tape::lowered::{
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use crate::canonical::StepOperands;
+use crate::canonical::{ClassedCanonical, StepOperands};
 use scratchy_subtile::handoff::ArenaExtents;
 use scratchy_target_metal::tape::lowering::TapeHalf;
 
@@ -72,7 +73,15 @@ pub struct CommandPool {
     affine_weights: BTreeMap<u32, BTreeSet<u32>>,
     /// Each weight family any command binds a tensor of, with the DSL weights its rows' ops read.
     sources: SourceReads,
+    /// The model's codes table for each chip class ([`Self::bake_codes`]): every tape of the class
+    /// is lowered from it.
+    codes: Vec<(GenClass, &'static AffineCodesTable)>,
+    /// The distinct codes tables the model's tape bodies hold, each one `__tape_cmds::CODES_<i>`.
+    codes_statics: Vec<&'static AffineCodesTable>,
 }
+
+/// The chip classes a model's tapes are baked for, each a rung of every bucket.
+const CLASSES: [GenClass; 4] = [GenClass::M1, GenClass::Mid, GenClass::M5, GenClass::M5Wide];
 
 /// The DSL weights row `row` of `half`'s op reads through a site of family `ix`.
 fn read_through(
@@ -289,6 +298,59 @@ impl CommandPool {
             self.affine_weights.entry(ix.0).or_default().extend(read);
         }
         Ok(())
+    }
+
+    /// Bake the model's codes table for every chip class: every codes tensor any bucket's step
+    /// tape for the class — the wide band's for [`GenClass::M5Wide`] where it folds apart, the
+    /// narrow's otherwise — reads ([`codes_reads`]), each decided once
+    /// ([`bake_table`]). Run once, over every bucket, before any bucket lowers.
+    ///
+    /// [`codes_reads`]: scratchy_target_metal::tape::lowering::codes_reads
+    /// [`bake_table`]: scratchy_target_metal::tape::codes::bake_table
+    pub fn bake_codes<'c>(
+        &mut self,
+        mc: &scratchy_ir::model_facts::ModelFacts,
+        canonicals: impl Iterator<Item = &'c ClassedCanonical> + Clone,
+    ) -> Result<(), BakeDefect> {
+        use scratchy_target_metal::tape::{codes::bake_table, lowering::codes_reads};
+        for class in CLASSES {
+            let mut reads = Vec::new();
+            for classed in canonicals.clone() {
+                let band = match (class, &classed.wide) {
+                    (GenClass::M5Wide, Some(wide)) => wide,
+                    _ => &classed.narrow,
+                };
+                let weight =
+                    |half, row, ix, kind: &_| band.operands.codes_weight(half, row, ix, kind);
+                reads.extend(
+                    codes_reads(&band.steps, &weight)
+                        .map_err(|e| BakeDefect(format!("a codes tensor's source: {e}")))?,
+                );
+            }
+            let table = bake_table(class, mc.drafter(), reads)
+                .map_err(|e| BakeDefect(format!("{class:?} codes table: {e}")))?;
+            self.codes.push((class, table));
+        }
+        Ok(())
+    }
+
+    /// The model's codes table for `class` ([`Self::bake_codes`]).
+    fn class_codes(&self, class: GenClass) -> Result<&'static AffineCodesTable, BakeDefect> {
+        (self.codes.iter())
+            .find_map(|&(c, table)| (c == class).then_some(table))
+            .ok_or_else(|| BakeDefect(format!("no {class:?} codes table was baked")))
+    }
+
+    /// The `__tape_cmds` static holding `table`, one per distinct table.
+    fn codes_ident(&mut self, table: &'static AffineCodesTable) -> proc_macro2::Ident {
+        let ix = match self.codes_statics.iter().position(|t| *t == table) {
+            Some(ix) => ix,
+            None => {
+                self.codes_statics.push(table);
+                self.codes_statics.len() - 1
+            }
+        };
+        quote::format_ident!("CODES_{ix}")
     }
 
     fn intern(&mut self, cmd: GatedCommand) -> Result<TokenStream, BakeDefect> {
@@ -509,6 +571,7 @@ impl CommandPool {
                 }
             }
         });
+        let codes = codes_tokens(&self.codes_statics)?;
         let tokens = quote! {
             #[cfg(scratchy_target = "metal")]
             mod __tape_cmds {
@@ -517,6 +580,7 @@ impl CommandPool {
                 #operands
                 #gemm_helpers
                 #command_helper
+                #codes
                 #(#statics)*
                 pub(super) static TABLE: __tl::CommandTable = __tl::CommandTable {
                     commands: &COMMANDS,
@@ -1258,6 +1322,53 @@ pub fn emit_bucket_barriers_static(static_ident: &syn::Ident, barriers: &[bool])
     }
 }
 
+/// The model's codes tables, each `__tape_cmds::CODES_<i>` ([`CommandPool::codes_ident`]): every
+/// entry a literal of its family, tensor, layer and layout.
+fn codes_tokens(tables: &[&'static AffineCodesTable]) -> Result<TokenStream, BakeDefect> {
+    use proc_macro2::Literal;
+    use scratchy_target_metal::tape::codes::{AffineCodes, RowCodes};
+    let row = |r: RowCodes| match r {
+        RowCodes::AsWritten => quote!(__tq::RowCodes::AsWritten),
+        RowCodes::Offset8 => quote!(__tq::RowCodes::Offset8),
+    };
+    let statics = tables.iter().enumerate().map(|(i, table)| {
+        let ident = quote::format_ident!("CODES_{i}");
+        let entries = table.entries.iter().map(|e| {
+            let (ix, layer) = (
+                Literal::u32_unsuffixed(e.ix.0),
+                Literal::u32_unsuffixed(e.layer.0),
+            );
+            let which = crate::const_tokens::const_tokens(&e.which)
+                .map_err(|err| BakeDefect(format!("serialize a codes entry's tensor: {err}")))?;
+            let codes = match e.codes {
+                AffineCodes::Rows(r) => {
+                    let r = row(r);
+                    quote!(__tq::AffineCodes::Rows(#r))
+                }
+                AffineCodes::Planes { k } => {
+                    let k = Literal::u32_unsuffixed(k.get());
+                    quote!(__tq::AffineCodes::Planes { k: __tq::PlanesK::of(#k) })
+                }
+            };
+            Ok(quote! {
+                __tq::CodesEntry {
+                    ix: __ti::SourceIx(#ix),
+                    which: #which,
+                    layer: __ti::LayerId(#layer),
+                    codes: #codes,
+                }
+            })
+        });
+        let entries = entries.collect::<Result<Vec<_>, BakeDefect>>()?;
+        Ok(quote! {
+            pub(super) static #ident: __tq::AffineCodesTable =
+                __tq::AffineCodesTable { entries: &[ #(#entries),* ] };
+        })
+    });
+    let statics = statics.collect::<Result<Vec<_>, BakeDefect>>()?;
+    Ok(quote! { #(#statics)* })
+}
+
 fn profile_for(class: GenClass) -> MetalTargetProfile {
     use scratchy_target_metal::tape::targets::{M1_MAX, M4_10CORE, M5_10CORE};
     match class {
@@ -1288,6 +1399,8 @@ fn par_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> 
 struct Rung<'a> {
     profile: &'a MetalTargetProfile,
     class: GenClass,
+    /// The model's codes table for the class.
+    codes: &'static AffineCodesTable,
     /// The step tape this rung lowers — the wide class's band when the bands fold differently —
     /// and the arena slot count that tape's colouring allocated.
     steps: &'a MetalStepTape,
@@ -1309,6 +1422,7 @@ fn run_lower(
         block_cap: rung.cap.get(),
         profile: Some(rung.profile),
         class: rung.class,
+        codes: rung.codes,
     };
     tl::lower_with_rows(rung.steps, mc, at)
 }
@@ -1416,7 +1530,9 @@ pub fn bake_bucket_tapes(
     if let Some(wide) = &input.wide_band {
         pool.read_affine(wide.steps, wide.operands)?;
     }
-    let classes = [GenClass::M1, GenClass::Mid, GenClass::M5, GenClass::M5Wide];
+    let class_codes = (CLASSES.iter())
+        .map(|&class| Ok((class, pool.class_codes(class)?)))
+        .collect::<Result<Vec<_>, BakeDefect>>()?;
     // The TurboQuant decode's head groups the global class admits; a model without attention
     // decodes no attention, so it bakes none.
     let candidates: Vec<TqDecodeHeads> = match mc.attention() {
@@ -1445,11 +1561,17 @@ pub fn bake_bucket_tapes(
     let defect = |e: LoweringError| BakeDefect(format!("bucket_m={}: {e}", input.bucket_m));
     // Every rung's tapes, lowered in parallel (each lowering is independent); `None` = the rung
     // cannot exist for this bucket.
-    let points: Vec<(GenClass, KvAddressing, MaxBlocksPerSeq)> = (classes.iter())
-        .flat_map(|&c| [KvAddressing::Direct, KvAddressing::Chunked].map(|a| (c, a)))
-        .flat_map(|(c, a)| input.cap_ladder.iter().map(move |&cap| (c, a, cap)))
+    // Each class with its codes table, every rung of it lowered from that table.
+    let points: Vec<(
+        GenClass,
+        &'static AffineCodesTable,
+        KvAddressing,
+        MaxBlocksPerSeq,
+    )> = (class_codes.iter())
+        .flat_map(|&(c, t)| [KvAddressing::Direct, KvAddressing::Chunked].map(|a| (c, t, a)))
+        .flat_map(|(c, t, a)| input.cap_ladder.iter().map(move |&cap| (c, t, a, cap)))
         .collect();
-    let lowered = par_map(&points, |&(class, addressing, cap)| {
+    let lowered = par_map(&points, |&(class, codes, addressing, cap)| {
         let profile = profile_for(class);
         let (steps, num_arena_slots) = match (class, input.wide_band.as_ref()) {
             (GenClass::M5Wide, Some(wide)) => (wide.steps, wide.num_arena_slots),
@@ -1458,6 +1580,7 @@ pub fn bake_bucket_tapes(
         let rung = Rung {
             profile: &profile,
             class,
+            codes,
             steps,
             num_arena_slots,
             addressing,
@@ -1471,7 +1594,7 @@ pub fn bake_bucket_tapes(
     // The scratch grows with the cap: the first rung of a `(class, addressing)` ladder that cannot
     // exist ends it (`points` holds each ladder contiguous, ascending).
     let mut ended = None;
-    for (&(class, addressing, cap), tapes) in points.iter().zip(lowered) {
+    for (&(class, _, addressing, cap), tapes) in points.iter().zip(lowered) {
         if ended == Some((class, addressing)) {
             continue;
         }
@@ -1513,8 +1636,10 @@ pub fn bake_bucket_tapes(
                 let cmd_refs = (named.into_iter())
                     .map(|c| pool.intern(c))
                     .collect::<Result<Vec<_>, _>>()?;
+                let codes = pool.codes_ident(body.codes);
                 let rest = LoweredMetalTape {
                     commands: TapeCommands::EMPTY,
+                    codes: AffineCodesTable::EMPTY,
                     ..body
                 };
                 let rest_toks = tok("tape", crate::const_tokens::const_tokens(&rest))?;
@@ -1528,6 +1653,7 @@ pub fn bake_bucket_tapes(
                             table: &__tape_cmds::TABLE,
                             ixs: { use __ti::CommandIx as I; &[ #(#cmd_refs),* ] },
                         },
+                        codes: &__tape_cmds::#codes,
                         ..#rest_toks
                     };
                 });

@@ -30,7 +30,9 @@ use scratchy_target_metal::quantized::{
     qmv_kernel_name,
 };
 use scratchy_target_metal::specialized_pipeline_cache::ConstantValue;
-use scratchy_target_metal::tape::kernel_constants::AffineCodes;
+use scratchy_target_metal::tape::ids::AffineBits;
+use scratchy_target_metal::tape::kernel_constants::{AffineCodes, RowCodes};
+use scratchy_target_metal::tape::lowered::GenClass;
 
 type Buffer = Retained<ProtocolObject<dyn MTLBuffer>>;
 type Device = Retained<ProtocolObject<dyn MTLDevice>>;
@@ -195,7 +197,7 @@ fn run_qmv_bf16(
         x,
         (m, n, k),
         group_size,
-        AffineCodes::AsWritten,
+        AffineCodes::Rows(RowCodes::AsWritten),
         /*wide_ok=*/ true,
     )
 }
@@ -500,7 +502,7 @@ fn run_qmv_bf16_with_packed_prefix(
         k,
         group_size,
         ScaleDtype::F16,
-        AffineCodes::AsWritten,
+        AffineCodes::Rows(RowCodes::AsWritten),
         /*wide_ok=*/ true,
     ) {
         return Some(Vec::new());
@@ -835,7 +837,7 @@ fn run_qmv_bf16_s_bf16(
         k,
         group_size,
         ScaleDtype::Bf16,
-        AffineCodes::AsWritten,
+        AffineCodes::Rows(RowCodes::AsWritten),
         /*wide_ok=*/ true,
     ) {
         return Some(Vec::new());
@@ -930,7 +932,7 @@ fn affine_qmv_generic_b4_bf16_s_bf16_matches_cpu_reference() {
 /// ships: Granite 4.1's mlx-community 4bit checkpoints are g32, and a g32
 /// build failed at bake when only gs 64 was instantiated. Only an M5 picks
 /// this kernel, and an M5 stores 4-bit codes offset-8, so each case also
-/// runs on XOR-0x88 codes under `AffineCodes::Offset8` and must match the
+/// runs on XOR-0x88 codes under `AffineCodes::Rows(RowCodes::Offset8)` and must match the
 /// as-written run exactly.
 #[test]
 fn affine_qmv_wide_b4_bf16_matches_cpu_reference_at_every_group_size() {
@@ -959,7 +961,7 @@ fn affine_qmv_wide_b4_bf16_matches_cpu_reference_at_every_group_size() {
                     /*wide_ok=*/ true,
                 )
             };
-            let Some(as_written) = run(&packed, AffineCodes::AsWritten) else {
+            let Some(as_written) = run(&packed, AffineCodes::Rows(RowCodes::AsWritten)) else {
                 eprintln!("skipping: no Metal 4 GPU");
                 return;
             };
@@ -973,7 +975,7 @@ fn affine_qmv_wide_b4_bf16_matches_cpu_reference_at_every_group_size() {
             );
             let offset8: Vec<u8> = packed.iter().map(|b| b ^ 0x88).collect();
             assert_eq!(
-                run(&offset8, AffineCodes::Offset8),
+                run(&offset8, AffineCodes::Rows(RowCodes::Offset8)),
                 Some(as_written),
                 "qmv_wide offset-8 gs={group_size} M={m}"
             );
@@ -985,7 +987,7 @@ fn affine_qmv_wide_b4_bf16_matches_cpu_reference_at_every_group_size() {
 /// pre-gen-15 target decodes with — `wide_ok` false, the pick `qmv_kernel_wide` makes
 /// there. The same `qmv_fast_impl` at MLX's 8-row threadgroups, so the parity bound is
 /// the one-row test's. Each case also runs on XOR-0x88 codes under
-/// `AffineCodes::Offset8` and must match the as-written run exactly.
+/// `AffineCodes::Rows(RowCodes::Offset8)` and must match the as-written run exactly.
 #[test]
 fn affine_qmv_fast_fold_b4_bf16_matches_cpu_reference() {
     let (n, k) = (64, 512);
@@ -1011,7 +1013,7 @@ fn affine_qmv_fast_fold_b4_bf16_matches_cpu_reference() {
                     /*wide_ok=*/ false,
                 )
             };
-            let Some(as_written) = run(&packed, AffineCodes::AsWritten) else {
+            let Some(as_written) = run(&packed, AffineCodes::Rows(RowCodes::AsWritten)) else {
                 eprintln!("skipping: no Metal 4 GPU");
                 return;
             };
@@ -1025,7 +1027,7 @@ fn affine_qmv_fast_fold_b4_bf16_matches_cpu_reference() {
             );
             let offset8: Vec<u8> = packed.iter().map(|b| b ^ 0x88).collect();
             assert_eq!(
-                run(&offset8, AffineCodes::Offset8),
+                run(&offset8, AffineCodes::Rows(RowCodes::Offset8)),
                 Some(as_written),
                 "qmv_fast fold twin offset-8 gs={group_size} M={m}"
             );
@@ -1053,18 +1055,18 @@ fn affine_qmv_b4_offset8_codes_match_as_written() {
                 /*wide_ok=*/ true,
             )
         };
-        let Some(as_written) = run(&packed, AffineCodes::AsWritten) else {
+        let Some(as_written) = run(&packed, AffineCodes::Rows(RowCodes::AsWritten)) else {
             eprintln!("skipping: no Metal 4 GPU");
             return;
         };
         assert!(!as_written.is_empty(), "no MTL4 queue");
         let offset8: Vec<u8> = packed.iter().map(|b| b ^ 0x88).collect();
         assert_ne!(
-            run(&offset8, AffineCodes::AsWritten).as_ref(),
+            run(&offset8, AffineCodes::Rows(RowCodes::AsWritten)).as_ref(),
             Some(&as_written)
         );
         assert_eq!(
-            run(&offset8, AffineCodes::Offset8),
+            run(&offset8, AffineCodes::Rows(RowCodes::Offset8)),
             Some(as_written),
             "m={m} n={n} k={k}"
         );
@@ -1094,12 +1096,12 @@ fn a_narrow_projection_fast_matvec_row_is_the_one_row_bits() {
     let (n, k, gs) = (48usize, 5120usize, 64usize);
     let m_max = 64usize;
     let (packed, scales, biases, x) = make_inputs_bf16(0x27BA_B5EED, n, k, m_max, gs);
-    // The tape's codes on this chip: offset-8 (`AffineCodes::of`), stored XOR 0x88.
-    let codes = AffineCodes::of(Some(&dev.profile), 4);
-    let stored: Vec<u8> = match codes {
-        AffineCodes::Offset8 => packed.iter().map(|b| b ^ 0x88).collect(),
-        AffineCodes::AsWritten => packed.clone(),
-        AffineCodes::Planes { .. } => unreachable!("`AffineCodes::of` never stores planes"),
+    // The tape's codes on this chip: row-whole offset-8 (`RowCodes::of`), stored XOR 0x88.
+    let rows = RowCodes::of(GenClass::of(dev.profile.generation), AffineBits::B4);
+    let codes = AffineCodes::Rows(rows);
+    let stored: Vec<u8> = match rows {
+        RowCodes::Offset8 => packed.iter().map(|b| b ^ 0x88).collect(),
+        RowCodes::AsWritten => packed.clone(),
     };
     let as_bytes =
         |v: &[half::f16]| -> Vec<u8> { v.iter().flat_map(|h| h.to_le_bytes()).collect() };

@@ -21,7 +21,7 @@ use scratchy_target_metal::specialized_pipeline_cache::{
 use scratchy_target_metal::tape::ids::{AffineBits, AffineGroupSize};
 use scratchy_target_metal::tape::ids::{KDimI32, MDimI32, NDimI32};
 use scratchy_target_metal::tape::kernel_constants::{
-    AffineCodes, AffineQmvConstants, AffineQmvWideConstants,
+    AffineCodes, AffineQmvConstants, AffineQmvWideConstants, RowCodes,
 };
 use scratchy_target_metal::tape::lowered::MetalDtype;
 use scratchy_target_metal::tape::quantized::{
@@ -58,7 +58,7 @@ fn qmv_key(n: u32, m: u32) -> (PipelineKey, QmvKernel) {
         AffineGroupSize::new(64).unwrap(),
     );
     let (k, n_dim) = (KDimI32(H as i32), NDimI32(n as i32));
-    let codes = AffineCodes::AsWritten;
+    let codes = AffineCodes::Rows(RowCodes::AsWritten);
     let constants: Vec<ConstantValue> = match kernel {
         QmvKernel::Wide { .. } => AffineQmvWideConstants {
             k,

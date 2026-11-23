@@ -27,7 +27,8 @@ use scratchy_target_metal::specialized_pipeline_cache::{
 use scratchy_target_metal::tape::ids::{AffineBits, AffineGroupSize};
 use scratchy_target_metal::tape::ids::{BucketM, KDimI32, LayerId, NDimI32, QSize, RmsNormEps};
 use scratchy_target_metal::tape::kernel_constants::{
-    AffineCodes, AffineGatedQmvConstants, AffineQmvConstants, RmsNormConstants, norm_threads,
+    AffineCodes, AffineGatedQmvConstants, AffineQmvConstants, RmsNormConstants, RowCodes,
+    norm_threads,
 };
 use scratchy_target_metal::tape::quantized::{
     DequantDtype, QmvKernel, ScaleDtype, gated_tile_rows, pick_qmv_kernel, qmv_dispatch_shape,
@@ -238,7 +239,7 @@ fn rig(c: &Case) -> Option<Rig> {
         let mut v: Vec<ConstantValue> = AffineQmvConstants {
             k: KDimI32(c.k as i32),
             n: NDimI32(c.n as i32),
-            codes: AffineCodes::AsWritten,
+            codes: AffineCodes::Rows(RowCodes::AsWritten),
         }
         .into();
         v.extend(Vec::<ConstantValue>::from(e));
@@ -474,7 +475,7 @@ fn a_normalizing_wide_matvec_is_as_close_to_the_exact_normed_product_on_every_ro
                     k: KDimI32(c.k as i32),
                     n: NDimI32(c.n as i32),
                     m: MDimI32(m as i32),
-                    codes: AffineCodes::AsWritten,
+                    codes: AffineCodes::Rows(RowCodes::AsWritten),
                 }
                 .into();
                 v.extend(Vec::<ConstantValue>::from(e));
@@ -591,7 +592,7 @@ fn a_normalizing_gated_matvec_is_as_close_as_the_norm_then_gated_matvec() {
             qmv: AffineQmvConstants {
                 k: KDimI32(c.k as i32),
                 n: NDimI32(c.n as i32),
-                codes: AffineCodes::AsWritten,
+                codes: AffineCodes::Rows(RowCodes::AsWritten),
             },
             act: ExpertBody::Gated(GatedAct::Silu),
         }
@@ -713,7 +714,7 @@ fn a_b3_normed_biased_matvec_matches_the_reference_at_glm_decode_shapes() {
         let mut v: Vec<ConstantValue> = AffineQmvConstants {
             k: KDimI32(c.k as i32),
             n: NDimI32(c.n as i32),
-            codes: AffineCodes::AsWritten,
+            codes: AffineCodes::Rows(RowCodes::AsWritten),
         }
         .into();
         // norm + bias, the M1 q/k/v ends: eps at 8, offset at 9, bias flag
@@ -842,7 +843,7 @@ fn a_b3_normed_residual_matvec_matches_the_reference_at_glm_o_proj_shape() {
     let mut v: Vec<ConstantValue> = AffineQmvConstants {
         k: KDimI32(c.k as i32),
         n: NDimI32(c.n as i32),
-        codes: AffineCodes::AsWritten,
+        codes: AffineCodes::Rows(RowCodes::AsWritten),
     }
     .into();
     v.extend(Vec::<ConstantValue>::from(normed(&c)));
@@ -972,7 +973,7 @@ fn a_b3_gated_matvec_matches_the_reference_at_glm_shared_expert_shapes() {
             qmv: AffineQmvConstants {
                 k: KDimI32(c.k as i32),
                 n: NDimI32(c.n as i32),
-                codes: AffineCodes::AsWritten,
+                codes: AffineCodes::Rows(RowCodes::AsWritten),
             },
             act: ExpertBody::Gated(GatedAct::Silu),
         }

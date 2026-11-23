@@ -741,9 +741,25 @@ pub(crate) fn emit(cx: &ModelCx<'_>) -> ModelEmission {
     // The head weight the model's logits read — the one statement of which weight the head is
     // (`codegen::head_weight`, the terminal walk `backbone_layout` classifies by): the weight a
     // drafter borrows of its target (`LentWeight::LmHead`) and a tied head shares with the
-    // embedding table, so its family's codes vote the way every reader of it reads them
-    // (`MetalStepFacts::head_weight` → `MetalStepTape::as_stored_sources`).
+    // embedding table, so its family's codes are stored row-whole
+    // (`MetalStepFacts::head_weight` → `MetalStepTape::head` → `CodesRole::Head`).
     let head_weight = scratchy_forward_compiler_macro::codegen::head_weight(fuf, program);
+    // The embedding table the gather reads, and — for a head tied to a table — that table: the
+    // DSL weights the codes table keys the gather's and the tied head's codes by
+    // (`StepOperands::codes_weight`). The tie's target is the one door's (`tied_table_role`).
+    let embed_role = scratchy_forward_compiler_macro::quantization::embed_table_role(program, fuf);
+    let weight_of = |role: &str| program.weights.find(&role.split('.').collect::<Vec<_>>());
+    let embed_weight = weight_of(&embed_role);
+    let tied_table = scratchy_forward_compiler_macro::quantization::is_tied_head(
+        model,
+        scratchy_forward_compiler_macro::config::LM_HEAD_ROLE,
+    )
+    .then(|| {
+        weight_of(
+            &scratchy_forward_compiler_macro::quantization::tied_table_role(program, &embed_role),
+        )
+    })
+    .flatten();
     for (canonical, (_, ns_field, bb_slot_field, term_field, slots_dec)) in
         canonical_lowered.iter_mut()
     {
@@ -852,6 +868,8 @@ pub(crate) fn emit(cx: &ModelCx<'_>) -> ModelEmission {
             embed_base: &embed_base,
             embed_quant,
             head_weight,
+            embed_weight,
+            tied_table,
             mlp: if fused_mlp {
                 mc3::MlpForm::Packed
             } else {
@@ -1051,6 +1069,11 @@ pub(crate) fn emit(cx: &ModelCx<'_>) -> ModelEmission {
     let mut metal_bucket_types: Vec<TokenStream> = Vec::new();
     let mut metal_arena_bytes_statics: Vec<TokenStream> = Vec::new();
     let mut metal_tape_cmds = crate::static_tape::CommandPool::default();
+    // THE MODEL'S CODES TABLES: every MLX-affine codes tensor any bucket's tape reads, each
+    // stored one way per chip class, decided once here before any bucket lowers.
+    metal_tape_cmds
+        .bake_codes(&model_facts, metal_steps.values())
+        .unwrap_or_else(|e| panic!("[metal static tape] {}: {e}", model.source_stem));
     // The most arena slots a bucket has: how many the model's arena ranks rank (`RankedSlots`).
     let mut metal_arena_slots: u32 = 0;
     // Every colour and arena the buckets' colourings make, in the model's `__arena`.

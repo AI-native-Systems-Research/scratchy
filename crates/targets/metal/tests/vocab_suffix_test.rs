@@ -22,7 +22,7 @@ use scratchy_target_metal::specialized_pipeline_cache::{
 use scratchy_target_metal::tape::ids::{AffineBits, AffineGroupSize};
 use scratchy_target_metal::tape::ids::{KDimI32, MDimI32, NDimI32};
 use scratchy_target_metal::tape::kernel_constants::{
-    AffineCodes, AffineQmvConstants, AffineQmvWideConstants,
+    AffineCodes, AffineQmvConstants, AffineQmvWideConstants, RowCodes,
 };
 use scratchy_target_metal::tape::lowered::MetalDtype;
 use scratchy_target_metal::tape::quantized::{
@@ -124,15 +124,15 @@ fn a_pass_past_the_prefix_picks_what_the_whole_vocabulary_picks() {
     let hidden = x_all.gpuAddress() + (first * H as usize * 2) as u64;
     // Every id picked: the prefix's and the suffix's both, or the comparison proves nothing.
     let mut picked = Vec::new();
-    for codes_read in [AffineCodes::AsWritten, AffineCodes::Offset8] {
+    for rows_read in [RowCodes::AsWritten, RowCodes::Offset8] {
+        let codes_read = AffineCodes::Rows(rows_read);
         // Stored the way the kernels read them: offset-8 codes are XOR 0x88 a byte.
-        let stored: Vec<u32> = match codes_read {
-            AffineCodes::AsWritten => words.clone(),
-            AffineCodes::Offset8 => words.iter().map(|w| w ^ 0x8888_8888).collect(),
-            AffineCodes::Planes { .. } => unreachable!("a vocabulary suffix never reads planes"),
+        let stored: Vec<u32> = match rows_read {
+            RowCodes::AsWritten => words.clone(),
+            RowCodes::Offset8 => words.iter().map(|w| w ^ 0x8888_8888).collect(),
         };
         let codes = shared_slice(&device, &stored);
-        let qmv_pipelines: Vec<Box<_>> = (keys.qmv.get(codes_read).iter())
+        let qmv_pipelines: Vec<Box<_>> = (keys.qmv.get(rows_read).iter())
             .map(|k| Box::new(build(k)))
             .collect();
         for m in 1..=VERIFY_ROWS {

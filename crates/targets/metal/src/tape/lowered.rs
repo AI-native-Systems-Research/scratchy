@@ -1067,49 +1067,58 @@ pub enum SourceRef<'w> {
     GatedDeltaNet(&'w scratchy_layers::GatedDeltaNetLayer),
 }
 
-/// The `which` tensors of a `kind` family that are MLX-affine packed codes — what a kernel
-/// reads as written or offset-8 ([`crate::tape::kernel_constants::AffineCodes`]). The one
-/// statement of which tensors of a family carry codes: [`SourceRef::is_affine_codes`] routes
-/// every arm through it, adding only the bundle's own affine-ness (a dense `Linear` holds no
-/// codes; the tape's coarse `WeightKind` cannot tell, its sites do — dense linears lower to
-/// GEMMs, which name no codes).
-pub fn codes_tensor(kind: &scratchy_subtile::handoff::WeightKind, which: WeightTensor) -> bool {
+/// What one MLX-affine codes tensor is to the model, which decides how its codes may be stored
+/// ([`crate::tape::codes::decide`]): only a projection's codes may be regrouped into planes; every
+/// other role is read a whole row at a time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum CodesRole {
+    /// An affine linear's weight that no row-whole reader reads.
+    Projection,
+    /// The head: the weight the model's logits read, which a drafter borrows of its target and
+    /// reads past its own prefix a row at a time (the vocabulary suffix).
+    Head,
+    /// An embedding table, which a gather reads a row (a token) at a time.
+    Table,
+    /// A MoE expert bank's projection, which the expert kernels read a row at a time.
+    ExpertBank,
+}
+
+/// The role of the `which` tensor of a `kind` family, when it is MLX-affine packed codes; `head`:
+/// whether the family is the model's head family (`codegen::head_weight`). The one statement of
+/// which tensors of a family carry codes, and of what each is: a tied head — the embedding
+/// table's weight under the head's name — is [`CodesRole::Head`] through its head family and
+/// [`CodesRole::Table`] through its table family, and both are row-whole, so the one tensor is
+/// stored one way whichever family names it.
+pub fn codes_role(
+    kind: &scratchy_subtile::handoff::WeightKind,
+    which: WeightTensor,
+    head: bool,
+) -> Option<CodesRole> {
     use WeightTensor as T;
     use scratchy_subtile::handoff::WeightKind as K;
     match kind {
-        K::Linear | K::AffineQuantEmbedding => which == T::Weight,
-        K::FusedMoe | K::SharedFusedMoe | K::GemmaSwitchGlu | K::GptOssMoe => matches!(
-            which,
-            T::MoeExpertGateW
-                | T::MoeExpertUpW
-                | T::MoeExpertDownW
-                | T::MoeSharedGateUpW
-                | T::MoeSharedDownW
-        ),
-        _ => false,
+        K::Linear if which == T::Weight => Some(match head {
+            true => CodesRole::Head,
+            false => CodesRole::Projection,
+        }),
+        K::AffineQuantEmbedding if which == T::Weight => Some(CodesRole::Table),
+        K::FusedMoe | K::SharedFusedMoe | K::GemmaSwitchGlu | K::GptOssMoe
+            if matches!(
+                which,
+                T::MoeExpertGateW
+                    | T::MoeExpertUpW
+                    | T::MoeExpertDownW
+                    | T::MoeSharedGateUpW
+                    | T::MoeSharedDownW
+            ) =>
+        {
+            Some(CodesRole::ExpertBank)
+        }
+        _ => None,
     }
 }
 
 impl SourceRef<'_> {
-    /// Whether the `which` tensor of this bundle is MLX-affine packed codes — what a kernel reads
-    /// as written or offset-8 ([`crate::tape::kernel_constants::AffineCodes`]). The bundle holds
-    /// the layer, so it separates a dense from an affine `Linear`; which tensors are codes is
-    /// [`codes_tensor`]'s one statement.
-    pub fn is_affine_codes(self, which: WeightTensor) -> bool {
-        use scratchy_subtile::handoff::WeightKind as K;
-        match self {
-            Self::Linear(scratchy_layers::LinearLayer::AffineQuant(_)) => {
-                codes_tensor(&K::Linear, which)
-            }
-            Self::AffineQuantEmbedding(_) => codes_tensor(&K::AffineQuantEmbedding, which),
-            Self::FusedMoe(_) => codes_tensor(&K::FusedMoe, which),
-            Self::SharedFusedMoe(_) => codes_tensor(&K::SharedFusedMoe, which),
-            Self::GemmaSwitchGlu(_) => codes_tensor(&K::GemmaSwitchGlu, which),
-            Self::GptOssMoe(_) => codes_tensor(&K::GptOssMoe, which),
-            _ => false,
-        }
-    }
-
     /// The `which` tensor of this bundle; `None` when the bundle holds no such tensor (a `which`
     /// of another kind, an absent optional bias or shared expert, a Dense MoE on metal).
     pub fn tensor(self, which: WeightTensor) -> Option<scratchy_tensors::tensor::GpuTensor> {
@@ -1212,7 +1221,7 @@ pub trait ModelSources {
 /// references. Most bundles have a single weight tensor (`Weight`);
 /// MLX-affine `LinearLayer::AffineQuant` carries four (packed weight,
 /// per-group scales, per-group affine offsets, optional fp linear bias).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
 pub enum WeightTensor {
     /// The bundle's primary weight (`RmsNorm.weight`,
     /// `LinearLayer::Dense(Linear { weight, .. })`,
@@ -2823,6 +2832,11 @@ pub struct LoweredMetalTape {
     /// the five sliding layers inside it are themselves a loop — so a row's layer is the SUM of
     /// every enclosing loop's contribution. A single `Option` could hold one or the other.
     pub loops: &'static [TapeLoop],
+    /// How every MLX-affine codes tensor the commands read is stored: the table each reading
+    /// command's codes constants were taken from, which the load stores the tensors by before any
+    /// command binds them ([`crate::tape::codes`]). Every tape of a model for one chip class
+    /// holds the same table.
+    pub codes: &'static crate::tape::codes::AffineCodesTable,
     /// Byte size of the shared SplitK scratch buffer the worker
     /// allocates if any `Instruction::AffineQmm` in this tape was
     /// lowered to the SplitK two-command form. Computed as
@@ -2980,6 +2994,17 @@ pub enum LoweringError {
         kind: scratchy_subtile::handoff::WeightKind,
         slot: u32,
     },
+    /// A codes reader binds the `which` tensor of family `ix` at `layer`, which the tape's codes
+    /// table has no entry for — the codes enumeration
+    /// ([`codes_reads`](crate::tape::lowering::codes_reads)) and the opcode lowering disagree.
+    NoCodesEntry {
+        ix: SourceIx,
+        which: WeightTensor,
+        layer: LayerId,
+    },
+    /// The codes-reading step at tape index `index` reads family `ix`'s codes, and its row records
+    /// no one DSL weight it reads through it — the tensor the codes table keys it by.
+    NoCodesWeight { index: usize, ix: SourceIx },
     /// A rope-on-read attention binds its layer class's rotary table, and the model has none.
     NoRotaryTable { index: usize },
     /// A gated row whose realization already gates its commands: one command, two gates.
@@ -3091,6 +3116,18 @@ impl std::fmt::Display for LoweringError {
                 f,
                 "lowering: the step at tape index {index} binds {kind:?} weight #{slot} of its \
                  site, which has no such source"
+            ),
+            Self::NoCodesWeight { index, ix } => write!(
+                f,
+                "lowering: the codes reader at tape index {index} reads family {}, and its row \
+                 records no one DSL weight it reads through it",
+                ix.0
+            ),
+            Self::NoCodesEntry { ix, which, layer } => write!(
+                f,
+                "lowering: a codes reader binds {which:?} of family {} at layer {}, which the \
+                 codes table has no entry for",
+                ix.0, layer.0
             ),
             Self::NoRotaryTable { index } => write!(
                 f,
@@ -3211,11 +3248,10 @@ impl GenClass {
 
     /// Whether this class stores MLX-affine 4-bit weight codes XOR 0x88
     /// (signed q - 8): the matrix unit's int8 x int4 lane reads them as
-    /// stored (the W4A8 GEMM). The weight loader flips them on load and the
-    /// lowering tells every other reader to flip them back
-    /// ([`AffineCodes`](super::kernel_constants::AffineCodes)) — one fact,
-    /// read by both.
-    pub fn stores_affine_b4_offset8(self) -> bool {
+    /// stored (the W4A8 GEMM). Read once, by the law of row-whole storage
+    /// ([`RowCodes::of`](super::kernel_constants::RowCodes::of)), which the
+    /// codes table every tape carries is decided from.
+    pub const fn stores_affine_b4_offset8(self) -> bool {
         matches!(self, GenClass::M5 | GenClass::M5Wide)
     }
 }

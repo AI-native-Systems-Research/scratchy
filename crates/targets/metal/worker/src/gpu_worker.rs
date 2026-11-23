@@ -4929,13 +4929,17 @@ fn vocab_suffix_draft(
         ));
     }
     let allocator = &gpu_device.allocator;
-    // The head's codes, read the way the device stores them — the head family's as-stored vote,
-    // the same one the target's tapes baked (`MetalStepTape::as_stored_sources`): the allocator
-    // hands back the target's own binding of the range.
-    let codes_read = allocator.affine_codes(suffix.bits);
-    let (buffer, offset) =
-        (allocator.bind_affine_codes(codes.raw_ptr(), codes.size_bytes(), codes_read))
-            .map_err(|e| format!("binding the target's lm_head codes: {e:?}"))?;
+    // The head's codes, stored as the target's codes table stores its head: row-whole
+    // (`CodesRole::Head`), by the one law of row-whole storage from this device's class and the
+    // head's width, which `baked` holds to the target's. The store hands back the target's own
+    // stored range when its pool stored it first.
+    let (class, _) = scratchy_target_metal::interpreter::metal::device_class(&gpu_device.device)
+        .map_err(|e| e.to_string())?;
+    let codes_read = scratchy_target_metal::tape::codes::RowCodes::of(class, suffix.bits);
+    let (buffer, offset) = allocator
+        .store_affine_codes(codes.raw_ptr(), codes.size_bytes(), codes_read.into())
+        .map_err(|e| format!("storing the target's lm_head codes: {e}"))?
+        .binding();
     let part = |t: &GpuTensor, what: &str| {
         (allocator.buffer_for(t.raw_ptr()))
             .map(|(buffer, offset)| LmHeadPart { buffer, offset })

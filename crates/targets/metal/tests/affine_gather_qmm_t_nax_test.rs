@@ -13,7 +13,7 @@ use scratchy_target_metal::mtl4_dispatch::{Mtl4DispatchBatch, shared_slice};
 use scratchy_target_metal::specialized_pipeline_cache::{
     ConstantValue, PipelineKey, SpecializedPipelineCache,
 };
-use scratchy_target_metal::tape::kernel_constants::AffineCodes;
+use scratchy_target_metal::tape::kernel_constants::{AffineCodes, RowCodes};
 use scratchy_target_metal::tape::quantized::NaxDequant;
 
 const GROUP: usize = 64;
@@ -91,7 +91,7 @@ fn every_live_row_is_written_past_32k_padded_rows() {
             ConstantValue::int(2, m as i32),
             ConstantValue::int(4, experts as i32),
         ];
-        constants.extend(AffineCodes::AsWritten.constants());
+        constants.extend(AffineCodes::Rows(RowCodes::AsWritten).constants());
         let key = PipelineKey::new("quantized_qmm_nax", symbol, constants);
         let pso = baked_build(&cache, &key).expect(symbol);
         // NaN everywhere first: a live row the kernel leaves unwritten stays NaN.

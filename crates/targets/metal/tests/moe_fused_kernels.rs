@@ -16,7 +16,7 @@ use scratchy_target_metal::tape::constants::{ConstSlot, ConstantValue};
 use scratchy_target_metal::tape::ids::{KDimI32, NDimI32, NumExperts, TopK};
 use scratchy_target_metal::tape::kernel_constants::{
     AffineCodes, AffineGatherQmvConstants, AffineQmvConstants, GatherRows, MoeRouteConstants,
-    RoutedConstants, SharedExperts,
+    RoutedConstants, RowCodes, SharedExperts,
 };
 use scratchy_target_metal::tape::step::{LayerId, RoutePost, RoutePre, RouteProgram, Scale};
 
@@ -88,7 +88,7 @@ impl Experts {
             qmv: AffineQmvConstants {
                 k: KDimI32(self.k_in as i32),
                 n: NDimI32(self.n_out as i32),
-                codes: AffineCodes::AsWritten,
+                codes: AffineCodes::Rows(RowCodes::AsWritten),
             },
             rows,
         }
@@ -954,7 +954,7 @@ fn plain_qmv_us(device: &common::Device, n_out: usize, k_in: usize) -> f64 {
     let constants = AffineQmvConstants {
         k: KDimI32(k_in as i32),
         n: NDimI32(n_out as i32),
-        codes: AffineCodes::AsWritten,
+        codes: AffineCodes::Rows(RowCodes::AsWritten),
     };
     let pso = baked_pipeline(device, "quantized_qmv", &name, constants.into()).expect("qmv");
     run(device, 300, 4, |i| {

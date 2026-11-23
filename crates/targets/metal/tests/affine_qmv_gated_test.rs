@@ -16,7 +16,7 @@ use scratchy_target_metal::specialized_pipeline_cache::{
 };
 use scratchy_target_metal::tape::ids::{HiddenSize, KDimI32, NDimI32};
 use scratchy_target_metal::tape::kernel_constants::{
-    AffineCodes, AffineGatedQmvConstants, AffineQmvConstants, SiluMulConstants,
+    AffineCodes, AffineGatedQmvConstants, AffineQmvConstants, RowCodes, SiluMulConstants,
 };
 use scratchy_target_metal::tape::quantized::{QmvKernel, gated_tile_rows, qmv_dispatch_shape};
 use scratchy_target_metal::tape::step::GatedAct;
@@ -146,7 +146,7 @@ fn run(c: Case) -> Option<(Vec<u16>, Vec<u16>)> {
     let qmv = || AffineQmvConstants {
         k: KDimI32(c.k as i32),
         n: NDimI32(c.n as i32),
-        codes: AffineCodes::AsWritten,
+        codes: AffineCodes::Rows(RowCodes::AsWritten),
     };
     let (a, s, gs, b) = (c.act.tag(), c.scale.tag(), c.group_size, c.bits);
     let fast = if c.fast() { "_fast" } else { "" };

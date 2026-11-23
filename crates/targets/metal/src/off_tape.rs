@@ -22,9 +22,9 @@ use crate::tape::ids::{
     AffineBits, AffineGroupSize, BitsetWords, BlockSize, KDimI32, LogitsWidth, MDimI32, NDimI32,
 };
 use crate::tape::kernel_constants::{
-    AffineCodes, AffineQmvConstants, AffineQmvWideConstants, ArgmaxConstants,
-    ChainAdvanceConstants, DraftAcceptConstants, GrammarMaskConstants, LogprobsConstants,
-    MtpChainConstants, TargetSamplingConstants,
+    AffineQmvConstants, AffineQmvWideConstants, ArgmaxConstants, ChainAdvanceConstants,
+    DraftAcceptConstants, GrammarMaskConstants, LogprobsConstants, MtpChainConstants, RowCodes,
+    TargetSamplingConstants,
 };
 use crate::tape::lowered::{BakedKernel, MetalDtype};
 use crate::tape::quantized::{
@@ -82,8 +82,8 @@ impl VocabSuffix {
         SuffixKernels {
             suffix: self,
             qmv: ByCodes {
-                as_written: rows(AffineCodes::AsWritten),
-                offset8: rows(AffineCodes::Offset8),
+                as_written: rows(RowCodes::AsWritten),
+                offset8: rows(RowCodes::Offset8),
             },
             argmax: PipelineKey::new(
                 "argmax",
@@ -97,7 +97,8 @@ impl VocabSuffix {
     }
 
     /// Its key, `dtype` activations, its codes read as `codes`.
-    fn qmv_key(self, dtype: DequantDtype, codes: AffineCodes, m: u32) -> PipelineKey {
+    fn qmv_key(self, dtype: DequantDtype, codes: RowCodes, m: u32) -> PipelineKey {
+        let codes: crate::tape::kernel_constants::AffineCodes = codes.into();
         let kernel = self.qmv_kernel(m);
         let name = qmv_kernel_static_name(kernel, dtype, self.scale, self.bits, self.group);
         let (k, n) = (KDimI32(self.hidden as i32), NDimI32(self.rows as i32));
@@ -115,7 +116,7 @@ impl VocabSuffix {
     }
 }
 
-/// One of each way a device's kernels read MLX-affine codes ([`AffineCodes`]).
+/// One of each way a device stores MLX-affine codes row-whole ([`RowCodes`]).
 #[derive(Clone, Copy)]
 pub struct ByCodes<T> {
     pub as_written: T,
@@ -124,16 +125,11 @@ pub struct ByCodes<T> {
 
 impl<T> ByCodes<T> {
     /// The kernels reading codes stored as `codes`. A vocabulary suffix reads rows past its
-    /// head's prefix, which planes regroup across: its kernels read the lm_head as the device
-    /// stores 4-bit codes (`MetalAllocator::affine_codes`), never planes — a target whose own
-    /// lm_head binds planes makes that bind refuse (`ReadersDisagree`) before this is asked.
-    pub fn get(&self, codes: AffineCodes) -> &T {
+    /// head's prefix: the head's codes are row-whole (`CodesRole::Head`), never planes.
+    pub fn get(&self, codes: RowCodes) -> &T {
         match codes {
-            AffineCodes::AsWritten => &self.as_written,
-            AffineCodes::Offset8 => &self.offset8,
-            AffineCodes::Planes { .. } => {
-                unreachable!("a vocabulary suffix's codes are never stored planes")
-            }
+            RowCodes::AsWritten => &self.as_written,
+            RowCodes::Offset8 => &self.offset8,
         }
     }
 

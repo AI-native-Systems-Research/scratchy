@@ -38,6 +38,7 @@ pub(crate) fn alias_preamble() -> TokenStream {
         use ::scratchy_target_metal::tape::constants as __tc;
         use ::scratchy_target_metal::tape::ids as __ti;
         use ::scratchy_target_metal::dflash2 as __td;
+        use ::scratchy_target_metal::tape::codes as __tq;
     }
 }
 
@@ -70,6 +71,7 @@ fn module_of(ty: &str) -> Result<TokenStream, Error> {
             quote!(__ti)
         }
         "DraftOutput" => quote!(__td),
+        "AffineCodesTable" => quote!(__tq),
         other => return Err(Error(format!("const_tokens: unmapped type `{other}`"))),
     };
     Ok(m)
@@ -79,7 +81,7 @@ fn module_of(ty: &str) -> Result<TokenStream, Error> {
 /// emitted as a reference to its literal, which `const` promotion makes `'static`.
 ///
 /// [`TapeCommands`]: scratchy_target_metal::tape::lowered::TapeCommands
-const HELD_BY_REFERENCE: &[&str] = &["CommandTable"];
+const HELD_BY_REFERENCE: &[&str] = &["CommandTable", "AffineCodesTable"];
 
 /// Emit the const-constructor tokens for `value`.
 pub fn const_tokens<T: Serialize>(value: &T) -> Result<TokenStream, Error> {

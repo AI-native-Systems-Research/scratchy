@@ -26,7 +26,10 @@ use scratchy_target_metal::specialized_pipeline_cache::{
 };
 use scratchy_target_metal::tape::ids::{AffineBits, AffineGroupSize};
 use scratchy_target_metal::tape::ids::{KDimI32, MDimI32, NDimI32};
-use scratchy_target_metal::tape::kernel_constants::{AffineCodes, AffineQmvWideConstants};
+use scratchy_target_metal::tape::kernel_constants::{
+    AffineCodes, AffineQmvWideConstants, RowCodes,
+};
+use scratchy_target_metal::tape::lowered::GenClass;
 use scratchy_target_metal::tape::quantized::{
     DequantDtype, SMALL_M_SIMDGROUPS, SMALL_M_TILE_COLS, ScaleDtype, SmallMTile, W4a8Gemm,
     W4a8Rows, pick_qmv_kernel_wide, qmv_dispatch_shape, qmv_kernel_static_name,
@@ -116,7 +119,10 @@ fn small_m_steps_in_the_eight_row_bucket_at_qwen38_27b_shapes() {
     let device = di.device.clone();
     let cache = SpecializedPipelineCache::new(device.clone(), &[]).expect("pipeline cache");
     let (act, scale) = (DequantDtype::Bf16, ScaleDtype::Bf16);
-    let codes = AffineCodes::of(Some(&di.profile), 4);
+    let codes = AffineCodes::Rows(RowCodes::of(
+        GenClass::of(di.profile.generation),
+        AffineBits::new(4).expect("affine bits"),
+    ));
     let twin = SmallMTile::for_bucket(BUCKET).expect("a small-M bucket");
     for live in LIVE {
         println!("µs (GB/s) a dispatch, {live} live rows in the {BUCKET}-row bucket");

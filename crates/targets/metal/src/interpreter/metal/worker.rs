@@ -478,9 +478,8 @@ pub enum WorkerError {
     },
     /// A per-bucket scratch or inline buffer a binding needs was not provisioned.
     WeightLookupFailed { reason: &'static str },
-    /// A command's MLX-affine codes operand could not be bound stored the
-    /// way its kernel reads them.
-    AffineCodes(crate::metal_allocator::AffineCodesBindError),
+    /// An MLX-affine codes tensor could not be stored the way its codes table entry says.
+    AffineCodes(crate::metal_allocator::AffineCodesStoreError),
     /// A model source a tape binds did not resolve at load.
     SourceUnresolved {
         ix: SourceIx,
@@ -1784,65 +1783,86 @@ pub struct ResolvedSources(HashMap<(SourceIx, WeightTensor, LayerId), (Buffer, u
 impl ResolvedSources {
     /// Resolve every [`Binding::Source`] of `tapes` (loops played out) through the model's
     /// generated [`ModelSources`] impl, each distinct `(ix, which, layer)` once.
+    ///
+    /// First, every MLX-affine codes tensor the tapes read is stored the way the tapes' codes
+    /// table says ([`LoweredMetalTape::codes`]), once, before any command binds it: each command
+    /// reading it was baked from that same entry, so binding it is binding its stored range.
     pub fn resolve<W: ModelSources>(
         weights: &W,
         allocator: &MetalAllocator,
         tapes: &[LoweredMetalTape],
     ) -> Result<Self, WorkerError> {
         let mut table = HashMap::new();
-        let mut codes_bound = Vec::new();
+        let miss = |ix: SourceIx, which, layer, why| WorkerError::SourceUnresolved {
+            ix,
+            source: W::SOURCES.get(ix.get() as usize).copied().unwrap_or("?"),
+            which,
+            layer,
+            why,
+        };
+        // Each distinct codes table the tapes hold, once.
+        let mut codes_tables: Vec<&'static crate::tape::codes::AffineCodesTable> = Vec::new();
+        for tape in tapes {
+            if !codes_tables.iter().any(|t| std::ptr::eq(*t, tape.codes)) {
+                codes_tables.push(tape.codes);
+            }
+        }
+        let mut codes_stored = Vec::new();
+        for entry in codes_tables.iter().flat_map(|t| t.entries) {
+            let crate::tape::codes::CodesEntry {
+                ix,
+                which,
+                layer,
+                codes,
+            } = *entry;
+            let bundle =
+                (weights.source(ix, layer)).ok_or(miss(ix, which, layer, SourceMiss::NoFamily))?;
+            let tensor =
+                (bundle.tensor(which)).ok_or(miss(ix, which, layer, SourceMiss::NoTensor))?;
+            let stored = allocator
+                .store_affine_codes(tensor.raw_ptr(), tensor.size_bytes(), codes)
+                .inspect_err(|e| {
+                    tracing::error!(
+                        "storing {} {which:?} of layer {} {codes:?}: {e}",
+                        W::SOURCES.get(ix.get() as usize).copied().unwrap_or("?"),
+                        layer.0,
+                    )
+                })
+                .map_err(WorkerError::AffineCodes)?;
+            table.entry((ix, which, layer)).or_insert(stored.binding());
+            codes_stored.push(tensor.raw_ptr().cast_const());
+        }
         for c in tapes.iter().flat_map(LoweredMetalTape::commands_expanded) {
-            // Every weight the command reads: its source bindings (a GEMM's, its weight).
+            // Every weight the command reads: its source bindings (a GEMM's, its weight). A codes
+            // tensor's binding is its stored range, resolved above.
             let bound = c.command.bindings().filter_map(|b| match b {
                 Binding::Source {
                     ix, which, layer, ..
                 } => Some((ix, which, layer)),
                 _ => None,
             });
-            // A GEMM's kernel reads its weight dense: it names no codes.
-            let (constants, reader) = match c.command {
-                TapeCommand::Dispatch(d) => (d.constants, d.function),
-                TapeCommand::Gemm(_) => (&[][..], "gemm"),
-            };
             for (ix, which, layer) in bound {
-                let miss = |why| WorkerError::SourceUnresolved {
-                    ix,
-                    source: W::SOURCES.get(ix.get() as usize).copied().unwrap_or("?"),
-                    which,
-                    layer,
-                    why,
-                };
-                let bundle = weights
-                    .source(ix, layer)
-                    .ok_or(miss(SourceMiss::NoFamily))?;
-                // MLX-affine packed codes bind stored the way each reading command's kernel
-                // reads them — every reader, so two that disagree refuse the load.
-                if bundle.is_affine_codes(which) {
-                    let tensor = bundle.tensor(which).ok_or(miss(SourceMiss::NoTensor))?;
-                    let codes = crate::tape::kernel_constants::AffineCodes::of_constants(constants);
-                    let at = allocator
-                        .bind_affine_codes(tensor.raw_ptr(), tensor.size_bytes(), codes)
-                        .inspect_err(|e| {
-                            tracing::error!(
-                                "binding {} {which:?} of layer {}: {} reads it {codes:?}: {e}",
-                                W::SOURCES.get(ix.get() as usize).copied().unwrap_or("?"),
-                                layer.0,
-                                reader
-                            )
-                        })
-                        .map_err(WorkerError::AffineCodes)?;
-                    table.entry((ix, which, layer)).or_insert(at);
-                    codes_bound.push(tensor.raw_ptr().cast_const());
-                } else if let Entry::Vacant(v) = table.entry((ix, which, layer)) {
-                    let tensor = bundle.tensor(which).ok_or(miss(SourceMiss::NoTensor))?;
+                if let Entry::Vacant(v) = table.entry((ix, which, layer)) {
+                    let bundle = (weights.source(ix, layer)).ok_or(miss(
+                        ix,
+                        which,
+                        layer,
+                        SourceMiss::NoFamily,
+                    ))?;
+                    let tensor = (bundle.tensor(which)).ok_or(miss(
+                        ix,
+                        which,
+                        layer,
+                        SourceMiss::NoTensor,
+                    ))?;
                     let at = allocator.buffer_for(tensor.raw_ptr());
-                    v.insert(at.ok_or(miss(SourceMiss::NotResident))?);
+                    v.insert(at.ok_or(miss(ix, which, layer, SourceMiss::NotResident))?);
                 }
             }
         }
         // Every codes range these tapes read is now stored the way they read it: release the
         // sidecar writers of the regions holding them.
-        allocator.settle_affine_codes(&codes_bound);
+        allocator.settle_affine_codes(&codes_stored);
         Ok(Self(table))
     }
 
@@ -2663,6 +2683,7 @@ mod tests {
             barrier_before: &[],
             // Straight-line: this fixture is one hand-built body, no rolled layer loop.
             loops: &[],
+            codes: crate::tape::codes::AffineCodesTable::EMPTY,
         }
     }
 
@@ -3073,6 +3094,7 @@ mod tests {
             barrier_before: &[],
             // Straight-line: this fixture is one hand-built body, no rolled layer loop.
             loops: &[],
+            codes: crate::tape::codes::AffineCodesTable::EMPTY,
         };
         let pipelines = crate::aot::tape_pipelines(
             &device,
@@ -3144,6 +3166,7 @@ mod tests {
             barrier_before: &[],
             // Straight-line: this fixture is one hand-built body, no rolled layer loop.
             loops: &[],
+            codes: crate::tape::codes::AffineCodesTable::EMPTY,
         };
         let pipelines = crate::aot::tape_pipelines(
             &device,
@@ -3315,6 +3338,7 @@ mod tests {
             barrier_before: &[],
             // Straight-line: this fixture is one hand-built body, no rolled layer loop.
             loops: &[],
+            codes: crate::tape::codes::AffineCodesTable::EMPTY,
         };
         let pipelines = crate::aot::tape_pipelines(
             &device,

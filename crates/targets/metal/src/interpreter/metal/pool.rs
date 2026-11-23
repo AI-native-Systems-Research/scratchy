@@ -701,12 +701,9 @@ pub fn pick_rung(
             .filter(|s| s.band == band)
             .collect::<Vec<_>>()
     };
-    let profile = crate::device::known_profile(device)
-        .ok_or_else(|| PoolBuildError::UnknownDevice(device.name().to_string()))?;
-    let gpu_cores = crate::device::gpu_cores(device).ok_or(PoolBuildError::UnknownGpuCores)?;
     // The class the routed fold's band rides on: a Max-scale M5 (enough GPU cores) takes the
     // wide band, every other chip the narrow one — selection only, both bands baked at expansion.
-    let gen_class = crate::tape::lowered::GenClass::for_device(profile.generation, gpu_cores);
+    let (gen_class, gpu_cores) = device_class(device)?;
     let band = FoldBand::for_class(gen_class);
     let band_buckets = band_specs(band);
     let smallest = band_buckets
@@ -756,6 +753,20 @@ pub fn pick_rung(
         tapes,
         ranks,
     })
+}
+
+/// The chip class `device` runs — its generation's, widened by its GPU cores
+/// ([`GenClass::for_device`](crate::tape::lowered::GenClass::for_device)): which tapes a pool
+/// picks, and so which codes table stores its weights — and the cores, read once from the IO
+/// registry.
+pub fn device_class(
+    device: &ProtocolObject<dyn MTLDevice>,
+) -> Result<(crate::tape::lowered::GenClass, crate::tape::ids::GpuCores), PoolBuildError> {
+    let profile = crate::device::known_profile(device)
+        .ok_or_else(|| PoolBuildError::UnknownDevice(device.name().to_string()))?;
+    let gpu_cores = crate::device::gpu_cores(device).ok_or(PoolBuildError::UnknownGpuCores)?;
+    let class = crate::tape::lowered::GenClass::for_device(profile.generation, gpu_cores);
+    Ok((class, gpu_cores))
 }
 
 /// Make the pool built into `pool` hold `guest`'s arena too (`ScratchyWeights::metal_host`, typed
@@ -2655,6 +2666,7 @@ mod tests {
             barrier_before: &[],
             // Straight-line: this fixture is one hand-built body, no rolled layer loop.
             loops: &[],
+            codes: crate::tape::codes::AffineCodesTable::EMPTY,
             moe_scratch_bytes: 0,
             decode_partials: crate::tape::lowered::DecodePartials::default(),
             roped_k_scratch_bytes: 0,
@@ -3835,6 +3847,7 @@ mod tests {
             barrier_before: &[],
             // Straight-line: this fixture is one hand-built body, no rolled layer loop.
             loops: &[],
+            codes: crate::tape::codes::AffineCodesTable::EMPTY,
             splitk_scratch_bytes: 0,
             moe_scratch_bytes: 0,
             decode_partials: crate::tape::lowered::DecodePartials::default(),

@@ -22,7 +22,7 @@ use scratchy_target_metal::mtl4_dispatch::{Mtl4DispatchBatch, shared_slice, shar
 use scratchy_target_metal::specialized_pipeline_cache::{
     ConstantValue, PipelineKey, SpecializedPipelineCache,
 };
-use scratchy_target_metal::tape::kernel_constants::AffineCodes;
+use scratchy_target_metal::tape::kernel_constants::{AffineCodes, RowCodes};
 use scratchy_target_metal::tape::lowered::GenClass;
 use scratchy_target_metal::tape::quantized::{
     DequantDtype, ScaleDtype, W4A8_TILE_ROWS, W4a8Gemm, W4a8SplitK, W4a8Tile, w4a8_scratch_bytes,
@@ -113,7 +113,7 @@ fn w4a8_against_split_k_at_qwen38_27b_shapes() {
                 ConstantValue::int(1, n as i32),
                 ConstantValue::int(2, m as i32),
             ];
-            constants.extend(AffineCodes::Offset8.constant());
+            constants.extend(AffineCodes::Rows(RowCodes::Offset8).constant());
             let tiles = [W4a8Tile::Cols128, W4a8Tile::Cols64];
             let kernels: Vec<W4a8Gemm> = (tiles.into_iter())
                 .filter(|t| n.is_multiple_of(t.cols()))

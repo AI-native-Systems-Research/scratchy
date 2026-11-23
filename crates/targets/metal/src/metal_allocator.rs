@@ -11,7 +11,7 @@ use objc2::runtime::ProtocolObject;
 use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions};
 
 use crate::residency::Pinned;
-use crate::tape::kernel_constants::{AffineCodes, AffineCodesTarget};
+use crate::tape::kernel_constants::{AffineCodes, PlanesK, RowCodes};
 use scratchy_tensors::DeviceAllocator;
 
 pub type Buffer = Retained<ProtocolObject<dyn MTLBuffer>>;
@@ -164,30 +164,18 @@ pub fn join_sidecar_writers() {
 /// `planes` ranges regrouped as well (`AffineCodes::Planes`).
 const ALIGNED_CACHE_LAYOUT_VERSION: u32 = 3;
 
-/// How a region's 4-bit code range is stored, past as written.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum StoredCodes {
-    /// XOR 0x88 ([`AffineCodes::Offset8`]).
-    Offset8,
-    /// XOR 0x88 and regrouped into planes of rows of `k` inputs ([`AffineCodes::Planes`]).
-    Planes { k: u32 },
-}
-
-impl StoredCodes {
-    /// What a command reading `codes` needs a range stored as (`None`: as written).
-    fn of(codes: AffineCodes) -> Option<Self> {
-        match codes {
-            AffineCodes::AsWritten => None,
-            AffineCodes::Offset8 => Some(Self::Offset8),
-            AffineCodes::Planes { k } => Some(Self::Planes { k }),
-        }
+/// How `codes` stores a range past as written; `None` for codes stored as written.
+fn past_as_written(codes: AffineCodes) -> Option<AffineCodes> {
+    match codes {
+        AffineCodes::Rows(RowCodes::AsWritten) => None,
+        codes => Some(codes),
     }
 }
 
 /// A region's 4-bit code ranges not stored as written (aligned-buffer offset →
 /// (length, how)). Shared with the region's sidecar writer, which snapshots the
 /// blob and the ranges under this lock.
-type StoredRanges = std::collections::BTreeMap<usize, (usize, StoredCodes)>;
+type StoredRanges = std::collections::BTreeMap<usize, (usize, AffineCodes)>;
 type Offset8Ranges = Arc<Mutex<StoredRanges>>;
 
 /// Set once a pool whose tapes read a region's codes has bound them ([`MetalAllocator::
@@ -198,31 +186,33 @@ type Offset8Ranges = Arc<Mutex<StoredRanges>>;
 /// second launch).
 type RegionSettled = Arc<AtomicBool>;
 
-/// Store `len` bytes of as-written codes at `ptr` the way `how` says, in place: XOR 0x88, and
-/// for planes regroup them a 64-input chunk at a time (`affine_codes.h`) through a scratch of
-/// `len` bytes.
+/// Store `len` bytes of as-written codes at `ptr` the way `codes` says, in place: as written
+/// they stay; offset-8 XORs them 0x88; planes XOR them and regroup them a 64-input chunk at a time
+/// (`affine_codes.h`) through a scratch of `len` bytes.
 ///
 /// # Safety
 /// `ptr..ptr + len` must be writable and not concurrently accessed.
-unsafe fn store_codes(ptr: *mut u8, len: usize, how: StoredCodes) {
-    unsafe { xor_codes_0x88(ptr, len) };
-    if let StoredCodes::Planes { k } = how {
-        let bytes = unsafe { std::slice::from_raw_parts_mut(ptr, len) };
-        let planes = codes_to_planes(bytes, k as usize);
-        bytes.copy_from_slice(&planes);
+unsafe fn store_codes(ptr: *mut u8, len: usize, codes: AffineCodes) {
+    match codes {
+        AffineCodes::Rows(RowCodes::AsWritten) => {}
+        AffineCodes::Rows(RowCodes::Offset8) => unsafe { xor_codes_0x88(ptr, len) },
+        AffineCodes::Planes { k } => {
+            unsafe { xor_codes_0x88(ptr, len) };
+            let bytes = unsafe { std::slice::from_raw_parts_mut(ptr, len) };
+            let planes = codes_to_planes(bytes, k);
+            bytes.copy_from_slice(&planes);
+        }
     }
 }
 
 /// Rows of `k` inputs' 4-bit codes (`k / 2` bytes a row, as written) regrouped into planes:
-/// chunk `c`'s 32 bytes of every row, row after row (`affine_codes.h`).
-fn codes_to_planes(rows: &[u8], k: usize) -> Vec<u8> {
+/// chunk `c`'s 32 bytes of every row, row after row (`affine_codes.h`). `k` is whole chunks by
+/// its type; the rows are whole rows of the tensor they are.
+fn codes_to_planes(rows: &[u8], k: PlanesK) -> Vec<u8> {
     use crate::tape::kernel_constants::AFFINE_PLANE_ROW_BYTES as P;
+    let k = k.get() as usize;
     let row = k / 2;
-    assert!(
-        k.is_multiple_of(64) && rows.len().is_multiple_of(row),
-        "whole 64-input chunks"
-    );
-    let (n, chunks) = (rows.len() / row, k / 64);
+    let (n, chunks) = (rows.len() / row, k / PlanesK::CHUNK as usize);
     let mut out = vec![0u8; rows.len()];
     for r in 0..n {
         for c in 0..chunks {
@@ -275,13 +265,13 @@ impl AlignedCacheMeta {
         // backslashes, unicode); the rest are numbers.
         let src_path = serde_json::to_string(&self.src_path).unwrap_or_else(|_| "\"\"".to_string());
         let offset8: Vec<String> = (stored.iter())
-            .filter(|(_, (_, how))| *how == StoredCodes::Offset8)
+            .filter(|(_, (_, how))| *how == AffineCodes::Rows(RowCodes::Offset8))
             .map(|(o, (l, _))| format!("[{o},{l}]"))
             .collect();
         let planes: Vec<String> = (stored.iter())
             .filter_map(|(o, (l, how))| match how {
-                StoredCodes::Planes { k } => Some(format!("[{o},{l},{k}]")),
-                StoredCodes::Offset8 => None,
+                AffineCodes::Planes { k } => Some(format!("[{o},{l},{}]", k.get())),
+                AffineCodes::Rows(_) => None,
             })
             .collect();
         format!(
@@ -315,11 +305,16 @@ impl AlignedCacheMeta {
             return None;
         }
         let n = |r: &serde_json::Value, i| r.get(i).and_then(|v| v.as_u64());
-        let offset8 = (j.get("offset8")?.as_array()?.iter())
-            .map(|r| Some((n(r, 0)? as usize, (n(r, 1)? as usize, StoredCodes::Offset8))));
-        let planes = (j.get("planes")?.as_array()?.iter()).map(|r| {
-            let how = StoredCodes::Planes { k: n(r, 2)? as u32 };
+        let offset8 = (j.get("offset8")?.as_array()?.iter()).map(|r| {
+            let how = AffineCodes::Rows(RowCodes::Offset8);
             Some((n(r, 0)? as usize, (n(r, 1)? as usize, how)))
+        });
+        let planes = (j.get("planes")?.as_array()?.iter()).map(|r| {
+            let k = PlanesK::new(u32::try_from(n(r, 2)?).ok()?)?;
+            Some((
+                n(r, 0)? as usize,
+                (n(r, 1)? as usize, AffineCodes::Planes { k }),
+            ))
         });
         offset8.chain(planes).collect()
     }
@@ -336,67 +331,65 @@ impl U128Lossy for serde_json::Value {
     }
 }
 
-/// The MLX-affine codes ranges a [`MetalAllocator`] has bound, keyed by
-/// source address.
+/// The MLX-affine codes ranges a [`MetalAllocator`] has stored, keyed by source address.
 #[derive(Default)]
-struct BoundAffineCodes {
-    /// (length, how every reader reads it) — two readers can never disagree.
-    reads: std::collections::BTreeMap<usize, (usize, AffineCodes)>,
-    /// Ranges of a sidecar-served region its blob lacks offset-8: source
-    /// address → the stored copy's address.
-    copies: std::collections::HashMap<usize, usize>,
+struct StoredAffineCodesRanges {
+    /// Each range stored ([`MetalAllocator::store_affine_codes`]): its length and handle.
+    stored: std::collections::BTreeMap<usize, (usize, StoredAffineCodes)>,
 }
 
-/// Why [`MetalAllocator::bind_affine_codes`] refused a codes range.
+/// One MLX-affine codes tensor stored the way its codes table entry says
+/// ([`MetalAllocator::store_affine_codes`]): the buffer and offset its stored bytes sit at, and
+/// how they are stored. Minted by the store alone, so a binding of it is a binding of codes stored
+/// as it says.
+#[derive(Clone)]
+pub struct StoredAffineCodes {
+    buffer: Buffer,
+    offset: u64,
+    codes: AffineCodes,
+}
+
+impl StoredAffineCodes {
+    /// How the bytes are stored.
+    pub fn codes(&self) -> AffineCodes {
+        self.codes
+    }
+
+    /// The buffer and offset a command binds them at.
+    pub fn binding(&self) -> (Buffer, u64) {
+        (self.buffer.clone(), self.offset)
+    }
+}
+
+/// Why [`MetalAllocator::store_affine_codes`] could not store a codes range.
 #[derive(Debug)]
-pub enum AffineCodesBindError {
-    /// The range lies in none of this allocator's buffers.
+pub enum AffineCodesStoreError {
+    /// The range lies in none of this allocator's buffers, or in a region's within no tensor.
     NotAllocated { addr: usize },
-    /// Two commands read one range differently.
-    ReadersDisagree {
-        addr: usize,
-        first: AffineCodes,
-        then: AffineCodes,
-    },
-    /// The range partially overlaps one bound before it.
+    /// The range partially overlaps one stored before it.
     Overlap {
         addr: usize,
         len: usize,
-        bound: usize,
-        bound_len: usize,
+        stored: usize,
+        stored_len: usize,
     },
-    /// A sidecar-served range is stored offset-8, but this command reads
-    /// it as written.
-    StoredOffset8 { addr: usize },
-    /// Allocating the stored copy of a stale sidecar's range failed.
+    /// Allocating the stored copy of a sidecar's range failed.
     Copy(anyhow::Error),
 }
 
-impl std::fmt::Display for AffineCodesBindError {
+impl std::fmt::Display for AffineCodesStoreError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NotAllocated { addr } => write!(f, "affine codes {addr:#x} are in no arena"),
-            Self::ReadersDisagree { addr, first, then } => {
-                write!(
-                    f,
-                    "affine codes {addr:#x}: one command reads them {first:?}, another {then:?}"
-                )
-            }
             Self::Overlap {
                 addr,
                 len,
-                bound,
-                bound_len,
+                stored,
+                stored_len,
             } => {
                 write!(
                     f,
-                    "affine codes {addr:#x}+{len} overlap bound range {bound:#x}+{bound_len}"
-                )
-            }
-            Self::StoredOffset8 { addr } => {
-                write!(
-                    f,
-                    "affine codes {addr:#x} are stored offset-8 but read as written"
+                    "affine codes {addr:#x}+{len} overlap stored range {stored:#x}+{stored_len}"
                 )
             }
             Self::Copy(e) => write!(f, "storing a copy of affine codes: {e}"),
@@ -404,7 +397,7 @@ impl std::fmt::Display for AffineCodesBindError {
     }
 }
 
-impl std::error::Error for AffineCodesBindError {}
+impl std::error::Error for AffineCodesStoreError {}
 
 /// Per-tensor record stored in the parent `MmapRegion`. Each tensor's
 /// bytes live at `aligned_buffer.contents() + dst_offset` (the
@@ -552,9 +545,8 @@ pub struct MetalAllocator {
     /// `residency` (weights pinned alongside the working set — legacy).
     weights_residency: crate::residency::MetalResidencySet,
     mmaps: Arc<Mutex<Vec<MmapRegion>>>,
-    /// Every MLX-affine codes range bound so far; see
-    /// [`Self::bind_affine_codes`].
-    affine_codes: Arc<Mutex<BoundAffineCodes>>,
+    /// Every MLX-affine codes range stored so far; see [`Self::store_affine_codes`].
+    affine_codes: Arc<Mutex<StoredAffineCodesRanges>>,
     /// Diagnostic counters for `alloc_and_copy_host` routing. Bumped
     /// once per call so the worker can print a one-shot "zero-copy
     /// vs memcpy" breakdown after `try_load` completes. Atomics are
@@ -855,19 +847,8 @@ impl MetalAllocator {
         None
     }
 
-    /// How this device's kernels read MLX-affine codes.
-    fn affine_codes_target(&self) -> AffineCodesTarget {
-        AffineCodesTarget::of(Some(&crate::device::profile_for_device(&self.device)))
-    }
-
-    /// How this device's kernels read `bits`-bit MLX-affine codes: what a command binding them
-    /// by [`Self::bind_affine_codes`] reads them as.
-    pub fn affine_codes(&self, bits: crate::tape::ids::AffineBits) -> AffineCodes {
-        self.affine_codes_target().for_bits(bits.get())
-    }
-
-    /// After a pool has bound every codes range its tapes read (`ptrs`, through
-    /// [`Self::bind_affine_codes`]): the regions holding them are settled, so their sidecar writers
+    /// After a pool has stored every codes range its tapes read (`ptrs`, through
+    /// [`Self::store_affine_codes`]): the regions holding them are settled, so their sidecar writers
     /// may persist them ([`RegionSettled`]). A region no pool binds codes in — a model without
     /// affine weights — settles when the load completes or the writers drain.
     pub fn settle_affine_codes(&self, ptrs: &[*const u8]) {
@@ -887,60 +868,44 @@ impl MetalAllocator {
         }
     }
 
-    /// The buffer binding for the MLX-affine packed codes `ptr..ptr + len`,
-    /// stored the way the reading command's kernel reads them (`codes`,
-    /// from its constants). On `Offset8` they are stored XOR 0x88 — signed
-    /// q - 8 — once, in place: in a copied region (whose sidecar writer
-    /// persists them that way and lists the range) or a weight arena. A
-    /// region served from a sidecar that already stores the range binds it
-    /// as is; one whose sidecar lacks it binds a stored copy and drops the
-    /// sidecar, so the next launch rebuilds it.
+    /// Store the MLX-affine packed codes `ptr..ptr + len` the way `codes` says — their codes table
+    /// entry ([`crate::tape::codes`]) — once, and hand back the [`StoredAffineCodes`] every command
+    /// reading them binds. A range already stored hands back its handle: one tensor has one entry
+    /// per model and class, and a tensor two models bind (a drafter's borrowed head or table) is
+    /// row-whole in both tables, decided by the one law of row-whole storage
+    /// ([`RowCodes::of`]) from the same class and the same width.
     ///
-    pub fn bind_affine_codes(
+    /// Offset-8 and planes are stored in place, through the allocator's own mapping of the range:
+    /// in a copied region (whose sidecar writer persists them that way and lists the range) or a
+    /// weight arena. A region served from a sidecar that already stores the range so binds it as
+    /// is; one whose sidecar stores it otherwise binds a stored copy of the source file's bytes
+    /// and drops the sidecar, so the next launch rebuilds it.
+    pub fn store_affine_codes(
         &self,
         ptr: *const u8,
         len: usize,
         codes: AffineCodes,
-    ) -> std::result::Result<(Buffer, u64), AffineCodesBindError> {
+    ) -> std::result::Result<StoredAffineCodes, AffineCodesStoreError> {
         let p = ptr as usize;
-        let mut bound = self.affine_codes.lock().expect("affine codes Mutex");
-        let prev = bound
-            .reads
-            .range(..p + len.max(1))
-            .next_back()
-            .map(|(&a, &r)| (a, r));
-        let first = match prev {
-            Some((a, (l, first))) if a == p && l == len => {
-                if first != codes {
-                    return Err(AffineCodesBindError::ReadersDisagree {
-                        addr: p,
-                        first,
-                        then: codes,
-                    });
-                }
-                false
-            }
-            Some((a, (l, _))) if a + l > p => {
-                return Err(AffineCodesBindError::Overlap {
+        let mut ranges = self.affine_codes.lock().expect("affine codes Mutex");
+        let prev = (ranges.stored.range(..p + len.max(1)).next_back())
+            .map(|(&a, (l, stored))| (a, *l, stored.clone()));
+        match prev {
+            Some((a, l, stored)) if a == p && l == len => return Ok(stored),
+            Some((a, l, _)) if a + l > p => {
+                return Err(AffineCodesStoreError::Overlap {
                     addr: p,
                     len,
-                    bound: a,
-                    bound_len: l,
+                    stored: a,
+                    stored_len: l,
                 });
             }
-            _ => {
-                bound.reads.insert(p, (len, codes));
-                true
-            }
-        };
-        if let Some(&copy) = bound.copies.get(&p) {
-            return self
-                .buffer_for(copy as *const u8)
-                .ok_or(AffineCodesBindError::NotAllocated { addr: copy });
+            _ => {}
         }
-        // In a region: bind in place, storing on first bind; a stale sidecar
-        // hands back its meta and the range. Every write goes through the
-        // allocator's own mapping of the range, never the caller's pointer.
+        let want = past_as_written(codes);
+        // In a region: in place, or a stored copy where its sidecar stores the range otherwise.
+        // Every write goes through the allocator's own mapping of the range, never the caller's
+        // pointer.
         let in_region = {
             let mmaps = self.mmaps.lock().expect("MetalAllocator mmaps Mutex");
             mmaps.iter().find_map(|r| {
@@ -954,82 +919,78 @@ impl MetalAllocator {
                     .map(|&(_, how)| how);
                 // SAFETY: `off + len` is within the region's aligned mapping.
                 let at = unsafe { r.aligned_base.add(off) };
-                Some(match (StoredCodes::of(codes), has, &r.served_from) {
-                    (None, Some(_), _) => Err(None),
-                    (None, None, _) => Ok((r.aligned_buffer.clone(), off as u64)),
-                    (Some(want), Some(how), _) if want == how => {
-                        Ok((r.aligned_buffer.clone(), off as u64))
-                    }
-                    (Some(want), None, None) => {
-                        // SAFETY: inside the region's writable aligned buffer;
-                        // no command has run, and its writer snapshots under
-                        // this lock.
-                        unsafe { store_codes(at, len, want) };
-                        stored.insert(off, (len, want));
-                        Ok((r.aligned_buffer.clone(), off as u64))
-                    }
-                    // A sidecar that stores the range otherwise, or not at all: a stored copy
-                    // of the source file's bytes (the blob's are not as written), the sidecar
-                    // rebuilt. A copied region's range stored otherwise has none to copy from.
-                    (Some(want), stored_as, served) => {
-                        let src = (r.tensors.iter())
-                            .find(|t| t.dst_offset == off && t.len == len)
-                            .map(|t| r.base.wrapping_add(t.src_offset));
-                        match (src, stored_as, served) {
-                            (Some(src), _, Some(_)) | (Some(src), None, None) => {
-                                Err(Some((served.clone(), want, src)))
-                            }
-                            _ => Err(None),
+                let here = || (r.aligned_buffer.clone(), off as u64);
+                Some(match &r.served_from {
+                    // A copied region's ranges are stored through here alone, each recorded
+                    // above first: this range is as written.
+                    None => {
+                        if let Some(want) = want {
+                            // SAFETY: inside the region's writable aligned buffer; no command
+                            // has run, and its writer snapshots under this lock.
+                            unsafe { store_codes(at, len, want) };
+                            stored.insert(off, (len, want));
                         }
+                        Ok(here())
+                    }
+                    Some(_) if has == want => Ok(here()),
+                    // A sidecar that stores the range otherwise: a stored copy of the source
+                    // file's bytes of it, the sidecar rebuilt.
+                    Some(meta) => {
+                        let src = (r.tensors.iter())
+                            .find(|t| t.dst_offset <= off && off + len <= t.dst_offset + t.len)
+                            .map(|t| r.base.wrapping_add(t.src_offset + (off - t.dst_offset)));
+                        Err((meta.clone(), src))
                     }
                 })
             })
         };
-        match in_region {
-            Some(Ok(binding)) => Ok(binding),
-            Some(Err(None)) => Err(AffineCodesBindError::StoredOffset8 { addr: p }),
-            Some(Err(Some((served, want, src)))) => {
-                if let Some(meta) = served
-                    && std::fs::remove_file(meta.meta_json_path()).is_ok()
-                {
+        let (buffer, offset) = match in_region {
+            Some(Ok(binding)) => binding,
+            Some(Err((meta, src))) => {
+                let src = src.ok_or(AffineCodesStoreError::NotAllocated { addr: p })?;
+                if std::fs::remove_file(meta.meta_json_path()).is_ok() {
                     tracing::warn!(
-                        "aligned-cache: {} stores codes otherwise than this launch reads them \
-                         ({len} bytes at {p:#x} read {codes:?}); storing copies and dropping the \
-                         sidecar for the next launch to rebuild",
+                        "aligned-cache: {} stores codes otherwise than this launch's codes table \
+                         ({len} bytes at {p:#x} stored {codes:?}); storing copies and dropping \
+                         the sidecar for the next launch to rebuild",
                         meta.bin.display()
                     );
                 }
                 let copy = self
                     .alloc_uninit_weights(len)
-                    .map_err(AffineCodesBindError::Copy)?;
+                    .map_err(AffineCodesStoreError::Copy)?;
                 // SAFETY: `src..src + len` is the tensor's bytes in the region's source
                 // mapping, which the region keeps alive; `copy` is a fresh `len`-byte weight
                 // allocation.
                 unsafe {
                     std::ptr::copy_nonoverlapping(src, copy, len);
-                    store_codes(copy, len, want);
+                    store_codes(copy, len, codes);
                 }
-                bound.copies.insert(p, copy as usize);
                 self.buffer_for(copy)
-                    .ok_or(AffineCodesBindError::NotAllocated {
+                    .ok_or(AffineCodesStoreError::NotAllocated {
                         addr: copy as usize,
-                    })
+                    })?
             }
             None => {
                 let (buffer, off) = self
                     .buffer_for(ptr)
-                    .ok_or(AffineCodesBindError::NotAllocated { addr: p })?;
-                if let (true, Some(want)) = (first, StoredCodes::of(codes)) {
-                    // SAFETY: the range lies in `buffer`'s shared contents
-                    // (resolved above); no command has run.
-                    unsafe {
-                        let at = buffer.contents().as_ptr().cast::<u8>().add(off as usize);
-                        store_codes(at, len, want);
-                    }
+                    .ok_or(AffineCodesStoreError::NotAllocated { addr: p })?;
+                // SAFETY: the range lies in `buffer`'s shared contents (resolved above); no
+                // command has run.
+                unsafe {
+                    let at = buffer.contents().as_ptr().cast::<u8>().add(off as usize);
+                    store_codes(at, len, codes);
                 }
-                Ok((buffer, off))
+                (buffer, off)
             }
-        }
+        };
+        let stored = StoredAffineCodes {
+            buffer,
+            offset,
+            codes,
+        };
+        ranges.stored.insert(p, (len, stored.clone()));
+        Ok(stored)
     }
 
     /// Parse a safetensors header (`[u64 header_size_le][JSON header]
@@ -1144,9 +1105,9 @@ impl MetalAllocator {
             .filter(|_| cache_enabled)
             .map(|m| m.cache_bin_path());
         if let (Some(cf), Some(m)) = (cache_file.as_ref(), meta.as_ref())
-            && let Some(offset8) = m.offset8_if_valid_on_disk().filter(|o| {
-                o.is_empty() || self.affine_codes_target().for_bits(4) != AffineCodes::AsWritten
-            })
+            // Each range it stores past as written is checked against the codes table as the
+            // range is stored (`store_affine_codes`).
+            && let Some(offset8) = m.offset8_if_valid_on_disk()
         {
             match Self::register_from_aligned_cache(
                 self,
@@ -2220,8 +2181,16 @@ mod tests {
             src_path: "/weird/pa\"th/model.safetensors".to_string(),
         };
         let json = meta.to_json(&StoredRanges::from([
-            (64, (128, StoredCodes::Offset8)),
-            (256, (512, StoredCodes::Planes { k: 128 })),
+            (64, (128, AffineCodes::Rows(RowCodes::Offset8))),
+            (
+                256,
+                (
+                    512,
+                    AffineCodes::Planes {
+                        k: PlanesK::of(128),
+                    },
+                ),
+            ),
         ]));
         let v: serde_json::Value = serde_json::from_str(&json).expect("to_json emits valid JSON");
         assert_eq!(v["src_path"], "/weird/pa\"th/model.safetensors");
@@ -2415,9 +2384,9 @@ mod tests {
         assert_eq!(alloc.used_bytes(), 0);
     }
 
-    /// Codes in a weight arena are stored offset-8 once, however many
-    /// commands bind them; a reader that disagrees, a partially overlapping
-    /// range and a foreign pointer are refused; codes read as written stay.
+    /// Codes in a weight arena are stored offset-8 once, however many times they are stored: the
+    /// range already stored hands back its handle. A partially overlapping range and a foreign
+    /// pointer are refused; codes stored as written stay.
     #[test]
     fn affine_codes_store_offset8_once_in_a_weight_arena() {
         let Some(device) = try_device() else {
@@ -2434,32 +2403,27 @@ mod tests {
         let read = |p: *mut u8| unsafe { std::slice::from_raw_parts(p, codes.len()) }.to_vec();
         let flipped: Vec<u8> = codes.iter().map(|c| c ^ 0x88).collect();
 
+        let offset8 = AffineCodes::Rows(RowCodes::Offset8);
         for _ in 0..2 {
-            let bound = alloc.bind_affine_codes(a, codes.len(), AffineCodes::Offset8);
+            let stored = alloc.store_affine_codes(a, codes.len(), offset8);
             assert_eq!(
-                bound.ok().map(|(_, o)| o),
+                stored.as_ref().ok().map(|s| s.binding().1),
                 alloc.buffer_for(a).map(|(_, o)| o)
             );
+            assert_eq!(stored.ok().map(|s| s.codes()), Some(offset8));
             assert_eq!(read(a), flipped);
         }
         assert!(matches!(
-            alloc.bind_affine_codes(a, codes.len(), AffineCodes::AsWritten),
-            Err(AffineCodesBindError::ReadersDisagree { .. })
+            alloc.store_affine_codes(a.wrapping_add(16), 16, offset8),
+            Err(AffineCodesStoreError::Overlap { .. })
         ));
-        assert!(matches!(
-            alloc.bind_affine_codes(a.wrapping_add(16), 16, AffineCodes::Offset8),
-            Err(AffineCodesBindError::Overlap { .. })
-        ));
-        assert!(
-            alloc
-                .bind_affine_codes(b, codes.len(), AffineCodes::AsWritten)
-                .is_ok()
-        );
+        let as_written = AffineCodes::Rows(RowCodes::AsWritten);
+        assert!(alloc.store_affine_codes(b, codes.len(), as_written).is_ok());
         assert_eq!(read(b), codes);
         let stack = [0u8; 4];
         assert!(matches!(
-            alloc.bind_affine_codes(stack.as_ptr(), 4, AffineCodes::Offset8),
-            Err(AffineCodesBindError::NotAllocated { .. })
+            alloc.store_affine_codes(stack.as_ptr(), 4, offset8),
+            Err(AffineCodesStoreError::NotAllocated { .. })
         ));
     }
 
@@ -2469,7 +2433,7 @@ mod tests {
     fn codes_regroup_into_planes_a_chunk_of_every_row_at_a_time() {
         let (rows, k) = (3usize, 128usize);
         let codes: Vec<u8> = (0..rows * k / 2).map(|i| i as u8).collect();
-        let planes = codes_to_planes(&codes, k);
+        let planes = codes_to_planes(&codes, PlanesK::of(k as u32));
         for r in 0..rows {
             for c in 0..k / 64 {
                 assert_eq!(
@@ -2484,8 +2448,8 @@ mod tests {
         assert_eq!(sorted, codes, "a permutation of the bytes");
     }
 
-    /// A planes reader stores its range once, XOR 0x88 and regrouped; a reader of the same range
-    /// stored any other way refuses the bind.
+    /// Planes are stored once, XOR 0x88 and regrouped: storing the range again hands back the
+    /// stored handle and leaves its bytes as they are.
     #[test]
     fn affine_codes_store_planes_once_in_a_weight_arena() {
         let Some(device) = try_device() else {
@@ -2504,21 +2468,13 @@ mod tests {
         };
         let read = |p: *mut u8| unsafe { std::slice::from_raw_parts(p, codes.len()) }.to_vec();
         let flipped: Vec<u8> = codes.iter().map(|c| c ^ 0x88).collect();
+        let k = PlanesK::of(k as u32);
         let want = codes_to_planes(&flipped, k);
-        let planes = AffineCodes::Planes { k: k as u32 };
+        let planes = AffineCodes::Planes { k };
         for _ in 0..2 {
-            assert!(alloc.bind_affine_codes(a, codes.len(), planes).is_ok());
+            let stored = alloc.store_affine_codes(a, codes.len(), planes);
+            assert_eq!(stored.ok().map(|s| s.codes()), Some(planes));
             assert_eq!(read(a), want);
-        }
-        for other in [
-            AffineCodes::Offset8,
-            AffineCodes::AsWritten,
-            AffineCodes::Planes { k: 64 },
-        ] {
-            assert!(matches!(
-                alloc.bind_affine_codes(a, codes.len(), other),
-                Err(AffineCodesBindError::ReadersDisagree { .. })
-            ));
         }
     }
 

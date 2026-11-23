@@ -17,6 +17,7 @@ use scratchy_target_metal::specialized_pipeline_cache::{
     ConstantValue, PipelineKey, SpecializedPipelineCache,
 };
 use scratchy_target_metal::tape::ids::{AffineBits, AffineGroupSize};
+use scratchy_target_metal::tape::lowered::GenClass;
 use scratchy_target_metal::targets::is_nax_capable;
 
 type Device = objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn MTLDevice>>;
@@ -426,7 +427,7 @@ fn staged_tiles_on_a_chip_emulated_by_width() {
     };
     use scratchy_target_metal::tape::ids::{KDimI32, MDimI32, NDimI32};
     use scratchy_target_metal::tape::kernel_constants::{
-        AffineCodes, AffineQmmTConstants, AffineQmvWideConstants,
+        AffineCodes, AffineQmmTConstants, AffineQmvWideConstants, RowCodes,
     };
     use scratchy_target_metal::tape::quantized::{
         pick_qmv_kernel_wide, qmv_dispatch_shape, qmv_kernel_static_name,
@@ -445,7 +446,10 @@ fn staged_tiles_on_a_chip_emulated_by_width() {
         .get() as usize;
     let width = EMULATED / cores;
     let cache = SpecializedPipelineCache::new(device.clone(), &[]).expect("pipeline cache");
-    let codes = AffineCodes::of(Some(&di.profile), 4);
+    let codes = AffineCodes::Rows(RowCodes::of(
+        GenClass::of(di.profile.generation),
+        AffineBits::new(4).expect("affine bits"),
+    ));
     let wide = |n: usize, k: usize, bucket: u32| {
         let kernel = pick_qmv_kernel_wide(n as u32, k as u32, 4, bucket, true);
         let name = qmv_kernel_static_name(
@@ -1020,7 +1024,7 @@ fn register_tile_on_a_chip_emulated_by_width() {
     };
     use scratchy_target_metal::tape::ids::{KDimI32, MDimI32, NDimI32};
     use scratchy_target_metal::tape::kernel_constants::{
-        AffineCodes, AffineQmmTConstants, AffineQmvWideConstants,
+        AffineCodes, AffineQmmTConstants, AffineQmvWideConstants, RowCodes,
     };
     use scratchy_target_metal::tape::quantized::{
         pick_qmv_kernel_wide, qmv_dispatch_shape, qmv_kernel_static_name,
@@ -1039,7 +1043,10 @@ fn register_tile_on_a_chip_emulated_by_width() {
         .get() as usize;
     let width = EMULATED / cores;
     let cache = SpecializedPipelineCache::new(device.clone(), &[]).expect("pipeline cache");
-    let codes = AffineCodes::of(Some(&di.profile), 4);
+    let codes = AffineCodes::Rows(RowCodes::of(
+        GenClass::of(di.profile.generation),
+        AffineBits::new(4).expect("affine bits"),
+    ));
     let bucket = 8u32;
     println!(
         "µs a dispatch, min/median/max of {ROUNDS} rounds, bucket {bucket}, a {EMULATED}-core chip emulated by \

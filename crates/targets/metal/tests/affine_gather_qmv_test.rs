@@ -19,7 +19,7 @@ use scratchy_target_metal::device::detect_device;
 use scratchy_target_metal::quantized::{DequantDtype, ScaleDtype};
 use scratchy_target_metal::tape::ids::{KDimI32, NDimI32, TopK};
 use scratchy_target_metal::tape::kernel_constants::{
-    AffineCodes, AffineGatherQmvConstants, AffineQmvConstants, GatherRows,
+    AffineCodes, AffineGatherQmvConstants, AffineQmvConstants, GatherRows, RowCodes,
 };
 
 /// The gather matvec's baked constants: K / N, codes as written, `top_k` output rows per x row.
@@ -28,7 +28,7 @@ fn gather_constants(k: u32, n_out: u32, top_k: u32) -> AffineGatherQmvConstants 
         qmv: AffineQmvConstants {
             k: KDimI32(k as i32),
             n: NDimI32(n_out as i32),
-            codes: AffineCodes::AsWritten,
+            codes: AffineCodes::Rows(RowCodes::AsWritten),
         },
         rows: GatherRows::Tokens(TopK(top_k)),
     }

@@ -19,7 +19,7 @@ use scratchy_target_metal::tape::constants::{ConstSlot, ConstantValue};
 use scratchy_target_metal::tape::ids::{KDimI32, NDimI32, NumExperts, TopK};
 use scratchy_target_metal::tape::kernel_constants::{
     AffineCodes, AffineGatherQmvConstants, AffineQmvConstants, GatherRows, MoeRouteConstants,
-    RoutedConstants,
+    RoutedConstants, RowCodes,
 };
 use scratchy_target_metal::tape::step::{LayerId, RoutePost, RoutePre, RouteProgram};
 
@@ -145,7 +145,7 @@ impl Experts {
             qmv: AffineQmvConstants {
                 k: KDimI32(self.k_in as i32),
                 n: NDimI32(self.n_out as i32),
-                codes: AffineCodes::AsWritten,
+                codes: AffineCodes::Rows(RowCodes::AsWritten),
             },
             rows,
         }
