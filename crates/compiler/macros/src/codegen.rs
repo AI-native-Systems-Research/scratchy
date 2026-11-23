@@ -7437,20 +7437,20 @@ impl KvCacheLayers {
     }
 }
 
-/// The model's KV codec. Int8 on a target that compresses KV (`compress`), wherever `codec_for`
-/// takes its geometry; dense everywhere else. A model it would compress but can't is named in the
+/// The model's KV codec. Int8 on a target whose kernels code its heads (`coded`), wherever
+/// `codec_for` takes its geometry; dense everywhere else. A model it would compress but can't is named in the
 /// build output.
 fn kv_codec_for(
     model: &ModelParams,
     head_dim: u32,
     global_head_dim: u32,
     kv_layers: &KvCacheLayers,
-    compress: bool,
+    coded: Option<scratchy_ir::CodedHeads>,
 ) -> scratchy_forward_compiler::KvCodec {
     use scratchy_ir::{DenseReason, KvRows, codec_for};
-    if !compress {
+    let Some(coded) = coded else {
         return scratchy_forward_compiler::KvCodec::Dense;
-    }
+    };
     let latent = model.bounds.get("kv_lora_rank").is_some_and(|&r| r > 0);
     let rows = match (kv_layers.any(), latent) {
         (false, _) => KvRows::None,
@@ -7460,7 +7460,7 @@ fn kv_codec_for(
             global_head_dim,
         },
     };
-    match codec_for(rows) {
+    match codec_for(rows, coded) {
         Ok(()) => scratchy_forward_compiler::KvCodec::Int8,
         Err(reason) => {
             if reason != DenseReason::NoKvCache {
@@ -7756,8 +7756,8 @@ pub(crate) fn fill_canonical_params(
     // For a body that reads its target's hidden rows (a head), how its width stands to its
     // target's ([`target_width`]): the facts state its target then.
     target: Option<scratchy_ir::model_facts::TargetWidth>,
-    // Whether the target compresses a KV cache the codec takes (`TargetEmitter::compresses_kv`).
-    compress_kv: bool,
+    // The heads the target's kernels code as int8 KV (`TargetEmitter::coded_kv_heads`).
+    coded_kv: Option<scratchy_ir::CodedHeads>,
 ) -> (scratchy_ir::model_facts::ModelFacts, TokenStream) {
     let tp = tp_world_size as u32;
     let tp_us = tp_world_size as usize;
@@ -8083,7 +8083,7 @@ pub(crate) fn fill_canonical_params(
         is_bf16_scale || is_nvfp4
     };
 
-    let kv_codec = kv_codec_for(model, head_dim, global_head_dim, kv_layers, compress_kv);
+    let kv_codec = kv_codec_for(model, head_dim, global_head_dim, kv_layers, coded_kv);
 
     let num_hidden_layers = model.text.layers.get();
 
@@ -8529,7 +8529,7 @@ pub fn emit_model(
         fuf_uses_rotary(fuf),
         &KvCacheLayers::of(fuf),
         fuf_reads_target_hidden(fuf).then(|| target_width(program, inferred)),
-        emitter.compresses_kv(),
+        emitter.coded_kv_heads(),
     );
     let canonical_params_impl = emit_canonical_params_impl(model_facts, &mla_consts);
     let crate::target::ModelEmission { weights, items } = emitter.model(&crate::target::ModelCx {

@@ -52,8 +52,8 @@ impl TargetEmitter for Metal {
 
     /// Every model whose geometry the int8 codec takes stores its KV cache as int8 codes; the
     /// rest stay dense and are named in the build output.
-    fn compresses_kv(&self) -> bool {
-        true
+    fn coded_kv_heads(&self) -> Option<scratchy_ir::CodedHeads> {
+        Some(scratchy_target_metal::kv_int8::METAL_CODED_HEADS)
     }
 
     /// The splice copies the tower's embeddings into the image-placeholder rows

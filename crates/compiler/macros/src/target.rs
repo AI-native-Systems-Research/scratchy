@@ -167,10 +167,10 @@ pub trait TargetEmitter: Sync {
         false
     }
 
-    /// Whether a model's KV cache is int8 codes wherever the codec takes its geometry
-    /// (`scratchy_ir::codec_for`), rather than dense.
-    fn compresses_kv(&self) -> bool {
-        false
+    /// The head dims the target's kernels code as int8 KV (`scratchy_ir::codec_for`), or `None`
+    /// for a target whose KV caches are dense.
+    fn coded_kv_heads(&self) -> Option<scratchy_ir::CodedHeads> {
+        None
     }
 
     /// Whether a decoder splices a multimodal tower's embeddings into its embedded rows on this

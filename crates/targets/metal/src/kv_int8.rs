@@ -6,7 +6,12 @@
 //! through `kv_stage` (`attention.metal`).
 
 use objc2_metal::MTLDevice;
-use scratchy_layers::kv_int8::KvCodec;
+use scratchy_layers::kv_int8::{CodedHeads, KvCodec};
+
+use crate::kv_int8_heads::{MAX_CODED_HEAD_DIM, MIN_CODED_HEAD_DIM};
+
+/// The head dims Metal's int8 KV kernels code (`kv_int8_heads`).
+pub const METAL_CODED_HEADS: CodedHeads = CodedHeads::new(MIN_CODED_HEAD_DIM, MAX_CODED_HEAD_DIM);
 
 use scratchy_ir::model_facts::HeadGeometry;
 

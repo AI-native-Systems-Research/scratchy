@@ -13,23 +13,25 @@
 #include <metal_stdlib>
 using namespace metal;
 
+#include "kv_int8_codec.h"
+
 // Element `e`'s sign before the transform: `kv_int8::sign`'s hash.
 inline float kv_sign(uint e) {
-    ulong z = ulong(e) + 0x9E3779B97F4A7C15ul;
-    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ul;
-    z = (z ^ (z >> 27)) * 0x94D049BB133111EBul;
-    z ^= z >> 31;
+    ulong z = ulong(e) + KV_SIGN_SEED;
+    z = (z ^ (z >> KV_SIGN_SHIFT_1)) * KV_SIGN_MUL_1;
+    z = (z ^ (z >> KV_SIGN_SHIFT_2)) * KV_SIGN_MUL_2;
+    z ^= z >> KV_SIGN_LAST_SHIFT;
     return (z & 1ul) == 0ul ? 1.0f : -1.0f;
 }
 
 // A rotated element's code against its row's scale.
 inline char kv_code(float r, float scale) {
-    return scale > 0.0f ? char(clamp(rint(r / scale), -128.0f, 127.0f)) : char(0);
+    return scale > 0.0f ? char(clamp(rint(r / scale), KV_MIN_CODE, KV_MAX_CODE)) : char(0);
 }
 
 // A row's scale from its rotated extremes.
 inline float kv_scale(float hi, float lo) {
-    return max(max(hi, 0.0f) / 127.0f, min(lo, 0.0f) / -128.0f);
+    return max(max(hi, 0.0f) / KV_MAX_CODE, min(lo, 0.0f) / KV_MIN_CODE);
 }
 
 // Thread `e` of a one-dimensional threadgroup is lane `e % KV_SIMD` of simdgroup `e / KV_SIMD`.
@@ -40,8 +42,8 @@ constexpr uint kv_encode_floats(uint n, uint dim) { return 2u * n * dim; }
 
 // Encode `N` `dim`-vectors together — vector `n`'s element `x[n]` on thread `elem` — sharing every
 // barrier: rotated, then coded into `codes[n][0, dim)` against the scale written to `*scale[n]`.
-// `scratch` is `kv_encode_floats(N, dim)` threadgroup floats. Threadgroup-uniform; `dim` a power of
-// two. A threadgroup wider than `dim` runs it whole: its threads past `dim` keep every barrier and
+// `scratch` is `kv_encode_floats(N, dim)` threadgroup floats. Threadgroup-uniform; `dim` a coded
+// head dim (`kv_coded_head`). A threadgroup wider than `dim` runs it whole: its threads past `dim` keep every barrier and
 // touch no memory.
 template <uint N>
 inline void kv_encode(array<float, N> x, uint elem, uint dim, array<device char*, N> codes,

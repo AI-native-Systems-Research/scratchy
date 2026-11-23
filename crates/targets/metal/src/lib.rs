@@ -302,6 +302,7 @@ pub mod metal_mem;
 pub mod model;
 pub use model::{MetalArchRegistration, MetalWeights, try_load};
 pub mod kv_int8;
+pub mod kv_int8_heads;
 pub mod mtl4_dispatch;
 pub mod off_tape;
 pub mod owned_metal;

@@ -1036,8 +1036,9 @@ template <typename T>
     const uint GROUP = ATTN_NUM_Q_HEADS / ATTN_NUM_KV_HEADS;
     constexpr uint KB = 8u;
     // Another kernel's bake may set a head dim this one cannot take: its arrays need a size all
-    // the same (the asserts below refuse baking this kernel with one).
-    constexpr bool D_OK = ATTN_HEAD_DIM % 64u == 0u && ATTN_HEAD_DIM - 1u < 512u;
+    // the same (the asserts below refuse baking this kernel with one). The coded heads are
+    // `kv_coded_head`'s, the codec rule's table.
+    constexpr bool D_OK = kv_coded_head(ATTN_HEAD_DIM);
     constexpr uint D = D_OK ? ATTN_HEAD_DIM : 128u;
     constexpr uint NSG = D / 32u;
     // A key group's simdgroups (the bake's `ATTN_DECODE_SG`), each a slice of the head dims, and
@@ -1061,7 +1062,7 @@ template <typename T>
     static_assert(sizeof(T) && ATTN_DECODE_HEADS <= G &&
                       (ATTN_NUM_Q_HEADS / ATTN_NUM_KV_HEADS) % ATTN_DECODE_HEADS == 0u,
                   "a threadgroup's heads divide its KV head's group and fit the fragment rows");
-    static_assert(sizeof(T) && D_OK, "head_dim a multiple of 64, at most 512");
+    static_assert(sizeof(T) && D_OK, "a coded head dim (kv_coded_head)");
     static_assert(sizeof(T) && NSG % SG == 0u, "the simdgroups tile into whole key groups");
     static_assert(sizeof(T) && ATTN_BLOCK_SIZE % KB == 0u, "a key block in one KV block");
     static_assert(sizeof(T) && (ATTN_ROR == 0u || ATTN_PAIR_OFF % QK == 0u),

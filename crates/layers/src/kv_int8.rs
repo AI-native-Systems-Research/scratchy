@@ -35,13 +35,56 @@ impl std::fmt::Display for KvCodec {
     }
 }
 
-/// The widest head the codec's kernels take: their threadgroup arrays hold one element per thread
-/// of a head.
-pub const MAX_HEAD_DIM: u32 = 512;
+mod numbers;
+pub use numbers::{MAX_CODE, MIN_CODE};
+use numbers::{SIGN_LAST_SHIFT, SIGN_ROUNDS, SIGN_SEED};
 
-/// The narrowest head the codec's kernels take: the decode attention splits a head's dims over
-/// whole 32-lane simdgroups, two at the least.
-pub const MIN_HEAD_DIM: u32 = 64;
+/// The head dims a target's kernels code: the powers of two from `min` to `max`, its table's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CodedHeads {
+    min: u32,
+    max: u32,
+}
+
+impl CodedHeads {
+    /// A target's table: `min` and `max` powers of two, `min <= max`.
+    pub const fn new(min: u32, max: u32) -> Self {
+        assert!(
+            min.is_power_of_two() && max.is_power_of_two() && min <= max,
+            "int8 KV: a coded head table's bounds are powers of two, the least first"
+        );
+        Self { min, max }
+    }
+
+    pub const fn min(self) -> u32 {
+        self.min
+    }
+
+    pub const fn max(self) -> u32 {
+        self.max
+    }
+
+    /// Whether a head of `head_dim` is coded: the one law.
+    pub const fn admits(self, head_dim: u32) -> bool {
+        head_dim.is_power_of_two() && head_dim >= self.min && head_dim <= self.max
+    }
+}
+
+/// Element `e`'s sign before the transform: a fixed ±1 the sign hash of `e` decides.
+pub const fn sign(e: u32) -> f32 {
+    let mut z = (e as u64).wrapping_add(SIGN_SEED);
+    let mut r = 0;
+    while r < SIGN_ROUNDS.len() {
+        let (shift, mul) = SIGN_ROUNDS[r];
+        z = (z ^ (z >> shift)).wrapping_mul(mul);
+        r += 1;
+    }
+    z ^= z >> SIGN_LAST_SHIFT;
+    match z & 1 {
+        0 => 1.0,
+        _ => -1.0,
+    }
+}
 
 /// What a model's KV cache holds a row of: what its codec is decided from.
 #[derive(Clone, Copy, Debug)]
@@ -61,9 +104,11 @@ pub enum DenseReason {
     NoKvCache,
     /// The codec rotates head vectors; an MLA latent is not one.
     LatentKv,
-    /// The rotation is a Walsh-Hadamard transform, over a power-of-two length from
-    /// [`MIN_HEAD_DIM`] to [`MAX_HEAD_DIM`].
-    HeadDim(u32),
+    /// A head the target's kernels do not code ([`CodedHeads`]).
+    HeadDim {
+        head_dim: u32,
+        coded: CodedHeads,
+    },
 }
 
 impl std::fmt::Display for DenseReason {
@@ -71,18 +116,20 @@ impl std::fmt::Display for DenseReason {
         match self {
             Self::NoKvCache => f.write_str("it has no KV cache"),
             Self::LatentKv => f.write_str("its KV cache is an MLA latent, not per-head K and V"),
-            Self::HeadDim(hd) => write!(
+            Self::HeadDim { head_dim, coded } => write!(
                 f,
-                "head_dim {hd} is not a power of two from {MIN_HEAD_DIM} to {MAX_HEAD_DIM}"
+                "head_dim {head_dim} is not a power of two from {} to {}",
+                coded.min(),
+                coded.max()
             ),
         }
     }
 }
 
-/// Int8 for a model whose KV cache holds `rows`, or why it stays dense. The one rule: the lowering
-/// injects the codec, the factory provisions it and the worker sizes its pool from the `KV_CODEC`
-/// this decides.
-pub fn codec_for(rows: KvRows) -> Result<(), DenseReason> {
+/// Int8 for a model whose KV cache holds `rows`, on a target whose kernels code the heads `coded`,
+/// or why it stays dense. The one rule: the lowering injects the codec, the factory provisions it
+/// and the worker sizes its pool from the `KV_CODEC` this decides.
+pub fn codec_for(rows: KvRows, coded: CodedHeads) -> Result<(), DenseReason> {
     let (head_dim, global_head_dim) = match rows {
         KvRows::None => return Err(DenseReason::NoKvCache),
         KvRows::Latent => return Err(DenseReason::LatentKv),
@@ -91,29 +138,12 @@ pub fn codec_for(rows: KvRows) -> Result<(), DenseReason> {
             global_head_dim,
         } => (head_dim, global_head_dim),
     };
-    let supported = |hd: u32| hd.is_power_of_two() && (MIN_HEAD_DIM..=MAX_HEAD_DIM).contains(&hd);
     match [head_dim, global_head_dim]
         .into_iter()
-        .find(|&hd| !supported(hd))
+        .find(|&hd| !coded.admits(hd))
     {
-        Some(hd) => Err(DenseReason::HeadDim(hd)),
+        Some(head_dim) => Err(DenseReason::HeadDim { head_dim, coded }),
         None => Ok(()),
-    }
-}
-
-/// The largest positive code and the most negative one.
-pub const MAX_CODE: f32 = 127.0;
-pub const MIN_CODE: f32 = -128.0;
-
-/// Element `e`'s sign before the transform: a fixed ±1 a hash of `e` decides, every target's.
-pub const fn sign(e: u32) -> f32 {
-    let mut z = (e as u64).wrapping_add(0x9E37_79B9_7F4A_7C15);
-    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    z ^= z >> 31;
-    match z & 1 {
-        0 => 1.0,
-        _ => -1.0,
     }
 }
 
@@ -220,16 +250,18 @@ mod tests {
     /// The codec takes a power-of-two head no wider than its kernels hold, and per-head K and V.
     #[test]
     fn the_codec_takes_power_of_two_heads() {
+        let coded = CodedHeads::new(64, 512);
         let g = |head_dim| KvRows::Heads {
             head_dim,
             global_head_dim: head_dim,
         };
-        assert_eq!(codec_for(g(128)), Ok(()));
-        assert_eq!(codec_for(g(512)), Ok(()));
-        assert_eq!(codec_for(g(96)), Err(DenseReason::HeadDim(96)));
-        assert_eq!(codec_for(g(32)), Err(DenseReason::HeadDim(32)));
-        assert_eq!(codec_for(g(1024)), Err(DenseReason::HeadDim(1024)));
-        assert_eq!(codec_for(KvRows::Latent), Err(DenseReason::LatentKv));
-        assert_eq!(codec_for(KvRows::None), Err(DenseReason::NoKvCache));
+        let dense = |head_dim| Err(DenseReason::HeadDim { head_dim, coded });
+        assert_eq!(codec_for(g(128), coded), Ok(()));
+        assert_eq!(codec_for(g(512), coded), Ok(()));
+        assert_eq!(codec_for(g(96), coded), dense(96));
+        assert_eq!(codec_for(g(32), coded), dense(32));
+        assert_eq!(codec_for(g(1024), coded), dense(1024));
+        assert_eq!(codec_for(KvRows::Latent, coded), Err(DenseReason::LatentKv));
+        assert_eq!(codec_for(KvRows::None, coded), Err(DenseReason::NoKvCache));
     }
 }
