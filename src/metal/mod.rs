@@ -102,7 +102,8 @@ fn read(site: &Site) -> Result<Vec<Run>, String> {
         });
     }
     for folder in folders {
-        let nested = datafile::folders(&folder).map_err(|e| format!("{}: {e}", folder.display()))?;
+        let nested =
+            datafile::folders(&folder).map_err(|e| format!("{}: {e}", folder.display()))?;
         for sub in nested {
             errors.push(format!(
                 "{}: a Mac's folder holds its runs directly; move them into {DATA}/<machine>/",
@@ -2924,7 +2925,10 @@ pub fn build(site: &Site, assets: &Published) -> Result<String, String> {
     crate::charts::keep_apart();
     // Over time reads every published run, the ones a newer run replaced too; the rest of the
     // page shows each Mac's two newest.
-    let Loaded { shown: runs, all: all_runs } = load(site)?;
+    let Loaded {
+        shown: runs,
+        all: all_runs,
+    } = load(site)?;
     let all_machines = index(&all_runs);
     let machines = index(&runs);
     let mut sections: Vec<(String, String)> = Vec::new();
@@ -3602,7 +3606,9 @@ mod tests {
     fn a_gzipped_run_loads() {
         let name = "apple-m3-pro-2026-10-27T031941Z-f9739363.json";
         let site = site_with("gzipped", &[name]);
-        let runs = super::load(&site).map(|l| l.shown).expect("the gzipped run");
+        let runs = super::load(&site)
+            .map(|l| l.shown)
+            .expect("the gzipped run");
         assert_eq!(runs.len(), 1);
         assert_eq!(
             runs[0].file,
@@ -3619,7 +3625,10 @@ mod tests {
         let plain = plain.with_extension("");
         std::fs::create_dir_all(plain.parent().unwrap()).unwrap();
         std::fs::write(&plain, fixture_text(name)).unwrap();
-        let err = super::load(&site).map(|l| l.shown).err().expect("a plain JSON is refused");
+        let err = super::load(&site)
+            .map(|l| l.shown)
+            .err()
+            .expect("a plain JSON is refused");
         assert!(err.contains("2026-10-27T031941Z-f9739363.json:"), "{err}");
         assert!(err.contains("gzip"), "{err}");
     }
@@ -3637,7 +3646,8 @@ mod tests {
             .join(FIXTURES)
             .join(format!("{name}.gz"));
         std::fs::copy(fixture, gz).unwrap();
-        let err = super::load(&site).map(|l| l.shown)
+        let err = super::load(&site)
+            .map(|l| l.shown)
             .err()
             .expect("a run named .gz is refused");
         assert!(err.contains("2026-10-27T031941Z-f9739363.gz"), "{err}");
@@ -3698,7 +3708,8 @@ mod tests {
             .join(FIXTURES)
             .join(format!("{name}.gz"));
         std::fs::copy(fixture, wrong).unwrap();
-        let err = super::load(&site).map(|l| l.all)
+        let err = super::load(&site)
+            .map(|l| l.all)
             .err()
             .expect("the wrong folder is refused");
         assert!(
@@ -3721,7 +3732,10 @@ mod tests {
             .join(FIXTURES)
             .join(format!("{name}.gz"));
         std::fs::copy(fixture, deep).unwrap();
-        let err = super::load(&site).map(|l| l.all).err().expect("a nested run is refused");
+        let err = super::load(&site)
+            .map(|l| l.all)
+            .err()
+            .expect("a nested run is refused");
         assert!(err.contains("apple-m3-pro/history"), "{err}");
         assert!(err.contains("holds its runs directly"), "{err}");
     }
@@ -3739,7 +3753,10 @@ mod tests {
             site.root.join(super::DATA).join(format!("{name}.gz")),
         )
         .unwrap();
-        let err = super::load(&site).map(|l| l.all).err().expect("a flat run is refused");
+        let err = super::load(&site)
+            .map(|l| l.all)
+            .err()
+            .expect("a flat run is refused");
         assert!(err.contains(&format!("{name}.gz")), "{err}");
         assert!(err.contains("its Mac's folder"), "{err}");
     }
