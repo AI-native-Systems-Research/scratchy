@@ -1097,7 +1097,7 @@ fn a_narrow_projection_fast_matvec_row_is_the_one_row_bits() {
     // The tape's codes on this chip: offset-8 (`AffineCodes::rows`), stored XOR 0x88.
     let codes = AffineCodes::rows(
         scratchy_target_metal::tape::lowered::GenClass::of(dev.profile.generation),
-        4,
+        scratchy_target_metal::tape::ids::AffineBits::B4,
     );
     let stored: Vec<u8> = match codes {
         AffineCodes::Offset8 => packed.iter().map(|b| b ^ 0x88).collect(),

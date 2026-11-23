@@ -663,7 +663,7 @@ pub enum CodesRole {
 
 impl AffineCodes {
     /// ⭐ THE ONE DECISION: how a tensor of `role`, `bits` wide in groups of `group`, rows of `k`
-    /// inputs, is stored on `class`, for a model that is a drafter when `drafter` — evaluated by
+    /// inputs, is stored on `class`, for a model that is a drafter when `drafter` is — evaluated by
     /// the lowering for every command reading the tensor and by its slot's type
     /// ([`crate::tape::typed::Codes`]) for its store, so the two are one value.
     ///
@@ -679,28 +679,31 @@ impl AffineCodes {
     pub const fn of(
         class: crate::tape::lowered::GenClass,
         role: CodesRole,
-        bits: u32,
-        k: u32,
-        group: u32,
-        drafter: bool,
+        bits: crate::tape::ids::AffineBits,
+        k: KDim,
+        group: crate::tape::ids::AffineGroupSize,
+        drafter: Option<scratchy_ir::model_facts::Drafter>,
     ) -> Self {
         let rows = Self::rows(class, bits);
         let planes = matches!(role, CodesRole::Projection)
             && matches!(class, crate::tape::lowered::GenClass::M5Wide)
-            && !drafter
+            && drafter.is_none()
             && matches!(rows, AffineCodes::Offset8)
-            && k.is_multiple_of(64)
-            && crate::tape::ids::NaxGroupSize::new(group).is_some();
+            && k.0.is_multiple_of(64)
+            && group.nax().is_some();
         match planes {
-            true => AffineCodes::Planes { k },
+            true => AffineCodes::Planes { k: k.0 },
             false => rows,
         }
     }
 
     /// How `class` stores `bits`-bit codes a row at a time: offset-8 for 4-bit codes on a class
     /// storing them so, as written otherwise.
-    pub const fn rows(class: crate::tape::lowered::GenClass, bits: u32) -> Self {
-        match class.stores_affine_b4_offset8() && bits == 4 {
+    pub const fn rows(
+        class: crate::tape::lowered::GenClass,
+        bits: crate::tape::ids::AffineBits,
+    ) -> Self {
+        match class.stores_affine_b4_offset8() && bits.get() == 4 {
             true => AffineCodes::Offset8,
             false => AffineCodes::AsWritten,
         }

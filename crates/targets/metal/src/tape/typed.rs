@@ -690,15 +690,22 @@ pub trait Class {
 pub mod class {
     use crate::tape::lowered::GenClass;
     macro_rules! classes {
-        ($($c:ident),*) => {$(
-            pub enum $c {}
-            impl super::Class for $c {
-                const CLASS: GenClass = GenClass::$c;
-            }
-        )*};
+        ($($c:ident),*) => {
+            $(
+                pub enum $c {}
+                impl super::Class for $c {
+                    const CLASS: GenClass = GenClass::$c;
+                }
+            )*
+            /// Every class, in order: the list each class's marker is one of.
+            pub const ALL: [GenClass; [$(GenClass::$c),*].len()] = [$(GenClass::$c),*];
+        };
     }
     classes!(M1, Mid, M5, M5Wide);
 }
+
+/// A DFlash2 drafter's geometry: the model fact a slot's codes depend on ([`CodesSlot::DRAFTER`]).
+pub use scratchy_ir::model_facts::Drafter;
 
 /// An affine slot's codes role ([`CodesRole`]), stated by the bake per slot (a head's slot, an
 /// embedding table's, a projection's).
@@ -706,10 +713,10 @@ pub mod class {
 /// [`CodesRole`]: crate::tape::kernel_constants::CodesRole
 pub trait CodesSlot: AffineSlot {
     const ROLE: crate::tape::kernel_constants::CodesRole;
-    /// Whether the slot's model is a drafter ([`ModelFacts::drafter`]).
+    /// The slot's model's drafter ([`ModelFacts::drafter`]), `None` for a model that is none.
     ///
     /// [`ModelFacts::drafter`]: scratchy_ir::model_facts::ModelFacts::drafter
-    const DRAFTER: bool;
+    const DRAFTER: Option<scratchy_ir::model_facts::Drafter>;
 }
 
 /// ⭐ HOW SLOT `S`'s CODES ARE STORED ON CLASS `C`: the one decision
@@ -721,9 +728,9 @@ pub const fn codes<S: CodesSlot, C: Class>() -> crate::tape::kernel_constants::A
     crate::tape::kernel_constants::AffineCodes::of(
         C::CLASS,
         S::ROLE,
-        w.bits.get(),
-        w.k,
-        w.group.get(),
+        w.bits,
+        crate::tape::ids::KDim(w.k),
+        w.group,
         S::DRAFTER,
     )
 }
@@ -754,7 +761,7 @@ pub const fn codes<S: CodesSlot, C: Class>() -> crate::tape::kernel_constants::A
 /// # }
 /// impl CodesSlot for LmHead {
 ///     const ROLE: CodesRole = CodesRole::Head;
-///     const DRAFTER: bool = false;
+///     const DRAFTER: Option<scratchy_ir::model_facts::Drafter> = None;
 /// }
 /// const _: () = codes_agree::<LmHead, class::M5Wide>(AffineCodes::Offset8);
 /// ```
@@ -783,7 +790,7 @@ pub const fn codes<S: CodesSlot, C: Class>() -> crate::tape::kernel_constants::A
 /// # }
 /// impl CodesSlot for LmHead {
 ///     const ROLE: CodesRole = CodesRole::Head;
-///     const DRAFTER: bool = false;
+///     const DRAFTER: Option<scratchy_ir::model_facts::Drafter> = None;
 /// }
 /// const _: () = codes_agree::<LmHead, class::M5Wide>(AffineCodes::Planes { k: 2048 });
 /// ```

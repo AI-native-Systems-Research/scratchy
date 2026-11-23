@@ -1646,15 +1646,26 @@ pub(crate) fn emit(cx: &ModelCx<'_>) -> ModelEmission {
     };
 
     {
+        // The table a tied head is, through the tie's one door (`is_tied_head`, `tied_table_role`):
+        // the source family of its gather, if a gather reads it.
+        use scratchy_forward_compiler_macro::quantization as q;
+        let tied_table =
+            q::is_tied_head(model, scratchy_forward_compiler_macro::config::LM_HEAD_ROLE)
+                .then(|| {
+                    let role = q::tied_table_role(program, &q::embed_table_role(program, fuf));
+                    let id = program.weights.find(&role.split('.').collect::<Vec<_>>())?;
+                    metal_sources.family(&scratchy_subtile::handoff::WeightSlot {
+                        kind: scratchy_subtile::handoff::WeightKind::AffineQuantEmbedding,
+                        base: program.weights.path(id).join("_"),
+                    })
+                })
+                .flatten();
         let table = metal_tape_cmds
             .into_tokens(
                 &resolver.typed,
                 &resolver.named,
                 &dims.weight_markers,
-                scratchy_forward_compiler_macro::quantization::is_tied_head(
-                    model,
-                    scratchy_forward_compiler_macro::config::LM_HEAD_ROLE,
-                ),
+                tied_table,
             )
             .unwrap_or_else(|e| {
                 panic!(

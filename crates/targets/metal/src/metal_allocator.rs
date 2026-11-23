@@ -848,7 +848,7 @@ impl MetalAllocator {
     /// ([`AffineCodes::rows`] on its class).
     pub fn affine_codes(&self, bits: crate::tape::ids::AffineBits) -> AffineCodes {
         let generation = crate::device::profile_for_device(&self.device).generation;
-        AffineCodes::rows(crate::tape::lowered::GenClass::of(generation), bits.get())
+        AffineCodes::rows(crate::tape::lowered::GenClass::of(generation), bits)
     }
 
     /// After a pool has bound every codes range its tapes read (`ptrs`, through

@@ -447,7 +447,7 @@ fn staged_tiles_on_a_chip_emulated_by_width() {
     let cache = SpecializedPipelineCache::new(device.clone(), &[]).expect("pipeline cache");
     let codes = AffineCodes::rows(
         scratchy_target_metal::tape::lowered::GenClass::of(di.profile.generation),
-        4,
+        scratchy_target_metal::tape::ids::AffineBits::B4,
     );
     let wide = |n: usize, k: usize, bucket: u32| {
         let kernel = pick_qmv_kernel_wide(n as u32, k as u32, 4, bucket, true);
@@ -1044,7 +1044,7 @@ fn register_tile_on_a_chip_emulated_by_width() {
     let cache = SpecializedPipelineCache::new(device.clone(), &[]).expect("pipeline cache");
     let codes = AffineCodes::rows(
         scratchy_target_metal::tape::lowered::GenClass::of(di.profile.generation),
-        4,
+        scratchy_target_metal::tape::ids::AffineBits::B4,
     );
     let bucket = 8u32;
     println!(

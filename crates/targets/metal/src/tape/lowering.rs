@@ -358,15 +358,7 @@ fn sample_rows(
         (Some(a), R::Matmul) => {
             let x = Some(SetAxis::SampledRows(crate::tape::lowered::MScaleAxis::X));
             let ix = w.of(WeightKind::Linear, 0)?;
-            let codes = codes_for(
-                p,
-                class,
-                head_family,
-                ix,
-                a.bits.get(),
-                a.k.get(),
-                a.group_size,
-            );
+            let codes = codes_for(p, class, head_family, ix, &a);
             let qmv = affine_qmv_command(
                 p,
                 &a,
@@ -445,27 +437,23 @@ fn writes_logits(tape: Option<LogitsRows>, step: Option<LogitsRows>) -> Option<L
     }
 }
 
-/// How the codes of the `bits`-wide linear of family `ix`, rows of `k` inputs in groups of
-/// `group`, are stored on `class` for the model `p`: the one decision
-/// ([`AffineCodes::of`](super::kernel_constants::AffineCodes::of)) for its role — the head's
-/// family's ([`MetalStepTape::head_source`]) or a projection's — which its slot's type evaluates
-/// too ([`crate::tape::typed::codes`]).
+/// How the codes of the affine linear `g` reads (family `ix`) are stored on `class` for the
+/// model `p`: the one decision ([`AffineCodes::of`](super::kernel_constants::AffineCodes::of))
+/// for its role — the head's family's ([`MetalStepTape::head_source`]) or a projection's — which
+/// its slot's type evaluates too ([`crate::tape::typed::codes`]).
 fn codes_for(
     p: &ModelFacts,
     class: crate::tape::lowered::GenClass,
     head_family: Option<SourceIx>,
     ix: SourceIx,
-    bits: u32,
-    k: u32,
-    group: AffineGroupSize,
+    g: &AffineMatmul,
 ) -> super::kernel_constants::AffineCodes {
     use super::kernel_constants::CodesRole;
     let role = match head_family == Some(ix) {
         true => CodesRole::Head,
         false => CodesRole::Projection,
     };
-    let drafter = p.drafter().is_some();
-    super::kernel_constants::AffineCodes::of(class, role, bits, k, group.get(), drafter)
+    super::kernel_constants::AffineCodes::of(class, role, g.bits, g.k, g.group_size, p.drafter())
 }
 
 /// Whether the sampled rows slice at this bake point: a multi-row bucket whose matmul lowers to
@@ -963,7 +951,7 @@ fn route_small_m(
     let ix = w.of(WeightKind::Linear, 0)?;
     // The small-M kernels read the codes as stored, signed (offset-8). The bf16 twin
     // (`AffineQmmSmallM`) reads them row-major only: planes codes take the W4A8 tile below.
-    let codes = codes_for(p, class, head_family, ix, 4, k, group);
+    let codes = codes_for(p, class, head_family, ix, &g);
     let tile = match SmallMTile::for_bucket(bucket_m) {
         Some(tile) if codes.signed() && n.is_multiple_of(SMALL_M_TILE_COLS) => tile,
         _ => return Ok(cmds),
@@ -3246,7 +3234,7 @@ fn lower_one(
             let is_nax = profile.is_some_and(|p| crate::targets::is_nax_capable(p.generation));
             if is_nax && narrow_matvec(n_v, k_v, bits_v, bucket_m) {
                 let layer = super::ids::LayerId(*layer + layer_offset);
-                let codes = codes_for(p, gen_class, head_family, ix, bits_v, k_v, group);
+                let codes = codes_for(p, gen_class, head_family, ix, g);
                 affine_qmv_command(
                     p,
                     g,
@@ -3266,15 +3254,7 @@ fn lower_one(
                 // single-stream M1 Max (the sweep's per-CB overhead
                 // biased it toward generic).
                 let layer = super::ids::LayerId(*layer + layer_offset);
-                let codes = codes_for(
-                    p,
-                    gen_class,
-                    head_family,
-                    ix,
-                    g.bits.get(),
-                    g.k.get(),
-                    g.group_size,
-                );
+                let codes = codes_for(p, gen_class, head_family, ix, g);
                 // MLX gates affine qmv_wide on arch gen >= 15 (quantized.cpp:537-539) —
                 // M3 and later (M4 is gen 16, M5 is gen 17). `affine_qmv_wide_ok` mirrors
                 // that boundary; M1/M2 keep the fold twin.
@@ -3366,7 +3346,7 @@ fn lower_one(
                 // W4A8 on the matrix unit's int8 lane: a pre-pass quantizes
                 // the activations per (row, 64-chunk) into the shared scratch,
                 // then the GEMM multiplies them against the offset-8 codes.
-                let codes = codes_for(p, gen_class, head_family, ix, bits_v, k_v, group);
+                let codes = codes_for(p, gen_class, head_family, ix, g);
                 let w4a8_tile = W4a8Tile::for_n(n_v).filter(|_| {
                     matches!(kernel, QmmTKernel::Nax(_))
                         && codes.signed()
@@ -3476,7 +3456,7 @@ fn lower_one(
                                 k: super::ids::KDimI32(k_v as i32),
                                 n: super::ids::NDimI32(n_v as i32),
                                 m: super::ids::MDimI32(bucket_m as i32),
-                                codes: codes_for(p, gen_class, head_family, ix, bits_v, k_v, group),
+                                codes: codes_for(p, gen_class, head_family, ix, g),
                             }
                             .into_baked(),
                             dispatch: DispatchShape {
@@ -3515,7 +3495,7 @@ fn lower_one(
                                 k: super::ids::KDimI32(k_v as i32),
                                 n: super::ids::NDimI32(n_v as i32),
                                 m: super::ids::MDimI32(bucket_m as i32),
-                                codes: codes_for(p, gen_class, head_family, ix, bits_v, k_v, group),
+                                codes: codes_for(p, gen_class, head_family, ix, g),
                             }
                             .into_baked(),
                             dispatch: DispatchShape {
@@ -3582,7 +3562,7 @@ fn lower_one(
                                 k_partition_size: super::ids::KPartitionSizeI32(
                                     k_partition_size as i32,
                                 ),
-                                codes: codes_for(p, gen_class, head_family, ix, bits_v, k_v, group),
+                                codes: codes_for(p, gen_class, head_family, ix, g),
                             }
                             .into_baked(),
                             dispatch: DispatchShape {
@@ -4363,10 +4343,10 @@ fn lower_one(
                     codes: super::kernel_constants::AffineCodes::of(
                         gen_class,
                         super::kernel_constants::CodesRole::Table,
-                        bits_v,
-                        hidden_size,
-                        group.get(),
-                        p.drafter().is_some(),
+                        width_bits,
+                        KDim(hidden_size),
+                        group,
+                        p.drafter(),
                     ),
                 }
                 .into_baked(),
@@ -4450,15 +4430,7 @@ fn lower_one(
                 return Err(LoweringError::OneRowFold { bucket_m });
             }
             let (n, k, gs, bits) = (g.n.get(), g.k.get(), g.group_size.get(), g.bits.get());
-            let codes = codes_for(
-                p,
-                gen_class,
-                head_family,
-                w.of(WeightKind::Linear, 0)?,
-                bits,
-                k,
-                g.group_size,
-            );
+            let codes = codes_for(p, gen_class, head_family, w.of(WeightKind::Linear, 0)?, g);
             let constants = super::kernel_constants::AffineGatedQmvConstants {
                 qmv: super::kernel_constants::AffineQmvConstants {
                     k: super::ids::KDimI32(k as i32),
@@ -8047,7 +8019,7 @@ fn moe_w4a8(b: &MoeBlock, at: MoeBake, s: &MoeScratch) -> bool {
     s.grouping == MoeGrouping::Grouped
         && at.is_nax
         && b.quant.widths.uniform().is_some_and(|w| {
-            super::kernel_constants::AffineCodes::rows(at.class, w.get())
+            super::kernel_constants::AffineCodes::rows(at.class, w)
                 == super::kernel_constants::AffineCodes::Offset8
         })
         && b.quant.group_size.nax().is_some()
@@ -8486,7 +8458,7 @@ fn lower_moe_step(
             qmv: qmv(
                 inter,
                 hidden,
-                super::kernel_constants::AffineCodes::rows(at.class, bits.get()),
+                super::kernel_constants::AffineCodes::rows(at.class, bits),
             ),
             rows: rows_read(&s, first.rows),
         };
@@ -8892,7 +8864,7 @@ fn lower_moe_step(
             };
             let weights = expert_weights(proj, l, 0)?;
             let bits = width.bits();
-            let codes = super::kernel_constants::AffineCodes::rows(at.class, bits.get());
+            let codes = super::kernel_constants::AffineCodes::rows(at.class, bits);
             let dims: Vec<ConstantValue> = [C::int(0, k_in as i32), C::int(1, n_out as i32)]
                 .into_iter()
                 .chain(codes.constant())
@@ -9102,7 +9074,7 @@ fn lower_moe_step(
                 qmv: qmv(
                     hidden,
                     inter,
-                    super::kernel_constants::AffineCodes::rows(at.class, bits.get()),
+                    super::kernel_constants::AffineCodes::rows(at.class, bits),
                 ),
                 top_k: b.top_k,
                 gate_scale: ends.gate_scale.is_some(),

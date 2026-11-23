@@ -237,7 +237,7 @@ fn qmv_wide_against_small_m_twin_by_bucket() {
         // exists).
         let codes = AffineCodes::rows(
             scratchy_target_metal::tape::lowered::GenClass::of(di.profile.generation),
-            s.bits,
+            scratchy_target_metal::tape::ids::AffineBits::new(s.bits).expect("affine bits"),
         );
         let (k_dim, n_dim) = (KDimI32(s.k as i32), NDimI32(s.n as i32));
         let mut cells = Vec::new();
@@ -351,7 +351,7 @@ fn norm_folded_into_its_readers_on_a_chip_emulated_by_width() {
     let cache = SpecializedPipelineCache::new(device.clone(), &[]).expect("pipeline cache");
     let codes = AffineCodes::rows(
         scratchy_target_metal::tape::lowered::GenClass::of(di.profile.generation),
-        4,
+        scratchy_target_metal::tape::ids::AffineBits::B4,
     );
     let hidden = 2048u32;
     let normed = QmvEnds {
@@ -542,7 +542,7 @@ fn narrow_projection_at_verify_buckets() {
     let cache = SpecializedPipelineCache::new(device.clone(), &[]).expect("pipeline cache");
     let codes = AffineCodes::rows(
         scratchy_target_metal::tape::lowered::GenClass::of(di.profile.generation),
-        4,
+        scratchy_target_metal::tape::ids::AffineBits::B4,
     );
     for &(n, k) in NARROW_SHAPES {
         let bytes = (n * k / 2) as usize;
