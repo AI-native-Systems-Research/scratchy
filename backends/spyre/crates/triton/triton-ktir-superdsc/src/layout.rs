@@ -118,9 +118,25 @@ pub fn allocate_paged_cache(node: &KtirNode, layout: &BundleLayout) -> Result<()
                 node.bindings.len()
             ));
         };
-        layout
-            .allocate_row_outermost(b.get())
-            .map_err(|e| format!("{}: {}", node.func.name, e.0))?;
+        // ⭐ THE CACHE'S FORMAT — the data→type door: the parameter's own view element type, each
+        // format the cache is allocated at by name, anything else refused by name.
+        let ptr = node.func.arguments.get(i).map(|(p, _)| *p);
+        let allocated = match ptr
+            .and_then(|p| ktir_superdsc::emit::lower_ktir_to_superdsc::param_elem(&node.func, p))
+        {
+            Some(ktir_core::dtypes::DType::F16) => layout
+                .allocate_row_outermost::<ktir_superdsc::superdsc_opspec::Fp16>(b.get()),
+            Some(ktir_core::dtypes::DType::Fp8E4m3) => layout
+                .allocate_row_outermost::<ktir_superdsc::superdsc_opspec::Fp8>(b.get()),
+            other => {
+                return Err(format!(
+                    "{}: the paged cache at parameter {i} states element type {other:?} — a paged \
+                     cache is allocated at f16 or f8E4M3FN",
+                    node.func.name
+                ));
+            }
+        };
+        allocated.map_err(|e| format!("{}: {}", node.func.name, e.0))?;
     }
     Ok(())
 }

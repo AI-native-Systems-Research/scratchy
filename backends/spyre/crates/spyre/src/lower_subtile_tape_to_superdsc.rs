@@ -801,6 +801,10 @@ pub fn compute_bundle_layout<T: ktir_superdsc::collective::Tp, F: RopeForm>(
         }
         m
     };
+    // ⭐ THE KV POOLS AT THE BUILD'S KV FORMAT — `scratchy_triton_splice::KvFormat`, the one selection
+    // the splice states every paged kernel's pool pointers from: the pools keep fp16's geometry and
+    // take the format's bytes.
+    let kv_pools: std::collections::HashSet<u32> = kv_pool_tids(ir).into_iter().collect();
     // ⭐⭐⭐ THE SEAT'S GATE TABLE (the quadruple's fourth word, the `SubOp::Sample` node's
     // `inputs[4]`) IS RESERVED AT THE CONVERT'S OWN DEVICE WIDTH — the β ruling
     // (front-b-noise, auditor 2026-10-27). The gate's chain crosses the i32→f32 convert
@@ -834,6 +838,8 @@ pub fn compute_bundle_layout<T: ktir_superdsc::collective::Tp, F: RopeForm>(
             *wide
         } else if fp8_weight_tids.contains(&tid) {
             Df::Fp8
+        } else if kv_pools.contains(&tid) {
+            <scratchy_triton_splice::KvFormat as ktir_superdsc::superdsc_opspec::DataFormat>::DF
         } else {
             Df::Fp16
         };
@@ -1699,7 +1705,7 @@ pub fn compute_bundle_layout<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     // ⭐ THE CACHE IS ALLOCATED ROW-OUTERMOST, as spyre-inference's `allocate_pages` allocates it
     // (`head_major_kv_layout`) — before any op addresses it.
     for &tid in &pools {
-        layout.allocate_row_outermost(tid)?;
+        layout.allocate_row_outermost::<scratchy_triton_splice::KvFormat>(tid)?;
     }
     Ok(layout)
 }

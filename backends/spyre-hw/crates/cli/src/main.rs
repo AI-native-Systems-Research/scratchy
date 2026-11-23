@@ -23,6 +23,11 @@ extern crate scratchy_target_spyre_worker as _;
 #[cfg(feature = "tp")]
 extern crate tp as _;
 
+// Anchor the kv alias the same way: `kv/<format>` names the KV pools' element format, and an
+// unreferenced optional dependency's features never reach the bake.
+#[cfg(feature = "kv")]
+extern crate kv as _;
+
 /// ⭐ THE ZERO-ALLOC PROOF INSTRUMENT, registered for the whole binary (`alloc-census`
 /// feature): flex-rs's census allocator over the system allocator, so every heap
 /// allocation the serve makes is countable. The worker's serving loop frames the

@@ -254,7 +254,7 @@ fn layout_for(k: &KtirNode) -> BundleLayout {
             },
         );
     }
-    l.allocate_row_outermost(k.bindings[1].get())
+    l.allocate_row_outermost::<ktir_superdsc::superdsc_opspec::Fp16>(k.bindings[1].get())
         .expect("the cache allocates row-outermost");
     l
 }

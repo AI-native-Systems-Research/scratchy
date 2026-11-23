@@ -12,6 +12,12 @@ publish = false
 # through it unconditionally — the target crate gains a hook, not a second copy of
 # the lowering.
 
+[features]
+# THE KV POOLS' ELEMENT FORMAT: `KvFormat` is `Fp8` under `kv-fp8`, else `Fp16` — the one selection.
+# The splice states the pools' pointer type and the write's saturation bound from it; the bake sizes
+# the pools from it.
+kv-fp8 = []
+
 [dependencies]
 scratchy-subtile = { path = "../../../../../crates/compiler/subtile" }
 scratchy-ir = { path = "../../../../../crates/compiler/ir" }

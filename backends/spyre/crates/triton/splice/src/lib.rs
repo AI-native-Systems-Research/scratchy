@@ -102,10 +102,43 @@ use scratchy_subtile::subtile_ir::{
     AttnScaleSite, EwKind, GainConvention, SubOp, SubtileIR, SubtileNode,
 };
 
+use ktir_superdsc::superdsc_opspec::{DataFormat, FloatFormat};
 use triton_frontend::codegen::{ArgSpec, KernelSpec};
 use triton_frontend::semantic::Val;
 use triton_frontend::target::Target;
+use triton_frontend::ttir::FloatKind;
 use triton_ktir_superdsc::CompiledKernel;
+
+/// ⭐ THE KV POOLS' ELEMENT FORMAT — the build's one selection (`kv/fp8` from the spyre CLI, through
+/// `scratchy-kv`), `Fp8` there and the model's `Fp16` otherwise. Every reader takes this type: the
+/// paged kernels' pool pointers ([`kv_pool_ptr`]), the write's saturation bound
+/// ([`FloatFormat::FMAX`], `FMAX`), and the bake's pool sizing. Nothing past the splice names it:
+/// below here a pool is a buffer whose view states its element type.
+#[cfg(feature = "kv-fp8")]
+pub type KvFormat = ktir_superdsc::superdsc_opspec::Fp8;
+/// See the `kv-fp8` arm.
+#[cfg(not(feature = "kv-fp8"))]
+pub type KvFormat = ktir_superdsc::superdsc_opspec::Fp16;
+
+/// The Triton float a pool held at format `P` is stated as — found in the door's own mapping
+/// ([`stated_float`]) as an associated CONST, evaluated for every `P` a caller names, so a format
+/// with no Triton float is a compile error at that caller.
+struct PoolFloat<P>(core::marker::PhantomData<P>);
+
+impl<P: DataFormat> PoolFloat<P> {
+    const KIND: FloatKind = stated_float(P::DF);
+}
+
+/// ⭐ A PAGED POOL'S POINTER TYPE at format `P` — the one statement every paged kernel's
+/// `k_pages`/`v_pages` and the write's `k_rows`/`v_rows` take.
+fn pool_ptr<P: DataFormat>() -> ArgSpec {
+    ArgSpec::Ptr(triton_frontend::ttir::Type::Float(PoolFloat::<P>::KIND))
+}
+
+/// The build's KV pools' pointer type: [`pool_ptr`] at [`KvFormat`].
+fn kv_pool_ptr() -> ArgSpec {
+    pool_ptr::<KvFormat>()
+}
 
 /// One registry row: the kernel's SOURCE TEXT and entry, and the STATED classification —
 /// declared data, not logic. Adding a kernel is a row; nothing else in this crate changes.
@@ -2089,9 +2122,11 @@ pub fn lower_attn<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile
         TritonKernelRow::Refused(why) => return Err(why.to_string()),
     };
     // ⛔ EVERY FIELD NAMED, NO `..`: spyre-inference's kernels take a soft cap, a float8 cache and the
-    // query's dtype, and this port takes none of them (the state and dots are f16, the cache is in
-    // the model's 16-bit dtype). The op states none of them either, so none reaches here today; a
-    // field added for one is a compile error at this line rather than an attention run without it.
+    // query's dtype. The cache's element type is the build's `KvFormat`, stated on the pool pointers
+    // ([`kv_pool_ptr`]) and widened in the kernel exactly where theirs is (`k_page.dtype != q.dtype`);
+    // the soft cap and the query's dtype this port does not take (the state and dots are f16). The op
+    // states neither, so neither reaches here today; a field added for one is a compile error at
+    // this line rather than an attention run without it.
     let SubOp::AttnDecode {
         valid_len: _,
         layout: _,
@@ -2209,8 +2244,6 @@ pub fn lower_attn<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile
         for (p, ty) in [
             ("query", "*fp16"),
             ("rep_row_ids", "*i32"),
-            ("k_pages", "*fp16"),
-            ("v_pages", "*fp16"),
             ("chunk_page_ids", "*i32"),
             ("mask_by_chunk", "*fp16"),
             ("out", "*fp16"),
@@ -2219,6 +2252,9 @@ pub fn lower_attn<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile
                 p.to_string(),
                 ArgSpec::parse(ty).map_err(|e| e.to_string())?,
             );
+        }
+        for p in ["k_pages", "v_pages"] {
+            signature.insert(p.to_string(), kv_pool_ptr());
         }
         for (k, v) in [
             ("NUM_TOKENS", mq),
@@ -2264,54 +2300,22 @@ pub fn lower_attn<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile
         e.ktir = Some(k);
         return Ok(vec![e]);
     }
-    let mut pointers = vec![
-        ("query", "*fp16"),
-        ("query_row_index", "*i32"),
-        ("k_pages", "*fp16"),
-        ("v_pages", "*fp16"),
-        ("page_index_table", "*i32"),
-    ];
-    if decode {
-        pointers.push(("kv_row_pool", "*i32"));
-    }
-    pointers.extend([("mask_stack", "*fp16"), ("out", "*fp16")]);
-    for (p, ty) in pointers {
-        signature.insert(
-            p.to_string(),
-            ArgSpec::parse(ty).map_err(|e| e.to_string())?,
-        );
-    }
-    let mut sizes = vec![
-        ("NUM_TOKENS", mq),
-        ("NUM_HEADS", nqh),
-        ("NUM_KV_HEADS", nkvh),
-        ("HEAD_SIZE", hd.get()),
-        ("BLOCK_SIZE", SchedulerBlockTokens::REFERENCE.get()),
-        ("NUM_PAGES", pages),
-        ("NUM_BLOCKS", blocks),
-    ];
-    if !decode {
-        // ⭐ ONE REQUEST'S QUERY WIDTH, NOT THE GRAPH'S ROWS — the kernel gathers `P` rows through
-        // `query_row_index` (a per-request table) and scatters them back through the same rows, so
-        // its padded query length is the rung's per-request width. At one request the two agree,
-        // which is why one `mq` served until S > 1.
-        sizes.push(("PADDED_QUERY_LEN", query_rows.per_request().get()));
-    }
-    for (k, v) in sizes {
-        signature.insert(k.to_string(), ArgSpec::Constexpr);
-        constexprs.insert(k.to_string(), Val::Int(i128::from(v)));
-    }
-    signature.insert("SCALE".to_string(), ArgSpec::Constexpr);
-    constexprs.insert("SCALE".to_string(), Val::Float(f64::from(scale)));
-    let spec = KernelSpec {
-        kernel: entry.to_string(),
-        signature,
-        constexprs,
-        file: file.to_string(),
-    };
-    let module = compile_kernel(src, &spec, &[1])?;
-    let positional = triton_ktir_superdsc::node_for_compiled(&module, program)
-        .map_err(|e| format!("triton splice: node_for: {e}"))?;
+    let positional = paged_attn_program::<KvFormat>(PagedAttnGeometry {
+        seq: if decode {
+            PagedSequence::Decode
+        } else {
+            PagedSequence::Prefill {
+                padded_query_len: query_rows.per_request().get(),
+            }
+        },
+        rows: mq,
+        nqh,
+        nkvh,
+        hd,
+        pages,
+        blocks,
+        scale,
+    })?;
     // ⭐ THE WINDOW FAMILY — a prefill pair's capacity is how many one-sequence programs the one
     // compiled module is rebind to. Every OTHER arm is one window by its own pair: a batch's rows
     // are one request's one token each (`paged_rows == Batch`), so its capacity names QUERY ROWS a
@@ -2401,16 +2405,6 @@ pub fn lower_kv_write<
     node: &SubtileNode<F>,
     ir: &SubtileIR<F>,
 ) -> Result<EmittedOp<T>, String> {
-    let row = kv_write_row();
-    let (src, file, entry, program) = match &row {
-        TritonKernelRow::Spliced {
-            src,
-            file,
-            entry,
-            program,
-        } => (*src, *file, *entry, *program),
-        TritonKernelRow::Refused(why) => return Err(why.to_string()),
-    };
     let SubOp::RopeAppend {
         attention,
         rope,
@@ -2456,20 +2450,73 @@ pub fn lower_kv_write<
             node.output.tensor.index()
         ));
     }
+    let positional = kv_write_program::<KvFormat>(KvWriteGeometry {
+        rows,
+        nkvh,
+        hd,
+        pages,
+    })?;
+    let t =
+        |tr: &scratchy_subtile::subtile_ir::TensorRegion| BufferId::new(tr.tensor.index() as u32);
+    let bindings = vec![
+        t(&node.output),
+        t(&node.inputs[3]),
+        t(&node.inputs[4]),
+        t(&node.inputs[5]),
+        BufferId::new(PagedStepTids::RESERVED.write_rows),
+    ];
+    let name = format!("kvwrite_s{}", node.id.index());
+    let k = rebind(positional, name.clone(), bindings, None)?;
+    let mut e = EmittedOp::bare(name);
+    e.ktir = Some(k);
+    Ok(e)
+}
+
+/// ⭐ THE PAGED KV WRITE'S GEOMETRY — what `reshape_and_cache_head_major` is compiled at: the token
+/// rows, the kv heads, the head width, and the pool's pages.
+#[derive(Clone, Copy, Debug)]
+pub struct KvWriteGeometry {
+    pub rows: u32,
+    pub nkvh: u32,
+    pub hd: HeadWidth,
+    pub pages: u32,
+}
+
+/// ⭐ THE KV WRITE'S PROGRAM — spyre-inference's `reshape_and_cache_head_major_kernel` compiled at
+/// `g` with its pools held at format `P`, minted positionally (`[key, value, k_rows, v_rows,
+/// row_index]`, buffers 0..5). The one statement of the write's launch contract: [`lower_kv_write`]
+/// rebinds it at the build's [`KvFormat`], and the card's KV round-trip leg launches it as minted.
+pub fn kv_write_program<P: FloatFormat>(g: KvWriteGeometry) -> Result<KtirNode, String> {
+    let (src, file, entry, program) = match kv_write_row() {
+        TritonKernelRow::Spliced {
+            src,
+            file,
+            entry,
+            program,
+        } => (src, file, entry, program),
+        TritonKernelRow::Refused(why) => return Err(why.to_string()),
+    };
+    let KvWriteGeometry {
+        rows,
+        nkvh,
+        hd,
+        pages,
+    } = g;
     let mut signature: HashMap<String, ArgSpec> = HashMap::new();
     let mut constexprs: HashMap<String, Val> = HashMap::new();
-    for (p, ty) in [
-        ("key", "*fp16"),
-        ("value", "*fp16"),
-        ("k_rows", "*fp16"),
-        ("v_rows", "*fp16"),
-        ("row_index", "*i32"),
-    ] {
+    for (p, ty) in [("key", "*fp16"), ("value", "*fp16"), ("row_index", "*i32")] {
         signature.insert(
             p.to_string(),
             ArgSpec::parse(ty).map_err(|e| e.to_string())?,
         );
     }
+    for p in ["k_rows", "v_rows"] {
+        signature.insert(p.to_string(), pool_ptr::<P>());
+    }
+    // ⭐ THE POOL FORMAT'S SATURATION BOUND — `torch.finfo(k_rows.dtype).max`, the kernel's `FMAX`.
+    // The kernel reads it only where the pool's element type is not the key's.
+    signature.insert("FMAX".to_string(), ArgSpec::Constexpr);
+    constexprs.insert("FMAX".to_string(), Val::Float(f64::from(P::FMAX)));
     for (k, v) in [
         ("T", rows),
         ("NUM_KV_HEADS", nkvh),
@@ -2489,22 +2536,111 @@ pub fn lower_kv_write<
         file: file.to_string(),
     };
     let module = compile_kernel(src, &spec, &[1])?;
-    let positional = triton_ktir_superdsc::node_for_compiled(&module, program)
-        .map_err(|e| format!("triton splice: node_for: {e}"))?;
-    let t =
-        |tr: &scratchy_subtile::subtile_ir::TensorRegion| BufferId::new(tr.tensor.index() as u32);
-    let bindings = vec![
-        t(&node.output),
-        t(&node.inputs[3]),
-        t(&node.inputs[4]),
-        t(&node.inputs[5]),
-        BufferId::new(PagedStepTids::RESERVED.write_rows),
+    triton_ktir_superdsc::node_for_compiled(&module, program)
+        .map_err(|e| format!("triton splice: node_for: {e}"))
+}
+
+/// Which of spyre-inference's two per-sequence paged kernels a program is: the decode kernel at
+/// one query row, or the prefill kernel at a padded query length.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PagedSequence {
+    Decode,
+    Prefill { padded_query_len: u32 },
+}
+
+/// ⭐ A PER-SEQUENCE PAGED ATTENTION'S GEOMETRY — what `page_attn_head_major_decode` /
+/// `_prefill` is compiled at.
+#[derive(Clone, Copy, Debug)]
+pub struct PagedAttnGeometry {
+    pub seq: PagedSequence,
+    /// `NUM_TOKENS` — the query's rows.
+    pub rows: u32,
+    pub nqh: u32,
+    pub nkvh: u32,
+    pub hd: HeadWidth,
+    pub pages: u32,
+    /// `NUM_BLOCKS` — the pages the walk reads ([`walk_pages`]).
+    pub blocks: u32,
+    pub scale: f32,
+}
+
+/// ⭐ THE PER-SEQUENCE PAGED ATTENTION'S PROGRAM — spyre-inference's kernel for `g.seq` compiled at
+/// `g` with its pools held at format `P`, minted positionally (`[query, query_row_index, k_pages,
+/// v_pages, page_index_table, (kv_row_pool,) mask_stack, out]`). The one statement of its launch
+/// contract: [`lower_attn`] rebinds it at the build's [`KvFormat`] per window, and the card's KV
+/// round-trip leg launches it as minted.
+pub fn paged_attn_program<P: DataFormat>(g: PagedAttnGeometry) -> Result<KtirNode, String> {
+    let PagedAttnGeometry {
+        seq,
+        rows,
+        nqh,
+        nkvh,
+        hd,
+        pages,
+        blocks,
+        scale,
+    } = g;
+    let decode = seq == PagedSequence::Decode;
+    let row = if decode { attn_decode_row() } else { attn_row() };
+    let (src, file, entry, program) = match row {
+        TritonKernelRow::Spliced {
+            src,
+            file,
+            entry,
+            program,
+        } => (src, file, entry, program),
+        TritonKernelRow::Refused(why) => return Err(why.to_string()),
+    };
+    let mut signature: HashMap<String, ArgSpec> = HashMap::new();
+    let mut constexprs: HashMap<String, Val> = HashMap::new();
+    let mut pointers = vec![
+        ("query", "*fp16"),
+        ("query_row_index", "*i32"),
+        ("page_index_table", "*i32"),
     ];
-    let name = format!("kvwrite_s{}", node.id.index());
-    let k = rebind(positional, name.clone(), bindings, None)?;
-    let mut e = EmittedOp::bare(name);
-    e.ktir = Some(k);
-    Ok(e)
+    if decode {
+        pointers.push(("kv_row_pool", "*i32"));
+    }
+    pointers.extend([("mask_stack", "*fp16"), ("out", "*fp16")]);
+    for (p, ty) in pointers {
+        signature.insert(
+            p.to_string(),
+            ArgSpec::parse(ty).map_err(|e| e.to_string())?,
+        );
+    }
+    for p in ["k_pages", "v_pages"] {
+        signature.insert(p.to_string(), pool_ptr::<P>());
+    }
+    let mut sizes = vec![
+        ("NUM_TOKENS", rows),
+        ("NUM_HEADS", nqh),
+        ("NUM_KV_HEADS", nkvh),
+        ("HEAD_SIZE", hd.get()),
+        ("BLOCK_SIZE", SchedulerBlockTokens::REFERENCE.get()),
+        ("NUM_PAGES", pages),
+        ("NUM_BLOCKS", blocks),
+    ];
+    // ⭐ ONE REQUEST'S QUERY WIDTH, NOT THE GRAPH'S ROWS — the prefill kernel gathers `P` rows
+    // through `query_row_index` (a per-request table) and scatters them back through the same rows,
+    // so its padded query length is the rung's per-request width.
+    if let PagedSequence::Prefill { padded_query_len } = seq {
+        sizes.push(("PADDED_QUERY_LEN", padded_query_len));
+    }
+    for (k, v) in sizes {
+        signature.insert(k.to_string(), ArgSpec::Constexpr);
+        constexprs.insert(k.to_string(), Val::Int(i128::from(v)));
+    }
+    signature.insert("SCALE".to_string(), ArgSpec::Constexpr);
+    constexprs.insert("SCALE".to_string(), Val::Float(f64::from(scale)));
+    let spec = KernelSpec {
+        kernel: entry.to_string(),
+        signature,
+        constexprs,
+        file: file.to_string(),
+    };
+    let module = compile_kernel(src, &spec, &[1])?;
+    triton_ktir_superdsc::node_for_compiled(&module, program)
+        .map_err(|e| format!("triton splice: node_for: {e}"))
 }
 
 /// A compiled program re-stated with this node's own name and bindings (`node_for` mints positional
@@ -3801,25 +3937,58 @@ pub fn operand_dfs<F: scratchy_subtile::subtile_ir::RopeForm>(
     ))
 }
 
-/// One stated pointer dtype → its device format — the door's own mapping law
-/// (F16→Fp16, BF16→Bf16, F32→Fp32, F8E4M3FN→Fp8, i32→SenUint32): a dtype with
-/// no device format is refused BY NAME.
-fn df_of_stated_type(param: &str, t: &triton_frontend::ttir::Type) -> Result<Df, String> {
-    use triton_frontend::ttir::{FloatKind, Type};
-    Ok(match t {
-        Type::Float(FloatKind::F16) => Df::Fp16,
-        Type::Float(FloatKind::BF16) => Df::Bf16,
-        Type::Float(FloatKind::F32) => Df::Fp32,
-        Type::Float(FloatKind::F8E4M3FN) => Df::Fp8,
-        Type::Int(32, _) => Df::SenUint32,
-        other => {
-            return Err(format!(
-                "triton splice: parameter `{param}` states element type {other:?}, which has no \
-                 device format — the placement would be sized at some other format's bytes and \
-                 the footprint guard would then compare an access against a fiction. Give the \
-                 buffer a dtype the device has (f16, bf16, f32, f8E4M3FN, i32)."
-            ));
+/// ⭐ THE DOOR'S FLOAT MAPPING — a stated Triton float → its device format, or `None` for a float
+/// the device has no format for. ONE table, read both ways: [`df_of_stated_type`] maps a kernel's
+/// stated dtype to its format, and [`stated_float`] finds the float a selected format is stated as.
+const fn float_df(k: FloatKind) -> Option<Df> {
+    match k {
+        FloatKind::F16 => Some(Df::Fp16),
+        FloatKind::BF16 => Some(Df::Bf16),
+        FloatKind::F32 => Some(Df::Fp32),
+        FloatKind::F8E4M3FN => Some(Df::Fp8),
+        FloatKind::F64 | FloatKind::F8E5M2 => None,
+    }
+}
+
+/// The Triton float a device format is stated as — the one [`float_df`] maps to it. A format no
+/// float maps to fails the const evaluation that asks.
+const fn stated_float(df: Df) -> FloatKind {
+    const KINDS: [FloatKind; 6] = [
+        FloatKind::F16,
+        FloatKind::BF16,
+        FloatKind::F32,
+        FloatKind::F64,
+        FloatKind::F8E4M3FN,
+        FloatKind::F8E5M2,
+    ];
+    let mut i = 0;
+    while i < KINDS.len() {
+        if let Some(d) = float_df(KINDS[i])
+            && d as u8 == df as u8
+        {
+            return KINDS[i];
         }
+        i += 1;
+    }
+    panic!("no Triton float type is stated as this device format");
+}
+
+/// One stated pointer dtype → its device format — the door's own mapping law ([`float_df`] for a
+/// float, i32→SenUint32): a dtype with no device format is refused BY NAME.
+fn df_of_stated_type(param: &str, t: &triton_frontend::ttir::Type) -> Result<Df, String> {
+    use triton_frontend::ttir::Type;
+    let df = match t {
+        Type::Float(k) => float_df(*k),
+        Type::Int(32, _) => Some(Df::SenUint32),
+        _ => None,
+    };
+    df.ok_or_else(|| {
+        format!(
+            "triton splice: parameter `{param}` states element type {t:?}, which has no \
+             device format — the placement would be sized at some other format's bytes and \
+             the footprint guard would then compare an access against a fiction. Give the \
+             buffer a dtype the device has (f16, bf16, f32, f8E4M3FN, i32)."
+        )
     })
 }
 
@@ -4531,6 +4700,14 @@ mod production_ktir_dump {
                         (
                             "NUM_ROWS",
                             Val::Int(4 * nkvh * i128::from(SchedulerBlockTokens::REFERENCE.get())),
+                        ),
+                        // The fixture's pools are f16: the saturation bound is f16's own (the
+                        // branch reading it is not taken at a 16-bit cache).
+                        (
+                            "FMAX",
+                            Val::Float(f64::from(
+                                <ktir_superdsc::superdsc_opspec::Fp16 as FloatFormat>::FMAX,
+                            )),
                         ),
                     ],
                 ),
@@ -6731,23 +6908,29 @@ def two_pages(k_index, v_index, k_pages, v_pages, out, NUM_PAGES: tl.constexpr):
         assert!(!ops.is_empty() && ops.iter().all(|e| e.walk.is_none()));
     }
 
-    /// `reshape_and_cache_head_major` writing `t` tokens of `nkvh` kv heads at head dim `hd` into a
-    /// four-page-per-head pool, through the card's lowering against its one-kernel layout.
-    fn kv_write_ops(
+    /// `src` — `reshape_and_cache_head_major` or a variant of its source — writing `t` tokens of
+    /// `nkvh` kv heads at head dim `hd` into a four-page-per-head pool held at format `DF`, through the
+    /// card's lowering against its one-kernel layout.
+    fn kv_write_lowered<DF: ktir_superdsc::superdsc_opspec::FloatFormat>(
+        src: &str,
         t: i128,
         nkvh: i128,
         hd: i128,
-    ) -> Vec<ktir_superdsc::emit::EmittedOp<ktir_superdsc::collective::TpWorld<1>>> {
-        let TritonKernelRow::Spliced {
-            src, file, entry, ..
-        } = kv_write_row()
-        else {
+    ) -> Result<Vec<ktir_superdsc::emit::EmittedOp<ktir_superdsc::collective::TpWorld<1>>>, String>
+    {
+        let TritonKernelRow::Spliced { file, entry, .. } = kv_write_row() else {
             panic!("the KV write row is spliced");
         };
         let mut signature = HashMap::new();
         let mut constexprs = HashMap::new();
-        for p in ["key", "value", "k_rows", "v_rows"] {
+        for p in ["key", "value"] {
             signature.insert(p.to_string(), ArgSpec::parse("*fp16").expect("spec"));
+        }
+        for p in ["k_rows", "v_rows"] {
+            signature.insert(
+                p.to_string(),
+                ArgSpec::Ptr(triton_frontend::ttir::Type::Float(stated_float(DF::DF))),
+            );
         }
         signature.insert(
             "row_index".to_string(),
@@ -6765,17 +6948,19 @@ def two_pages(k_index, v_index, k_pages, v_pages, out, NUM_PAGES: tl.constexpr):
             signature.insert(k.to_string(), ArgSpec::Constexpr);
             constexprs.insert(k.to_string(), Val::Int(v));
         }
+        signature.insert("FMAX".to_string(), ArgSpec::Constexpr);
+        constexprs.insert("FMAX".to_string(), Val::Float(f64::from(DF::FMAX)));
         let spec = KernelSpec {
             kernel: entry.to_string(),
             signature,
             constexprs,
             file: file.to_string(),
         };
-        let module = compile_kernel(src, &spec, &[1]).expect("the write compiles");
+        let module = compile_kernel(src, &spec, &[1])?;
         let node = triton_ktir_superdsc::node_for(&module, Program::PagedKvWrite)
-            .expect("the write mints");
-        let layout = triton_ktir_superdsc::layout::for_node(&node).expect("the write places");
-        allocate_paged_cache(&node, &layout).expect("the cache allocates");
+            .map_err(|e| e.to_string())?;
+        let layout = triton_ktir_superdsc::layout::for_node(&node).map_err(|e| e.to_string())?;
+        allocate_paged_cache(&node, &layout)?;
         let mut sym = 0i64;
         ktir_superdsc::emit::whole_function::lower_walk(
             &node,
@@ -6783,7 +6968,25 @@ def two_pages(k_index, v_index, k_pages, v_pages, out, NUM_PAGES: tl.constexpr):
             &mut sym,
             &mut ktir_superdsc::emit::ktir_matmul_fp8::QuantizedActivations::default(),
         )
-        .unwrap_or_else(|e| panic!("t={t} nkvh={nkvh} hd={hd}: the write lowers: {}", e.message))
+        .map_err(|e| e.message)
+    }
+
+    /// The write kernel's own source.
+    fn kv_write_src() -> &'static str {
+        let TritonKernelRow::Spliced { src, .. } = kv_write_row() else {
+            panic!("the KV write row is spliced");
+        };
+        src
+    }
+
+    /// The write at the 16-bit pool, lowered.
+    fn kv_write_ops(
+        t: i128,
+        nkvh: i128,
+        hd: i128,
+    ) -> Vec<ktir_superdsc::emit::EmittedOp<ktir_superdsc::collective::TpWorld<1>>> {
+        kv_write_lowered::<ktir_superdsc::superdsc_opspec::Fp16>(kv_write_src(), t, nkvh, hd)
+            .unwrap_or_else(|e| panic!("t={t} nkvh={nkvh} hd={hd}: the write lowers: {e}"))
     }
 
     /// ⭐ A HEAD TWO STICKS WIDE IS WRITTEN WHOLE, one index entry per row. The pool is row-outermost,
@@ -6820,5 +7023,97 @@ def two_pages(k_index, v_index, k_pages, v_pages, out, NUM_PAGES: tl.constexpr):
         assert_eq!(rows.len(), 2, "one scatter each for K and V: {:?}", {
             rows.iter().map(|e| e.op_name.clone()).collect::<Vec<_>>()
         });
+    }
+
+    /// ⭐ THE NARROWING FAMILY FOLD — MATCH. At a float8 pool the write's per-head (below the scatter
+    /// floor, per-row) `clamp → narrow → store` chains tile the key and the value, so each lowers as
+    /// the reference's one pass over the whole tensor — `clip`, `clip`, `qfp8ch` — and one scatter run
+    /// of its narrowed rows: no per-head op, and no relayout (a float8 row is one stick, read in
+    /// place). Decode, under the floor, and a prompt chunk, at granite-3.1-8b's 8 heads of 128.
+    #[test]
+    fn a_float8_write_quantizes_each_whole_tensor_once() {
+        for t in [1i128, 4, 96] {
+            let ops = kv_write_lowered::<ktir_superdsc::superdsc_opspec::Fp8>(
+                kv_write_src(),
+                t,
+                8,
+                128,
+            )
+            .unwrap_or_else(|e| panic!("t={t}: the float8 write lowers: {e}"));
+            let names: Vec<&str> = ops.iter().map(|e| e.op_name.as_str()).collect();
+            let count = |p: &str| names.iter().filter(|n| n.starts_with(p)).count();
+            let runs = ktir_superdsc::emit::lower_ktir_to_superdsc::index_runs(t as u32 * 8).len();
+            assert_eq!(count("clipmin_o"), 2, "t={t}: one clamp_min each for K and V: {names:?}");
+            assert_eq!(count("clipmax_o"), 2, "t={t}: one clamp_max each: {names:?}");
+            assert_eq!(count("qfp8ch_o"), 2, "t={t}: one qfp8ch each: {names:?}");
+            assert_eq!(count("scatter_rows"), 0, "t={t}: nothing relaid: {names:?}");
+            assert_eq!(count("scatter_run"), 2 * runs, "t={t}: one run each: {names:?}");
+            assert_eq!(ops.len(), 6 + 2 * runs, "t={t}: nothing else: {names:?}");
+        }
+    }
+
+    /// NEAR-MISS — a family whose windows do not tile the key (one kv head's chain absent) is not the
+    /// reference's whole pass: the fold leaves it unclaimed, and its narrowing is the walk's own
+    /// by-name refusal.
+    #[test]
+    fn a_float8_write_that_misses_a_head_is_left_unclaimed() {
+        let src = kv_write_src().replace(
+            "for h in tl.static_range(NUM_KV_HEADS):",
+            // Seven of the test's eight kv heads.
+            "for h in tl.static_range(7):",
+        );
+        let Err(e) = kv_write_lowered::<ktir_superdsc::superdsc_opspec::Fp8>(&src, 96, 8, 128) else {
+            panic!("a family that leaves a head out is not folded");
+        };
+        assert!(
+            e.contains("is not one of the dtype-converts this door lowers"),
+            "the narrowing's own refusal: {e}"
+        );
+    }
+
+    /// NEAR-MISS — a chain without its saturation (`.to` straight off the load) is not the pattern:
+    /// left unclaimed, refused by name at its narrowing. The value's chains still fold.
+    #[test]
+    fn a_float8_write_without_its_clamp_is_left_unclaimed() {
+        let src = kv_write_src().replace(
+            "k = tl.minimum(tl.maximum(k, -FMAX), FMAX).to(k_dst.dtype)",
+            "k = k.to(k_dst.dtype)",
+        );
+        let Err(e) = kv_write_lowered::<ktir_superdsc::superdsc_opspec::Fp8>(&src, 96, 8, 128) else {
+            panic!("an unsaturated narrowing is not folded");
+        };
+        assert!(
+            e.contains("is not one of the dtype-converts this door lowers"),
+            "the narrowing's own refusal: {e}"
+        );
+    }
+
+    /// NEAR-MISS — members that disagree on a bound are not one pass: left unclaimed, refused by
+    /// name at the narrowing.
+    #[test]
+    fn a_float8_write_whose_heads_disagree_on_a_bound_is_left_unclaimed() {
+        let src = kv_write_src().replace("tl.maximum(k, -FMAX)", "tl.maximum(k, -FMAX + h)");
+        let Err(e) = kv_write_lowered::<ktir_superdsc::superdsc_opspec::Fp8>(&src, 96, 8, 128) else {
+            panic!("members with different bounds are not folded");
+        };
+        assert!(
+            e.contains("is not one of the dtype-converts this door lowers"),
+            "the narrowing's own refusal: {e}"
+        );
+    }
+
+    /// NEIGHBOUR — the 16-bit write states no narrowing, so the fold claims nothing and the write is
+    /// main's: one relaid head group per kv head at two sticks, one scatter run each for K and V, no
+    /// clip and no convert.
+    #[test]
+    fn a_16_bit_write_is_not_a_narrowing_family() {
+        let ops = kv_write_ops(96, 8, 128);
+        let names: Vec<&str> = ops.iter().map(|e| e.op_name.as_str()).collect();
+        assert!(
+            names
+                .iter()
+                .all(|n| !n.starts_with("clip") && !n.starts_with("qfp8ch")),
+            "{names:?}"
+        );
     }
 }

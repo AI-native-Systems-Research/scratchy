@@ -4240,6 +4240,42 @@ pub fn staggered_sources<G: ktir_core::ddl_binds::DeviceGen>(
         if is_plumbing(op.op_type) {
             continue;
         }
+        // ⭐ A FLOAT8 VALUE IS NEVER A TABLE VALUE — an op whose result or operand states
+        // f8E4M3FN is a narrowing-store family's `arith.truncf` (lowered by the family's whole-view
+        // `qfp8ch`, `narrow_families_of`) or a float8 page's `gather → reshape → extf` (the page
+        // arm's `fp8todl16`), each holding the float8 bytes in a buffer of its own and never as a
+        // `Lowering`. The propagation has no arrangement to decide for it (the 16-bit value the
+        // widen produces is standard, the convert's own table row); an fp8 op
+        // neither arm claims is the walk's by-name refusal, exactly as for an op it cannot
+        // classify. ⛔ ONE guard stays, by name: a STAGGERED f16 value narrowed to float8 would be
+        // quantized in the stagger's lane order.
+        let elem_of = |v: Ssa| {
+            f.operations
+                .iter()
+                .find(|o| o.result == Some(v))
+                .and_then(|o| o.result_type)
+                .and_then(|t| t.elem())
+        };
+        let narrows = op.result_type.and_then(|t| t.elem()) == Some(DType::Fp8E4m3);
+        let widens = op
+            .operands
+            .iter()
+            .any(|&v| elem_of(v) == Some(DType::Fp8E4m3));
+        if narrows || widens {
+            if narrows
+                && op
+                    .operands
+                    .iter()
+                    .any(|v| arr.get(v) == Some(&ElementArrangement::Dl16ToFp32))
+            {
+                return err(format!(
+                    "{}: a staggered value is narrowed to float8 at `{:?}` — the convert would \
+                     quantize it in the stagger's lane order. Reduce before the narrowing",
+                    f.name, op.op_type
+                ));
+            }
+            continue;
+        }
         if op.result.is_some_and(|r| {
             silus.iter().any(|c| c.consumed.contains(&r))
                 || rmsnorms.iter().any(|c| c.consumed.contains(&r))
@@ -4689,6 +4725,8 @@ fn lower_function_folded<T: crate::collective::Tp>(
     let mut gather_carried = vec![false; gathers.len()];
     // The second op of every head-major pair ([`head_major_pair`]), lowered with the first.
     let mut head_major_skip: std::collections::HashSet<Ssa> = std::collections::HashSet::new();
+    // A float8 page's widen ([`PageFormat::held`]), landed with its page by the page arm.
+    let mut widened: std::collections::HashSet<Ssa> = std::collections::HashSet::new();
     // Under the prompt trip's division ([`crate::placement::WalkDivision::HeadsInner`]), the rows a
     // head holds, once the query's head-major pair has laid its rows out query-row-major.
     let mut heads_rows: Option<u32> = None;
@@ -4795,6 +4833,56 @@ fn lower_function_folded<T: crate::collective::Tp>(
     // frame's own bytes; wider it is not, and only the readers that address a block at its base
     // take one ([`wide_blocks`]).
     let mut batch_blocks: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+    // ⭐⭐⭐ THE NARROWING-STORE FAMILIES THE PROGRAM STATES
+    // ([`super::lower_ktir_to_superdsc::narrow_families_of`]), read ONCE: each family's whole-view
+    // chain — `clip`, `clip`, `qfp8ch` ([`narrow_chain`]) — is emitted here, into three buffers minted
+    // for its leader's values; the members' own ops are skipped below, and its one scatter run follows
+    // the walk.
+    let narrow = super::lower_ktir_to_superdsc::narrow_families_of(k)?;
+    let narrow_skip: std::collections::HashSet<Ssa> =
+        narrow.iter().flat_map(|fam| fam.claimed()).collect();
+    let mut narrowed: Vec<u32> = Vec::with_capacity(narrow.len());
+    if !narrow.is_empty() {
+        let Some(layout) = layout else {
+            return err(format!(
+                "{}: a narrowing-store family's whole-view buffers need a `BundleLayout` to hold them",
+                f.name
+            ));
+        };
+        let params = regions(k)?;
+        for fam in &narrow {
+            let x = params
+                .iter()
+                .find(|r| r.tid == fam.src_tid)
+                .ok_or_else(|| Error {
+                    message: format!(
+                        "{}: t{} is not a parameter of the program",
+                        f.name, fam.src_tid
+                    ),
+                })?;
+            let (rows, cols) = fam.view;
+            let lead = fam.leader();
+            let lo_t = mint_inter(k, layout, floor, lead.clamp_min);
+            layout.synth(crate::place::SynthId::Act(lo_t), &[rows, cols]);
+            let hi_t = mint_inter(k, layout, floor, lead.clamp_max);
+            layout.synth(crate::place::SynthId::Act(hi_t), &[rows, cols]);
+            let q_t = mint_inter(k, layout, floor, lead.narrow);
+            layout.synth_df(
+                crate::place::SynthId::Act(q_t),
+                &[rows, cols],
+                <crate::superdsc_opspec::Fp8 as crate::superdsc_opspec::DataFormat>::DF,
+            );
+            out.extend(narrow_chain::<T>(
+                f.name,
+                fam,
+                x,
+                [lo_t, hi_t, q_t],
+                sym_id_base,
+                layout,
+            )?);
+            narrowed.push(q_t);
+        }
+    }
 
     for (oi, op) in f.operations.iter().enumerate() {
         if let Some((start, end)) = body_at {
@@ -4920,6 +5008,10 @@ fn lower_function_folded<T: crate::collective::Tp>(
                 // A row-folded family's non-leader block: the leader's one whole-view descriptor
                 // already computed its rows (see [`row_tiled_family`]).
                 || row_fold_skip.contains(&r)
+                // A narrowing-store family's member: the family's whole-view chain computed it.
+                || narrow_skip.contains(&r)
+                // A float8 page's widen: the page arm wrote its 16-bit landing (`fp8todl16`).
+                || widened.contains(&r)
         }) {
             continue;
         }
@@ -5723,153 +5815,33 @@ fn lower_function_folded<T: crate::collective::Tp>(
                         .map_err(|e| Error {
                             message: format!("{}: `{:?}` {}", f.name, op.op_type, e),
                         })?;
-                    // ⭐ THE CHUNK LEGS EVERY FRAME SHARES — one op a run of one index stick
-                    // (the frame's own [`LandingFrame::legs`]: each run at its own entry base,
-                    // the gather's own first entry plus the run's start, both whole sticks, and
-                    // its own landing offset, whole blocks in).
-                    let mut chunk_legs = |frame: crate::superdsc_opspec::LandingFrame,
-                                      land_tid: u32,
-                                      land_name: &str,
-                                      page_of: &dyn Fn(
-                        crate::superdsc_opspec::GatherEntries,
-                        crate::superdsc_opspec::LandingOffset,
-                    ) -> crate::ir::bridge::tiled_op_sdsc_op::IndexSelectPage|
-                     -> Result<(), Error> {
-                        let mut emitted = 0u32;
-                        for (run_start, run, offset) in frame.legs() {
-                            let base = g.first_entry.plus_entries(run_start.entries()).map_err(
-                                |message| Error {
-                                    message: format!("{}: {message}", f.name),
-                                },
-                            )?;
-                            out.push(
-                                crate::ir::bridge::tiled_op_sdsc_op::assemble_index_select(
-                                    &format!(
-                                        "gather{}_o{land_tid}",
-                                        if emitted == 0 {
-                                            String::new()
-                                        } else {
-                                            emitted.to_string()
-                                        }
-                                    ),
-                                    &crate::place::act_name(g.value_tid),
-                                    land_name,
-                                    crate::superdsc_opspec::OnePositionIndex::of_scratch_rows(
-                                        crate::place::act_name(g.index_tid),
-                                        base,
-                                    ),
-                                    page_of(run, offset),
-                                    sym_id_base,
-                                    Some(layout),
-                                )
-                                .map_err(|message| Error {
-                                    message: format!("{}: {message}", f.name),
-                                })?,
-                            );
-                            emitted += run.get();
-                        }
-                        Ok(())
+                    // ⭐ THE PAGE'S FORMAT — THE DATA→TYPE DOOR: the gathered view's own element
+                    // type, read ONCE, here, each format by name. A 16-bit page lands as it is; a
+                    // float8 page lands in a local of its own format and is widened into the 16-bit
+                    // landing ([`PageFormat`]), the only way it enters this walk's table.
+                    let cx = PageCx {
+                        k,
+                        layout,
+                        floor,
+                        sym_id_base: &mut *sym_id_base,
+                        out: &mut out,
+                        inter: &mut inter,
+                        batch_blocks: &mut batch_blocks,
+                        widened: &mut widened,
                     };
-                    match frame {
-                        // ⭐ THE RANK-2 FRAME, RESTICKIFIED — a `[T, w]` read of several gathered
-                        // planes wider than one stick. The card frame of a `[T, w]` tensor is ONE
-                        // stick column over all `T` rows, while the gather lands each entry's
-                        // blocks stick-major one after another — the same bytes exactly when there
-                        // is one block or one stick (a single entry, or `w` one stick wide, where
-                        // the landing IS the frame and nothing follows). Otherwise the entries
-                        // land as ONE-ROW blocks — row-major `[T, w]`, the same bytes the op
-                        // reads — and one whole stick permute restickifies them into the frame's
-                        // own column: the restickify the consumer's reshape used to perform (the
-                        // deleted `page_to_sticks` arm), stated here at the landing that needs it.
-                        crate::superdsc_opspec::LandingFrame::Restickify { t_rows, w, .. } => {
-                            // The landing: one-row blocks — each entry's plane as `t_rows /
-                            // entries` blocks of `[1, w]`, a stick-major one-row block being that
-                            // row's own bytes — so the whole landing is row-major `[T, w]` in a
-                            // minted scratch. The frame: one stick column over all `T` rows, the
-                            // same buffer every rank-2 `[T, w]` value holds, one whole permute
-                            // away.
-                            let land_tid =
-                                mint_scratch(k, layout, floor, res, Scratch::GatherLanding);
-                            layout.synth(
-                                crate::place::SynthId::Act(land_tid),
-                                &[t_rows.get(), w.elems()],
-                            );
-                            let land = Region {
-                                tid: land_tid,
-                                v_rows: t_rows.get(),
-                                v_cols: w.elems(),
-                                r_start: 0,
-                                c_start: 0,
-                                r_len: t_rows.get(),
-                                c_len: w.elems(),
-                                r_cover: (0, t_rows.get()),
-                                c_cover: (0, w.elems()),
-                                is_out: true,
-                                is_fp8: false,
-                                band: None,
-                            };
-                            let land_name = land.name();
-                            chunk_legs(frame, land_tid, &land_name, &|run, offset| {
-                                crate::ir::bridge::tiled_op_sdsc_op::IndexSelectPage::of_run(
-                                    frame, run, offset,
-                                )
-                            })?;
-                            let tid = mint_inter(k, layout, floor, res);
-                            let dst =
-                                stick_major_region(tid, t_rows.get(), w.stick_count(), layout);
-                            out.push(permute(
-                                f.name,
-                                &Region {
-                                    is_out: false,
-                                    ..land
-                                },
-                                &dst,
-                                Permuted::whole((t_rows.get(), w.stick_count())),
-                                crate::ir::bridge::tiled_op_sdsc_op::StickPermute::RowToStick,
-                                sym_id_base,
-                                Some(layout),
-                            )?);
-                            inter.insert(
-                                res,
-                                Region {
-                                    is_out: false,
-                                    ..dst
-                                },
-                            );
+                    match super::lower_ktir_to_superdsc::indirect_view_elem(f, g.tile) {
+                        Some(DType::F16) => {
+                            land_page::<crate::superdsc_opspec::Fp16, T>(cx, &g, frame, res)?
                         }
-                        // ⭐ THE DIRECT LANDING — rank ≥ 3 `[..., blocks, rows, w]` (each entry
-                        // `blocks` stick-major `[rows, w]` blocks, one after another — the frame
-                        // the trip's batched restickify and contractions read a block of at its
-                        // base) or a rank-2 `[T, w]` whose landing IS the frame's own bytes (one
-                        // stick column, per-entry one-stick blocks).
-                        frame => {
-                            let w = frame.width();
-                            let landing_rows = frame.landing_rows();
-                            let tid = mint_inter(k, layout, floor, res);
-                            let dst =
-                                stick_major_region(tid, landing_rows, w.stick_count(), layout);
-                            let land_name = dst.name();
-                            chunk_legs(frame, tid, &land_name, &|run, offset| {
-                                crate::ir::bridge::tiled_op_sdsc_op::IndexSelectPage::of_run(
-                                    frame, run, offset,
-                                )
-                            })?;
-                            // A rank ≥ 3 frame stated its blocks, so the landing registers them;
-                            // a rank-2 frame stated none, and its landing — one stick column,
-                            // per-entry one-stick blocks, or the restickified column above — is
-                            // the flat frame's own bytes.
-                            if matches!(frame, crate::superdsc_opspec::LandingFrame::Blocks { .. })
-                                && let Some(c) = block_landing_cols(w.elems(), stick)
-                            {
-                                batch_blocks.insert(tid, c);
-                            }
-                            inter.insert(
-                                res,
-                                Region {
-                                    is_out: false,
-                                    ..dst
-                                },
-                            );
+                        Some(DType::Fp8E4m3) => {
+                            land_page::<crate::superdsc_opspec::Fp8, T>(cx, &g, frame, res)?
+                        }
+                        other => {
+                            return err(format!(
+                                "{}: the gathered page's view states element type {other:?} — a \
+                                 paged cache is f16 or f8E4M3FN",
+                                f.name
+                            ));
                         }
                     }
                     gather_carried[gi] = true;
@@ -7819,26 +7791,69 @@ fn lower_function_folded<T: crate::collective::Tp>(
     // The rows are a parameter's, so they move once the compute is done — which is program order
     // only while nothing the program reads is a destination they land in, so that is refused.
     let scattered = super::lower_ktir_to_superdsc::load_scatters(f.name, k, sym_id_base, layout)?;
-    for sc in super::lower_ktir_to_superdsc::scatters_of(k)? {
-        let read = gathers.iter().any(|g| g.value_tid == sc.value_tid)
+    // ⭐ EACH NARROWING FAMILY'S ONE SCATTER RUN — its narrowed rows (the whole-view `qfp8ch`'s
+    // stick-major float8 `[rows, cols]`, whose row `(c / width) · rows + r` is window `(r, c)`'s, the
+    // source-row law a parameter's rows take) onto its destination through its index, the one card
+    // form every run takes ([`super::lower_ktir_to_superdsc::scatter_run`]).
+    let mut narrow_runs = Vec::new();
+    if !narrow.is_empty() {
+        let params = regions(k)?;
+        let param = |tid: u32| {
+            params.iter().find(|x| x.tid == tid).ok_or_else(|| Error {
+                message: format!("{}: t{tid} is not a parameter of the program", f.name),
+            })
+        };
+        for (fam, &q_t) in narrow.iter().zip(&narrowed) {
+            let run = fam.extent(f.name)?;
+            narrow_runs.extend(super::lower_ktir_to_superdsc::scatter_run::<
+                crate::superdsc_opspec::Fp8,
+                T,
+            >(
+                f.name,
+                k,
+                layout,
+                super::lower_ktir_to_superdsc::RunCopy {
+                    src: &crate::place::act_name(q_t),
+                    src_rows: fam.view.0,
+                    groups: fam.view.1 / fam.width.elems(),
+                    width: fam.width,
+                    s0: run.s0,
+                    e0: run.e0,
+                    total: run.total,
+                    dst: param(fam.dst_tid)?,
+                    index: param(fam.index_tid)?,
+                    key: fam.leader().narrow,
+                },
+                sym_id_base,
+            )?);
+        }
+    }
+    for value_tid in super::lower_ktir_to_superdsc::scatters_of(k)?
+        .iter()
+        .map(|sc| sc.value_tid)
+        .chain(narrow.iter().map(|fam| fam.dst_tid))
+    {
+        let read = gathers.iter().any(|g| g.value_tid == value_tid)
             || f.ops_deep().iter().any(|o| {
                 o.op_type == OpKind::KtdpLoad
                     && o.result.is_some_and(|v| {
                         region_for_operand(k, v)
                             .ok()
                             .flatten()
-                            .is_some_and(|r| r.tid == sc.value_tid)
+                            .is_some_and(|r| r.tid == value_tid)
                     })
             });
         if read {
             return err(format!(
-                "{}: the program scatters rows into t{} and also reads it — the scatter runs after \
-                 the compute, so a read of its destination would see the rows before they land",
-                f.name, sc.value_tid
+                "{}: the program scatters rows into t{value_tid} and also reads it — the scatter \
+                 runs after the compute, so a read of its destination would see the rows before \
+                 they land",
+                f.name
             ));
         }
     }
-    let scatters = !scattered.is_empty();
+    let scatters = !scattered.is_empty() || !narrow_runs.is_empty();
+    out.extend(narrow_runs);
     out.extend(scattered);
 
     // ⭐ THE PURE-COPY ARM. A copy program states no compute op at all — its ops are loads and
@@ -8952,6 +8967,377 @@ fn int_zero_run(name: &str, layout: &BundleLayout) -> Result<u32, Error> {
             placed.map_or(0, |p| p.size)
         )),
     }
+}
+
+/// ⭐ ONE NARROWING FAMILY'S WHOLE-VIEW CHAIN — torch-spyre's three device ops for spyre-inference's
+/// `quantize_kv` over the whole tensor: `clip` (`clamp_min`, [`crate::superdsc_opspec::ClipBounds::at_least`]),
+/// `clip` (`clamp_max`, [`crate::superdsc_opspec::ClipBounds::at_most`]) and `qfp8ch` — the W8A8
+/// activation quantizer's own convert door ([`super::assemble_convert`], `fq_afp8_op`) — over the
+/// source's stick-major `[rows, cols]`, into the family's three minted buffers `[lo, hi, q]` (`q` at
+/// float8).
+fn narrow_chain<T: crate::collective::Tp>(
+    name: &str,
+    fam: &super::lower_ktir_to_superdsc::NarrowFamily,
+    x: &Region,
+    [lo_t, hi_t, q_t]: [u32; 3],
+    sym_id_base: &mut i64,
+    layout: &BundleLayout,
+) -> Result<Vec<super::EmittedOp<T>>, Error> {
+    let (rows, cols) = fam.view;
+    let m_rows = crate::sdsc_abstract::RowCount::of_token_rows(rows);
+    let k_cols = crate::sdsc_abstract::BlockCols::of_feature_cols(cols);
+    let x_h = super::rb(&x.name(), rows, cols);
+    let lo_h = super::rb(&crate::place::act_name(lo_t), rows, cols);
+    let hi_h = super::rb(&crate::place::act_name(hi_t), rows, cols);
+    let q_h = super::rb_df(&crate::place::act_name(q_t), rows, cols, Df::Fp8);
+    let (lo_name, hi_name, q_name) = (
+        format!("clipmin_o{lo_t}"),
+        format!("clipmax_o{hi_t}"),
+        format!("qfp8ch_o{q_t}"),
+    );
+    let lift = |e: crate::superdsc_error::SuperDscError| Error {
+        message: format!("{name}: {}", e.0),
+    };
+    Ok(vec![
+        super::assemble_clip(
+            super::ClipOp {
+                op_name: &lo_name,
+                bounds: crate::superdsc_opspec::ClipBounds::at_least(fam.lo),
+                rows: m_rows,
+                cols: k_cols,
+                a: super::In::full(&x_h),
+                o: &lo_h,
+            },
+            sym_id_base,
+            Some(layout),
+        )
+        .map_err(lift)?,
+        super::assemble_clip(
+            super::ClipOp {
+                op_name: &hi_name,
+                bounds: crate::superdsc_opspec::ClipBounds::at_most(fam.hi),
+                rows: m_rows,
+                cols: k_cols,
+                a: super::In::full(&lo_h),
+                o: &hi_h,
+            },
+            sym_id_base,
+            Some(layout),
+        )
+        .map_err(lift)?,
+        super::assemble_convert(
+            &q_name,
+            "qfp8ch",
+            rows,
+            cols,
+            &hi_h,
+            &q_h,
+            sym_id_base,
+            Some(layout),
+        )
+        .map_err(lift)?,
+    ])
+}
+
+/// What one page landing writes into — the walk's own state, threaded so [`land_page`] can be generic
+/// over the page's format (the walk itself is not).
+struct PageCx<'a, T: crate::collective::Tp> {
+    k: &'a KtirNode,
+    layout: &'a BundleLayout,
+    floor: u32,
+    sym_id_base: &'a mut i64,
+    out: &'a mut Vec<super::EmittedOp<T>>,
+    inter: &'a mut std::collections::HashMap<Ssa, Region>,
+    batch_blocks: &'a mut std::collections::HashMap<u32, u32>,
+    widened: &'a mut std::collections::HashSet<Ssa>,
+}
+
+/// What a page fill reads: the gather, its frame in the table's 16-bit terms, the landing it fills,
+/// and the walk's mint state.
+struct PageFill<'a> {
+    k: &'a KtirNode,
+    g: &'a Gather,
+    frame: crate::superdsc_opspec::LandingFrame,
+    land: &'a Region,
+    floor: u32,
+    layout: &'a BundleLayout,
+}
+
+/// ⭐ HOW A GATHERED PAGE OF FORMAT `Self` REACHES THE WALK'S 16-BIT TABLE — the one place a page's
+/// format decides anything, chosen by the page arm's door. A 16-bit page lands as it is; a float8
+/// page lands in a local of its own format and is widened into the 16-bit landing.
+trait PageFormat: crate::superdsc_opspec::DataFormat {
+    /// The value the 16-bit landing holds: the reshape's own result, or its widen's.
+    fn held(f: &IRFunction<'static>, reshape: Ssa) -> Result<Ssa, Error>;
+    /// The ops that fill the 16-bit landing's bytes from the gather.
+    fn fill<T: crate::collective::Tp>(
+        p: PageFill<'_>,
+        sym_id_base: &mut i64,
+    ) -> Result<Vec<super::EmittedOp<T>>, Error>;
+}
+
+impl PageFormat for crate::superdsc_opspec::Fp16 {
+    fn held(_: &IRFunction<'static>, reshape: Ssa) -> Result<Ssa, Error> {
+        Ok(reshape)
+    }
+
+    fn fill<T: crate::collective::Tp>(
+        p: PageFill<'_>,
+        sym_id_base: &mut i64,
+    ) -> Result<Vec<super::EmittedOp<T>>, Error> {
+        page_legs::<Self, T>(
+            p.k.func.name,
+            p.g,
+            p.frame,
+            p.land.tid,
+            &p.land.name(),
+            sym_id_base,
+            p.layout,
+        )
+    }
+}
+
+impl PageFormat for crate::superdsc_opspec::Fp8 {
+    /// A float8 page is read through its widen to f16 alone (`k_page.to(q.dtype)`): the reshape's
+    /// ONE reader, an `arith.extf` to f16. Its bytes are fp8 and no op of the 16-bit walk reads them.
+    fn held(f: &IRFunction<'static>, reshape: Ssa) -> Result<Ssa, Error> {
+        let deep = f.ops_deep();
+        let readers: Vec<_> = deep
+            .iter()
+            .copied()
+            .filter(|o| o.operands.contains(&reshape))
+            .collect();
+        match readers[..] {
+            [w] if w.op_type == OpKind::ArithExtf
+                && w.result_type.and_then(|t| t.elem()) == Some(DType::F16) =>
+            {
+                w.result.ok_or_else(|| Error {
+                    message: format!("{}: the float8 page's widen states no result", f.name),
+                })
+            }
+            _ => err(format!(
+                "{}: a float8 page is read through its widen to f16 alone (`k_page.to(q.dtype)`, \
+                 one `arith.extf`), and this one has {} reader(s) — the page's bytes are fp8 and \
+                 no op of the 16-bit walk reads them",
+                f.name,
+                readers.len()
+            )),
+        }
+    }
+
+    /// The gather lands the table frame's own blocks at fp8 in a local ([`LandingFrame::in_format`] —
+    /// the type that refuses a row not whole fp8 sticks), and ONE `fp8todl16` widens the whole local
+    /// into the 16-bit landing in the same frame
+    /// ([`crate::ir::bridge::tiled_op_sdsc_op::widen_landing_opspec`]).
+    fn fill<T: crate::collective::Tp>(
+        p: PageFill<'_>,
+        sym_id_base: &mut i64,
+    ) -> Result<Vec<super::EmittedOp<T>>, Error> {
+        let name = p.k.func.name;
+        let narrow = p.frame.in_format::<Self>().map_err(|e| Error {
+            message: format!("{name}: the float8 page {e}"),
+        })?;
+        // The float8 page's own buffer — the gathered load's value, as gathered.
+        let local = mint_inter(p.k, p.layout, p.floor, p.g.load);
+        p.layout.synth_df(
+            crate::place::SynthId::Act(local),
+            &[narrow.landing_rows(), narrow.width().elems()],
+            <Self as crate::superdsc_opspec::DataFormat>::DF,
+        );
+        let local_name = crate::place::act_name(local);
+        let mut ops =
+            page_legs::<Self, T>(name, p.g, narrow, local, &local_name, sym_id_base, p.layout)?;
+        ops.push(
+            crate::ir::bridge::tiled_op_sdsc_op::assemble_widen_landing(
+                &format!(
+                    "{}_o{}",
+                    ktir_core::ddl_binds::DeviceOp::Fp8ToDl16.op_func(),
+                    p.land.tid
+                ),
+                &local_name,
+                &p.land.name(),
+                narrow,
+                sym_id_base,
+                Some(p.layout),
+            )
+            .map_err(|message| Error {
+                message: format!("{name}: {message}"),
+            })?,
+        );
+        Ok(ops)
+    }
+}
+
+/// ⭐ ONE PAGE GATHER'S LEGS — one `index_select` op a run of one index stick (the frame's own
+/// [`LandingFrame::legs`]: each run at its own entry base, the gather's own first entry plus the
+/// run's start, both whole sticks, and its own landing offset, whole blocks in), landing `frame`'s
+/// blocks at format `DF` in `land_name`.
+fn page_legs<DF: crate::superdsc_opspec::DataFormat, T: crate::collective::Tp>(
+    name: &str,
+    g: &Gather,
+    frame: crate::superdsc_opspec::LandingFrame<DF>,
+    land_tid: u32,
+    land_name: &str,
+    sym_id_base: &mut i64,
+    layout: &BundleLayout,
+) -> Result<Vec<super::EmittedOp<T>>, Error> {
+    let mut ops = Vec::new();
+    let mut emitted = 0u32;
+    for (run_start, run, offset) in frame.legs() {
+        let base = g
+            .first_entry
+            .plus_entries(run_start.entries())
+            .map_err(|message| Error {
+                message: format!("{name}: {message}"),
+            })?;
+        ops.push(
+            crate::ir::bridge::tiled_op_sdsc_op::assemble_index_select::<DF, T>(
+                &format!(
+                    "gather{}_o{land_tid}",
+                    if emitted == 0 {
+                        String::new()
+                    } else {
+                        emitted.to_string()
+                    }
+                ),
+                &crate::place::act_name(g.value_tid),
+                land_name,
+                crate::superdsc_opspec::OnePositionIndex::of_scratch_rows(
+                    crate::place::act_name(g.index_tid),
+                    base,
+                ),
+                crate::ir::bridge::tiled_op_sdsc_op::IndexSelectPage::of_run(frame, run, offset),
+                sym_id_base,
+                Some(layout),
+            )
+            .map_err(|message| Error {
+                message: format!("{name}: {message}"),
+            })?,
+        );
+        emitted += run.get();
+    }
+    Ok(ops)
+}
+
+/// ⭐ A GATHERED PAGE INTO THE TABLE — the landing main's page arm mints for the reshape's frame
+/// (a `Restickify` frame's row-major scratch and its one permute, or the stick-major landing a
+/// `Blocks`/`Flat` frame IS, registered in `batch_blocks` when it states blocks), its bytes filled at
+/// the page's format `P` ([`PageFormat::fill`]), and held as `P`'s value ([`PageFormat::held`]).
+fn land_page<P: PageFormat, T: crate::collective::Tp>(
+    cx: PageCx<'_, T>,
+    g: &Gather,
+    frame: crate::superdsc_opspec::LandingFrame,
+    reshape: Ssa,
+) -> Result<(), Error> {
+    let PageCx {
+        k,
+        layout,
+        floor,
+        sym_id_base,
+        out,
+        inter,
+        batch_blocks,
+        widened,
+    } = cx;
+    let f = &k.func;
+    let held = P::held(f, reshape)?;
+    if held != reshape {
+        widened.insert(held);
+    }
+    match frame {
+        // ⭐ THE RANK-2 FRAME, RESTICKIFIED — a `[T, w]` read of several gathered planes wider than
+        // one stick: the entries land as ONE-ROW blocks (row-major `[T, w]`) in a minted scratch, and
+        // one whole stick permute restickifies them into the frame's own column.
+        crate::superdsc_opspec::LandingFrame::Restickify { t_rows, w, .. } => {
+            let land_tid =
+                mint_scratch(k, layout, floor, reshape, crate::ktir_node::Scratch::GatherLanding);
+            layout.synth(
+                crate::place::SynthId::Act(land_tid),
+                &[t_rows.get(), w.elems()],
+            );
+            let land = Region {
+                tid: land_tid,
+                v_rows: t_rows.get(),
+                v_cols: w.elems(),
+                r_start: 0,
+                c_start: 0,
+                r_len: t_rows.get(),
+                c_len: w.elems(),
+                r_cover: (0, t_rows.get()),
+                c_cover: (0, w.elems()),
+                is_out: true,
+                is_fp8: false,
+                band: None,
+            };
+            out.extend(P::fill::<T>(
+                PageFill {
+                    k,
+                    g,
+                    frame,
+                    land: &land,
+                    floor,
+                    layout,
+                },
+                sym_id_base,
+            )?);
+            let tid = mint_inter(k, layout, floor, reshape);
+            let dst = stick_major_region(tid, t_rows.get(), w.stick_count(), layout);
+            out.push(permute(
+                f.name,
+                &Region {
+                    is_out: false,
+                    ..land
+                },
+                &dst,
+                Permuted::whole((t_rows.get(), w.stick_count())),
+                crate::ir::bridge::tiled_op_sdsc_op::StickPermute::RowToStick,
+                sym_id_base,
+                Some(layout),
+            )?);
+            inter.insert(
+                held,
+                Region {
+                    is_out: false,
+                    ..dst
+                },
+            );
+        }
+        // ⭐ THE DIRECT LANDING — rank ≥ 3 `[..., blocks, rows, w]` (each entry `blocks` stick-major
+        // `[rows, w]` blocks, one after another — the frame the trip's batched restickify and
+        // contractions read a block of at its base) or a rank-2 `[T, w]` whose landing IS the
+        // frame's own bytes. A rank ≥ 3 frame stated its blocks, so the landing registers them.
+        frame => {
+            let w = frame.width();
+            let landing_rows = frame.landing_rows();
+            let tid = mint_inter(k, layout, floor, reshape);
+            let dst = stick_major_region(tid, landing_rows, w.stick_count(), layout);
+            out.extend(P::fill::<T>(
+                PageFill {
+                    k,
+                    g,
+                    frame,
+                    land: &dst,
+                    floor,
+                    layout,
+                },
+                sym_id_base,
+            )?);
+            if matches!(frame, crate::superdsc_opspec::LandingFrame::Blocks { .. })
+                && let Some(c) =
+                    block_landing_cols(w.elems(), i64::from(crate::work::FP16_ELEMS_PER_STICK))
+            {
+                batch_blocks.insert(tid, c);
+            }
+            inter.insert(
+                held,
+                Region {
+                    is_out: false,
+                    ..dst
+                },
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Whether `tid` holds batch blocks wider than one stick — bytes no flat frame names

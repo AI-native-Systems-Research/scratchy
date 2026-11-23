@@ -216,7 +216,11 @@ pub fn rows_per_block(cols: u32, live: u32) -> u32 {
 /// twelve of its rows, packed int2/int4 included. Every impl below derives
 /// `ELEMS_PER_STICK` by that law, and `superdsc_opspec::tests` pins each
 /// derived value against the vendor map's own row.
-pub trait DataFormat: private::SealedDf {
+///
+/// A format is a zero-variant TYPE-LEVEL marker, so it is `Copy` and `Debug` by its own trait: a
+/// value generic over its format (`StickExtent<DF>`, `LandingFrame<DF>`, `IndexSelectPage<DF>`)
+/// derives `Copy`/`Debug` under `DF: DataFormat` alone.
+pub trait DataFormat: private::SealedDf + Copy + core::fmt::Debug {
     const ELEMS_PER_STICK: u32;
     /// DeepTools `dataFormat_` string.
     const NAME: &'static str;
@@ -337,6 +341,26 @@ impl DataFormat for SenUint32 {
     const NAME: &'static str = "SENUINT32";
     const WORD_LENGTH: u32 = 4;
     const DF: Df = Df::SenUint32;
+}
+
+/// ⭐ A FLOATING FORMAT'S LARGEST FINITE VALUE — `torch.finfo(dtype).max`, stated ONCE per format.
+/// spyre-inference's `quantize_kv` saturates to it before narrowing a value to a smaller float
+/// (`fmax = torch.finfo(dtype).max`, `ops/reshape_and_cache.py:23`); the splice hands the KV pool
+/// format's to the write kernel as its `FMAX` constexpr.
+pub trait FloatFormat: DataFormat {
+    const FMAX: f32;
+}
+
+impl FloatFormat for Fp16 {
+    const FMAX: f32 = half::f16::MAX.to_f32_const();
+}
+
+impl FloatFormat for Fp32 {
+    const FMAX: f32 = f32::MAX;
+}
+
+impl FloatFormat for Fp8 {
+    const FMAX: f32 = ktir_core::codec::E4M3_FMAX;
 }
 
 mod private {
@@ -1633,6 +1657,9 @@ pub enum OpFunc {
     /// converts the fp32 accumulator → f16 for the output.
     Dl16ToFp32,
     Fp32ToDl16,
+    /// `fp8todl16` — the SFP widen SEN143_FP8 → fp16 (quantization_double_pad.ddl:60, the upcast
+    /// twin of [`Dl16ToFp32`](OpFunc::Dl16ToFp32)): the read of a float8 KV page, `qfp8ch`'s inverse.
+    Fp8ToDl16,
     /// `fp32toint32` — the SFP VALUE CAST fp32 → 32-bit integer (unary_parallel.ddl:50, ICVT imm=8;
     /// "the conversion is carried out in fp32 mode"). The MoE expert gather's index producer: the
     /// router's top-k ids, computed on device as fp16 lane values, become the `SENUINT32` entries a
@@ -1900,6 +1927,7 @@ impl OpFunc {
             OpFunc::Tanh => "tanh",
             OpFunc::Dl16ToFp32 => "dl16tofp32",
             OpFunc::Fp32ToDl16 => "fp32todl16",
+            OpFunc::Fp8ToDl16 => "fp8todl16",
             OpFunc::Fp32ToInt32 => "fp32toint32",
             OpFunc::Int32ToFp32 => "int32tofp32",
             OpFunc::MulI32ToI32 => "muli32toi32",
@@ -2000,13 +2028,6 @@ impl OpFunc {
                 ("clipMax", 448.0),
                 ("mulConst", 1.0 / 448.0),
             ],
-            // ⭐ THE fp8 E4M3 CLAMP BOUNDS, the same ±448 the `fq_chi`/`fq_cl` pair used to read as
-            // `[1, stick]` H2D tensor operands. `unary_pipeline.ddl`'s clip body is
-            // `FMAX(x, clipMin)` in PE (`:370-377`) then `FMIN(·, clipMax)` on the SFP (`:472-479`) —
-            // the min/max pair encoded, in the same order-independent clamp form. The bounds are the
-            // E4M3 finite range, so they are quant-format constants, not model constants: they belong
-            // to the op, which is why they live in this table.
-            OpFunc::Clip => &[("clipMin", -448.0), ("clipMax", 448.0)],
             // ⭐ THE TOP-K PAIR NEEDS NONE — the running `(max, idx)` state, the `-inf`/`-1`/`1`
             // SFP constants and the ring are ALL `ddl.internal_tensor`s or template-internal
             // constant units (`topk.ddl:87-115`), reached by no `ddl.get_external_constant` in
@@ -2097,6 +2118,7 @@ impl OpFunc {
             | OpFunc::Tanh
             | OpFunc::Dl16ToFp32
             | OpFunc::Fp32ToDl16
+            | OpFunc::Fp8ToDl16
             | OpFunc::Fp32ToInt32
             | OpFunc::Int32ToFp32
             | OpFunc::MulI32ToI32
@@ -2248,24 +2270,47 @@ pub enum ViewFrame {
     /// ([`StickLayout::row_blocked_df`]): core `(x, mb)`'s slice starts at row `x·MB + mb` of it,
     /// the row the flat frame's own row-wise ops hand the same core.
     FoldedRows,
-    /// ⭐ A page-gather LANDING of ONE block, several sticks wide: a stick-major `[r, c]` block
-    /// (each core's start at its own block, the view's own flat walk). The tensor's ONE
-    /// arrangement is the stick-major `[r, c]` that block is — declared so, derived from the
-    /// landing's own extents at the arrangement authority. A landing of SEVERAL blocks is NOT
-    /// stated by this frame: its bytes are blocks-one-after-another, which no `StickKind` states
-    /// (the walk carries that frame as `batch_blocks` / `BatchFrame::Blocks`), and stamping it
-    /// `LandedBlocks` anyway would declare the batched transpose's read of the landing wrong —
-    /// the arrangement authority refuses the conflict. So only a one-block landing several
-    /// sticks wide carries this frame.
-    /// ADDRESSING is not this frame's to change: the view keeps its own walk (a landing's per-core
-    /// starts are its blocks), so it derives no layout of its own and stays classified as `Own`
-    /// outside the authority's declaration.
-    /// A one-stick landing is the flat frame's own bytes and never carries this frame.
-    ///
-    /// ⭐ IT CARRIES THE ARRANGEMENT IT DECLARES — the stick-major `[rows, cols]` of the one block,
-    /// minted at the stamp from the landing's own extents. The authority reads it; nothing re-derives
-    /// it from the view at emit, so the stamp and the declaration are one fact.
-    LandedBlocks(crate::sdsc_abstract::StickLayout),
+    /// ⭐ A PAGE LANDING — `blocks` stick-major `[rows, cols]` blocks one after another over the
+    /// view's `[mb, y, x, out]` (the frame a page gather writes and the batched contraction reads,
+    /// `batch_blocks` / `BatchFrame::Blocks`). It ADDRESSES as those blocks ([`PageLanding::off`]):
+    /// a core's start is its corner's block, then that block's stick-major `(x, out)`, whatever axes
+    /// the op divides — the start and the walk read one frame. Its DECLARATION is
+    /// [`PageLanding::declared`]: the one block's stick-major arrangement when the landing is one block
+    /// several sticks wide, and the view's own otherwise (several blocks are bytes no `StickKind`
+    /// states, and stamping them would declare the batched transpose's read wrong — the arrangement
+    /// authority refuses the conflict).
+    Landing(PageLanding),
+}
+
+/// ⭐ A PAGE LANDING'S OWN FRAME — how many blocks, and the one block's stick-major `[rows, cols]` at
+/// the landing's format. Minted by the landing's one stamp (`landing_arg`); the address law and the
+/// declaration are both read off it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PageLanding {
+    blocks: u32,
+    block: crate::sdsc_abstract::StickLayout,
+}
+
+impl PageLanding {
+    /// `blocks` blocks, each the stick-major `[rows, cols]` at `df`.
+    pub fn of(blocks: u32, rows: usize, cols: usize, df: Df) -> PageLanding {
+        PageLanding {
+            blocks,
+            block: crate::sdsc_abstract::StickLayout::row_blocked_df(rows, cols, df),
+        }
+    }
+
+    /// The arrangement the landing declares to the authority: its one block's, when it is ONE block
+    /// several sticks wide; otherwise none of its own (the view's).
+    pub fn declared(self) -> Option<crate::sdsc_abstract::StickLayout> {
+        (self.blocks == 1 && self.block.cols > self.block.lanes()).then_some(self.block)
+    }
+
+    /// The element offset of row `row`, column `col` of block `block`: the blocks one after another,
+    /// each stick-major ([`crate::sdsc_abstract::StickLayout::dev_off`]).
+    pub fn off(self, block: usize, row: usize, col: usize) -> usize {
+        block * self.block.rows * self.block.cols + self.block.dev_off(row, col)
+    }
 }
 
 /// ⭐ A TENSOR'S STATED DEVICE ORDER — the order dxp reads its dims in, innermost first, as the dims
@@ -2818,6 +2863,53 @@ impl AnyTensorArg {
 // OpInfo — op-specific aux (only the sfp constant-table request today).
 // ───────────────────────────────────────────────────────────────────────────
 
+/// ⭐ DLFloat16's LARGEST FINITE VALUE — torch-spyre's `DLFLOAT16_MAX`
+/// (`torch_spyre/_inductor/constants.py:197`, `(1 + 510/512)·2³²`): the bound `lower_clamp` gives the
+/// side of a one-sided clamp the program does not state (`lowering.py:1537-1546`, "DLFloat16, whose
+/// infinity encoding is finite"). [`sen169_bits`](crate::emit::sen169_bits) saturates it to that
+/// encoder's largest finite word, which exceeds every fp16 value just as this one does.
+pub const DLFLOAT16_MAX: f32 = (1.0 + 510.0 / 512.0) * 4_294_967_296.0;
+
+/// ⭐ A `clip`'s TWO NAMED EXTERNAL CONSTANTS — `clipMin` and `clipMax`, as SEN169 words. The clip body
+/// is `FMAX(x, clipMin)` in PE (`unary_pipeline.ddl:370-377`) then `FMIN(·, clipMax)` on the SFP
+/// (`:472-479`), its bounds read by `ddl.get_external_constant` out of `constantInfo_`. torch-spyre
+/// states them per op (`PointwiseOp("clip", [x], {"constants": {"clipMin", "clipMax"}})`,
+/// `spyre_kernel.py:236-244`), so they are each op's own data: [`OpInfo::Clip`] carries them, and
+/// [`crate::emit::assemble_clip`] is the one door a `clip` descriptor is built by.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClipBounds {
+    min: u16,
+    max: u16,
+}
+
+impl ClipBounds {
+    /// `spyre.clamp(x, min, max)` — both bounds stated (torch-spyre's fp8 quantize,
+    /// `decompositions.py:3938-3941`).
+    pub fn new(min: f32, max: f32) -> ClipBounds {
+        ClipBounds {
+            min: crate::emit::sen169_bits(min),
+            max: crate::emit::sen169_bits(max),
+        }
+    }
+
+    /// `clamp_min(x, min)` — `lower_clamp(x, min=min, max=None)`: the upper bound is
+    /// [`DLFLOAT16_MAX`].
+    pub fn at_least(min: f32) -> ClipBounds {
+        ClipBounds::new(min, DLFLOAT16_MAX)
+    }
+
+    /// `clamp_max(x, max)` — `lower_clamp(x, min=None, max=max)`: the lower bound is
+    /// `−`[`DLFLOAT16_MAX`].
+    pub fn at_most(max: f32) -> ClipBounds {
+        ClipBounds::new(-DLFLOAT16_MAX, max)
+    }
+
+    /// The descriptor's two constants, in the DDL's order.
+    pub fn named_words(self) -> [(&'static str, u16); 2] {
+        [("clipMin", self.min), ("clipMax", self.max)]
+    }
+}
+
 /// Op-specific aux, serialized into `constantInfo_` ONLY when non-empty.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum OpInfo {
@@ -2853,6 +2945,8 @@ pub enum OpInfo {
     ///   [`OpFunc::Exx2`]'s doc for the card-measured failure). 0 is the vendor's own
     ///   production spelling (decompositions.py:1038 passes `False`).
     Exx2Scale(u32),
+    /// A `clip`'s two bounds ([`ClipBounds`]), its `clipMin`/`clipMax` external constants.
+    Clip(ClipBounds),
     /// A SECOND `computeOp_` entry chained onto this (matmul) op's own PE/SFP-resident output,
     /// mirroring IBM's own golden fixture (`sdsc_bmm_lxopt.json`'s `MatMul_122`: `batchmatmul` +
     /// `biasadd`, the second reading AND writing the first's own output labeled-ds in place).
@@ -3253,8 +3347,11 @@ impl PagePlane {
 /// `[entries, slab]` keeping dim 0), so the frame must tile each entry's plane into whole
 /// blocks; the two ways it can not are the type's own two errors, and NOTHING downstream
 /// re-checks them — the variants make the refused shapes unrepresentable.
+///
+/// `DF` is the landing's format: the table's frame is `LandingFrame<Fp16>`, minted by [`Self::of`];
+/// a narrower page lands the same frame at its own format ([`Self::in_format`]).
 #[derive(Clone, Copy, Debug)]
-pub enum LandingFrame {
+pub enum LandingFrame<DF: DataFormat = Fp16> {
     /// Rank ≥ 3 `[..., blocks, rows, w]` — each entry is `blocks` stick-major `[rows, w]`
     /// blocks, landed one after another (`batch_blocks`: the only frame that registers them).
     Blocks {
@@ -3264,7 +3361,7 @@ pub enum LandingFrame {
         /// Blocks ONE ENTRY lands.
         blocks: NonZeroU32,
         rows: NonZeroU32,
-        w: StickExtent<Fp16>,
+        w: StickExtent<DF>,
     },
     /// Rank-2 `[T, w]` with one entry or a one-stick width, or a rank ≥ 3 frame one stick wide
     /// whose blocks span several entries — the landing IS the frame's own bytes (a single stick
@@ -3272,7 +3369,7 @@ pub enum LandingFrame {
     Flat {
         entries: NonZeroU32,
         rows: NonZeroU32,
-        w: StickExtent<Fp16>,
+        w: StickExtent<DF>,
     },
     /// Rank-2 `[T, w]`, several entries, `w` wider than one stick — each entry lands as
     /// one-row blocks (row-major `[T, w]`) and ONE whole-stick `RowToStick` permute
@@ -3284,11 +3381,11 @@ pub enum LandingFrame {
         /// ONE ENTRY'S one-row blocks — `t_rows / entries`, the division the rank-2 law
         /// guarantees exact (stored here so no reader re-derives it).
         rows: NonZeroU32,
-        w: StickExtent<Fp16>,
+        w: StickExtent<DF>,
     },
 }
 
-impl LandingFrame {
+impl LandingFrame<Fp16> {
     /// ⭐ THE ONE PLACE THE PROGRAM'S VIEW IS READ — the reshape's `to` dims against the
     /// gather's own plane and entry count. The two remaining refusals of the gather live HERE
     /// and nowhere else:
@@ -3426,6 +3523,9 @@ impl LandingFrame {
         }
     }
 
+}
+
+impl<DF: DataFormat> LandingFrame<DF> {
     /// The gather's TOTAL entry count, read off the frame — minted once, at [`Self::of`], so
     /// no reader can pass any other count in.
     pub fn entries(self) -> NonZeroU32 {
@@ -3460,7 +3560,7 @@ impl LandingFrame {
     }
 
     /// The frame's width — the landing's column extent in elements.
-    pub fn width(self) -> StickExtent<Fp16> {
+    pub fn width(self) -> StickExtent<DF> {
         match self {
             LandingFrame::Blocks { w, .. }
             | LandingFrame::Flat { w, .. }
@@ -3480,6 +3580,61 @@ impl LandingFrame {
             let offset = LandingOffset::after(emitted, block);
             emitted += run.get();
             (base, run, offset)
+        })
+    }
+
+    /// ⭐ ONE ENTRY'S LANDED BLOCKS — `(blocks, rows, w)`: the frame's own `[rows, w]` blocks, the
+    /// ONE block the flat landing states, or the restickify's per-entry one-row blocks. What every op
+    /// over a landing iterates per entry (`mb` entries × `y` blocks × `x` rows × `out` columns).
+    pub fn block_extents(self) -> (NonZeroU32, NonZeroU32, StickExtent<DF>) {
+        let one = NonZeroU32::MIN;
+        match self {
+            LandingFrame::Blocks {
+                blocks, rows, w, ..
+            } => (blocks, rows, w),
+            LandingFrame::Flat { rows, w, .. } => (one, rows, w),
+            LandingFrame::Restickify { rows, w, .. } => (rows, one, w),
+        }
+    }
+
+    /// ⭐ THE SAME FRAME AT ANOTHER FORMAT — the variant and every extent kept, the width re-typed: a
+    /// float8 page lands the table frame's own blocks at its own format, so the one law that can
+    /// refuse is the width's, `StickExtent::<F>::new` — a row that is not whole sticks of `F`
+    /// (spyre-inference's `head_size % 128`: "a float8 stick holds 128 elements").
+    pub fn in_format<F: DataFormat>(self) -> Result<LandingFrame<F>, FrameError> {
+        let w = self.width();
+        let wf = StickExtent::<F>::new(w.elems()).map_err(|_| FrameError::NotWholeSticks {
+            width: u64::from(w.elems()),
+            stick: F::ELEMS_PER_STICK,
+        })?;
+        Ok(match self {
+            LandingFrame::Blocks {
+                entries,
+                blocks,
+                rows,
+                ..
+            } => LandingFrame::Blocks {
+                entries,
+                blocks,
+                rows,
+                w: wf,
+            },
+            LandingFrame::Flat { entries, rows, .. } => LandingFrame::Flat {
+                entries,
+                rows,
+                w: wf,
+            },
+            LandingFrame::Restickify {
+                entries,
+                t_rows,
+                rows,
+                ..
+            } => LandingFrame::Restickify {
+                entries,
+                t_rows,
+                rows,
+                w: wf,
+            },
         })
     }
 }
@@ -3535,7 +3690,7 @@ pub enum FrameError {
     /// The frame states a dim no landing can hold — negative, or a stated extent whose
     /// product overflows.
     NotStatable { dim: i64 },
-    /// The frame's last dim is not a whole number of fp16 sticks.
+    /// The frame's last dim is not a whole number of the landing format's sticks.
     NotWholeSticks { width: u64, stick: u32 },
     /// The frame does not tile each gathered entry's plane into whole `[rows, w]` blocks —
     /// `index_select` keeps the entry axis whole, so each entry's plane must be a whole

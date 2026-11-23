@@ -21,7 +21,7 @@
 //!   (`Restickify`).
 
 use ktir_superdsc::superdsc_opspec::{
-    Fp16, FrameError, GatherEntries, LandingFrame, PagePlane, StickExtent,
+    Fp8, Fp16, FrameError, GatherEntries, LandingFrame, PagePlane, StickExtent,
 };
 use std::num::NonZeroU32;
 
@@ -298,4 +298,55 @@ fn the_extents_are_whole_by_construction() {
         StickExtent::<Fp16>::new(65).is_err(),
         "sub-stick widths do not exist"
     );
+}
+
+/// ⭐ THE SAME FRAME AT ANOTHER FORMAT — `in_format` keeps the variant, every extent and the legs,
+/// and re-types only the width: a 128-wide frame is one fp8 stick; a 64-wide one is not whole fp8
+/// sticks, and the width's own type is what refuses it.
+#[test]
+fn a_frame_in_another_format_keeps_its_blocks_and_the_width_type_refuses() {
+    // granite-3.1-8b's decode page read: 8 entries of one [64, 128] block.
+    let f16 = LandingFrame::of(&[8, 64, 128], plane(128), nz(8)).expect("the decode page frame");
+    let f8: LandingFrame<Fp8> = f16.in_format::<Fp8>().expect("128 is one fp8 stick");
+    assert_eq!(f8.entries(), f16.entries());
+    assert_eq!(f8.landing_rows(), f16.landing_rows());
+    assert_eq!(f8.elems_per_entry(), f16.elems_per_entry());
+    assert_eq!(f8.width().elems(), 128);
+    assert_eq!(f8.width().stick_count(), 1);
+    assert!(matches!(f8, LandingFrame::Blocks { .. }));
+    assert_eq!(
+        f8.legs().map(|(_, r, o)| (r.get(), o.get())).collect::<Vec<_>>(),
+        f16.legs().map(|(_, r, o)| (r.get(), o.get())).collect::<Vec<_>>(),
+        "the legs are the same entries at the same element offsets"
+    );
+    // A 64-wide frame is whole fp16 sticks and not whole fp8 sticks.
+    let narrow = LandingFrame::of(&[8, 64, 64], plane(64), nz(8)).expect("a 64-wide page frame");
+    assert_eq!(
+        narrow.in_format::<Fp8>().map(drop),
+        Err(FrameError::NotWholeSticks {
+            width: 64,
+            stick: 128
+        })
+    );
+}
+
+/// ⭐ A LANDING ADDRESSES AS ITS BLOCKS UNDER EVERY DIVISION — the start of `(block, row, col)` is
+/// the block, then the block's stick-major `(row, col)`: a block-granular corner is the block's base
+/// (the flat start the gather's division always gave), and a row- or column-split corner lands
+/// inside the block's stick planes, never at a flat `row·cols`. granite's decode page: 8 blocks of
+/// `[128, 128]` fp16 (two stick planes of `128·64`), and the fp8 page (one stick a row).
+#[test]
+fn a_page_landing_addresses_as_its_blocks_under_every_division() {
+    use ktir_superdsc::superdsc_opspec::{Df, PageLanding};
+    let f16 = PageLanding::of(8, 128, 128, Df::Fp16);
+    assert_eq!(f16.off(3, 0, 0), 3 * 128 * 128, "a block-granular corner is the block's base");
+    assert_eq!(f16.off(0, 32, 0), 32 * 64, "row 32, stick 0: one stick a row");
+    assert_eq!(f16.off(0, 32, 64), 128 * 64 + 32 * 64, "row 32, stick 1: the second plane");
+    assert_eq!(f16.off(0, 4, 0), 4 * 64, "the prefill core-1 corner");
+    assert_eq!(f16.declared(), None, "several blocks declare none of their own");
+    let fp8 = PageLanding::of(8, 128, 128, Df::Fp8);
+    assert_eq!(fp8.off(0, 32, 0), 32 * 128, "one fp8 stick a row: row-major");
+    let one = PageLanding::of(1, 128, 128, Df::Fp16);
+    assert!(one.declared().is_some(), "one block several sticks wide declares its block");
+    assert_eq!(PageLanding::of(1, 128, 64, Df::Fp16).declared(), None, "one stick declares none");
 }

@@ -1005,6 +1005,10 @@ fn e4m3_to_f32_compute(byte: u8) -> f32 {
     sign * mag
 }
 
+/// The largest finite `float8_e4m3fn` value — `0x7E`, exponent `1111` mantissa `110`, `1.75·2⁸`.
+/// e4m3fn has no infinity and `0x7F` is its NaN, so this is `torch.finfo(torch.float8_e4m3fn).max`.
+pub const E4M3_FMAX: f32 = 448.0;
+
 /// Encode one `f32` to a `float8_e4m3fn` byte, round-to-nearest-even — THE CARD'S `qfp8ch`, byte
 /// for byte, including past the finite range.
 ///
@@ -1034,7 +1038,7 @@ pub fn f32_to_e4m3(v: f32) -> u8 {
     if a >= NAN_FROM {
         return sign | 0x7F;
     }
-    if a >= 448.0 {
+    if a >= E4M3_FMAX {
         return sign | 0x7E; // exp 1111, mant 110 — the largest finite
     }
     // Subnormal range: below 2^-6, the grid is a multiple of 2^-9.

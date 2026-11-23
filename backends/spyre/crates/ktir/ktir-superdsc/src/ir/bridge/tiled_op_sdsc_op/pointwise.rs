@@ -770,76 +770,96 @@ pub fn assemble_page_gather_copy<T: crate::collective::Tp>(
 /// [`LandingFrame`](crate::superdsc_opspec::LandingFrame) plus the chunk iterator, so no
 /// u32 field can be stated raw: `entries` is one run of the chunking
 /// ([`GatherEntries`](crate::superdsc_opspec::GatherEntries), 1..=one index stick by
-/// construction), `blocks`/`rows` are non-zero, `cols` is whole sticks
-/// ([`StickExtent<Fp16>`](crate::superdsc_opspec::StickExtent)), and `dst` is whole landed
-/// blocks ([`LandingOffset`](crate::superdsc_opspec::LandingOffset)). The zero/cap,
-/// zero-block/row and stick-multiple checks the opspec used to carry are UNWRITABLE now,
-/// not re-checked.
+/// construction), `blocks`/`rows` are non-zero, `cols` is whole sticks of the landing's format
+/// `DF` ([`StickExtent`](crate::superdsc_opspec::StickExtent)), and `dst` is whole landed blocks
+/// ([`LandingOffset`](crate::superdsc_opspec::LandingOffset)). The zero/cap, zero-block/row and
+/// stick-multiple checks the opspec used to carry are UNWRITABLE now, not re-checked.
 #[derive(Clone, Copy, Debug)]
-pub struct IndexSelectPage {
+pub struct IndexSelectPage<DF: DataFormat = Fp16> {
     pub entries: crate::superdsc_opspec::GatherEntries,
     pub blocks: std::num::NonZeroU32,
     pub rows: std::num::NonZeroU32,
-    pub cols: crate::superdsc_opspec::StickExtent<crate::superdsc_opspec::Fp16>,
+    pub cols: crate::superdsc_opspec::StickExtent<DF>,
     pub dst: crate::superdsc_opspec::LandingOffset,
 }
 
-impl IndexSelectPage {
-    /// ⭐ THE ONLY CONSTRUCTOR — one chunk leg's page: the frame's own extents
-    /// at the run the chunk iterator hands, `offset` whole blocks into the
-    /// landing (both straight off [`LandingFrame::legs`]). Infallible: every
-    /// extent the page states is already proved by the frame — the restickify's
-    /// one-row blocks are the variant's own stored per-entry rows, and the
-    /// single-block rows of the flat and restickify landings are the ONE block
-    /// those frames state.
+impl<DF: DataFormat> IndexSelectPage<DF> {
+    /// ⭐ THE ONLY CONSTRUCTOR — one chunk leg's page: the frame's own per-entry blocks
+    /// ([`LandingFrame::block_extents`](crate::superdsc_opspec::LandingFrame::block_extents)) at
+    /// the run the chunk iterator hands, `offset` whole blocks into the landing (both straight off
+    /// [`LandingFrame::legs`](crate::superdsc_opspec::LandingFrame::legs)). Infallible: every extent
+    /// the page states is already proved by the frame.
     pub fn of_run(
-        frame: crate::superdsc_opspec::LandingFrame,
+        frame: crate::superdsc_opspec::LandingFrame<DF>,
         run: crate::superdsc_opspec::GatherEntries,
         offset: crate::superdsc_opspec::LandingOffset,
     ) -> Self {
-        use crate::superdsc_opspec::LandingFrame;
-        use std::num::NonZeroU32;
-        // The ONE block the flat and restickify landings state — the type's own minimum,
-        // which is that one.
-        let one = NonZeroU32::MIN;
-        match frame {
-            LandingFrame::Blocks {
-                blocks, rows, w, ..
-            } => IndexSelectPage {
-                entries: run,
-                blocks,
-                rows,
-                cols: w,
-                dst: offset,
-            },
-            LandingFrame::Flat { rows, w, .. } => IndexSelectPage {
-                entries: run,
-                blocks: one,
-                rows,
-                cols: w,
-                dst: offset,
-            },
-            LandingFrame::Restickify { rows, w, .. } => IndexSelectPage {
-                entries: run,
-                blocks: rows,
-                rows: one,
-                cols: w,
-                dst: offset,
-            },
+        let (blocks, rows, cols) = frame.block_extents();
+        IndexSelectPage {
+            entries: run,
+            blocks,
+            rows,
+            cols,
+            dst: offset,
         }
     }
 }
 
+/// ⭐ A PAGE LANDING'S OWN TENSOR — `n` stick-major `[rows, cols]` blocks one after another over
+/// the `[mb, y, x, out]` iteration (`['x','out','y','mb']` innermost-first), at the landing's
+/// format `DF`. ONE statement for every op that touches a landing: [`index_select_opspec`] writes
+/// one, and [`widen_landing_opspec`] reads a float8 one and writes the 16-bit one in this same frame
+/// — so the 16-bit landing's arrangement, and every reader's, is the gather's own. Every landing
+/// carries its own frame (`ViewFrame::Landing`, [`crate::superdsc_opspec::PageLanding`]): it
+/// ADDRESSES as its blocks under any division of `[mb, y, x, out]` (the gather divides its blocks,
+/// the widen its rows too), and it DECLARES the one block's stick-major `[rows, cols]` exactly when
+/// it is one block several sticks wide — several blocks are bytes no stick layout states, the frame
+/// the walk carries as `batch_blocks` / `BatchFrame::Blocks`.
+fn landing_arg<DF: DataFormat>(
+    is_input: bool,
+    name: &str,
+    role: Role,
+    plan: &crate::superdsc_opspec::WorkPlan,
+    landed_blocks: u32,
+    rows: std::num::NonZeroU32,
+    cols: crate::superdsc_opspec::StickExtent<DF>,
+) -> Result<AnyTensorArg, String> {
+    let layout = ["mb", "y", "x", "out"];
+    let frame = crate::superdsc_opspec::ViewFrame::Landing(crate::superdsc_opspec::PageLanding::of(
+        landed_blocks,
+        rows.get() as usize,
+        cols.elems() as usize,
+        DF::DF,
+    ));
+    Ok(AnyTensorArg::R4(
+        TensorArg::<4>::new(
+            is_input,
+            name.to_string(),
+            role,
+            [Scale::Active; 4],
+            plan.iter_syms(layout),
+            layout,
+            "out",
+            Allocation::Hbm,
+        )
+        .map_err(|e| e.0)?
+        .with_device_order(["x", "out", "y", "mb"])
+        .map_err(|e| e.0)?
+        .with_frame(frame)
+        .with_df(DF::DF),
+    ))
+}
+
 /// ⭐ THE ONE GATHER — `index_select` over a paged cache's folded dim 0 (the reference's
 /// `page_attn_head_major_prefill.py`: `kv.index_select(0, page_ids)`), for ANY entry size, page
-/// count and head width. An `identity` over `N_ {mb: entries, y: blocks, x: rows, out: cols}`,
-/// the index on `mb` (one position an entry, so `skip_addr` is the entry's whole `y·x·out`
-/// plane): one entry on one core as the reference's compiled gathers are (its `sdsc_4` /
+/// count, head width and cache format `DF`. An `identity` over `N_ {mb: entries, y: blocks, x: rows,
+/// out: cols}`, the index on `mb` (one position an entry, so `skip_addr` is the entry's whole
+/// `y·x·out` plane): one entry on one core as the reference's compiled gathers are (its `sdsc_4` /
 /// `sdsc_5`: `N_ {mb: 8, x: 128, y: 128, out: 1, i: 1}`, the index on the size-one `i`,
 /// `numWkSlicesPerDim_ {}`), and several entries (a decode batch's chunk) one a core. The value
 /// is read as the reference reads it — row-major, `['out','x','y','mb']` innermost-first — and
-/// each `[rows, cols]` block lands stick-major (`['x','out','y','mb']`), one after another, the
-/// frame the trip's batched restickify and contractions read a block of at its base.
+/// each `[rows, cols]` block lands stick-major ([`landing_arg`]), one after another, the frame the
+/// trip's batched restickify and contractions read a block of at its base.
 ///
 /// The landing goes where the scratchpad plan places it — HBM for a prefill trip's whole-page
 /// landing (shown by the splice's placement test: the in-body page gathers' destinations are
@@ -851,7 +871,7 @@ impl IndexSelectPage {
 /// domain, not a device refusal: the walk composes around it by chunking (one op a run of
 /// entries, each at its own [`crate::superdsc_opspec::EntryBase`] and `dst_elems` landing
 /// offset), never by refusing an entry count.
-pub fn index_select_opspec(
+pub fn index_select_opspec<DF: DataFormat>(
     src: &str,
     dst: &str,
     gather: crate::superdsc_opspec::OnePositionIndex,
@@ -861,9 +881,9 @@ pub fn index_select_opspec(
         rows,
         cols,
         dst: page_dst,
-    }: IndexSelectPage,
+    }: IndexSelectPage<DF>,
 ) -> Result<OpSpec, String> {
-    let df = Df::Fp16;
+    let df = DF::DF;
     let dim = |name: &'static str, size: u32, is_stick: bool| crate::superdsc_opspec::ItDim {
         name,
         size,
@@ -882,58 +902,32 @@ pub fn index_select_opspec(
             gather_copy_cores(d, max, 1)
         })?;
     let layout = ["mb", "y", "x", "out"];
-    let arg = |is_input: bool,
-               name: &str,
-               device: [&'static str; 4],
-               frame: crate::superdsc_opspec::ViewFrame|
-     -> Result<_, String> {
-        Ok(AnyTensorArg::R4(
-            TensorArg::<4>::new(
-                is_input,
-                name.to_string(),
-                Role::Output,
-                [Scale::Active; 4],
-                plan.iter_syms(layout),
-                layout,
-                "out",
-                Allocation::Hbm,
-            )
-            .map_err(|e| e.0)?
-            .with_device_order(device)
-            .map_err(|e| e.0)?
-            .with_frame(frame),
-        ))
-    };
-    // ⭐ THE LANDING'S OWN FRAME — a landing of ONE block (entries·blocks == 1) several sticks
-    // wide lands stick-major and the authority records the ONE stick-major [rows, cols] it
-    // tiles. A landing of SEVERAL blocks is NOT stated by any stick layout — its bytes are
-    // blocks-one-after-another, a frame the walk carries as `batch_blocks` / `BatchFrame::Blocks`
-    // — so it keeps [`ViewFrame::Own`]: stamping it `LandedBlocks` would declare the batched
-    // transpose's read of it wrong, and the arrangement authority refuses the conflict. The
-    // frame changes the DECLARATION only — the landing's per-core starts stay its blocks.
-    let landed = |cols: crate::superdsc_opspec::StickExtent<
-        crate::superdsc_opspec::Fp16,
-    >| -> crate::superdsc_opspec::ViewFrame {
-        if entries.get() * blocks.get() == 1 && cols.elems() > df.elems_per_stick() {
-            // The one block's stick-major `[rows, cols]` — the arrangement the frame declares.
-            crate::superdsc_opspec::ViewFrame::LandedBlocks(
-                crate::sdsc_abstract::StickLayout::row_blocked_df(
-                    rows.get() as usize,
-                    cols.elems() as usize,
-                    df,
-                ),
-            )
-        } else {
-            crate::superdsc_opspec::ViewFrame::Own
-        }
-    };
-    let input = arg(
-        true,
-        src,
-        ["out", "x", "y", "mb"],
-        crate::superdsc_opspec::ViewFrame::Own,
+    let input = AnyTensorArg::R4(
+        TensorArg::<4>::new(
+            true,
+            src.to_string(),
+            Role::Output,
+            [Scale::Active; 4],
+            plan.iter_syms(layout),
+            layout,
+            "out",
+            Allocation::Hbm,
+        )
+        .map_err(|e| e.0)?
+        .with_device_order(["out", "x", "y", "mb"])
+        .map_err(|e| e.0)?
+        .with_frame(crate::superdsc_opspec::ViewFrame::Own)
+        .with_df(df),
+    );
+    let output = landing_arg::<DF>(
+        false,
+        dst,
+        Role::Output,
+        &plan,
+        entries.get() * blocks.get(),
+        rows,
+        cols,
     )?;
-    let output = arg(false, dst, ["x", "out", "y", "mb"], landed(cols))?;
     let mut op = OpSpec::new(OpFunc::Identity, plan, vec![input], output).map_err(|e| e.0)?;
     op.attach_gather_index(gather.gather_index(), 0)
         .ok_or_else(|| {
@@ -949,12 +943,12 @@ pub fn index_select_opspec(
 }
 
 /// [`index_select_opspec`] + `emit_sdsc_tiled`.
-pub fn assemble_index_select<T: crate::collective::Tp>(
+pub fn assemble_index_select<DF: DataFormat, T: crate::collective::Tp>(
     op_name: &str,
     src: &str,
     dst: &str,
     gather: crate::superdsc_opspec::OnePositionIndex,
-    page: IndexSelectPage,
+    page: IndexSelectPage<DF>,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
 ) -> Result<EmittedOp<T>, String> {
@@ -962,6 +956,72 @@ pub fn assemble_index_select<T: crate::collective::Tp>(
     let folds = SdscFoldSet::new(op.iter.cores_used());
     crate::emit::emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)
         .map_err(|e| format!("assemble_index_select {op_name}: {e}"))
+}
+
+/// ⭐ A FLOAT8 PAGE LANDING WIDENED INTO THE 16-BIT ONE — `fp8todl16` (quantization_double_pad.ddl:60)
+/// over the landing's own `[mb, y, x, out]` blocks, every entry in one op: the float8 landing in,
+/// the 16-bit landing out, both stated by [`landing_arg`] — the frame [`index_select_opspec`] lands a
+/// 16-bit page in — so the 16-bit landing holds, block for block, the bytes a 16-bit page's gather
+/// lands. A convert's two sides keep their own sticks (`Role::Input` / `Role::Output`: two
+/// `primaryDsInfo_`, as every dtype convert states them), and the stick dim's work-division basis is
+/// the WIDER stick, the float8 side's.
+pub fn widen_landing_opspec(
+    src: &str,
+    dst: &str,
+    frame: crate::superdsc_opspec::LandingFrame<crate::superdsc_opspec::Fp8>,
+) -> Result<OpSpec, String> {
+    let (blocks, rows, cols) = frame.block_extents();
+    let entries = frame.entries();
+    let wide = crate::superdsc_opspec::StickExtent::<Fp16>::new(cols.elems())?;
+    let dim = |name: &'static str, size: u32, is_stick: bool| crate::superdsc_opspec::ItDim {
+        name,
+        size,
+        is_reduction: false,
+        is_stick,
+        df: if is_stick {
+            crate::emit::convert_stick_df(OpFunc::Fp8ToDl16)
+        } else {
+            Df::Fp16
+        },
+    };
+    let dims = [
+        dim("mb", entries.get(), false),
+        dim("y", blocks.get(), false),
+        dim("x", rows.get(), false),
+        dim("out", cols.elems(), true),
+    ];
+    let plan = crate::superdsc_opspec::WorkPlan::divide(
+        &dims,
+        crate::device_gen::whole(),
+        crate::work::distribute_cores,
+    )?;
+    let landed = entries.get() * blocks.get();
+    let input = landing_arg::<crate::superdsc_opspec::Fp8>(
+        true,
+        src,
+        Role::Input,
+        &plan,
+        landed,
+        rows,
+        cols,
+    )?;
+    let output = landing_arg::<Fp16>(false, dst, Role::Output, &plan, landed, rows, wide)?;
+    OpSpec::new(OpFunc::Fp8ToDl16, plan, vec![input], output).map_err(|e| e.0)
+}
+
+/// [`widen_landing_opspec`] + `emit_sdsc_tiled`.
+pub fn assemble_widen_landing<T: crate::collective::Tp>(
+    op_name: &str,
+    src: &str,
+    dst: &str,
+    frame: crate::superdsc_opspec::LandingFrame<crate::superdsc_opspec::Fp8>,
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<EmittedOp<T>, String> {
+    let op = widen_landing_opspec(src, dst, frame)?;
+    let folds = SdscFoldSet::new(op.iter.cores_used());
+    crate::emit::emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)
+        .map_err(|e| format!("assemble_widen_landing {op_name}: {e}"))
 }
 
 /// What a [`expand_blocks_opspec`] copies: `batch` stick-major `[rows, cols]` blocks, each `group`
@@ -2399,7 +2459,7 @@ mod index_select_tests {
         // `LandingOffset::after(7, ...)` — seven entries already landed, each one block.
         let dst_offset = |entries: u32, dst: crate::superdsc_opspec::LandingOffset| -> u32 {
             let mut sym = 0i64;
-            let op = assemble_index_select::<crate::collective::TpWorld<1>>(
+            let op = assemble_index_select::<crate::superdsc_opspec::Fp16, crate::collective::TpWorld<1>>(
                 "gather_o1",
                 &act_name(1),
                 &act_name(2),
@@ -2483,7 +2543,7 @@ mod index_select_tests {
         // ONE block, two sticks wide: the (4, 1, 128) case itself — stick-major, declared so.
         let l = gathered(1, 128, 128);
         let mut sym = 0i64;
-        assemble_index_select::<crate::collective::TpWorld<1>>(
+        assemble_index_select::<crate::superdsc_opspec::Fp16, crate::collective::TpWorld<1>>(
             "gather_o1",
             &act_name(1),
             &act_name(2),
@@ -2513,7 +2573,7 @@ mod index_select_tests {
         // declaration it must NOT make is the authority's refusal.
         let l = gathered(8, 128, 128);
         let mut sym = 0i64;
-        assemble_index_select::<crate::collective::TpWorld<1>>(
+        assemble_index_select::<crate::superdsc_opspec::Fp16, crate::collective::TpWorld<1>>(
             "gather_o1",
             &act_name(1),
             &act_name(2),
@@ -2548,7 +2608,7 @@ mod index_select_tests {
     fn one_blocks_landing_two_sticks_wide_declares_its_blocks_frame() {
         let l = gathered(1, 128, 128);
         let mut sym = 0i64;
-        assemble_index_select::<crate::collective::TpWorld<1>>(
+        assemble_index_select::<crate::superdsc_opspec::Fp16, crate::collective::TpWorld<1>>(
             "gather_o1",
             &act_name(1),
             &act_name(2),
@@ -2581,7 +2641,7 @@ mod index_select_tests {
         // ONE block in total: one entry, one block, two sticks wide — stick-major, declared so.
         let l = gathered(1, 128, 128);
         let mut sym = 0i64;
-        assemble_index_select::<crate::collective::TpWorld<1>>(
+        assemble_index_select::<crate::superdsc_opspec::Fp16, crate::collective::TpWorld<1>>(
             "gather_o1",
             &act_name(1),
             &act_name(2),
@@ -2605,7 +2665,7 @@ mod index_select_tests {
         // SEVERAL blocks: one entry, 8 blocks, two sticks wide — the view's own flat frame.
         let l = gathered(8, 128, 128);
         let mut sym = 0i64;
-        assemble_index_select::<crate::collective::TpWorld<1>>(
+        assemble_index_select::<crate::superdsc_opspec::Fp16, crate::collective::TpWorld<1>>(
             "gather_o1",
             &act_name(1),
             &act_name(2),
@@ -2640,7 +2700,7 @@ mod index_select_tests {
     fn a_one_stick_landing_keeps_the_flat_frame() {
         let l = gathered(8, 128, 64);
         let mut sym = 0i64;
-        assemble_index_select::<crate::collective::TpWorld<1>>(
+        assemble_index_select::<crate::superdsc_opspec::Fp16, crate::collective::TpWorld<1>>(
             "gather_o1",
             &act_name(1),
             &act_name(2),

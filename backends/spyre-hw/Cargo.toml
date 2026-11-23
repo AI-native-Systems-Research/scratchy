@@ -10,6 +10,7 @@ members = [
     "crates/worker",
     "crates/cli",
     "crates/tp",
+    "crates/kv",
     "crates/builder",
 ]
 

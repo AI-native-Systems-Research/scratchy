@@ -97,6 +97,10 @@ def page_attn_head_major_prefill_kernel(query, query_row_index, k_pages, v_pages
         # k_page = k_pages.index_select(0, page_idx).squeeze(0).unsqueeze(1)
         k_page = tl.reshape(k_unfolded.load([page, 0]), [NUM_KV_HEADS, BLOCK_SIZE, HEAD_SIZE])
         v_page = tl.reshape(v_unfolded.load([page, 0]), [NUM_KV_HEADS, BLOCK_SIZE, HEAD_SIZE])
+        # if k_page.dtype != q.dtype: k_page = k_page.to(q.dtype); v_page = v_page.to(q.dtype)
+        if k_page.dtype != q.dtype:
+            k_page = k_page.to(q.dtype)
+            v_page = v_page.to(q.dtype)
         # scores = torch.matmul(q, k_page.transpose(-2, -1)) * scale
         scores = tl.reshape(tl.dot(q, tl.trans(k_page, (0, 2, 1)), out_dtype=tl.float16) * SCALE,
                             [NUM_KV_HEADS, G, P, BLOCK_SIZE])

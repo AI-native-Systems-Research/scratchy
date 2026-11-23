@@ -974,80 +974,135 @@ pub fn scatters_of(k: &KtirNode) -> Result<Vec<Scatter>, Error> {
             continue;
         };
         let first_entry = indirect_tile_anchor(k, tile, &consts)?;
-        let src_tile_v = load.operands.first().copied();
-        let src_tile = f
-            .operations
-            .iter()
-            .find(|o| o.result == src_tile_v && o.op_type == OpKind::KtdpConstructAccessTile)
-            .ok_or_else(|| Error {
-                message: format!(
-                    "{}: the scatter's stored rows are not loaded through a plain access tile",
-                    f.name
-                ),
-            })?;
-        let src_view_v = src_tile.operands.first().copied();
-        let src_view = f
-            .operations
-            .iter()
-            .find(|o| o.result == src_view_v && o.op_type == OpKind::KtdpConstructMemoryView)
-            .ok_or_else(|| Error {
-                message: format!("{}: the scatter's source tile reads no memory view", f.name),
-            })?;
-        let ptr = src_view.operands.first().copied();
-        let i = f
-            .arguments
-            .iter()
-            .position(|(a, _)| Some(*a) == ptr)
-            .ok_or_else(|| Error {
-                message: format!(
-                    "{}: the scatter's source view does not reinterpret a parameter",
-                    f.name
-                ),
-            })?;
-        let src_tid = k.bindings.get(i).map(|b| b.get()).ok_or_else(|| Error {
-            message: format!("{}: parameter {i} has no bound buffer", f.name),
-        })?;
-        let corner = |slot: usize| {
-            src_tile
-                .operands
-                .get(slot)
-                .and_then(|r| consts.get(r).copied())
-                .and_then(|r| u32::try_from(r).ok())
-        };
-        let (Some(src_row), Some(src_col)) = (corner(1), corner(2)) else {
-            return err(format!(
-                "{}: the scatter's source tile states no constant corner, so which source rows it \
-                 writes is unknown",
-                f.name
-            ));
-        };
-        let stick = Fp16::ELEMS_PER_STICK;
-        let view_rows = src_view
-            .result_type
-            .and_then(|t| t.dims())
-            .and_then(|d| d.first().copied())
-            .unwrap_or(0) as u32;
-        let width = shape_2d(src_tile).map_or(0, |(_, c)| c);
-        if width == 0 || !width.is_multiple_of(stick) || !src_col.is_multiple_of(width) {
-            return err(format!(
-                "{}: the scatter's source rows are {width} wide at column {src_col} — a scattered \
-                 row is a whole number of {stick}-element sticks of the source, its own head, at a \
-                 column that is a multiple of its width",
-                f.name
-            ));
-        }
+        let src = param_rows(k, &consts, load)?;
         out.push(Scatter {
             index_tid,
             value_tid,
-            src_tid,
+            src_tid: src.src_tid,
             entries,
             first_entry,
-            sticks: width / stick,
-            src_row: (src_col / width) * view_rows + src_row,
+            sticks: src.width / Fp16::ELEMS_PER_STICK,
+            src_row: src.src_row(),
             value,
         });
     }
     Ok(out)
+}
+
+/// ⭐ THE ROWS A PLAIN LOAD READS OF A PARAMETER — the source side of a store through an indirect
+/// tile: which parameter, the window's corner and extent, and the view it reads. Read once, here,
+/// for every reader of a stored row's source ([`scatters_of`], [`narrow_families_of`]).
+pub(crate) struct ParamRows {
+    /// The parameter the rows are loaded from.
+    pub src_tid: u32,
+    /// The window's row corner.
+    pub row: u32,
+    /// The window's column corner, a multiple of its width.
+    pub col: u32,
+    /// The window's rows.
+    pub rows: u32,
+    /// The window's width, a whole number of fp16 sticks.
+    pub width: u32,
+    /// The view's rows.
+    pub view_rows: u32,
+    /// The view's columns.
+    pub view_cols: u32,
+}
+
+impl ParamRows {
+    /// The window's first row in the source's stick-major row grouping: the source is stick-major
+    /// `[view_rows, view_cols]` and its stick columns group into rows `width` wide, so row `r` of the
+    /// group at column `c` is `(c / width) · view_rows + r` — spyre-inference's `key[:, h]` row `t` is
+    /// `h · T + t`, which is where their head-major `kv_write_index` puts its entry. At one stick a
+    /// row it is the source's own stick.
+    pub fn src_row(&self) -> u32 {
+        (self.col / self.width) * self.view_rows + self.row
+    }
+}
+
+/// [`ParamRows`] of `load`, a `ktdp.load` over a plain access tile of a parameter's view.
+fn param_rows(
+    k: &KtirNode,
+    consts: &std::collections::HashMap<Ssa, i64>,
+    load: &Operation<'_>,
+) -> Result<ParamRows, Error> {
+    let f = &k.func;
+    let src_tile_v = load.operands.first().copied();
+    let src_tile = f
+        .operations
+        .iter()
+        .find(|o| o.result == src_tile_v && o.op_type == OpKind::KtdpConstructAccessTile)
+        .ok_or_else(|| Error {
+            message: format!(
+                "{}: the scatter's stored rows are not loaded through a plain access tile",
+                f.name
+            ),
+        })?;
+    let src_view_v = src_tile.operands.first().copied();
+    let src_view = f
+        .operations
+        .iter()
+        .find(|o| o.result == src_view_v && o.op_type == OpKind::KtdpConstructMemoryView)
+        .ok_or_else(|| Error {
+            message: format!("{}: the scatter's source tile reads no memory view", f.name),
+        })?;
+    let ptr = src_view.operands.first().copied();
+    let i = f
+        .arguments
+        .iter()
+        .position(|(a, _)| Some(*a) == ptr)
+        .ok_or_else(|| Error {
+            message: format!(
+                "{}: the scatter's source view does not reinterpret a parameter",
+                f.name
+            ),
+        })?;
+    let src_tid = k.bindings.get(i).map(|b| b.get()).ok_or_else(|| Error {
+        message: format!("{}: parameter {i} has no bound buffer", f.name),
+    })?;
+    let corner = |slot: usize| {
+        src_tile
+            .operands
+            .get(slot)
+            .and_then(|r| consts.get(r).copied())
+            .and_then(|r| u32::try_from(r).ok())
+    };
+    let (Some(row), Some(col)) = (corner(1), corner(2)) else {
+        return err(format!(
+            "{}: the scatter's source tile states no constant corner, so which source rows it \
+             writes is unknown",
+            f.name
+        ));
+    };
+    let stick = Fp16::ELEMS_PER_STICK;
+    let view_rows = src_view
+        .result_type
+        .and_then(|t| t.dims())
+        .and_then(|d| d.first().copied())
+        .unwrap_or(0) as u32;
+    let view_cols = src_view
+        .result_type
+        .and_then(|t| t.dims())
+        .and_then(|d| d.get(1).copied())
+        .unwrap_or(0) as u32;
+    let (rows, width) = shape_2d(src_tile).unwrap_or((0, 0));
+    if width == 0 || !width.is_multiple_of(stick) || !col.is_multiple_of(width) {
+        return err(format!(
+            "{}: the scatter's source rows are {width} wide at column {col} — a scattered row is a \
+             whole number of {stick}-element sticks of the source, its own head, at a column that \
+             is a multiple of its width",
+            f.name
+        ));
+    }
+    Ok(ParamRows {
+        src_tid,
+        row,
+        col,
+        rows,
+        width,
+        view_rows,
+        view_cols,
+    })
 }
 
 /// One store's share of a scatter run: where its entries start, how many rows it writes, and the
@@ -1139,139 +1194,434 @@ pub fn load_scatters<T: crate::collective::Tp>(
         mut pieces,
     } in runs
     {
-        pieces.sort_unstable();
-        let (e0, s0) = pieces
-            .first()
-            .map(|p| (p.entry, p.src_row))
-            .unwrap_or_default();
-        let mut next = e0;
-        for &RunPiece {
-            entry,
-            rows,
-            src_row,
-        } in &pieces
-        {
-            if entry != next || src_row - s0 != entry - e0 {
-                return err(format!(
-                    "{name}: a store writes source rows {src_row}.. through index entries \
-                     {entry}.. where the run so far ends at {next} — the card's scatter copies \
-                     source row `{s0} + j` through entry `{e0} + j`, so the program's stores must \
-                     tile the run in order"
-                ));
-            }
-            next += rows;
-        }
-        let total = next - e0;
+        let RunExtent { e0, s0, total } = run_extent(name, &mut pieces)?;
         let (src, dst, index) = (region(src_tid)?, region(dst_tid)?, region(index_tid)?);
-        let width = sticks * stick;
-        if dst.v_cols != width {
-            return err(format!(
-                "{name}: t{dst_tid} is written as {}-wide rows by stores of {width}-wide rows — the \
-                 scatter copies one stored row per index entry",
-                dst.v_cols
-            ));
-        }
-        let groups = src.v_cols / width;
-        if s0 + total > src.v_rows * groups {
-            return err(format!(
-                "{name}: the stores write rows {s0}..{} of t{src_tid}, whose view holds {}",
-                s0 + total,
-                src.v_rows * groups
-            ));
-        }
-        // Where the scatter reads its rows: the source itself at one stick a row, or at one row a
-        // view (a decode step's — stick-major and row-major are then the same bytes), else the
-        // scratch its rows are relaid into, row-major.
-        let from = if sticks == 1 || src.v_rows == 1 {
-            src.name()
-        } else {
-            let Some(layout) = layout else {
-                return err(format!(
-                    "{name}: rows of {sticks} sticks are relaid through a scratch, which needs a \
-                     `BundleLayout` to hold it"
-                ));
-            };
-            if !layout.is_row_outermost(dst_tid) {
-                return err(format!(
-                    "{name}: t{dst_tid} takes rows of {sticks} sticks one entry each, which needs it \
-                     allocated row-outermost (`BundleLayout::allocate_row_outermost`), its rows \
-                     contiguous"
-                ));
-            }
-            let tid = super::whole_function::mint_scratch(
-                k,
-                layout,
-                super::whole_function::mint_floor(k),
-                value,
-                crate::ktir_node::Scratch::RelayoutMid,
-            );
-            layout.synth(
-                crate::place::SynthId::Act(tid),
-                &[src.v_rows * groups, width],
-            );
-            let scratch = crate::place::act_name(tid);
-            // Each head's group of columns, stick-major `[sticks][rows]` in the source, to row-major
-            // `[rows][sticks]` at the same base in the scratch.
-            for g in s0 / src.v_rows..=(s0 + total - 1) / src.v_rows {
-                let base = g * src.v_rows * width;
-                ops.push(
-                    crate::ir::bridge::tiled_op_sdsc_op::assemble_stick_permute(
-                        &format!("scatter_rows{g}_o{dst_tid}"),
-                        &src.name(),
-                        &scratch,
-                        crate::ir::bridge::tiled_op_sdsc_op::StickPermuteSpec {
-                            rows: src.v_rows,
-                            sticks,
-                            df: Df::Fp16,
-                            direction:
-                                crate::ir::bridge::tiled_op_sdsc_op::StickPermute::StickToRow,
-                            src_elems: base,
-                            dst_elems: base,
-                        },
-                        sym_id_base,
-                        Some(layout),
-                    )
-                    .map_err(|message| Error {
-                        message: format!("{name}: {message}"),
-                    })?,
-                );
-            }
-            scratch
-        };
-        let page = crate::superdsc_opspec::PageExtent::of_positions(sticks);
-        let (dst_name, index_name) = (dst.name(), index.name());
-        for (i, (first, entries)) in index_runs(total).into_iter().enumerate() {
-            let base =
-                crate::superdsc_opspec::EntryBase::of_entries(e0 + first).map_err(|message| {
-                    Error {
-                        message: format!("{name}: {message}"),
-                    }
-                })?;
-            let scatter = crate::superdsc_opspec::GatherIndex::of_scratch_rows(
-                index_name.clone(),
-                page,
-                base,
-            );
-            let op = crate::ir::bridge::tiled_op_sdsc_op::assemble_scatter_copy(
-                &format!("scatter_run{i}_o{dst_tid}"),
-                &from,
-                &dst_name,
-                scatter,
-                crate::ir::bridge::tiled_op_sdsc_op::ScatterCopySpec {
-                    rows: entries * sticks,
-                    cols: stick,
-                    df: Df::Fp16,
-                    src_elems: (s0 + first) * width,
-                    dst_elems: 0,
-                },
-                sym_id_base,
-                layout,
-            )
-            .map_err(|message| Error { message })?;
-            ops.push(op);
-        }
+        let width = StickExtent::<Fp16>::new(sticks * stick).map_err(|message| Error {
+            message: format!("{name}: {message}"),
+        })?;
+        ops.extend(scatter_run::<Fp16, T>(
+            name,
+            k,
+            layout,
+            RunCopy {
+                src: &src.name(),
+                src_rows: src.v_rows,
+                groups: src.v_cols / width.elems(),
+                width,
+                s0,
+                e0,
+                total,
+                dst,
+                index,
+                key: value,
+            },
+            sym_id_base,
+        )?);
     }
     Ok(ops)
+}
+
+/// ⭐ WHERE ONE SCATTER RUN SITS — its first entry `e0`, the source row `s0` it reads first, and its
+/// row count. The card's scatter copies source row `s0 + j` through entry `e0 + j` and nothing else,
+/// so every store of the run continues it in order: its entry the run's end so far, its source row as
+/// far past `s0` as its entry is past `e0`. A store that does not is refused by name. The one
+/// statement of the run law, taken by a parameter's rows ([`load_scatters`]) and a narrowing family's
+/// ([`NarrowFamily::extent`]).
+pub(crate) struct RunExtent {
+    pub e0: u32,
+    pub s0: u32,
+    pub total: u32,
+}
+
+fn run_extent(name: &str, pieces: &mut [RunPiece]) -> Result<RunExtent, Error> {
+    pieces.sort_unstable();
+    let (e0, s0) = pieces
+        .first()
+        .map(|p| (p.entry, p.src_row))
+        .unwrap_or_default();
+    let mut next = e0;
+    for &RunPiece {
+        entry,
+        rows,
+        src_row,
+    } in pieces.iter()
+    {
+        if entry != next || src_row - s0 != entry - e0 {
+            return err(format!(
+                "{name}: a store writes source rows {src_row}.. through index entries \
+                 {entry}.. where the run so far ends at {next} — the card's scatter copies \
+                 source row `{s0} + j` through entry `{e0} + j`, so the program's stores must \
+                 tile the run in order"
+            ));
+        }
+        next += rows;
+    }
+    Ok(RunExtent {
+        e0,
+        s0,
+        total: next - e0,
+    })
+}
+
+/// ⭐ WHAT ONE SCATTER RUN MOVES — `total` rows of `width` from row `s0` of `src` (stick-major
+/// `[src_rows, groups·width]`, its column groups heads `src_rows` rows tall) through index entries
+/// `e0..` of `index` onto the rows of `dst`, at format `DF`. `key` names the run's mints.
+pub struct RunCopy<'a, DF: DataFormat> {
+    pub src: &'a str,
+    pub src_rows: u32,
+    pub groups: u32,
+    pub width: StickExtent<DF>,
+    pub s0: u32,
+    pub e0: u32,
+    pub total: u32,
+    pub dst: &'a Region,
+    pub index: &'a Region,
+    pub key: Ssa,
+}
+
+/// ⭐⭐⭐ ONE SCATTER RUN, ON THE CARD — the one card form of every run: a parameter's loaded rows
+/// ([`load_scatters`]) and a narrowed value's local ([`NarrowRun`]). A row of one stick, or a source
+/// of one row, is read in place; a wider row is relaid row-major through a scratch first, one stick
+/// permute per head group (the restickify torch-spyre's stickification inserts ahead of their
+/// `index_copy_`), because the destination is allocated row-outermost and takes an entry's sticks
+/// contiguous. Then one scatter per index run of the run's entries ([`index_runs`]), each entry
+/// `width` wide.
+pub fn scatter_run<DF: DataFormat, T: crate::collective::Tp>(
+    name: &str,
+    k: &KtirNode,
+    layout: Option<&BundleLayout>,
+    run: RunCopy<'_, DF>,
+    sym_id_base: &mut i64,
+) -> Result<Vec<EmittedOp<T>>, Error> {
+    let RunCopy {
+        src,
+        src_rows,
+        groups,
+        width,
+        s0,
+        e0,
+        total,
+        dst,
+        index,
+        key,
+    } = run;
+    let stick = DF::ELEMS_PER_STICK;
+    let sticks = width.stick_count();
+    let width = width.elems();
+    let dst_tid = dst.tid;
+    if dst.v_cols != width {
+        return err(format!(
+            "{name}: t{dst_tid} is written as {}-wide rows by stores of {width}-wide rows — the \
+             scatter copies one stored row per index entry",
+            dst.v_cols
+        ));
+    }
+    if s0 + total > src_rows * groups {
+        return err(format!(
+            "{name}: the stores write rows {s0}..{} of {src}, whose view holds {}",
+            s0 + total,
+            src_rows * groups
+        ));
+    }
+    let mut ops = Vec::new();
+    // Where the scatter reads its rows: the source itself at one stick a row, or at one row a
+    // view (a decode step's — stick-major and row-major are then the same bytes), else the
+    // scratch its rows are relaid into, row-major.
+    let from = if sticks == 1 || src_rows == 1 {
+        src.to_string()
+    } else {
+        let Some(layout) = layout else {
+            return err(format!(
+                "{name}: rows of {sticks} sticks are relaid through a scratch, which needs a \
+                 `BundleLayout` to hold it"
+            ));
+        };
+        if !layout.is_row_outermost(dst_tid) {
+            return err(format!(
+                "{name}: t{dst_tid} takes rows of {sticks} sticks one entry each, which needs it \
+                 allocated row-outermost (`BundleLayout::allocate_row_outermost`), its rows \
+                 contiguous"
+            ));
+        }
+        let tid = super::whole_function::mint_scratch(
+            k,
+            layout,
+            super::whole_function::mint_floor(k),
+            key,
+            crate::ktir_node::Scratch::RelayoutMid,
+        );
+        layout.synth_df(
+            crate::place::SynthId::Act(tid),
+            &[src_rows * groups, width],
+            DF::DF,
+        );
+        let scratch = crate::place::act_name(tid);
+        // Each head's group of columns, stick-major `[sticks][rows]` in the source, to row-major
+        // `[rows][sticks]` at the same base in the scratch.
+        for g in s0 / src_rows..=(s0 + total - 1) / src_rows {
+            let base = g * src_rows * width;
+            ops.push(
+                crate::ir::bridge::tiled_op_sdsc_op::assemble_stick_permute(
+                    &format!("scatter_rows{g}_o{dst_tid}"),
+                    src,
+                    &scratch,
+                    crate::ir::bridge::tiled_op_sdsc_op::StickPermuteSpec {
+                        rows: src_rows,
+                        sticks,
+                        df: DF::DF,
+                        direction: crate::ir::bridge::tiled_op_sdsc_op::StickPermute::StickToRow,
+                        src_elems: base,
+                        dst_elems: base,
+                    },
+                    sym_id_base,
+                    Some(layout),
+                )
+                .map_err(|message| Error {
+                    message: format!("{name}: {message}"),
+                })?,
+            );
+        }
+        scratch
+    };
+    let page = crate::superdsc_opspec::PageExtent::of_positions(sticks);
+    let (dst_name, index_name) = (dst.name(), index.name());
+    for (i, (first, entries)) in index_runs(total).into_iter().enumerate() {
+        let base = crate::superdsc_opspec::EntryBase::of_entries(e0 + first).map_err(|message| {
+            Error {
+                message: format!("{name}: {message}"),
+            }
+        })?;
+        let scatter =
+            crate::superdsc_opspec::GatherIndex::of_scratch_rows(index_name.clone(), page, base);
+        let op = crate::ir::bridge::tiled_op_sdsc_op::assemble_scatter_copy(
+            &format!("scatter_run{i}_o{dst_tid}"),
+            &from,
+            &dst_name,
+            scatter,
+            crate::ir::bridge::tiled_op_sdsc_op::ScatterCopySpec {
+                rows: entries * sticks,
+                cols: stick,
+                df: DF::DF,
+                src_elems: (s0 + first) * width,
+                dst_elems: 0,
+            },
+            sym_id_base,
+            layout,
+        )
+        .map_err(|message| Error { message })?;
+        ops.push(op);
+    }
+    Ok(ops)
+}
+
+/// ⭐⭐⭐ A NARROWING-STORE FAMILY — spyre-inference's `quantize_kv` then `index_copy_`
+/// (`ops/reshape_and_cache.py:20-29, 47-52`) as the KV write states it, one window at a time: each
+/// member loads a window of ONE f16 parameter, saturates it (`arith.maxnumf` against a splatted `lo`,
+/// then `arith.minnumf` against a splatted `hi` — `torch.clamp`'s `clamp_min` and `clamp_max`),
+/// narrows it to f8E4M3FN (`arith.truncf`) and stores it through an indirect tile. When the members'
+/// windows TILE the parameter's view exactly ([`tiles_the_view`]), the family is the reference's ONE
+/// elementwise pass over the whole tensor followed by its stores, and it lowers as torch-spyre lowers
+/// that: `clip` (`clamp_min`), `clip` (`clamp_max`) and `qfp8ch` over the whole view
+/// (`lower_clamp`, `lowering.py:1505-1579`; `spyre.qfp8ch` over `x.get_size()`,
+/// `lowering.py:2969-2992`), then ONE scatter run of the narrowed rows ([`scatter_run`]).
+///
+/// ⛔ THE FOLD'S LAWS: stated over op kinds and operand identity only; every interior value — the
+/// load, both saturations, the narrowing — has exactly one reader; ONE shape predicate,
+/// [`tiles_the_view`]; and a family that does not close — a member whose chain differs, members that
+/// disagree on the bounds or the row width, windows that leave a gap or overlap — is LEFT
+/// UNCLAIMED, its ops lowered one by one, where the f16→f8E4M3FN `arith.truncf` is the walk's own
+/// by-name refusal (`convert_kind_of`).
+pub(crate) struct NarrowFamily {
+    /// The f16 parameter every member loads.
+    pub src_tid: u32,
+    /// The parameter every member stores through its index.
+    pub dst_tid: u32,
+    /// The parameter holding the index.
+    pub index_tid: u32,
+    /// The `clamp_min` bound every member states.
+    pub lo: f32,
+    /// The `clamp_max` bound every member states.
+    pub hi: f32,
+    /// One stored row's width, whole float8 sticks.
+    pub width: StickExtent<crate::superdsc_opspec::Fp8>,
+    /// The source view's `[rows, cols]`.
+    pub view: (u32, u32),
+    /// The members, in program order.
+    members: Vec<NarrowMember>,
+}
+
+/// One member of a [`NarrowFamily`]: its three chain values, its share of the run, its window.
+pub(crate) struct NarrowMember {
+    /// The `arith.maxnumf` result.
+    pub clamp_min: Ssa,
+    /// The `arith.minnumf` result.
+    pub clamp_max: Ssa,
+    /// The `arith.truncf` result.
+    pub narrow: Ssa,
+    piece: RunPiece,
+    /// `(row, col, rows, cols)` of the source window.
+    window: (u32, u32, u32, u32),
+}
+
+impl NarrowFamily {
+    /// The first member in program order — the values the family's whole-view buffers are minted
+    /// by. A family is created with its first member.
+    pub fn leader(&self) -> &NarrowMember {
+        &self.members[0]
+    }
+
+    /// Every value the family's whole-view chain stands for: the walk lowers none of them.
+    pub fn claimed(&self) -> impl Iterator<Item = Ssa> + '_ {
+        self.members
+            .iter()
+            .flat_map(|m| [m.clamp_min, m.clamp_max, m.narrow])
+    }
+
+    /// The family's one scatter run ([`run_extent`]).
+    pub fn extent(&self, name: &str) -> Result<RunExtent, Error> {
+        let mut pieces: Vec<RunPiece> = self.members.iter().map(|m| m.piece).collect();
+        run_extent(name, &mut pieces)
+    }
+}
+
+/// ⭐ THE FAMILY'S ONE SHAPE PREDICATE — its members' source windows tile the source view exactly:
+/// every window inside the view, no two overlapping, their areas summing to the view's.
+fn tiles_the_view(fam: &NarrowFamily) -> bool {
+    let (vr, vc) = fam.view;
+    let w = &fam.members;
+    let inside = w.iter().all(|m| {
+        let (r, c, rows, cols) = m.window;
+        r + rows <= vr && c + cols <= vc
+    });
+    let disjoint = w.iter().enumerate().all(|(i, a)| {
+        w[i + 1..].iter().all(|b| {
+            let (ar, ac, arn, acn) = a.window;
+            let (br, bc, brn, bcn) = b.window;
+            ar + arn <= br || br + brn <= ar || ac + acn <= bc || bc + bcn <= ac
+        })
+    });
+    let area: u64 = w
+        .iter()
+        .map(|m| u64::from(m.window.2) * u64::from(m.window.3))
+        .sum();
+    inside && disjoint && area == u64::from(vr) * u64::from(vc)
+}
+
+/// [`NarrowFamily`] for every `(source, destination, index)` triple whose stores close the pattern
+/// and tile their source.
+pub(crate) fn narrow_families_of(k: &KtirNode) -> Result<Vec<NarrowFamily>, Error> {
+    use crate::superdsc_opspec::Fp8;
+    let f = &k.func;
+    let consts = index_constants(f);
+    let deep = f.ops_deep();
+    let def_of = |v: Ssa| f.operations.iter().find(|o| o.result == Some(v));
+    let one_reader = |v: Ssa| deep.iter().filter(|o| o.operands.contains(&v)).count() == 1;
+    // Each triple in first-store order; `None` once its members disagree (left unclaimed).
+    let mut groups: Vec<((u32, u32, u32), Option<NarrowFamily>)> = Vec::new();
+    for store in f
+        .operations
+        .iter()
+        .filter(|o| o.op_type == OpKind::KtdpStore)
+    {
+        let (Some(&narrow), Some(&tv)) = (store.operands.first(), store.operands.get(1)) else {
+            continue;
+        };
+        let Some(tile) = f
+            .operations
+            .iter()
+            .find(|o| o.result == Some(tv) && o.op_type == OpKind::KtdpConstructIndirectAccessTile)
+        else {
+            continue;
+        };
+        // The chain, link by link, from the store up: any other link is not this pattern.
+        let Some(trunc) = def_of(narrow).filter(|o| {
+            o.op_type == OpKind::ArithTruncf
+                && o.result_type.and_then(|t| t.elem()) == Some(ktir_core::dtypes::DType::Fp8E4m3)
+        }) else {
+            continue;
+        };
+        let Some(&clamp_max) = trunc.operands.first() else {
+            continue;
+        };
+        let Some(max_op) = def_of(clamp_max).filter(|o| o.op_type == OpKind::ArithMinnumf) else {
+            continue;
+        };
+        let Some((hi, clamp_min)) = super::whole_function::splat_scale_of(f, max_op) else {
+            continue;
+        };
+        let Some(min_op) = def_of(clamp_min).filter(|o| o.op_type == OpKind::ArithMaxnumf) else {
+            continue;
+        };
+        let Some((lo, x)) = super::whole_function::splat_scale_of(f, min_op) else {
+            continue;
+        };
+        let Some(load) = def_of(x).filter(|o| o.op_type == OpKind::KtdpLoad) else {
+            continue;
+        };
+        if ![x, clamp_min, clamp_max, narrow]
+            .into_iter()
+            .all(one_reader)
+        {
+            continue;
+        }
+        let src = param_rows(k, &consts, load)?;
+        let dst_tid = indirect_tile_param(k, tile, 0, "written")?;
+        let index_tid = indirect_tile_param(k, tile, 1, "index")?;
+        let (rows, _) = shape_2d(tile).ok_or_else(|| Error {
+            message: format!(
+                "{}: a narrowing store's indirect tile states no 2-D `shape`, so how many rows it \
+                 writes is unknown",
+                f.name
+            ),
+        })?;
+        let entry = indirect_tile_anchor(k, tile, &consts)?;
+        let member = NarrowMember {
+            clamp_min,
+            clamp_max,
+            narrow,
+            piece: RunPiece {
+                entry,
+                rows,
+                src_row: src.src_row(),
+            },
+            window: (src.row, src.col, src.rows, src.width),
+        };
+        let key = (src.src_tid, dst_tid, index_tid);
+        match groups.iter_mut().find(|(g, _)| *g == key) {
+            None => groups.push((
+                key,
+                StickExtent::<Fp8>::new(src.width)
+                    .ok()
+                    .map(|width| NarrowFamily {
+                        src_tid: src.src_tid,
+                        dst_tid,
+                        index_tid,
+                        lo,
+                        hi,
+                        width,
+                        view: (src.view_rows, src.view_cols),
+                        members: vec![member],
+                    }),
+            )),
+            Some((_, slot)) => {
+                let joined = match slot.take() {
+                    Some(mut fam)
+                        if fam.lo == lo && fam.hi == hi && fam.width.elems() == src.width =>
+                    {
+                        fam.members.push(member);
+                        Some(fam)
+                    }
+                    _ => None,
+                };
+                *slot = joined;
+            }
+        }
+    }
+    Ok(groups
+        .into_iter()
+        .filter_map(|(_, fam)| fam)
+        .filter(tiles_the_view)
+        .collect())
 }
 
 /// ⛔⛔⛔ THE GUARD FOR THE FACT THIS FILE USED TO DROP: an operand this emitter addresses at the
@@ -1613,6 +1963,40 @@ pub fn regions(k: &KtirNode) -> Result<Vec<Region>, Error> {
         });
     }
     Ok(out)
+}
+
+/// ⭐ A MEMORY VIEW'S STATED ELEMENT TYPE — the `Dtype` its `ktdp.construct_memory_view` carries: the
+/// one KTIR fact a lowering reads a buffer's format from. `None` when the view states none. Each
+/// door that turns it into a type is ONE match over this answer, at the arm that reads the view.
+pub fn view_elem(f: &IRFunction<'static>, view: Ssa) -> Option<ktir_core::dtypes::DType> {
+    f.operations
+        .iter()
+        .find(|o| o.result == Some(view) && o.op_type == OpKind::KtdpConstructMemoryView)
+        .and_then(|o| {
+            o.attributes.iter().find_map(|(k, v)| match (k, v) {
+                (AttrKey::Dtype, Attr::Dtype(d)) => Some(*d),
+                _ => None,
+            })
+        })
+}
+
+/// The element type the view an indirect access tile reads or writes through (its operand 0)
+/// states ([`view_elem`]).
+pub fn indirect_view_elem(f: &IRFunction<'static>, tile: Ssa) -> Option<ktir_core::dtypes::DType> {
+    f.operations
+        .iter()
+        .find(|o| o.result == Some(tile) && o.op_type == OpKind::KtdpConstructIndirectAccessTile)
+        .and_then(|t| t.operands.first().copied())
+        .and_then(|view| view_elem(f, view))
+}
+
+/// The element type the view of parameter `ptr` states ([`view_elem`]).
+pub fn param_elem(f: &IRFunction<'static>, ptr: Ssa) -> Option<ktir_core::dtypes::DType> {
+    f.operations
+        .iter()
+        .find(|o| o.op_type == OpKind::KtdpConstructMemoryView && o.operands.first() == Some(&ptr))
+        .and_then(|o| o.result)
+        .and_then(|view| view_elem(f, view))
 }
 
 /// Every view a `ktdp.store` writes through — the program's OUTPUT buffers. A store's second operand

@@ -24,6 +24,9 @@ spyre-emu = ["scratchy-target-spyre/spyre-emu"]
 tp-2 = ["scratchy-target-spyre/tp-2"]
 tp-4 = ["scratchy-target-spyre/tp-4"]
 tp-8 = ["scratchy-target-spyre/tp-8"]
+# `kv-fp8` — the KV pools hold float8 e4m3 (`kv/fp8` from the CLI); see scratchy-triton-splice's
+# `KvFormat`.
+kv-fp8 = ["scratchy-target-spyre/kv-fp8"]
 
 [dependencies]
 # The shared pipeline this crate's emitter plugs into (`target::TargetEmitter`), and the passes the
