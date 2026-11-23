@@ -867,6 +867,13 @@ pub struct MetalStepTape {
     pub lm_head_sources: Vec<Vec<RowSource>>,
     /// Per lm_head row, likewise: never a play of cache writes alone.
     pub lm_head_live: Vec<super::lowered::PlayLive>,
+    /// The source families whose codes some reader reads as the device stores them, never
+    /// planes: the head (the one weight a drafter borrows of its target; a tied head is the
+    /// table's weight under another name) and the embedding tables the gathers read row-whole.
+    /// Resolved per model from the weights themselves, never from where a reader sits, so every
+    /// band and bucket holds the same families — one weight, one vote
+    /// ([`super::lowering::codes_for`]).
+    pub as_stored_sources: Vec<SourceIx>,
 }
 
 /// The bytes of weights a forward of a bucket reads ([`MetalStepTape::weight_bytes`]): what it reads

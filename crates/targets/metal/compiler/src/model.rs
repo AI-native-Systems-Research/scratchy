@@ -738,6 +738,12 @@ pub(crate) fn emit(cx: &ModelCx<'_>) -> ModelEmission {
         });
         metal_sources.rotary_tables(local)
     });
+    // The head weight the model's logits read — the one statement of which weight the head is
+    // (`codegen::head_weight`, the terminal walk `backbone_layout` classifies by): the weight a
+    // drafter borrows of its target (`LentWeight::LmHead`) and a tied head shares with the
+    // embedding table, so its family's codes vote the way every reader of it reads them
+    // (`MetalStepFacts::head_weight` → `MetalStepTape::as_stored_sources`).
+    let head_weight = scratchy_forward_compiler_macro::codegen::head_weight(fuf, program);
     for (canonical, (_, ns_field, bb_slot_field, term_field, slots_dec)) in
         canonical_lowered.iter_mut()
     {
@@ -845,6 +851,7 @@ pub(crate) fn emit(cx: &ModelCx<'_>) -> ModelEmission {
             shared_expert_banks: &shared_expert_banks,
             embed_base: &embed_base,
             embed_quant,
+            head_weight,
             mlp: if fused_mlp {
                 mc3::MlpForm::Packed
             } else {

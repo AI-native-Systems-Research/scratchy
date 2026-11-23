@@ -1731,10 +1731,12 @@ fn plan_field_load(
         // HF convention: every decoder-only model that ties them
         // calls the sharing field `embed_tokens`; the macro looks
         // up that field by name.
-        if accessor.name == "lm_head"
+        if crate::quantization::is_tied_head(model, &accessor.name.to_string())
             && prefixes.len() == 1
-            && (prefixes[0] == "lm_head" || prefixes[0].ends_with(".lm_head"))
-            && tie_word_embeddings(model)
+            && (prefixes[0] == crate::config::LM_HEAD_ROLE
+                || prefixes[0]
+                    .strip_suffix(crate::config::LM_HEAD_ROLE)
+                    .is_some_and(|p| p.ends_with('.')))
         {
             // P6: detect whether the source embedding is MLX-affine
             // quantized AND kept as the packed `AffineQuantEmbedding`
@@ -2034,13 +2036,6 @@ pub(crate) fn norm_weight_runtime_offset(model: &ModelParams) -> f32 {
     } else {
         0.0
     }
-}
-
-pub fn tie_word_embeddings(model: &ModelParams) -> bool {
-    // `ModelParams::tie_word_embeddings` is populated by the config
-    // loader from the HF JSON; read directly rather than re-parsing
-    // the file here.
-    model.tie_word_embeddings
 }
 
 /// The routed experts' input width an ungated bank is packed at, probed at the last MoE
@@ -7265,28 +7260,32 @@ pub enum BackboneLayout {
     Encoder,
 }
 
-/// Classify the FUF's terminal as decoder vs encoder. A decoder
-/// terminal is `gemm(<tile>, <lm_head_weight>)`, optionally followed
-/// by an `AllGather` (inserted by tp>1 lowering on the vocab-parallel
-/// lm_head Gemm). Walks past trailing `MmEmbedSplice` / `LoadRows`
-/// nodes via [`last_non_splice_node`] — those are
-/// appended by lowering passes but aren't the body's actual terminal.
+/// Classify the FUF's terminal as decoder vs encoder: a decoder reads its logits through the
+/// head weight ([`head_weight`]); an encoder reads them through no such weight.
 pub fn backbone_layout(fuf: &Fuf, program: &Program) -> BackboneLayout {
-    const LM_HEAD_PREFIX: &str = "lm_head";
+    match head_weight(fuf, program) {
+        Some(_) => BackboneLayout::Decoder,
+        None => BackboneLayout::Encoder,
+    }
+}
 
+/// The head weight a decoder's logits read: the terminal `gemm(<tile>, <head weight>)`'s weight
+/// — the [`LM_HEAD_ROLE`] weight — optionally behind an `AllGather` (tp>1's vocab-parallel head
+/// Gemm) and terminal post-ops (granite's `logits_scaling` multiply, gemma2's
+/// `final_logit_softcapping`). `None` for an encoder: a terminal reading no head weight — text
+/// encoders (ModernBERT) and every `#[vision_forward]` body — or one whose Gemm does not read
+/// the `LM_HEAD_ROLE` weight.
+///
+/// The one statement of which weight the head is: the loader plan, the terminal classification
+/// ([`backbone_layout`]) and the metal tape's vote facts all take this walk, never their own.
+/// Misreading a decoder as an encoder bakes a logits width of `hidden_size`, and the argmax
+/// kernel then scans only the first `hidden_size` of `vocab_size` logits — greedy decode picks
+/// low-id tokens (asterisks and single characters) while sampling, which does not use that
+/// kernel, stays clean.
+pub fn head_weight(fuf: &Fuf, program: &Program) -> Option<WeightId> {
     let last_node = last_non_splice_node(fuf).expect("FUF must be non-empty to emit a forward fn");
-    // Granite-class arches divide the logits by `logits_scaling`, so the FUF
-    // terminates in `Mul(gemm_out, scalar)` rather than the lm_head Gemm
-    // itself. That is still a DECODER: walk past the scalar multiply to the
-    // Gemm, exactly as the AllGather arm below walks past tp>1's collective.
-    // Misreading it as an encoder bakes a logits width of `hidden_size`, and
-    // the argmax kernel then scans only the first `hidden_size` of
-    // `vocab_size` logits — greedy decode picks low-id tokens (asterisks and
-    // single characters) while sampling, which does not use that kernel,
-    // stays clean.
-    // Walk back over any chain of these; gemma2 has BOTH a softcap and (via
-    // other stems) a scale, and a decoder must not be misread because its
-    // logits get post-processed.
+    // Walk back over any chain of terminal post-ops; gemma2 has BOTH a softcap and (via other
+    // stems) a scale, and a decoder must not be misread because its logits get post-processed.
     let mut last_node = last_node;
     loop {
         let terminal_postop = match last_node.op {
@@ -7316,7 +7315,7 @@ pub fn backbone_layout(fuf: &Fuf, program: &Program) -> BackboneLayout {
         // AllGather has exactly one tile input by construction.
         match last_node.inputs.first() {
             Some(FufInput::Tile { id, .. }) => fuf.get(*id),
-            _ => return BackboneLayout::Encoder,
+            _ => return None,
         }
     } else {
         last_node
@@ -7324,25 +7323,18 @@ pub fn backbone_layout(fuf: &Fuf, program: &Program) -> BackboneLayout {
 
     // Decoder shape: `gemm(<tile>, <lm_head weight>)`.
     if lm_head_node.op != crate::classified::OpKind::Gemm {
-        return BackboneLayout::Encoder;
+        return None;
     }
-    let weight_is_lm_head = matches!(
-        lm_head_node.inputs.get(1),
+    let head = match lm_head_node.inputs.get(1) {
         Some(FufInput::Weight { id, .. })
-            if program
-                .weights
-                .path(*id)
-                .first()
-                .map(|s| s.as_str())
-                == Some(LM_HEAD_PREFIX)
-    );
-    if !weight_is_lm_head {
-        return BackboneLayout::Encoder;
-    }
-    match lm_head_node.inputs.first() {
-        Some(FufInput::Tile { .. }) => BackboneLayout::Decoder,
-        _ => BackboneLayout::Encoder,
-    }
+            if program.weights.path(*id).first().map(|s| s.as_str())
+                == Some(crate::config::LM_HEAD_ROLE) =>
+        {
+            *id
+        }
+        _ => return None,
+    };
+    matches!(lm_head_node.inputs.first(), Some(FufInput::Tile { .. })).then_some(head)
 }
 
 /// Build the workload-point bounds map the tape lowering consumes —
