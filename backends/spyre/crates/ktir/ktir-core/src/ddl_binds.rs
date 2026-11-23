@@ -74,6 +74,8 @@ pub enum DdlDf {
     Fp16,
     /// `IEEE_FP32` — `%type_fp32`.
     Fp32,
+    /// `SEN143_FP8` — `%type_fp8` (float8 e4m3).
+    Fp8,
 }
 
 /// The element arrangement a value's buffer carries: the order of elements
@@ -167,6 +169,8 @@ device_ops!(
     Fp32ToInt32,
     Dl16ToFp32,
     Fp32ToDl16,
+    Fp8ToDl16,
+    Qfp8ch,
     // ── the reduce family
     Sum,
     Mean,
@@ -207,6 +211,8 @@ impl DeviceOp {
             DeviceOp::Fp32ToInt32 => "fp32toint32",
             DeviceOp::Dl16ToFp32 => "dl16tofp32",
             DeviceOp::Fp32ToDl16 => "fp32todl16",
+            DeviceOp::Fp8ToDl16 => "fp8todl16",
+            DeviceOp::Qfp8ch => "qfp8ch",
             DeviceOp::Sum => "sum",
             DeviceOp::Mean => "mean",
             DeviceOp::Max => "max",
@@ -241,7 +247,9 @@ impl DeviceOp {
             DeviceOp::Int32ToFp32
             | DeviceOp::Fp32ToInt32
             | DeviceOp::Dl16ToFp32
-            | DeviceOp::Fp32ToDl16 => DeviceFamily::Convert,
+            | DeviceOp::Fp32ToDl16
+            | DeviceOp::Fp8ToDl16
+            | DeviceOp::Qfp8ch => DeviceFamily::Convert,
             DeviceOp::Sum | DeviceOp::Mean | DeviceOp::Max | DeviceOp::Min | DeviceOp::AbsMax => {
                 DeviceFamily::Reduce
             }
@@ -342,10 +350,7 @@ pub trait DeviceGen {
                 let mut d = 0;
                 let mut bound = false;
                 while d < Self::DEVICE_OPS[i].dfs.len() {
-                    if matches!(
-                        (Self::DEVICE_OPS[i].dfs[d], admitted),
-                        (DdlDf::Fp16, DdlDf::Fp16) | (DdlDf::Fp32, DdlDf::Fp32)
-                    ) {
+                    if Self::DEVICE_OPS[i].dfs[d] as u8 == admitted as u8 {
                         bound = true;
                     }
                     d += 1;
@@ -650,6 +655,29 @@ impl DeviceGen for Gen1 {
                    convert-probe 2026-11-07, element-exact at [256,2048] and \
                    [1,2048]; main stages it Standard, so this row keeps main's \
                    behavior, and moving it is the Z4 solve's PR",
+        },
+        DeviceOpRow {
+            op: DeviceOp::Fp8ToDl16,
+            dfs: &[DdlDf::Fp8, DdlDf::Fp16],
+            admitted: &[DdlDf::Fp8, DdlDf::Fp16],
+            arrangement: ElementArrangement::Standard,
+            citation: "quantization_double_pad.ddl:60 fp8todl16 — a TYPELESS bind ([]); \
+                   %inp_tensor is [%type_fp16, %type_fp32, %type_fp8] (:42-43) and the output \
+                   %output_fp16_tensor [%type_fp16] (:51): fp8 in, fp16 out. The upcast twin \
+                   of dl16tofp32 (%chupcast_ops, :98; one fp8 stick SHUFFLEd into two fp16 \
+                   sticks, :315-321). Its input is the QFP8CH in-stick order qfp8ch writes, so \
+                   its fp16 output is standard",
+        },
+        DeviceOpRow {
+            op: DeviceOp::Qfp8ch,
+            dfs: &[DdlDf::Fp16, DdlDf::Fp8],
+            admitted: &[DdlDf::Fp16, DdlDf::Fp8],
+            arrangement: ElementArrangement::Standard,
+            citation: "qfp8ch — f16 in, SEN143_FP8 out: the W8A8 activation quantizer's convert \
+                   (`emit::convert_dtypes`' own row, `fq_afp8_op`). Its output is the QFP8CH \
+                   in-stick order the fp8todl16 row reads, so the widen of it is standard; \
+                   card-proven by the kv_fp8_round_trip leg (qfp8ch, the scatter and fp8todl16 \
+                   return the pattern bit-exact)",
         },
         // ── summeanmaxexx2.ddl / summeanmaxexx2_fp32.ddl — the reduce family,
         //    every combiner bound at BOTH formats (the fp16 template's stick

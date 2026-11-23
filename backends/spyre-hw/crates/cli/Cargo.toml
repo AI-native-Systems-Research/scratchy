@@ -68,6 +68,10 @@ quant = { package = "scratchy-quantizations", path = "../../../../crates/models/
 # never activates) has its features dropped, silently baking one card. The anchor
 # is also what marks the alias used, keeping cargo::unused_dependencies silent.
 tp = { package = "scratchy-tp", path = "../tp", optional = true }
+# THE KV ALIAS: `--features kv/fp8` selects the KV pools' element format (its features forward to
+# scratchy-target-spyre-worker's `kv-<format>`). Optional and anchored in `main.rs` for the reason the
+# tp alias is: resolver v2 drops the features of an optional dependency nothing references.
+kv = { package = "scratchy-kv", path = "../kv", optional = true }
 clap = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 anyhow = { workspace = true }

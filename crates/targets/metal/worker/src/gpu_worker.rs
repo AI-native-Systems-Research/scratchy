@@ -697,7 +697,7 @@ fn kv_per_block_bytes(model: &dyn scratchy_target_metal::MetalWeights, block_siz
     }
     block_size.saturating_mul(pool_bytes_per_token(
         model,
-        scratchy_forward_compiler::KvCodec::Dense,
+        scratchy_target_metal::MetalKvCodec::Dense,
         elt_bytes,
     ))
 }
@@ -707,7 +707,7 @@ fn kv_per_block_bytes(model: &dyn scratchy_target_metal::MetalWeights, block_siz
 /// `codec` is dense.
 fn pool_bytes_per_token(
     model: &dyn scratchy_target_metal::MetalWeights,
-    codec: scratchy_forward_compiler::KvCodec,
+    codec: scratchy_target_metal::MetalKvCodec,
     dense_elem_bytes: usize,
 ) -> usize {
     scratchy_target_metal::kv_int8::kv_bytes_per_token(
@@ -6849,8 +6849,8 @@ impl Worker for MetalWorker {
         let kv_codec = model.kv_codec();
         match (self.config.kv_cache_dtype.as_str(), kv_codec) {
             ("auto", _)
-            | ("fp16", scratchy_forward_compiler::KvCodec::Dense)
-            | ("int8", scratchy_forward_compiler::KvCodec::Int8) => {}
+            | ("fp16", scratchy_target_metal::MetalKvCodec::Dense)
+            | ("int8", scratchy_target_metal::MetalKvCodec::Int8) => {}
             (asked, built) => {
                 return Err(ExecutorError::WorkerInit(format!(
                     "--kv-cache-dtype {asked}: this binary stores the model's KV cache as \

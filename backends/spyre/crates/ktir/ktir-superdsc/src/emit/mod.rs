@@ -412,6 +412,8 @@ fn per_core_addr(
             )
         } else if view.frame == crate::superdsc_opspec::ViewFrame::FoldedRows {
             folded_rows_off(view, &extents, &corner, view_layout.lanes()) as u64
+        } else if let crate::superdsc_opspec::ViewFrame::Landing(landing) = view.frame {
+            landing_off(view, &extents, &corner, landing)? as u64
         } else {
             view_layout.off_view(&extents, &corner) as u64
         };
@@ -421,6 +423,25 @@ fn per_core_addr(
         addrs.push(base + off_elems * view.df.word_length() as u64);
     }
     Ok(addrs)
+}
+
+/// A [`crate::superdsc_opspec::ViewFrame::Landing`] view's element offset of `corner` over its
+/// `[mb, y, x, out]` (the landing stamp's layout): block `mb·Y + y`, row `x`, column `out`
+/// ([`crate::superdsc_opspec::PageLanding::off`]). A landing view of any other rank is refused by
+/// name — the stamp mints only the four-axis view.
+fn landing_off(
+    view: &ArgView<'_>,
+    extents: &crate::sdsc_abstract::DeviceExtents,
+    corner: &[usize],
+    landing: crate::superdsc_opspec::PageLanding,
+) -> Result<usize, SuperDscError> {
+    let ([mb, y, x, out], [_, y_ext, _, _]) = (corner, extents.dims()) else {
+        return Err(SuperDscError(format!(
+            "'{}': a page landing view is `[mb, y, x, out]`, and this one states {:?}",
+            view.name, view.layout
+        )));
+    };
+    Ok(landing.off(mb * y_ext + y, *x, *out))
 }
 
 /// A [`crate::superdsc_opspec::ViewFrame::FoldedRows`] view's element offset of `corner`: its non-stick
@@ -2140,6 +2161,63 @@ pub fn assemble_pointwise_broadcast_divided<T: crate::collective::Tp, O: KindTag
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
 ) -> Result<EmittedOp<T>, crate::superdsc_error::SuperDscError> {
+    let func = op_func_from_str(p.op_func);
+    assemble_pointwise_stated(p, func, None, sym_id_base, layout)
+}
+
+/// What one `clip` states: its name, its bounds, its extent, its one input and its output.
+pub struct ClipOp<'a, A: KindTag, O: KindTag> {
+    pub op_name: &'a str,
+    pub bounds: crate::superdsc_opspec::ClipBounds,
+    pub rows: crate::sdsc_abstract::RowCount,
+    pub cols: crate::sdsc_abstract::BlockCols,
+    pub a: In<'a, A>,
+    pub o: &'a Stk<O>,
+}
+
+/// ⭐ A `clip` — `FMIN(FMAX(x, clipMin), clipMax)` over one input — with its bounds stated
+/// ([`crate::superdsc_opspec::ClipBounds`], carried as [`OpInfo::Clip`]): the ONE door a clip
+/// descriptor is built by. Otherwise the one-input pointwise op [`pw1`] states.
+pub fn assemble_clip<T: crate::collective::Tp, A: KindTag, O: KindTag>(
+    c: ClipOp<'_, A, O>,
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<EmittedOp<T>, crate::superdsc_error::SuperDscError> {
+    let ClipOp {
+        op_name,
+        bounds,
+        rows,
+        cols,
+        a,
+        o,
+    } = c;
+    assemble_pointwise_stated(
+        PointwiseDivided {
+            op_name,
+            op_func: OpFunc::Clip.name(),
+            rows,
+            cols,
+            inputs: &[a.ew()],
+            o,
+            out_offset: crate::addr::OutCorner::ZERO,
+            division: crate::work::EwDivision::Law,
+        },
+        OpFunc::Clip,
+        Some(OpInfo::Clip(bounds)),
+        sym_id_base,
+        layout,
+    )
+}
+
+/// The body of every pointwise door above: `func` is the op the descriptor runs (`p.op_func` its
+/// spelling), and `info` the aux it states beyond the one its op func implies.
+fn assemble_pointwise_stated<T: crate::collective::Tp, O: KindTag>(
+    p: PointwiseDivided<'_, O>,
+    func: OpFunc,
+    info: Option<OpInfo>,
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<EmittedOp<T>, crate::superdsc_error::SuperDscError> {
     let PointwiseDivided {
         op_name,
         op_func,
@@ -2192,7 +2270,7 @@ pub fn assemble_pointwise_broadcast_divided<T: crate::collective::Tp, O: KindTag
         )));
     }
     let mut op = pointwise_broadcast_opspec_df(
-        op_func_from_str(op_func),
+        func,
         rows,
         cols,
         inputs,
@@ -2206,6 +2284,9 @@ pub fn assemble_pointwise_broadcast_divided<T: crate::collective::Tp, O: KindTag
     .map_err(|e| {
         crate::superdsc_error::SuperDscError(format!("assemble_pointwise_broadcast {op_name}: {e}"))
     })?;
+    if let Some(info) = info {
+        op = op.with_op_info(info);
+    }
     apply_lx_residency(&mut op, layout);
     let folds = SdscFoldSet::new(op.iter.cores_used());
     emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout).map_err(|e| {
@@ -3875,19 +3956,14 @@ pub fn emit_sdsc(
                 let arrangement = match v.frame {
                     crate::superdsc_opspec::ViewFrame::Own
                     | crate::superdsc_opspec::ViewFrame::FoldedRows => own,
-                    // ⭐ THE LANDING'S OWN FRAME — a page-gather landing of ONE block, several
-                    // sticks wide: the tensor's ONE arrangement is the stick-major [r, c] that
-                    // block is, derived from the landing's own extents — all its elements over
-                    // its stick dim's extent. A landing of SEVERAL blocks never carries this
-                    // frame (the stamp sites keep it `Own`): its bytes are blocks-one-after-
-                    // another, which no `StickKind` states — the walk carries that frame as
-                    // `batch_blocks` / `BatchFrame::Blocks` — and declaring it stick-major here
-                    // would contradict the batched transpose's read of the same tensor, which
-                    // the arrangement authority refuses. ADDRESSING is unchanged (the landing's
-                    // per-core starts are its blocks); a one-stick landing never carries this
-                    // frame, and a view whose extents do not divide keeps `own`.
-                    // The arrangement the stamp minted from the landing's own extents.
-                    crate::superdsc_opspec::ViewFrame::LandedBlocks(landed) => landed,
+                    // ⭐ A PAGE LANDING declares what its frame states ([`PageLanding::declared`]):
+                    // the one block's stick-major `[rows, cols]` when it is ONE block several sticks
+                    // wide, and the view's own otherwise — several blocks are bytes no `StickKind`
+                    // states, and declaring them stick-major would contradict the batched
+                    // transpose's read of the same tensor, which the arrangement authority refuses.
+                    crate::superdsc_opspec::ViewFrame::Landing(landing) => {
+                        landing.declared().unwrap_or(own)
+                    }
                     crate::superdsc_opspec::ViewFrame::StickColumns => {
                         own.of_stick_columns().ok_or_else(|| {
                             SuperDscError(format!(
@@ -4171,20 +4247,12 @@ pub fn emit_sdsc(
         // OBJECT (`fold_manager_const`), one entry per named constant, NO `allocations_` (the
         // validator's additionalProperties-style rejection killed that field). Each value is ONE
         // SEN169 word — the DDL reads it per-element out of `dataFormat_`.
-        serde_json::Value::Object(
+        named_sen169_consts(
             op.op()
                 .op_consts()
                 .iter()
-                .map(|&(cname, v)| {
-                    serde_json::json!({
-                        "dataFormat_": "SEN169_FP16",
-                        "name_": cname,
-                        "data_": fold_manager_const(sen169_bits(v) as u32, folds)
-                    })
-                })
-                .enumerate()
-                .map(|(i, entry)| (i.to_string(), entry))
-                .collect(),
+                .map(|&(cname, v)| (cname, sen169_bits(v))),
+            folds,
         )
     } else {
         match op.op_info() {
@@ -4192,6 +4260,8 @@ pub fn emit_sdsc(
             OpInfo::ReduceScaling(packed) => scaling_factor_const(packed, folds),
             OpInfo::ReduceScalingFp32(bits) => scaling_factor_const_fp32(bits, folds),
             OpInfo::Exx2Scale(bits) => exx2_consts(bits, folds),
+            // A `clip`'s bounds are its own data, written exactly as a table's constants are.
+            OpInfo::Clip(bounds) => named_sen169_consts(bounds.named_words().into_iter(), folds),
             OpInfo::None | OpInfo::FusedEpilogue { .. } => serde_json::json!({}),
         }
     };
@@ -4893,6 +4963,8 @@ pub(crate) fn convert_dtypes(op: OpFunc) -> (Df, Df) {
     match op {
         OpFunc::Dl16ToFp32 => (Df::Fp16, Df::Fp32),
         OpFunc::Fp32ToDl16 => (Df::Fp32, Df::Fp16),
+        // fp8todl16: SEN143_FP8 (E4M3) → f16, qfp8ch's inverse — a float8 KV page widened on read.
+        OpFunc::Fp8ToDl16 => (Df::Fp8, Df::Fp16),
         // qfp8ch: f16 activation → SEN143_FP8 (E4M3). The DDL `matmulfp8` then consumes the fp8 stick.
         OpFunc::Qfp8ch => (Df::Fp16, Df::Fp8),
         // fp32toint32: IEEE_FP32 value → SENUINT32 index. ⛔ THE INPUT TENSOR
@@ -4915,6 +4987,19 @@ pub(crate) fn convert_dtypes(op: OpFunc) -> (Df, Df) {
         // noise's wrap-fold extraction (front-b-noise) rides it.
         OpFunc::Int32ToFp32 => (Df::SenUint32, Df::Fp32),
         _ => (Df::Fp16, Df::Fp16),
+    }
+}
+
+/// ⭐ THE STICK A CONVERT'S WORK DIVISION KEEPS WHOLE — the WIDER of its two formats' sticks
+/// ([`convert_dtypes`]): a convert touches both dataspaces per core, so a core's slab must be a whole
+/// stick of each. Read by every convert's opspec ([`convert_opspec`], and a float8 page's gather
+/// widening as it lands: [`crate::ir::bridge::tiled_op_sdsc_op::Widens`]).
+pub(crate) fn convert_stick_df(op: OpFunc) -> Df {
+    let (in_df, out_df) = convert_dtypes(op);
+    if out_df.elems_per_stick() >= in_df.elems_per_stick() {
+        out_df
+    } else {
+        in_df
     }
 }
 
@@ -4947,11 +5032,7 @@ fn convert_opspec(
     // qfp8ch is f16→fp8, so the fp8 output's 128-lane stick binds (NOT the f16 input's 64), else a
     // core gets a 64-wide slab = HALF an fp8 stick → dxp `L3DlOpsScheduler:1070`. This df drives the
     // work-division stick basis; fp16→fp32 keeps 64 (fp16 wider than fp32's 32) ⇒ byte-identical.
-    let stick_df = if out_df.elems_per_stick() >= in_df.elems_per_stick() {
-        out_df
-    } else {
-        in_df
-    };
+    let stick_df = convert_stick_df(op);
     // Validate `cols` against the WIDER stick (128 for the fp8 output), not just fp16's 64: an fp8
     // convert whose cols is a 64- but not 128-multiple is a typed `Err` here, never a sub-stick fault.
     assert_df_stick_multiple(cols, stick_df)?;
@@ -7072,6 +7153,7 @@ pub fn op_func_from_str(s: &str) -> OpFunc {
         "sigmoid" => OpFunc::Sigmoid,
         "dl16tofp32" => OpFunc::Dl16ToFp32,
         "fp32todl16" => OpFunc::Fp32ToDl16,
+        "fp8todl16" => OpFunc::Fp8ToDl16,
         "fp32toint32" => OpFunc::Fp32ToInt32,
         "gelu" => OpFunc::Gelu,
         "mish" => OpFunc::Mish,
@@ -7086,7 +7168,6 @@ pub fn op_func_from_str(s: &str) -> OpFunc {
         "identity" => OpFunc::Identity,
         "maximum" => OpFunc::Maximum,
         "minimum" => OpFunc::Minimum,
-        "clip" => OpFunc::Clip,
         "qfp8ch" => OpFunc::Qfp8ch,
         "quantscalepertokenfp8" => OpFunc::QuantScalePerTokenFp8,
         "lesserthan" => OpFunc::LesserThan,
@@ -7176,6 +7257,28 @@ pub fn sen169_bits(v: f32) -> u16 {
         return sign | (62 << 9) | 0x1FF; // saturate to max finite
     }
     sign | ((exp_field as u16) << 9) | (mant as u16 & 0x1FF)
+}
+
+/// ⭐ NAMED SEN169 EXTERNAL CONSTANTS — `constantInfo_` as `{"<i>": {dataFormat_, name_, data_}}`, one
+/// entry per name, in order, each value ONE SEN169 word: the one writer of an op func's table
+/// ([`OpFunc::op_consts`]) and of a `clip`'s bounds ([`crate::superdsc_opspec::ClipBounds`]).
+fn named_sen169_consts<'a>(
+    entries: impl Iterator<Item = (&'a str, u16)>,
+    folds: &SdscFoldSet,
+) -> serde_json::Value {
+    serde_json::Value::Object(
+        entries
+            .map(|(cname, word)| {
+                serde_json::json!({
+                    "dataFormat_": "SEN169_FP16",
+                    "name_": cname,
+                    "data_": fold_manager_const(u32::from(word), folds)
+                })
+            })
+            .enumerate()
+            .map(|(i, entry)| (i.to_string(), entry))
+            .collect(),
+    )
 }
 
 /// `constantInfo_.data_` as the NEW (post-2026-09) dxp contract demands it: a FoldManager

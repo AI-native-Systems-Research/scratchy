@@ -435,7 +435,7 @@ fn emit_regions<T: ktir_superdsc::collective::Tp>(
         // THIRTEEN parameters — lowered from its compiled ops through the
         // whole-function door (`emit_whole`), and a per-`Program` dispatch would be a
         // second, hand-rolled path. Do not add one.
-        Program::Sample | Program::PagedAttn | Program::PagedKvWrite => {
+        Program::Sample | Program::PagedAttn | Program::PagedKvWrite | Program::KvQuantize => {
             return Err(Error {
                 stage: "program",
                 message: format!(

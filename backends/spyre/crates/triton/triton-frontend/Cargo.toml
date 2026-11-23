@@ -27,5 +27,9 @@ default = []
 # THIS crate, so the reverse edge lives in dev-dependencies where it cannot cycle.
 [dev-dependencies]
 triton-ktir = { path = "../triton-ktir" }
+# THE PAGED KERNELS' ONE SPEC BUILDERS (`const_fold.rs`'s shipped-kernel folds). The same reverse
+# edge as triton-ktir's: a dev-dependency, where it cannot cycle.
+scratchy-triton-splice = { path = "../splice" }
+ktir-superdsc = { path = "../../ktir/ktir-superdsc" }
 
 [dependencies]

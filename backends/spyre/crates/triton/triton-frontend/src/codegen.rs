@@ -1124,6 +1124,22 @@ impl<'a> CodeGen<'a> {
                     ("dtype", Val::Ir(id)) => {
                         return Ok(Val::Dtype(self.sem.ty(*id).scalar().clone()));
                     }
+                    // A descriptor's dtype is its block's ELEMENT type (Triton's
+                    // `tensor_descriptor_base.dtype`, `core.py`) — what `k_dst.dtype` names in
+                    // `reshape_and_cache_head_major.py` — read off the handle's `!tt.tensordesc`.
+                    ("dtype", Val::Desc { handle, .. }) => {
+                        return match self.sem.ty(*handle) {
+                            Type::TensorDesc(_, e) => Ok(Val::Dtype((*e).clone())),
+                            other => Err(Error::new(
+                                format!(
+                                    "a tensor descriptor's handle is `{other}`, not a \
+                                     `!tt.tensordesc`, so it states no element type"
+                                ),
+                                pos.line,
+                                pos.col,
+                            )),
+                        };
+                    }
                     ("shape", Val::Ir(id)) => {
                         let s = self.sem.ty(*id).shape().to_vec();
                         return Ok(Val::Seq(
@@ -1281,6 +1297,20 @@ impl<'a> CodeGen<'a> {
     }
 
     fn comparison(&mut self, op: CmpKind, l: Val, r: Val, pos: Pos) -> Result<Val> {
+        // ⭐ A DTYPE COMPARISON IS PYTHON'S, AT TRACE TIME — Triton's `dtype.__eq__`/`__ne__`
+        // (`core.py`) run while the kernel is traced, so `k_page.dtype != q.dtype` is a constexpr
+        // bool and the `if` on it is resolved here, never emitted. A dtype has no order.
+        if let (Val::Dtype(a), Val::Dtype(b)) = (&l, &r) {
+            return match op {
+                CmpKind::Eq => Ok(Val::Bool(a == b)),
+                CmpKind::NotEq => Ok(Val::Bool(a != b)),
+                _ => Err(Error::new(
+                    "two dtypes compare with `==` and `!=` only — a dtype has no order",
+                    pos.line,
+                    pos.col,
+                )),
+            };
+        }
         if l.is_const()
             && r.is_const()
             && let Some(v) = fold_compare(op, &l, &r)

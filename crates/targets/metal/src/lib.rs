@@ -300,7 +300,7 @@ pub mod metal_allocator;
 pub mod metal_mem;
 // A loaded model as metal runs it (`MetalWeights`), and the registry its loaders live in.
 pub mod model;
-pub use model::{MetalArchRegistration, MetalWeights, try_load};
+pub use model::{MetalArchRegistration, MetalKvCodec, MetalWeights, try_load};
 pub mod kv_int8;
 pub mod kv_int8_heads;
 pub mod mtl4_dispatch;

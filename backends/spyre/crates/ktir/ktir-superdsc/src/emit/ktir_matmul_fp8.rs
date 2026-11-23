@@ -14,8 +14,9 @@
 //! through the KTIR, from facts the KTIR itself states.
 
 use super::{
-    EmittedOp, In, assemble_convert, assemble_convert_col, assemble_pointwise_broadcast_off,
-    bmm_site, emit_sdsc_tiled, op_func_from_str, pw1, pw2, rb, rb_df, rbo,
+    ClipOp, EmittedOp, In, assemble_clip, assemble_convert, assemble_convert_col,
+    assemble_pointwise_broadcast_off, bmm_site, emit_sdsc_tiled, op_func_from_str, pw1, pw2, rb,
+    rb_df, rbo,
 };
 use crate::ir::bridge::tiled_op_sdsc_op::reduce::{
     assemble_reduce_off, assemble_reduce_seeded, reduce_opspec, win_reduce_accum, win_reduce_data,
@@ -455,7 +456,8 @@ pub(crate) fn fp8_quantize_descriptors<T: crate::collective::Tp>(
             // `FMIN(FMAX(x, clipMin), clipMax)` (`unary_pipeline.ddl:370-377` PE stage, `:472-479` SFP
             // stage) — the same min/max pair the two ops it replaces encoded, so the swap is
             // value-preserving by construction. The ±448 E4M3 bounds arrive as the external constants
-            // `clipMin`/`clipMax` out of the descriptor's `constantInfo_` ([`OpFunc::op_consts`]),
+            // `clipMin`/`clipMax` out of the descriptor's `constantInfo_` (this op's own
+            // [`crate::superdsc_opspec::ClipBounds`]),
             // NOT as the `[1, stick]` H2D tensor operands `fq_chi`/`fq_cl` read through
             // `In::scalar(&pos448)`/`In::scalar(&neg448)` — the constants dxp folds before the
             // constant tables, per the same contract as `quantscalepertokenfp8`'s three. 2 ops → 1,
@@ -468,13 +470,18 @@ pub(crate) fn fp8_quantize_descriptors<T: crate::collective::Tp>(
             // dropping entries would shift every later tensor and confound a coherence comparison
             // with the baseline.
             let cl_h = rb(&cl, m, cl_reach);
-            ops.push(pw1(
-                &opn("fq_clip_op"),
-                "clip",
-                m_rows,
-                k_cols,
-                In::full(&sc_h),
-                &cl_h,
+            ops.push(assemble_clip(
+                ClipOp {
+                    op_name: &opn("fq_clip_op"),
+                    bounds: crate::superdsc_opspec::ClipBounds::new(
+                        -ktir_core::codec::E4M3_FMAX,
+                        ktir_core::codec::E4M3_FMAX,
+                    ),
+                    rows: m_rows,
+                    cols: k_cols,
+                    a: In::full(&sc_h),
+                    o: &cl_h,
+                },
                 sym_id_base,
                 layout,
             )?);

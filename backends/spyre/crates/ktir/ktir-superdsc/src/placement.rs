@@ -23,7 +23,7 @@ use crate::addr::{DevOff, Win};
 use crate::place::{PlaceId, SynthId};
 use crate::sdsc_abstract::{KindTag, StickKind, StickLayout, Stk};
 use crate::superdsc_error::SuperDscError;
-use crate::superdsc_opspec::Df;
+use crate::superdsc_opspec::{DataFormat, Df};
 
 /// HBM SEGMENT each tensor ROLE owns in the packed bundle (≤7; seg7 is the
 /// flex-reserved program segment, never a data operand). Indexes [`crate::wire::SEGMENT_OFFSETS`].
@@ -1488,30 +1488,32 @@ impl BundleLayout {
         }
     }
 
-    /// ⭐ A BUFFER ALLOCATED ROW-OUTERMOST — its fp16 elements in order, `[rows][sticks][stick]`:
+    /// ⭐ A BUFFER ALLOCATED ROW-OUTERMOST — its `DF` elements in order, `[rows][sticks][stick]`:
     /// torch-spyre's row-outermost `SpyreTensorLayout`, the one spyre-inference allocates its paged
-    /// KV cache in (`head_major_kv_layout`, device `[pages·kv, block, sticks, stick]`, which keeps the
-    /// indexed row whole at device position 0). One row of it is one contiguous run in whatever frame
-    /// a program reads it, so a gather of a row is one copy. Stated by whoever allocates the buffer,
-    /// through the arrangement authority and before any op addresses it, so an op that then addresses
-    /// it stick-major is the authority's build `Err`.
-    pub fn allocate_row_outermost(&self, tid: u32) -> Result<(), SuperDscError> {
+    /// KV cache in (`head_major_kv_layout`, device `[pages·kv, block, sticks, eps]` at the cache's own
+    /// `eps = get_elem_in_stick(dtype)`, which keeps the indexed row whole at device position 0). One
+    /// row of it is one contiguous run in whatever frame a program reads it, so a gather of a row is
+    /// one copy. Stated by whoever allocates the buffer, at the buffer's own format, through the
+    /// arrangement authority and before any op addresses it, so an op that then addresses it
+    /// stick-major is the authority's build `Err`.
+    pub fn allocate_row_outermost<DF: DataFormat>(&self, tid: u32) -> Result<(), SuperDscError> {
         let Some(p) = self.placements.get(&tid) else {
             return Err(SuperDscError(format!(
                 "t{tid} is allocated row-outermost but this bundle never placed it"
             )));
         };
-        let stick = u64::from(Df::Fp16.elems_per_stick());
-        let elems = p.size / 2;
+        let stick = u64::from(DF::ELEMS_PER_STICK);
+        let elems = p.size / u64::from(DF::WORD_LENGTH);
         if !elems.is_multiple_of(stick) {
             return Err(SuperDscError(format!(
-                "t{tid}: a row-outermost allocation of {elems} fp16 elements is not whole \
-                 {stick}-element sticks"
+                "t{tid}: a row-outermost allocation of {elems} {} elements is not whole \
+                 {stick}-element sticks",
+                DF::NAME
             )));
         }
         self.declare_arrangement(
             &crate::place::act_name(tid),
-            StickLayout::flat((elems / stick) as usize, stick as usize),
+            StickLayout::flat_df((elems / stick) as usize, stick as usize, DF::DF),
         )
         .map(drop)
     }

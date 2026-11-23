@@ -102,10 +102,27 @@ use scratchy_subtile::subtile_ir::{
     AttnScaleSite, EwKind, GainConvention, SubOp, SubtileIR, SubtileNode,
 };
 
+use ktir_superdsc::superdsc_opspec::{DataFormat, FloatFormat};
 use triton_frontend::codegen::{ArgSpec, KernelSpec};
 use triton_frontend::semantic::Val;
 use triton_frontend::target::Target;
+use triton_frontend::ttir::FloatKind;
 use triton_ktir_superdsc::CompiledKernel;
+
+/// The Triton float a pool held at format `P` is stated as — found in the door's own mapping
+/// ([`stated_float`]) as an associated CONST, evaluated for every `P` a caller names, so a format
+/// with no Triton float is a compile error at that caller.
+struct PoolFloat<P>(core::marker::PhantomData<P>);
+
+impl<P: DataFormat> PoolFloat<P> {
+    const KIND: FloatKind = stated_float(P::DF);
+}
+
+/// ⭐ A PAGED POOL'S POINTER TYPE at format `P` — the one statement every paged kernel's
+/// `k_pages`/`v_pages` and the write's `k_rows`/`v_rows` take.
+fn pool_ptr<P: DataFormat>() -> ArgSpec {
+    ArgSpec::Ptr(triton_frontend::ttir::Type::Float(PoolFloat::<P>::KIND))
+}
 
 /// One registry row: the kernel's SOURCE TEXT and entry, and the STATED classification —
 /// declared data, not logic. Adding a kernel is a row; nothing else in this crate changes.
@@ -398,6 +415,8 @@ pub fn row<F: scratchy_subtile::subtile_ir::RopeForm>(op: &SubOp<F>) -> TritonKe
             entry: "reshape_fwd",
             program: Program::Reshape,
         },
+        // ⭐ THE FLOAT8 KV CACHE'S QUANTIZE — the one-op splice of `quantize_kv.py`.
+        SubOp::KvQuantize { .. } => quantize_kv_row(),
         // ⭐ THE TOKEN DRAW — the whole vocab scan as ONE kernel per request
         // row: the row, its per-row noise block and temperature reciprocals,
         // the nine staged tables (functions of the vocab alone, host-staged at
@@ -683,6 +702,11 @@ pub fn lower_all<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile_
             lower_one(node, ir, rows_are_requests)?,
             lower_kv_write(node, ir)?,
         ]);
+    }
+    // ⭐ AN UN-ROTATED KV WRITER IS ITS PAGED WRITE ALONE — the float8 cache's (`KvCodec::Fp8E4m3`:
+    // its K and V are its `KvQuantize`s) and any other.
+    if let SubOp::KvAppend { .. } = &node.op {
+        return Ok(vec![lower_kv_write(node, ir)?]);
     }
     lower_one(node, ir, rows_are_requests).map(|e| vec![e])
 }
@@ -1233,8 +1257,11 @@ fn lower_one<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile_ir::
         // storage (row 0 alone at S = 1), a legal prefix view — and every operand
         // the draw binds (the per-row pair, the nine tables, the idx stick) is
         // whole at corner 0.
-        let states_neither_corner =
-            matches!(&node.op, SubOp::TanhSoftCap { .. } | SubOp::Sample { .. });
+        // The float8 cache's quantize is the same law: its view is the whole `[T, kv_width]` K or V.
+        let states_neither_corner = matches!(
+            &node.op,
+            SubOp::TanhSoftCap { .. } | SubOp::Sample { .. } | SubOp::KvQuantize { .. }
+        );
         if states_neither_corner {
             let corner0 = |tr: &scratchy_subtile::subtile_ir::TensorRegion| {
                 tr.region.rows.start == 0 && tr.region.cols.start == 0
@@ -1331,7 +1358,10 @@ fn lower_one<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile_ir::
         // wall-4 ruling (a); the row word is GONE from the key — the P3
         // localization ruling, 2026-10-27, request-owned noise alone.)
         SubOp::Sample { .. } => 26,
-        SubOp::TanhSoftCap { .. } | SubOp::RmsNormUnit { .. } | SubOp::Reshape { .. } => 1,
+        SubOp::TanhSoftCap { .. }
+        | SubOp::RmsNormUnit { .. }
+        | SubOp::Reshape { .. }
+        | SubOp::KvQuantize { .. } => 1,
         // ⛔ NO `_` ARM. A spliced kind is a row above, and a row without an arity here is
         // an unreachable — the same discipline `lower_one_node`'s match holds.
         _ => {
@@ -1692,6 +1722,11 @@ pub fn lower_block_copy<
 /// [`PoolPageSlots`]) is a DIFFERENT quantity: before they were types, a plain integer
 /// accepted either. Integer boundaries call `.get()`.
 pub use ktir_superdsc::sdsc_abstract::{HeadWidth, PoolPageSlots, SchedulerBlockTokens};
+/// The shared head facts every paged kernel's geometry states — re-exported so the leg and the tests
+/// mint them from the same crate the splice reads them from.
+pub use scratchy_ir::model_facts::{
+    AttnScale, BlockSize, HeadDim, HeadGeometry, KvHeads, QueryHeads, RotDim,
+};
 
 /// An int32 stick (spyre-inference's `INT32_ELEMS_PER_STICK`).
 pub const INT32_STICK: u32 = 32;
@@ -1942,26 +1977,43 @@ pub fn kv_write_row() -> TritonKernelRow {
 }
 
 /// The pool a cache tensor is: `pages` of `SchedulerBlockTokens::REFERENCE` slots at `kv_width = nkvh · hd` per slot.
-/// Refused unless the cache is exactly that — a whole number of pages of the stated width.
+/// Refused unless the cache is exactly that — a whole, positive number of pages of the stated width,
+/// which is the `NonZeroU32` it answers.
 fn pool_pages<F: scratchy_subtile::subtile_ir::RopeForm>(
     ir: &SubtileIR<F>,
     cache: &scratchy_subtile::subtile_ir::TensorRegion,
     kv_width: u32,
     what: &str,
-) -> Result<u32, String> {
+) -> Result<std::num::NonZeroU32, String> {
     let t = &ir.tensors[cache.tensor.index()];
     let block = SchedulerBlockTokens::REFERENCE.get();
-    if t.cols != kv_width || t.rows == 0 || !t.rows.is_multiple_of(block) {
-        return Err(format!(
-            "triton splice: the {what} cache t{} is [{}, {}], which is not a whole number of \
-             {block}-slot pages at {kv_width} columns — the pool it is read as is \
-             [pages, nkvh, {block}, hd] over exactly those bytes",
-            cache.tensor.index(),
-            t.rows,
-            t.cols
-        ));
-    }
-    Ok(t.rows / SchedulerBlockTokens::REFERENCE.get())
+    std::num::NonZeroU32::new(t.rows / block)
+        .filter(|_| t.cols == kv_width && t.rows.is_multiple_of(block))
+        .ok_or_else(|| {
+            format!(
+                "triton splice: the {what} cache t{} is [{}, {}], which is not a whole number of \
+                 {block}-slot pages at {kv_width} columns — the pool it is read as is \
+                 [pages, nkvh, {block}, hd] over exactly those bytes",
+                cache.tensor.index(),
+                t.rows,
+                t.cols
+            )
+        })
+}
+
+/// A count a graph region states, as the nonzero a paged kernel's geometry takes. A region of no
+/// rows, or a walk of no pages, is a malformed graph: refused by name at the bake, never compiled
+/// at an empty extent.
+fn positive(n: u32, what: &str) -> Result<std::num::NonZeroU32, String> {
+    std::num::NonZeroU32::new(n).ok_or_else(|| {
+        format!("triton splice: {what} is zero — a paged kernel counts positive extents")
+    })
+}
+
+/// A test's positive extent, as the nonzero a geometry takes.
+#[cfg(test)]
+fn nz(v: u32) -> std::num::NonZeroU32 {
+    std::num::NonZeroU32::new(v).expect("a test extent is positive")
 }
 
 /// A region that is its whole tensor, `rows × cols` — what a kernel viewing the tensor from corner
@@ -2072,26 +2124,12 @@ pub fn lower_attn<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile
 ) -> Result<Vec<EmittedOp<T>>, String> {
     let batch = paged_rows == PagedRows::Batch;
     let decode = !batch && node.output.region.rows.len == 1;
-    let row = if batch {
-        batched_decode_row()
-    } else if decode {
-        attn_decode_row()
-    } else {
-        attn_row()
-    };
-    let (src, file, entry, program) = match &row {
-        TritonKernelRow::Spliced {
-            src,
-            file,
-            entry,
-            program,
-        } => (*src, *file, *entry, *program),
-        TritonKernelRow::Refused(why) => return Err(why.to_string()),
-    };
-    // ⛔ EVERY FIELD NAMED, NO `..`: spyre-inference's kernels take a soft cap, a float8 cache and the
-    // query's dtype, and this port takes none of them (the state and dots are f16, the cache is in
-    // the model's 16-bit dtype). The op states none of them either, so none reaches here today; a
-    // field added for one is a compile error at this line rather than an attention run without it.
+    // ⛔ EVERY FIELD NAMED, NO `..`: spyre-inference's kernels take a soft cap, a float8 cache and
+    // the query's dtype. The cache's element type is the tape's (`attn_pool_format`), stated on the
+    // pool pointers ([`pool_ptr`]) and widened in the kernel exactly where theirs is
+    // (`k_page.dtype != q.dtype`); the soft cap and the query's dtype this port does not take (the
+    // state and dots are f16). The op states neither, so neither reaches here today; a field added
+    // for one is a compile error at this line rather than an attention run without it.
     let SubOp::AttnDecode {
         valid_len: _,
         layout: _,
@@ -2177,13 +2215,14 @@ pub fn lower_attn<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile
     // decode kernel (one query row) and the batched kernel (the request axis carried inside one
     // launch) keep the graph's row count, exactly as before.
     let blocks = if batch || decode {
-        walk_pages(pages, mq, active_cap)
+        walk_pages(pages.get(), mq, active_cap)
     } else {
-        walk_pages(pages, query_rows.per_request().get(), active_cap)
+        walk_pages(pages.get(), query_rows.per_request().get(), active_cap)
     };
     let tids = PagedStepTids::RESERVED;
-    let mut signature: HashMap<String, ArgSpec> = HashMap::new();
-    let mut constexprs: HashMap<String, Val> = HashMap::new();
+    // ⭐ THE POOLS' FORMAT IS THE TAPE'S — the writer this attention's cache names
+    // ([`attn_pool_format`]), never a build selection.
+    let format = attn_pool_format(ir, node)?;
     let t =
         |tr: &scratchy_subtile::subtile_ir::TensorRegion| BufferId::new(tr.tensor.index() as u32);
     if batch {
@@ -2196,7 +2235,7 @@ pub fn lower_attn<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile
         // (tinyllama-1.1b, 2048) bakes no spyre decode at all (its head is untied). PORTING their
         // loop is what admits such a pool.
         let chunking = BatchChunking::of(mq, blocks, nkvh, g.q_width(), g.head_dim().get());
-        if chunking.entries() >= pages {
+        if chunking.entries() >= pages.get() {
             return Err(format!(
                 "triton splice: AttnDecode t{}: a {mq}-sequence decode walking {blocks} block(s) \
                  gathers {} page(s) a chunk, and the pool holds {pages} — a gather of the whole \
@@ -2206,46 +2245,17 @@ pub fn lower_attn<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile
                 chunking.entries()
             ));
         }
-        for (p, ty) in [
-            ("query", "*fp16"),
-            ("rep_row_ids", "*i32"),
-            ("k_pages", "*fp16"),
-            ("v_pages", "*fp16"),
-            ("chunk_page_ids", "*i32"),
-            ("mask_by_chunk", "*fp16"),
-            ("out", "*fp16"),
-        ] {
-            signature.insert(
-                p.to_string(),
-                ArgSpec::parse(ty).map_err(|e| e.to_string())?,
-            );
-        }
-        for (k, v) in [
-            ("NUM_TOKENS", mq),
-            ("NUM_SEQS", chunking.seqs),
-            ("BLOCKS_PER_CHUNK", chunking.blocks_per_chunk),
-            ("NUM_CHUNKS", chunking.num_chunks),
-            ("NUM_KV_HEADS", nkvh),
-            ("NUM_QUERIES_PER_KV", nqh / nkvh),
-            ("BLOCK_SIZE", SchedulerBlockTokens::REFERENCE.get()),
-            ("HEAD_SIZE", hd.get()),
-            ("NUM_PAGES", pages),
-            ("ROWS_PER_PAGE", chunking.rows_per_page),
-        ] {
-            signature.insert(k.to_string(), ArgSpec::Constexpr);
-            constexprs.insert(k.to_string(), Val::Int(i128::from(v)));
-        }
-        signature.insert("SCALE".to_string(), ArgSpec::Constexpr);
-        constexprs.insert("SCALE".to_string(), Val::Float(f64::from(scale)));
-        let spec = KernelSpec {
-            kernel: entry.to_string(),
-            signature,
-            constexprs,
-            file: file.to_string(),
-        };
-        let module = compile_kernel(src, &spec, &[1])?;
-        let positional = triton_ktir_superdsc::node_for_compiled(&module, program)
-            .map_err(|e| format!("triton splice: node_for: {e}"))?;
+        let positional = batched_decode_at(
+            format,
+            BatchedDecodeGeometry {
+                rows: TokenRows::new(query_rows.graph_rows().rows()),
+                heads: g,
+                block: SchedulerBlockTokens::REFERENCE,
+                pages: PoolPages::new(pages),
+                chunking,
+                scale: AttnScale::new(scale),
+            },
+        )?;
         let k = rebind(
             positional,
             format!("attn_s{}", node.id.index()),
@@ -2264,54 +2274,24 @@ pub fn lower_attn<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile
         e.ktir = Some(k);
         return Ok(vec![e]);
     }
-    let mut pointers = vec![
-        ("query", "*fp16"),
-        ("query_row_index", "*i32"),
-        ("k_pages", "*fp16"),
-        ("v_pages", "*fp16"),
-        ("page_index_table", "*i32"),
-    ];
-    if decode {
-        pointers.push(("kv_row_pool", "*i32"));
-    }
-    pointers.extend([("mask_stack", "*fp16"), ("out", "*fp16")]);
-    for (p, ty) in pointers {
-        signature.insert(
-            p.to_string(),
-            ArgSpec::parse(ty).map_err(|e| e.to_string())?,
-        );
-    }
-    let mut sizes = vec![
-        ("NUM_TOKENS", mq),
-        ("NUM_HEADS", nqh),
-        ("NUM_KV_HEADS", nkvh),
-        ("HEAD_SIZE", hd.get()),
-        ("BLOCK_SIZE", SchedulerBlockTokens::REFERENCE.get()),
-        ("NUM_PAGES", pages),
-        ("NUM_BLOCKS", blocks),
-    ];
-    if !decode {
-        // ⭐ ONE REQUEST'S QUERY WIDTH, NOT THE GRAPH'S ROWS — the kernel gathers `P` rows through
-        // `query_row_index` (a per-request table) and scatters them back through the same rows, so
-        // its padded query length is the rung's per-request width. At one request the two agree,
-        // which is why one `mq` served until S > 1.
-        sizes.push(("PADDED_QUERY_LEN", query_rows.per_request().get()));
-    }
-    for (k, v) in sizes {
-        signature.insert(k.to_string(), ArgSpec::Constexpr);
-        constexprs.insert(k.to_string(), Val::Int(i128::from(v)));
-    }
-    signature.insert("SCALE".to_string(), ArgSpec::Constexpr);
-    constexprs.insert("SCALE".to_string(), Val::Float(f64::from(scale)));
-    let spec = KernelSpec {
-        kernel: entry.to_string(),
-        signature,
-        constexprs,
-        file: file.to_string(),
-    };
-    let module = compile_kernel(src, &spec, &[1])?;
-    let positional = triton_ktir_superdsc::node_for_compiled(&module, program)
-        .map_err(|e| format!("triton splice: node_for: {e}"))?;
+    let positional = paged_attn_at(
+        format,
+        PagedAttnGeometry {
+            seq: if decode {
+                PagedSequence::Decode
+            } else {
+                PagedSequence::Prefill {
+                    padded_query_len: TokenRows::new(query_rows.per_request().rows()),
+                }
+            },
+            rows: TokenRows::new(query_rows.graph_rows().rows()),
+            heads: g,
+            block: SchedulerBlockTokens::REFERENCE,
+            pages: PoolPages::new(pages),
+            blocks: WalkBlocks::new(positive(blocks, "the attention's walked pages")?),
+            scale: AttnScale::new(scale),
+        },
+    )?;
     // ⭐ THE WINDOW FAMILY — a prefill pair's capacity is how many one-sequence programs the one
     // compiled module is rebind to. Every OTHER arm is one window by its own pair: a batch's rows
     // are one request's one token each (`paged_rows == Batch`), so its capacity names QUERY ROWS a
@@ -2390,10 +2370,212 @@ pub fn lower_attn<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile
     Ok(out)
 }
 
-/// THE KV WRITE'S SPLICE — the scatter half of a `RopeAppend`: compile spyre-inference's
-/// `reshape_and_cache_head_major_kernel` for the node's rows and pools, and mint the
-/// `Program::PagedKvWrite` node over their operands: `[key, value, k_rows, v_rows, row_index]`, where
-/// `key` is the RopeAppend's own output (the rotated K) and `value` its V input.
+/// ⭐ A KV POOL'S ELEMENT FORMAT, AS THE TAPE STATES IT — one answer per KV writer, read by every
+/// reader of its pools: the write's and the attention's kernels ([`kv_write_at`],
+/// [`paged_attn_at`], [`batched_decode_at`]) and the bake's pool placement ([`kv_pool_formats`]).
+/// The shared float8 codec (`KvCodec::Fp8E4m3`) states its cache as a `KvAppend` of two
+/// `KvQuantize` outputs (`scratchy_subtile::kv_codec::expand_kv_quantize`); a writer storing values
+/// no quantize produced stores the model's 16-bit values.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KvPoolFormat {
+    Fp16,
+    /// Float8 at the model's KV scales — the writer's quantizes' own.
+    Fp8(scratchy_ir::KvCacheScales),
+}
+
+impl KvPoolFormat {
+    /// The pools' device format.
+    pub const fn df(self) -> Df {
+        match self {
+            KvPoolFormat::Fp16 => Df::Fp16,
+            KvPoolFormat::Fp8(_) => Df::Fp8,
+        }
+    }
+}
+
+/// The format of the pools `writer` fills ([`KvPoolFormat`]). A writer whose K and V disagree is
+/// refused by name: one pool pair holds one format.
+pub fn kv_pool_format<F: scratchy_subtile::subtile_ir::RopeForm>(
+    ir: &SubtileIR<F>,
+    writer: &SubtileNode<F>,
+) -> Result<KvPoolFormat, String> {
+    // The scales of the quantize that produced `r`, if one did.
+    let quantized = |r: &scratchy_subtile::subtile_ir::TensorRegion| {
+        ir.nodes.iter().find_map(|n| match n.op {
+            SubOp::KvQuantize { scales, .. } if n.output.tensor == r.tensor => Some(scales),
+            _ => None,
+        })
+    };
+    match (&writer.op, &writer.inputs[..]) {
+        (SubOp::RopeAppend { .. }, _) => Ok(KvPoolFormat::Fp16),
+        (SubOp::KvAppend { .. }, [k, v, _, _]) => match (quantized(k), quantized(v)) {
+            (Some(ks), Some(vs)) if ks == vs => Ok(KvPoolFormat::Fp8(ks)),
+            (None, None) => Ok(KvPoolFormat::Fp16),
+            _ => Err(format!(
+                "triton splice: KvAppend t{}: one of its K and V is a KvQuantize output and the \
+                 other is not, or their scales differ — one pool pair holds one format",
+                writer.output.tensor.index()
+            )),
+        },
+        (op, _) => Err(format!(
+            "triton splice: t{} ({}) is not a KV writer, so it states no pool format",
+            writer.output.tensor.index(),
+            op.name()
+        )),
+    }
+}
+
+/// The format of the pools `attn` reads: its cache's writer's ([`kv_pool_format`]), the node its
+/// producer names. A cache no writer of this forward fills states none, refused by name.
+pub fn attn_pool_format<F: scratchy_subtile::subtile_ir::RopeForm>(
+    ir: &SubtileIR<F>,
+    attn: &SubtileNode<F>,
+) -> Result<KvPoolFormat, String> {
+    let SubOp::AttnDecode {
+        producer:
+            scratchy_subtile::subtile_ir::KvCacheProducer::SameForwardRopeAppend {
+                producer_node_idx,
+                ..
+            },
+        ..
+    } = &attn.op
+    else {
+        return Err(format!(
+            "triton splice: t{}: an attention whose cache no writer of this forward fills states \
+             no pool format",
+            attn.output.tensor.index()
+        ));
+    };
+    let writer = ir.nodes.get(*producer_node_idx as usize).ok_or_else(|| {
+        format!(
+            "triton splice: t{}: its cache's producer, node {producer_node_idx}, is not in the \
+             graph",
+            attn.output.tensor.index()
+        )
+    })?;
+    kv_pool_format(ir, writer)
+}
+
+/// ⭐ EVERY KV POOL'S FORMAT, in the order the graph's attentions name their caches — the bake's
+/// placement reads these, never a build selection. A pool two attentions read at two formats is
+/// refused by name.
+pub fn kv_pool_formats<F: scratchy_subtile::subtile_ir::RopeForm>(
+    ir: &SubtileIR<F>,
+) -> Result<Vec<(u32, KvPoolFormat)>, String> {
+    let mut out: Vec<(u32, KvPoolFormat)> = Vec::new();
+    for n in &ir.nodes {
+        let SubOp::AttnDecode { layout, .. } = &n.op else {
+            continue;
+        };
+        let format = attn_pool_format(ir, n)?;
+        for t in [layout.cache_tensor(), layout.v_cache_tensor()] {
+            let tid = t.index() as u32;
+            match out.iter().find(|(p, _)| *p == tid) {
+                None => out.push((tid, format)),
+                Some(&(_, f)) if f == format => {}
+                Some(&(_, f)) => {
+                    return Err(format!(
+                        "triton splice: pool t{tid} is read at {f:?} and at {format:?}"
+                    ));
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// The KV write's program at the pools' format — the one data→type door over [`KvPoolFormat`] for
+/// [`kv_write_program`].
+pub fn kv_write_at(format: KvPoolFormat, g: KvWriteGeometry) -> Result<KtirNode, String> {
+    match format {
+        KvPoolFormat::Fp16 => kv_write_program::<ktir_superdsc::superdsc_opspec::Fp16>(g),
+        // The write stores rows already scaled by their quantize: it is scale-free, the reference's
+        // `index_copy_`.
+        KvPoolFormat::Fp8(_) => kv_write_program::<ktir_superdsc::superdsc_opspec::Fp8>(g),
+    }
+}
+
+/// The per-sequence attention's program at the pools' format ([`paged_attn_program`]).
+pub fn paged_attn_at(format: KvPoolFormat, g: PagedAttnGeometry) -> Result<KtirNode, String> {
+    match format {
+        KvPoolFormat::Fp16 => paged_attn_program::<ktir_superdsc::superdsc_opspec::Fp16>(g),
+        // Unscaled: the softmax scale takes no `k_scale` and the output no `v_scale`, the reference's
+        // `_read_scales` and `page_attn_decode.py:143-144` at a cache stored unscaled.
+        KvPoolFormat::Fp8(scratchy_ir::KvCacheScales::Unscaled) => {
+            paged_attn_program::<ktir_superdsc::superdsc_opspec::Fp8>(g)
+        }
+    }
+}
+
+/// The batched decode's program at the pools' format ([`batched_decode_program`]).
+pub fn batched_decode_at(
+    format: KvPoolFormat,
+    g: BatchedDecodeGeometry,
+) -> Result<KtirNode, String> {
+    match format {
+        KvPoolFormat::Fp16 => batched_decode_program::<ktir_superdsc::superdsc_opspec::Fp16>(g),
+        KvPoolFormat::Fp8(scratchy_ir::KvCacheScales::Unscaled) => {
+            batched_decode_program::<ktir_superdsc::superdsc_opspec::Fp8>(g)
+        }
+    }
+}
+
+/// The float8 KV cache's quantize — `quantize_kv.py`, spyre-inference's `quantize_kv`
+/// (4a7d21d, `ops/reshape_and_cache.py:20-29`): one whole-tensor saturate and cast.
+pub fn quantize_kv_row() -> TritonKernelRow {
+    TritonKernelRow::Spliced {
+        src: include_str!("../../../../kernels/quantize_kv.py"),
+        file: "quantize_kv.py",
+        entry: "quantize_kv_fwd",
+        program: Program::KvQuantize,
+    }
+}
+
+/// ⭐ THE FLOAT8 KV CACHE'S QUANTIZE GEOMETRY — what `quantize_kv` is compiled at: the new K's (or
+/// V's) token rows and its width, whole float8 sticks.
+#[derive(Clone, Copy, Debug)]
+pub struct KvQuantizeGeometry {
+    pub rows: TokenRows,
+    pub cols: ktir_superdsc::superdsc_opspec::StickExtent<ktir_superdsc::superdsc_opspec::Fp8>,
+}
+
+/// ⭐ THE FLOAT8 KV CACHE'S QUANTIZE KERNEL — spyre-inference's `quantize_kv` over one whole
+/// `[rows, cols]` tensor (`[desc_x, desc_o]`): saturate to `±FMAX` (their
+/// `torch.finfo(dtype).max`, the float8 format's own), then cast to e4m3. ONE whole-tensor tile, as
+/// their one elementwise pass is: the program states no row corner, and the lowering's own work
+/// division splits the tensor across the cores, as it does every elementwise op's.
+pub fn kv_quantize_kernel(g: KvQuantizeGeometry) -> Result<PagedKernel, String> {
+    paged_kernel(
+        quantize_kv_row(),
+        vec![
+            ("desc_x", fixed("*fp16")?),
+            ("desc_o", pool_ptr::<ktir_superdsc::superdsc_opspec::Fp8>()),
+        ],
+        vec![
+            ("M", int(g.rows.get())),
+            ("N", int(g.cols.elems())),
+            (
+                "FMAX",
+                Val::Float(f64::from(
+                    <ktir_superdsc::superdsc_opspec::Fp8 as FloatFormat>::FMAX,
+                )),
+            ),
+        ],
+    )
+}
+
+/// ⭐ THE FLOAT8 KV CACHE'S QUANTIZE PROGRAM — [`kv_quantize_kernel`] minted positionally (`[x,
+/// out]`), the program `lower_one` splices for a `KvQuantize` node and the card leg launches.
+pub fn kv_quantize_program(g: KvQuantizeGeometry) -> Result<KtirNode, String> {
+    kv_quantize_kernel(g)?.program()
+}
+
+/// THE KV WRITE'S SPLICE — the scatter of a KV writer: compile spyre-inference's
+/// `reshape_and_cache_head_major_kernel` for the writer's rows and pools at the pools' format
+/// ([`kv_pool_format`]), and mint the `Program::PagedKvWrite` node over `[key, value, k_rows,
+/// v_rows, row_index]`. A `RopeAppend`'s `key` is its own output (the rotated K) and its `value` its
+/// V input; a `KvAppend`'s are its two value operands — the float8 cache's `KvQuantize`s
+/// (`KvCodec::Fp8E4m3`).
 pub fn lower_kv_write<
     T: ktir_superdsc::collective::Tp,
     F: scratchy_subtile::subtile_ir::RopeForm,
@@ -2401,103 +2583,86 @@ pub fn lower_kv_write<
     node: &SubtileNode<F>,
     ir: &SubtileIR<F>,
 ) -> Result<EmittedOp<T>, String> {
-    let row = kv_write_row();
-    let (src, file, entry, program) = match &row {
-        TritonKernelRow::Spliced {
-            src,
-            file,
-            entry,
-            program,
-        } => (*src, *file, *entry, *program),
-        TritonKernelRow::Refused(why) => return Err(why.to_string()),
-    };
-    let SubOp::RopeAppend {
-        attention,
-        rope,
-        attn,
-        ..
-    } = &node.op
-    else {
-        return Err(
-            "triton splice: lower_kv_write called on a node that is not a RopeAppend".to_string(),
-        );
-    };
-    if node.inputs.len() < 6 {
-        return Err(format!(
-            "triton splice: RopeAppend t{} expects 6 inputs [k, cos, sin, v, k cache, v cache], \
-             found {}",
-            node.output.tensor.index(),
-            node.inputs.len()
-        ));
-    }
-    // The class's facts off the op's own attention value (minted at the bridge): the head
-    // dim is the rope class's own, the head count the mask class's — never a division of
-    // the region's width, which is CHECKED against them below.
+    // The writer's key, value and pools, and the class's facts off the op's own attention value
+    // (minted at the bridge): the head dim is the writer's own, the head count the mask class's —
+    // never a division of the region's width, which is CHECKED against them below.
+    let (attention, head_dim, attn, [key, value, k_pool, v_pool]) =
+        match (&node.op, &node.inputs[..]) {
+            (
+                SubOp::RopeAppend {
+                    attention,
+                    rope,
+                    attn,
+                    ..
+                },
+                [_, _, _, v, kc, vc],
+            ) => (
+                *attention,
+                rope.head_dim(*attention),
+                *attn,
+                [&node.output, v, kc, vc],
+            ),
+            (
+                SubOp::KvAppend {
+                    attention,
+                    head_dim,
+                    attn,
+                    ..
+                },
+                [k, v, kc, vc],
+            ) => (*attention, *head_dim, *attn, [k, v, kc, vc]),
+            (op, inputs) => {
+                return Err(format!(
+                    "triton splice: lower_kv_write called on {} t{} with {} inputs — a KV writer \
+                     is a RopeAppend `[k, cos, sin, v, k cache, v cache]` or a KvAppend `[k, v, \
+                     k cache, v cache]`",
+                    op.name(),
+                    node.output.tensor.index(),
+                    inputs.len()
+                ));
+            }
+        };
+    let name = node.op.name();
     let g = attention.class(attn.class());
     let (hd, nkvh) = (
-        HeadWidth::of_whole_sticks(rope.head_dim(*attention).get()),
+        HeadWidth::of_whole_sticks(head_dim.get()),
         g.kv_heads().get(),
     );
-    let (rows, kv_width) = (node.output.region.rows.len, node.output.region.cols.len);
+    let (rows, kv_width) = (key.region.rows.len, key.region.cols.len);
     if kv_width != nkvh * hd.get() {
         return Err(format!(
-            "triton splice: RopeAppend t{}: its {kv_width}-column K is not the class's \
-             {nkvh} whole heads of {hd_wide}",
+            "triton splice: {name} t{}: its {kv_width}-column K is not the class's {nkvh} whole \
+             heads of {hd_wide}",
             node.output.tensor.index(),
             hd_wide = hd.get()
         ));
     }
-    whole(ir, &node.output, rows, kv_width, "rotated K")?;
-    whole(ir, &node.inputs[3], rows, kv_width, "V")?;
-    let pages = pool_pages(ir, &node.inputs[4], kv_width, "K")?;
-    if pool_pages(ir, &node.inputs[5], kv_width, "V")? != pages {
+    whole(ir, key, rows, kv_width, "K")?;
+    whole(ir, value, rows, kv_width, "V")?;
+    let pages = pool_pages(ir, k_pool, kv_width, "K")?;
+    if pool_pages(ir, v_pool, kv_width, "V")? != pages {
         return Err(format!(
-            "triton splice: RopeAppend t{}: the K and V pools differ in pages",
+            "triton splice: {name} t{}: the K and V pools differ in pages",
             node.output.tensor.index()
         ));
     }
-    let mut signature: HashMap<String, ArgSpec> = HashMap::new();
-    let mut constexprs: HashMap<String, Val> = HashMap::new();
-    for (p, ty) in [
-        ("key", "*fp16"),
-        ("value", "*fp16"),
-        ("k_rows", "*fp16"),
-        ("v_rows", "*fp16"),
-        ("row_index", "*i32"),
-    ] {
-        signature.insert(
-            p.to_string(),
-            ArgSpec::parse(ty).map_err(|e| e.to_string())?,
-        );
-    }
-    for (k, v) in [
-        ("T", rows),
-        ("NUM_KV_HEADS", nkvh),
-        ("HEAD_SIZE", hd.get()),
-        (
-            "NUM_ROWS",
-            pages * nkvh * SchedulerBlockTokens::REFERENCE.get(),
-        ),
-    ] {
-        signature.insert(k.to_string(), ArgSpec::Constexpr);
-        constexprs.insert(k.to_string(), Val::Int(i128::from(v)));
-    }
-    let spec = KernelSpec {
-        kernel: entry.to_string(),
-        signature,
-        constexprs,
-        file: file.to_string(),
-    };
-    let module = compile_kernel(src, &spec, &[1])?;
-    let positional = triton_ktir_superdsc::node_for_compiled(&module, program)
-        .map_err(|e| format!("triton splice: node_for: {e}"))?;
+    let positional = kv_write_at(
+        kv_pool_format(ir, node)?,
+        KvWriteGeometry {
+            rows: TokenRows::new(positive(rows, "the KV write's token rows")?),
+            nkvh: g.kv_heads(),
+            hd,
+            block: SchedulerBlockTokens::REFERENCE,
+            pages: PoolPages::new(pages),
+        },
+    )?;
     let t =
         |tr: &scratchy_subtile::subtile_ir::TensorRegion| BufferId::new(tr.tensor.index() as u32);
     let bindings = vec![
-        t(&node.output),
-        t(&node.inputs[3]),
-        t(&node.inputs[4]),
-        t(&node.inputs[5]),
+        t(key),
+        t(value),
+        t(k_pool),
+        t(v_pool),
         BufferId::new(PagedStepTids::RESERVED.write_rows),
     ];
     let name = format!("kvwrite_s{}", node.id.index());
@@ -2505,6 +2670,306 @@ pub fn lower_kv_write<
     let mut e = EmittedOp::bare(name);
     e.ktir = Some(k);
     Ok(e)
+}
+
+/// ⭐ A POSITIVE COUNT OF A PAGED KERNEL'S GEOMETRY — one type per quantity, so a kernel's rows
+/// cannot stand where its pages do. The law is the storage's type, `NonZeroU32`: the constructor
+/// takes one and checks nothing, and a caller hands over the nonzero it already holds.
+macro_rules! paged_count {
+    ($($(#[$m:meta])* $name:ident),* $(,)?) => {$(
+        $(#[$m])*
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        pub struct $name(std::num::NonZeroU32);
+        impl $name {
+            /// The count.
+            pub const fn new(v: std::num::NonZeroU32) -> Self {
+                Self(v)
+            }
+            /// The count as a number.
+            pub const fn get(self) -> u32 {
+                self.0.get()
+            }
+            /// The count as its nonzero — handed over, never re-minted.
+            pub const fn nonzero(self) -> std::num::NonZeroU32 {
+                self.0
+            }
+        }
+    )*};
+}
+
+paged_count! {
+    /// A paged kernel's token rows: the write's `T`, the attention's `NUM_TOKENS`, the prefill
+    /// kernel's `PADDED_QUERY_LEN`.
+    TokenRows,
+    /// The pages a KV pool holds (`NUM_PAGES`; the write's `NUM_ROWS` is these pages' rows).
+    PoolPages,
+    /// The pages a per-sequence walk reads (`NUM_BLOCKS`, [`walk_pages`]).
+    WalkBlocks,
+}
+
+/// ⭐ A PAGED KERNEL'S COMPILE STATEMENT — its source, the spec it is compiled at, and the program
+/// it mints. The ONE statement each of the KV cache's five kernels has: production, the card leg
+/// and every test take it from the kernel's builder ([`kv_quantize_kernel`], [`kv_write_kernel`],
+/// [`paged_attn_kernel`], [`batched_decode_kernel`]), so a constexpr a kernel adds is a missing
+/// entry in ONE place, never in a test's copy of its spec.
+pub struct PagedKernel {
+    pub src: &'static str,
+    pub spec: KernelSpec,
+    program: Program,
+}
+
+impl PagedKernel {
+    /// The program, compiled at its spec and minted positionally.
+    pub fn program(&self) -> Result<KtirNode, String> {
+        let module = compile_kernel(self.src, &self.spec, &[1])?;
+        triton_ktir_superdsc::node_for_compiled(&module, self.program)
+            .map_err(|e| format!("triton splice: node_for: {e}"))
+    }
+}
+
+/// A paged kernel's row compiled at `pointers` and `constexprs`: every constexpr is both a
+/// signature entry and a binding.
+fn paged_kernel(
+    row: TritonKernelRow,
+    pointers: Vec<(&str, ArgSpec)>,
+    constexprs: Vec<(&str, Val)>,
+) -> Result<PagedKernel, String> {
+    let (src, file, entry, program) = match row {
+        TritonKernelRow::Spliced {
+            src,
+            file,
+            entry,
+            program,
+        } => (src, file, entry, program),
+        TritonKernelRow::Refused(why) => return Err(why.to_string()),
+    };
+    let mut signature: HashMap<String, ArgSpec> = HashMap::new();
+    let mut values: HashMap<String, Val> = HashMap::new();
+    for (p, ty) in pointers {
+        signature.insert(p.to_string(), ty);
+    }
+    for (k, v) in constexprs {
+        signature.insert(k.to_string(), ArgSpec::Constexpr);
+        values.insert(k.to_string(), v);
+    }
+    Ok(PagedKernel {
+        src,
+        spec: KernelSpec {
+            kernel: entry.to_string(),
+            signature,
+            constexprs: values,
+            file: file.to_string(),
+        },
+        program,
+    })
+}
+
+/// A fixed-type pointer parameter.
+fn fixed(ty: &str) -> Result<ArgSpec, String> {
+    ArgSpec::parse(ty).map_err(|e| e.to_string())
+}
+
+/// An integer constexpr.
+fn int(v: u32) -> Val {
+    Val::Int(i128::from(v))
+}
+
+/// ⭐ THE PAGED KV WRITE'S GEOMETRY — what `reshape_and_cache_head_major` is compiled at: the token
+/// rows, the kv heads, the head width, the scheduler's block, and the pool's pages.
+#[derive(Clone, Copy, Debug)]
+pub struct KvWriteGeometry {
+    pub rows: TokenRows,
+    pub nkvh: KvHeads,
+    pub hd: HeadWidth,
+    /// The scheduler's block — the rows a page holds per kv head (production's is
+    /// [`SchedulerBlockTokens::REFERENCE`]).
+    pub block: SchedulerBlockTokens,
+    pub pages: PoolPages,
+}
+
+/// ⭐ THE KV WRITE'S KERNEL — spyre-inference's `reshape_and_cache_head_major_kernel` at `g` with its
+/// pools held at format `P` (`[key, value, k_rows, v_rows, row_index]`).
+pub fn kv_write_kernel<P: DataFormat>(g: KvWriteGeometry) -> Result<PagedKernel, String> {
+    let KvWriteGeometry {
+        rows,
+        nkvh,
+        hd,
+        block,
+        pages,
+    } = g;
+    paged_kernel(
+        kv_write_row(),
+        vec![
+            // A float8 cache's key and value arrive quantized (`KvQuantize`): the write is a pure
+            // scatter at the pools' format, their `index_copy_`.
+            ("key", pool_ptr::<P>()),
+            ("value", pool_ptr::<P>()),
+            ("k_rows", pool_ptr::<P>()),
+            ("v_rows", pool_ptr::<P>()),
+            ("row_index", fixed("*i32")?),
+        ],
+        vec![
+            ("T", int(rows.get())),
+            ("NUM_KV_HEADS", int(nkvh.get())),
+            ("HEAD_SIZE", int(hd.get())),
+            ("NUM_ROWS", int(pages.get() * nkvh.get() * block.get())),
+        ],
+    )
+}
+
+/// ⭐ THE KV WRITE'S PROGRAM — [`kv_write_kernel`] minted positionally (buffers 0..5). The one
+/// statement of the write's launch contract: [`lower_kv_write`] rebinds it at the pools' format
+/// ([`KvPoolFormat`]), and the card's KV round-trip leg launches it as minted.
+pub fn kv_write_program<P: DataFormat>(g: KvWriteGeometry) -> Result<KtirNode, String> {
+    kv_write_kernel::<P>(g)?.program()
+}
+
+/// Which of spyre-inference's two per-sequence paged kernels a program is: the decode kernel at
+/// one query row, or the prefill kernel at a padded query length.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PagedSequence {
+    Decode,
+    Prefill { padded_query_len: TokenRows },
+}
+
+/// ⭐ A PER-SEQUENCE PAGED ATTENTION'S GEOMETRY — what `page_attn_head_major_decode` /
+/// `_prefill` is compiled at.
+#[derive(Clone, Copy, Debug)]
+pub struct PagedAttnGeometry {
+    pub seq: PagedSequence,
+    /// `NUM_TOKENS` — the query's rows.
+    pub rows: TokenRows,
+    /// The class's heads: `NUM_HEADS`, `NUM_KV_HEADS` and `HEAD_SIZE`.
+    pub heads: HeadGeometry,
+    /// `BLOCK_SIZE` — the scheduler's block (production's is [`SchedulerBlockTokens::REFERENCE`]).
+    pub block: SchedulerBlockTokens,
+    pub pages: PoolPages,
+    /// `NUM_BLOCKS` — the pages the walk reads ([`walk_pages`]).
+    pub blocks: WalkBlocks,
+    pub scale: AttnScale,
+}
+
+/// ⭐ THE PER-SEQUENCE PAGED ATTENTION'S KERNEL — spyre-inference's kernel for `g.seq` at `g` with its
+/// pools held at format `P` (`[query, query_row_index, k_pages, v_pages, page_index_table,
+/// (kv_row_pool,) mask_stack, out]`).
+pub fn paged_attn_kernel<P: DataFormat>(g: PagedAttnGeometry) -> Result<PagedKernel, String> {
+    let PagedAttnGeometry {
+        seq,
+        rows,
+        heads,
+        block,
+        pages,
+        blocks,
+        scale,
+    } = g;
+    let mut pointers = vec![
+        ("query", fixed("*fp16")?),
+        ("query_row_index", fixed("*i32")?),
+        ("k_pages", pool_ptr::<P>()),
+        ("v_pages", pool_ptr::<P>()),
+        ("page_index_table", fixed("*i32")?),
+    ];
+    if seq == PagedSequence::Decode {
+        pointers.push(("kv_row_pool", fixed("*i32")?));
+    }
+    pointers.extend([("mask_stack", fixed("*fp16")?), ("out", fixed("*fp16")?)]);
+    let mut constexprs = vec![
+        ("NUM_TOKENS", int(rows.get())),
+        ("NUM_HEADS", int(heads.q_heads().get())),
+        ("NUM_KV_HEADS", int(heads.kv_heads().get())),
+        (
+            "HEAD_SIZE",
+            int(HeadWidth::of_whole_sticks(heads.head_dim().get()).get()),
+        ),
+        ("BLOCK_SIZE", int(block.get())),
+        ("NUM_PAGES", int(pages.get())),
+        ("NUM_BLOCKS", int(blocks.get())),
+        ("SCALE", Val::Float(f64::from(scale.get()))),
+    ];
+    // ⭐ ONE REQUEST'S QUERY WIDTH, NOT THE GRAPH'S ROWS — the prefill kernel gathers `P` rows
+    // through `query_row_index` (a per-request table) and scatters them back through the same rows,
+    // so its padded query length is the rung's per-request width.
+    let row = match seq {
+        PagedSequence::Decode => attn_decode_row(),
+        PagedSequence::Prefill { padded_query_len } => {
+            constexprs.push(("PADDED_QUERY_LEN", int(padded_query_len.get())));
+            attn_row()
+        }
+    };
+    paged_kernel(row, pointers, constexprs)
+}
+
+/// ⭐ THE PER-SEQUENCE PAGED ATTENTION'S PROGRAM — [`paged_attn_kernel`] minted positionally. The
+/// one statement of its launch contract: [`lower_attn`] rebinds it at the pools' format
+/// ([`KvPoolFormat`]) per window, and the card's KV round-trip leg launches it as minted.
+pub fn paged_attn_program<P: DataFormat>(g: PagedAttnGeometry) -> Result<KtirNode, String> {
+    paged_attn_kernel::<P>(g)?.program()
+}
+
+/// ⭐ A BATCHED DECODE'S GEOMETRY — what `batched_decode_head_major` is compiled at: one query row a
+/// sequence, the class's heads, the scheduler's block, the pool's pages, the chunking
+/// ([`BatchChunking::of`]) and the scale.
+#[derive(Clone, Copy, Debug)]
+pub struct BatchedDecodeGeometry {
+    /// `NUM_TOKENS` — one query row a sequence.
+    pub rows: TokenRows,
+    /// The class's heads: `NUM_KV_HEADS`, `NUM_QUERIES_PER_KV` and `HEAD_SIZE`.
+    pub heads: HeadGeometry,
+    /// `BLOCK_SIZE` — the scheduler's block (production's is [`SchedulerBlockTokens::REFERENCE`]).
+    pub block: SchedulerBlockTokens,
+    pub pages: PoolPages,
+    pub chunking: BatchChunking,
+    pub scale: AttnScale,
+}
+
+/// ⭐ THE BATCHED DECODE'S KERNEL — spyre-inference's `batched_decode_head_major_kernel` at `g` with
+/// its pools held at format `P` (`[query, rep_row_ids, k_pages, v_pages, chunk_page_ids,
+/// mask_by_chunk, out]`).
+pub fn batched_decode_kernel<P: DataFormat>(
+    g: BatchedDecodeGeometry,
+) -> Result<PagedKernel, String> {
+    let BatchedDecodeGeometry {
+        rows,
+        heads,
+        block,
+        pages,
+        chunking,
+        scale,
+    } = g;
+    paged_kernel(
+        batched_decode_row(),
+        vec![
+            ("query", fixed("*fp16")?),
+            ("rep_row_ids", fixed("*i32")?),
+            ("k_pages", pool_ptr::<P>()),
+            ("v_pages", pool_ptr::<P>()),
+            ("chunk_page_ids", fixed("*i32")?),
+            ("mask_by_chunk", fixed("*fp16")?),
+            ("out", fixed("*fp16")?),
+        ],
+        vec![
+            ("NUM_TOKENS", int(rows.get())),
+            ("NUM_SEQS", int(chunking.seqs)),
+            ("BLOCKS_PER_CHUNK", int(chunking.blocks_per_chunk)),
+            ("NUM_CHUNKS", int(chunking.num_chunks)),
+            ("NUM_KV_HEADS", int(heads.kv_heads().get())),
+            ("NUM_QUERIES_PER_KV", int(heads.gqa().get())),
+            ("BLOCK_SIZE", int(block.get())),
+            (
+                "HEAD_SIZE",
+                int(HeadWidth::of_whole_sticks(heads.head_dim().get()).get()),
+            ),
+            ("NUM_PAGES", int(pages.get())),
+            ("ROWS_PER_PAGE", int(chunking.rows_per_page)),
+            ("SCALE", Val::Float(f64::from(scale.get()))),
+        ],
+    )
+}
+
+/// ⭐ THE BATCHED DECODE'S PROGRAM — [`batched_decode_kernel`] minted positionally; [`lower_attn`]
+/// rebinds it at the pools' format ([`KvPoolFormat`]).
+pub fn batched_decode_program<P: DataFormat>(g: BatchedDecodeGeometry) -> Result<KtirNode, String> {
+    batched_decode_kernel::<P>(g)?.program()
 }
 
 /// A compiled program re-stated with this node's own name and bindings (`node_for` mints positional
@@ -3003,6 +3468,23 @@ fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
                 HeadWidth::of_whole_sticks(rope.head_dim(*attention).get()),
             )?;
         }
+        // The float8 cache's quantize: the spec is its ONE builder's ([`kv_quantize_kernel`]).
+        // Unscaled: `quantize_kv` divides by nothing (the reference's `if scale != 1.0` is about a
+        // scale this cache does not have).
+        (
+            SubOp::KvQuantize {
+                scales: scratchy_ir::KvCacheScales::Unscaled,
+                ..
+            },
+            "quantize_kv_fwd",
+        ) => {
+            let cols = ktir_superdsc::superdsc_opspec::StickExtent::new(c)?;
+            return kv_quantize_kernel(KvQuantizeGeometry {
+                rows: TokenRows::new(positive(m, "the float8 quantize's rows")?),
+                cols,
+            })
+            .map(|k| k.spec);
+        }
         (SubOp::TanhSoftCap { cap }, "tanhsoftcap_fwd") => {
             // The kernel's own parameter spellings: desc_x, desc_o, then the constexprs
             // M / N / BLOCK_M / BLOCK_N / CAP / N_BLOCKS / TAIL_H.
@@ -3442,7 +3924,8 @@ fn grid<F: scratchy_subtile::subtile_ir::RopeForm>(
         SubOp::TanhSoftCap { .. }
         | SubOp::RmsNormUnit { .. }
         | SubOp::ScalarWeightMul
-        | SubOp::Reshape { .. } => Ok(vec![1]),
+        | SubOp::Reshape { .. }
+        | SubOp::KvQuantize { .. } => Ok(vec![1]),
         // ⭐ ONE PROGRAM PER REQUEST ROW: the sampler's grid is the rung's
         // own row count — 1 on the solo rung, the batched rung's baked width
         // on every batch rung. Every per-row operand is a `[B, ·]` descriptor
@@ -3801,25 +4284,58 @@ pub fn operand_dfs<F: scratchy_subtile::subtile_ir::RopeForm>(
     ))
 }
 
-/// One stated pointer dtype → its device format — the door's own mapping law
-/// (F16→Fp16, BF16→Bf16, F32→Fp32, F8E4M3FN→Fp8, i32→SenUint32): a dtype with
-/// no device format is refused BY NAME.
-fn df_of_stated_type(param: &str, t: &triton_frontend::ttir::Type) -> Result<Df, String> {
-    use triton_frontend::ttir::{FloatKind, Type};
-    Ok(match t {
-        Type::Float(FloatKind::F16) => Df::Fp16,
-        Type::Float(FloatKind::BF16) => Df::Bf16,
-        Type::Float(FloatKind::F32) => Df::Fp32,
-        Type::Float(FloatKind::F8E4M3FN) => Df::Fp8,
-        Type::Int(32, _) => Df::SenUint32,
-        other => {
-            return Err(format!(
-                "triton splice: parameter `{param}` states element type {other:?}, which has no \
-                 device format — the placement would be sized at some other format's bytes and \
-                 the footprint guard would then compare an access against a fiction. Give the \
-                 buffer a dtype the device has (f16, bf16, f32, f8E4M3FN, i32)."
-            ));
+/// ⭐ THE DOOR'S FLOAT MAPPING — a stated Triton float → its device format, or `None` for a float
+/// the device has no format for. ONE table, read both ways: [`df_of_stated_type`] maps a kernel's
+/// stated dtype to its format, and [`stated_float`] finds the float a selected format is stated as.
+const fn float_df(k: FloatKind) -> Option<Df> {
+    match k {
+        FloatKind::F16 => Some(Df::Fp16),
+        FloatKind::BF16 => Some(Df::Bf16),
+        FloatKind::F32 => Some(Df::Fp32),
+        FloatKind::F8E4M3FN => Some(Df::Fp8),
+        FloatKind::F64 | FloatKind::F8E5M2 => None,
+    }
+}
+
+/// The Triton float a device format is stated as — the one [`float_df`] maps to it. A format no
+/// float maps to fails the const evaluation that asks.
+const fn stated_float(df: Df) -> FloatKind {
+    const KINDS: [FloatKind; 6] = [
+        FloatKind::F16,
+        FloatKind::BF16,
+        FloatKind::F32,
+        FloatKind::F64,
+        FloatKind::F8E4M3FN,
+        FloatKind::F8E5M2,
+    ];
+    let mut i = 0;
+    while i < KINDS.len() {
+        if let Some(d) = float_df(KINDS[i])
+            && d as u8 == df as u8
+        {
+            return KINDS[i];
         }
+        i += 1;
+    }
+    panic!("no Triton float type is stated as this device format");
+}
+
+/// One stated pointer dtype → its device format — the door's own mapping law ([`float_df`] for a
+/// float, i32→SenUint32): a dtype with no device format is refused BY NAME.
+fn df_of_stated_type(param: &str, t: &triton_frontend::ttir::Type) -> Result<Df, String> {
+    use triton_frontend::ttir::Type;
+    let df = match t {
+        Type::Float(k) => float_df(*k),
+        Type::Int(32, _) => Some(Df::SenUint32),
+        _ => None,
+    };
+    df.ok_or_else(|| {
+        format!(
+            "triton splice: parameter `{param}` states element type {t:?}, which has no \
+             device format — the placement would be sized at some other format's bytes and \
+             the footprint guard would then compare an access against a fiction. Give the \
+             buffer a dtype the device has (f16, bf16, f32, f8E4M3FN, i32)."
+        )
     })
 }
 
@@ -3948,11 +4464,6 @@ mod production_ktir_dump {
     //! production emits.
     use super::*;
 
-    const PAGED_DECODE: &str = include_str!("../../../../kernels/page_attn_head_major_decode.py");
-    const PAGED_PREFILL: &str = include_str!("../../../../kernels/page_attn_head_major_prefill.py");
-    const PAGED_KV_WRITE: &str =
-        include_str!("../../../../kernels/reshape_and_cache_head_major.py");
-    const BATCHED_DECODE: &str = include_str!("../../../../kernels/batched_decode_head_major.py");
     const ELEMENTWISE: &str = include_str!("../../../../kernels/elementwise.py");
     const LMLAST: &str = include_str!("../../../../kernels/lmlast.py");
     const MATMUL: &str = include_str!("../../../../kernels/matmul.py");
@@ -4356,8 +4867,19 @@ mod production_ktir_dump {
         // ...plus the walk at granite-3.1-2b's own pool — `max_position_embeddings` 131072 in 2048
         // pages — decoding over the whole of it and a prompt chunk walking four pages, so the card
         // compile is checked at the extents a bake states, not only at a toy pool.
+        // The paged kernels at the 16-bit pool, each through its ONE builder.
+        let heads = |hd: u32| {
+            HeadGeometry::new(
+                QueryHeads::new(32),
+                KvHeads::new(8),
+                HeadDim::new(hd),
+                RotDim::new(hd),
+                BlockSize::new(SchedulerBlockTokens::REFERENCE.get()),
+            )
+        };
+        let scale = AttnScale::new(0.125);
         for (name, mq, blocks, pages, hd) in [
-            ("paged_attn_decode", 1i128, 4i128, 4i128, 64i128),
+            ("paged_attn_decode", 1u32, 4u32, 4u32, 64u32),
             ("paged_attn_prefill", 64, 1, 4, 64),
             ("paged_attn_decode_pool", 1, 2048, 2048, 64),
             ("paged_attn_prefill_walk", 64, 4, 2048, 64),
@@ -4365,46 +4887,23 @@ mod production_ktir_dump {
             ("paged_attn_decode_hd128", 1, 4, 4, 128),
             ("paged_attn_prefill_hd128", 64, 4, 4, 128),
         ] {
-            let decode = mq == 1;
-            let mut ptrs: Vec<(&str, &str)> = vec![
-                ("query", "*fp16"),
-                ("query_row_index", "*i32"),
-                ("k_pages", "*fp16"),
-                ("v_pages", "*fp16"),
-                ("page_index_table", "*i32"),
-            ];
-            if decode {
-                ptrs.push(("kv_row_pool", "*i32"));
-            }
-            ptrs.extend([("mask_stack", "*fp16"), ("out", "*fp16")]);
-            let mut ces = vec![
-                ("NUM_TOKENS", Val::Int(mq)),
-                ("NUM_HEADS", Val::Int(32)),
-                ("NUM_KV_HEADS", Val::Int(8)),
-                ("HEAD_SIZE", Val::Int(hd)),
-                (
-                    "BLOCK_SIZE",
-                    Val::Int(i128::from(SchedulerBlockTokens::REFERENCE.get())),
-                ),
-                ("NUM_PAGES", Val::Int(pages)),
-                ("NUM_BLOCKS", Val::Int(blocks)),
-                ("SCALE", Val::Float(0.125)),
-            ];
-            let (src, file, entry) = if decode {
-                (
-                    PAGED_DECODE,
-                    "page_attn_head_major_decode.py",
-                    "page_attn_head_major_decode_kernel",
-                )
-            } else {
-                ces.push(("PADDED_QUERY_LEN", Val::Int(mq)));
-                (
-                    PAGED_PREFILL,
-                    "page_attn_head_major_prefill.py",
-                    "page_attn_head_major_prefill_kernel",
-                )
-            };
-            v.push((name, src, spec(file, entry, &ptrs, &ces), vec![1]));
+            let k = paged_attn_kernel::<ktir_superdsc::superdsc_opspec::Fp16>(PagedAttnGeometry {
+                seq: if mq == 1 {
+                    PagedSequence::Decode
+                } else {
+                    PagedSequence::Prefill {
+                        padded_query_len: TokenRows::new(nz(mq)),
+                    }
+                },
+                rows: TokenRows::new(nz(mq)),
+                heads: heads(hd),
+                block: SchedulerBlockTokens::REFERENCE,
+                pages: PoolPages::new(nz(pages)),
+                blocks: WalkBlocks::new(nz(blocks)),
+                scale,
+            })
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+            v.push((name, k.src, k.spec, vec![1]));
         }
         // ── and the PREFILL kernel at a PACKED rung's split extents (M2's S=2 shape, stated at the
         // splice level): `NUM_TOKENS` is the graph's rows (two requests of 64) while
@@ -4412,43 +4911,23 @@ mod production_ktir_dump {
         // [`QueryExtent`] separates, compiled at the pair a (64, 2) rung mints. The walk is the
         // rung's own law at `ActiveCap::NONE` (a start==0 chunk: the pages its own per-request
         // rows fill), stated by the same [`walk_pages`] the splice bakes it with.
-        {
-            let ptrs: Vec<(&str, &str)> = vec![
-                ("query", "*fp16"),
-                ("query_row_index", "*i32"),
-                ("k_pages", "*fp16"),
-                ("v_pages", "*fp16"),
-                ("page_index_table", "*i32"),
-                ("mask_stack", "*fp16"),
-                ("out", "*fp16"),
-            ];
-            let blocks = walk_pages(4, 64, ktir_superdsc::ktir_node::ActiveCap::NONE);
-            let ces = vec![
-                ("NUM_TOKENS", Val::Int(128)),
-                ("NUM_HEADS", Val::Int(32)),
-                ("NUM_KV_HEADS", Val::Int(8)),
-                ("HEAD_SIZE", Val::Int(64)),
-                (
-                    "BLOCK_SIZE",
-                    Val::Int(i128::from(SchedulerBlockTokens::REFERENCE.get())),
-                ),
-                ("NUM_PAGES", Val::Int(4)),
-                ("NUM_BLOCKS", Val::Int(i128::from(blocks))),
-                ("PADDED_QUERY_LEN", Val::Int(64)),
-                ("SCALE", Val::Float(0.125)),
-            ];
-            v.push((
-                "paged_attn_prefill_packed",
-                PAGED_PREFILL,
-                spec(
-                    "page_attn_head_major_prefill.py",
-                    "page_attn_head_major_prefill_kernel",
-                    &ptrs,
-                    &ces,
-                ),
-                vec![1],
-            ));
-        }
+        let k = paged_attn_kernel::<ktir_superdsc::superdsc_opspec::Fp16>(PagedAttnGeometry {
+            seq: PagedSequence::Prefill {
+                padded_query_len: TokenRows::new(nz(64)),
+            },
+            rows: TokenRows::new(nz(128)),
+            heads: heads(64),
+            block: SchedulerBlockTokens::REFERENCE,
+            pages: PoolPages::new(nz(4)),
+            blocks: WalkBlocks::new(nz(walk_pages(
+                4,
+                64,
+                ktir_superdsc::ktir_node::ActiveCap::NONE,
+            ))),
+            scale,
+        })
+        .expect("paged_attn_prefill_packed");
+        v.push(("paged_attn_prefill_packed", k.src, k.spec, vec![1]));
         // ...and `batched_decode_head_major` over that pool, the chunkings a decode batch rung
         // states (`BatchChunking::of`): 4 sequences on the 4-page rung (one chunk), on the 64-page
         // rung (8 chunks, each block slot its own softmax), 2 sequences on the 2-page rung (four
@@ -4456,7 +4935,7 @@ mod production_ktir_dump {
         // the widest batch rung, where the slots' merge folds one). At head dim 128 (granite-3.1-8b)
         // the one-chunk and many-chunk batches, and the widest rung on its one-page walk.
         for (name, seqs, walk, hd) in [
-            ("batched_decode", 4u32, 4u32, 64i128),
+            ("batched_decode", 4u32, 4u32, 64u32),
             ("batched_decode_chunks", 4, 64, 64),
             ("batched_decode_pair", 2, 2, 64),
             ("batched_decode_one_slot", 32, 4, 64),
@@ -4464,78 +4943,39 @@ mod production_ktir_dump {
             ("batched_decode_chunks_hd128", 4, 64, 128),
             ("batched_decode_one_slot_hd128", 32, 1, 128),
         ] {
-            let c = BatchChunking::of(seqs, walk, 8, 32 * hd as u32, hd as u32);
-            v.push((
-                name,
-                BATCHED_DECODE,
-                spec(
-                    "batched_decode_head_major.py",
-                    "batched_decode_head_major_kernel",
-                    &[
-                        ("query", "*fp16"),
-                        ("rep_row_ids", "*i32"),
-                        ("k_pages", "*fp16"),
-                        ("v_pages", "*fp16"),
-                        ("chunk_page_ids", "*i32"),
-                        ("mask_by_chunk", "*fp16"),
-                        ("out", "*fp16"),
-                    ],
-                    &[
-                        ("NUM_TOKENS", Val::Int(i128::from(seqs))),
-                        ("NUM_SEQS", Val::Int(i128::from(c.seqs))),
-                        ("BLOCKS_PER_CHUNK", Val::Int(i128::from(c.blocks_per_chunk))),
-                        ("NUM_CHUNKS", Val::Int(i128::from(c.num_chunks))),
-                        ("NUM_KV_HEADS", Val::Int(8)),
-                        ("NUM_QUERIES_PER_KV", Val::Int(4)),
-                        (
-                            "BLOCK_SIZE",
-                            Val::Int(i128::from(SchedulerBlockTokens::REFERENCE.get())),
-                        ),
-                        ("HEAD_SIZE", Val::Int(hd)),
-                        ("NUM_PAGES", Val::Int(2048)),
-                        ("ROWS_PER_PAGE", Val::Int(i128::from(c.rows_per_page))),
-                        ("SCALE", Val::Float(0.125)),
-                    ],
-                ),
-                vec![1],
-            ));
+            let k = batched_decode_kernel::<ktir_superdsc::superdsc_opspec::Fp16>(
+                BatchedDecodeGeometry {
+                    rows: TokenRows::new(nz(seqs)),
+                    heads: heads(hd),
+                    block: SchedulerBlockTokens::REFERENCE,
+                    pages: PoolPages::new(nz(2048)),
+                    chunking: BatchChunking::of(seqs, walk, 8, 32 * hd, hd),
+                    scale,
+                },
+            )
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+            v.push((name, k.src, k.spec, vec![1]));
         }
         // A decode step's write (8 kv heads, one store per head), one below the scatter floor (2
         // heads, one store per row), a 20-token prompt chunk's (160 index entries, five scatter ops
         // of 32), and at head dim 128 the first two and a prompt chunk's.
         for (name, t, nkvh, hd) in [
-            ("paged_kv_write", 1i128, 8i128, 64i128),
+            ("paged_kv_write", 1u32, 8u32, 64u32),
             ("paged_kv_write_rows", 1, 2, 64),
             ("paged_kv_write_prompt", 20, 8, 64),
             ("paged_kv_write_hd128", 1, 8, 128),
             ("paged_kv_write_rows_hd128", 1, 2, 128),
             ("paged_kv_write_prompt_hd128", 96, 8, 128),
         ] {
-            v.push((
-                name,
-                PAGED_KV_WRITE,
-                spec(
-                    "reshape_and_cache_head_major.py",
-                    "reshape_and_cache_head_major_kernel",
-                    &[
-                        ("key", "*fp16"),
-                        ("value", "*fp16"),
-                        ("k_rows", "*fp16"),
-                        ("v_rows", "*fp16"),
-                        ("row_index", "*i32"),
-                    ],
-                    &[
-                        ("T", Val::Int(t)),
-                        ("NUM_KV_HEADS", Val::Int(nkvh)),
-                        ("HEAD_SIZE", Val::Int(hd)),
-                        (
-                            "NUM_ROWS",
-                            Val::Int(4 * nkvh * i128::from(SchedulerBlockTokens::REFERENCE.get())),
-                        ),
-                    ],
-                ),
-                vec![1],
-            ));
+            let k = kv_write_kernel::<ktir_superdsc::superdsc_opspec::Fp16>(KvWriteGeometry {
+                rows: TokenRows::new(nz(t)),
+                nkvh: KvHeads::new(nkvh),
+                hd: HeadWidth::of_whole_sticks(hd),
+                block: SchedulerBlockTokens::REFERENCE,
+                pages: PoolPages::new(nz(4)),
+            })
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+            v.push((name, k.src, k.spec, vec![1]));
         }
         // ── moe.py / moe_prefill.py: the MoE numeric tests' golden geometry — the
         // smallest geometry the real-Triton compile admits — at grid [1]. ──
@@ -4825,7 +5265,8 @@ mod production_ktir_dump {
             | Program::ScalarMul
             | Program::Sample
             | Program::PagedAttn
-            | Program::PagedKvWrite => windowed(lower_function(
+            | Program::PagedKvWrite
+            | Program::KvQuantize => windowed(lower_function(
                 node,
                 Some(&layout),
                 &mut sym,
@@ -5028,59 +5469,29 @@ mod walk_on_the_card {
 
     /// [`walk`] at head dim `hd`.
     fn walk_at(mq: i128, blocks: i128, hd: i128) -> KtirNode {
-        let decode = mq == 1;
-        let row = if decode {
-            attn_decode_row()
-        } else {
-            attn_row()
-        };
-        let TritonKernelRow::Spliced {
-            src, file, entry, ..
-        } = row
-        else {
-            panic!("the attention rows are spliced");
-        };
-        let mut signature = HashMap::new();
-        let mut constexprs = HashMap::new();
-        for p in ["query", "k_pages", "v_pages", "mask_stack", "out"] {
-            signature.insert(p.to_string(), ArgSpec::parse("*fp16").expect("spec"));
-        }
-        let mut ints = vec!["query_row_index", "page_index_table"];
-        if decode {
-            ints.push("kv_row_pool");
-        }
-        for p in ints {
-            signature.insert(p.to_string(), ArgSpec::parse("*i32").expect("spec"));
-        }
-        let mut sizes = vec![
-            ("NUM_TOKENS", mq),
-            ("NUM_HEADS", 32),
-            ("NUM_KV_HEADS", 8),
-            ("HEAD_SIZE", hd),
-            (
-                "BLOCK_SIZE",
-                i128::from(SchedulerBlockTokens::REFERENCE.get()),
+        let (mq, hd) = (mq as u32, hd as u32);
+        paged_attn_program::<ktir_superdsc::superdsc_opspec::Fp16>(PagedAttnGeometry {
+            seq: if mq == 1 {
+                PagedSequence::Decode
+            } else {
+                PagedSequence::Prefill {
+                    padded_query_len: TokenRows::new(nz(mq)),
+                }
+            },
+            rows: TokenRows::new(nz(mq)),
+            heads: HeadGeometry::new(
+                QueryHeads::new(32),
+                KvHeads::new(8),
+                HeadDim::new(hd),
+                RotDim::new(hd),
+                BlockSize::new(SchedulerBlockTokens::REFERENCE.get()),
             ),
-            ("NUM_PAGES", 2048),
-            ("NUM_BLOCKS", blocks),
-        ];
-        if !decode {
-            sizes.push(("PADDED_QUERY_LEN", mq));
-        }
-        for (k, v) in sizes {
-            signature.insert(k.to_string(), ArgSpec::Constexpr);
-            constexprs.insert(k.to_string(), Val::Int(v));
-        }
-        signature.insert("SCALE".to_string(), ArgSpec::Constexpr);
-        constexprs.insert("SCALE".to_string(), Val::Float(0.125));
-        let spec = KernelSpec {
-            kernel: entry.to_string(),
-            signature,
-            constexprs,
-            file: file.to_string(),
-        };
-        let module = compile_kernel(src, &spec, &[1]).expect("the walk compiles");
-        triton_ktir_superdsc::node_for(&module, Program::PagedAttn).expect("the walk mints")
+            block: SchedulerBlockTokens::REFERENCE,
+            pages: PoolPages::new(nz(2048)),
+            blocks: WalkBlocks::new(nz(blocks as u32)),
+            scale: AttnScale::new(0.125),
+        })
+        .expect("the walk mints")
     }
 
     /// ⭐ A PROMPT CHUNK UNDER TRITON'S SCATTER FLOOR WRITES ITS OUTPUT. Under 8 query rows the
@@ -5266,47 +5677,23 @@ mod walk_on_the_card {
         kv_heads: u32,
         group: u32,
     ) -> (KtirNode, BatchChunking) {
-        let TritonKernelRow::Spliced {
-            src, file, entry, ..
-        } = batched_decode_row()
-        else {
-            panic!("the batched decode row is spliced");
-        };
         let c = BatchChunking::of(seqs, walk, kv_heads, kv_heads * group * hd, hd);
-        let mut signature = HashMap::new();
-        let mut constexprs = HashMap::new();
-        for p in ["query", "k_pages", "v_pages", "mask_by_chunk", "out"] {
-            signature.insert(p.to_string(), ArgSpec::parse("*fp16").expect("spec"));
-        }
-        for p in ["rep_row_ids", "chunk_page_ids"] {
-            signature.insert(p.to_string(), ArgSpec::parse("*i32").expect("spec"));
-        }
-        for (k, v) in [
-            ("NUM_TOKENS", seqs),
-            ("NUM_SEQS", c.seqs),
-            ("BLOCKS_PER_CHUNK", c.blocks_per_chunk),
-            ("NUM_CHUNKS", c.num_chunks),
-            ("NUM_KV_HEADS", kv_heads),
-            ("NUM_QUERIES_PER_KV", group),
-            ("BLOCK_SIZE", SchedulerBlockTokens::REFERENCE.get()),
-            ("HEAD_SIZE", hd),
-            ("NUM_PAGES", 2048),
-            ("ROWS_PER_PAGE", c.rows_per_page),
-        ] {
-            signature.insert(k.to_string(), ArgSpec::Constexpr);
-            constexprs.insert(k.to_string(), Val::Int(i128::from(v)));
-        }
-        signature.insert("SCALE".to_string(), ArgSpec::Constexpr);
-        constexprs.insert("SCALE".to_string(), Val::Float(0.125));
-        let spec = KernelSpec {
-            kernel: entry.to_string(),
-            signature,
-            constexprs,
-            file: file.to_string(),
-        };
-        let module = compile_kernel(src, &spec, &[1]).expect("the batched walk compiles");
         let node =
-            triton_ktir_superdsc::node_for(&module, Program::PagedAttn).expect("the walk mints");
+            batched_decode_program::<ktir_superdsc::superdsc_opspec::Fp16>(BatchedDecodeGeometry {
+                rows: TokenRows::new(nz(seqs)),
+                heads: HeadGeometry::new(
+                    QueryHeads::new(kv_heads * group),
+                    KvHeads::new(kv_heads),
+                    HeadDim::new(hd),
+                    RotDim::new(hd),
+                    BlockSize::new(SchedulerBlockTokens::REFERENCE.get()),
+                ),
+                block: SchedulerBlockTokens::REFERENCE,
+                pages: PoolPages::new(nz(2048)),
+                chunking: c,
+                scale: AttnScale::new(0.125),
+            })
+            .expect("the batched walk mints");
         (node, c)
     }
 
@@ -6731,51 +7118,30 @@ def two_pages(k_index, v_index, k_pages, v_pages, out, NUM_PAGES: tl.constexpr):
         assert!(!ops.is_empty() && ops.iter().all(|e| e.walk.is_none()));
     }
 
-    /// `reshape_and_cache_head_major` writing `t` tokens of `nkvh` kv heads at head dim `hd` into a
-    /// four-page-per-head pool, through the card's lowering against its one-kernel layout.
-    fn kv_write_ops(
+    /// `src` — `reshape_and_cache_head_major` or a variant of its source — writing `t` tokens of
+    /// `nkvh` kv heads at head dim `hd` into a four-page-per-head pool held at format `DF`, through the
+    /// card's lowering against its one-kernel layout. The spec is the write's ONE builder's
+    /// ([`kv_write_kernel`]); only the source may be a variant.
+    fn kv_write_lowered<DF: ktir_superdsc::superdsc_opspec::FloatFormat>(
+        src: &str,
         t: i128,
         nkvh: i128,
         hd: i128,
-    ) -> Vec<ktir_superdsc::emit::EmittedOp<ktir_superdsc::collective::TpWorld<1>>> {
-        let TritonKernelRow::Spliced {
-            src, file, entry, ..
-        } = kv_write_row()
-        else {
-            panic!("the KV write row is spliced");
-        };
-        let mut signature = HashMap::new();
-        let mut constexprs = HashMap::new();
-        for p in ["key", "value", "k_rows", "v_rows"] {
-            signature.insert(p.to_string(), ArgSpec::parse("*fp16").expect("spec"));
-        }
-        signature.insert(
-            "row_index".to_string(),
-            ArgSpec::parse("*i32").expect("spec"),
-        );
-        for (k, v) in [
-            ("T", t),
-            ("NUM_KV_HEADS", nkvh),
-            ("HEAD_SIZE", hd),
-            (
-                "NUM_ROWS",
-                4 * nkvh * i128::from(SchedulerBlockTokens::REFERENCE.get()),
-            ),
-        ] {
-            signature.insert(k.to_string(), ArgSpec::Constexpr);
-            constexprs.insert(k.to_string(), Val::Int(v));
-        }
-        let spec = KernelSpec {
-            kernel: entry.to_string(),
-            signature,
-            constexprs,
-            file: file.to_string(),
-        };
-        let module = compile_kernel(src, &spec, &[1]).expect("the write compiles");
+    ) -> Result<Vec<ktir_superdsc::emit::EmittedOp<ktir_superdsc::collective::TpWorld<1>>>, String>
+    {
+        let spec = kv_write_kernel::<DF>(KvWriteGeometry {
+            rows: TokenRows::new(nz(t as u32)),
+            nkvh: KvHeads::new(nkvh as u32),
+            hd: HeadWidth::of_whole_sticks(hd as u32),
+            block: SchedulerBlockTokens::REFERENCE,
+            pages: PoolPages::new(nz(4)),
+        })?
+        .spec;
+        let module = compile_kernel(src, &spec, &[1])?;
         let node = triton_ktir_superdsc::node_for(&module, Program::PagedKvWrite)
-            .expect("the write mints");
-        let layout = triton_ktir_superdsc::layout::for_node(&node).expect("the write places");
-        allocate_paged_cache(&node, &layout).expect("the cache allocates");
+            .map_err(|e| e.to_string())?;
+        let layout = triton_ktir_superdsc::layout::for_node(&node).map_err(|e| e.to_string())?;
+        allocate_paged_cache(&node, &layout)?;
         let mut sym = 0i64;
         ktir_superdsc::emit::whole_function::lower_walk(
             &node,
@@ -6783,7 +7149,25 @@ def two_pages(k_index, v_index, k_pages, v_pages, out, NUM_PAGES: tl.constexpr):
             &mut sym,
             &mut ktir_superdsc::emit::ktir_matmul_fp8::QuantizedActivations::default(),
         )
-        .unwrap_or_else(|e| panic!("t={t} nkvh={nkvh} hd={hd}: the write lowers: {}", e.message))
+        .map_err(|e| e.message)
+    }
+
+    /// The write kernel's own source.
+    fn kv_write_src() -> &'static str {
+        let TritonKernelRow::Spliced { src, .. } = kv_write_row() else {
+            panic!("the KV write row is spliced");
+        };
+        src
+    }
+
+    /// The write at the 16-bit pool, lowered.
+    fn kv_write_ops(
+        t: i128,
+        nkvh: i128,
+        hd: i128,
+    ) -> Vec<ktir_superdsc::emit::EmittedOp<ktir_superdsc::collective::TpWorld<1>>> {
+        kv_write_lowered::<ktir_superdsc::superdsc_opspec::Fp16>(kv_write_src(), t, nkvh, hd)
+            .unwrap_or_else(|e| panic!("t={t} nkvh={nkvh} hd={hd}: the write lowers: {e}"))
     }
 
     /// ⭐ A HEAD TWO STICKS WIDE IS WRITTEN WHOLE, one index entry per row. The pool is row-outermost,
@@ -6820,5 +7204,176 @@ def two_pages(k_index, v_index, k_pages, v_pages, out, NUM_PAGES: tl.constexpr):
         assert_eq!(rows.len(), 2, "one scatter each for K and V: {:?}", {
             rows.iter().map(|e| e.op_name.clone()).collect::<Vec<_>>()
         });
+    }
+
+    /// NEIGHBOUR — the 16-bit write states no narrowing, so the walk emits no clip and no convert: the write is
+    /// main's: one relaid head group per kv head at two sticks, one scatter run each for K and V, no
+    /// clip and no convert.
+    #[test]
+    fn a_16_bit_write_is_not_a_narrowing_family() {
+        let ops = kv_write_ops(96, 8, 128);
+        let names: Vec<&str> = ops.iter().map(|e| e.op_name.as_str()).collect();
+        assert!(
+            names
+                .iter()
+                .all(|n| !n.starts_with("clip") && !n.starts_with("qfp8ch")),
+            "{names:?}"
+        );
+    }
+}
+
+/// ⭐ THE KV CACHE AT EACH POOL FORMAT, PINNED — the paged programs the kv-fp8 card build bakes,
+/// minted by their one builders at granite-3.1-8b's geometry (32 query heads over 8 kv heads of
+/// 128), placed by the one-kernel layout and lowered by the walk chat's bake runs. The emulator runs
+/// KTIR, not SuperDSC, so the emitted descriptor sequence is pinned here, against the 16-bit one.
+#[cfg(test)]
+mod kv_pool_formats {
+    use super::*;
+    use ktir_superdsc::superdsc_opspec::{Fp8, Fp16, OpFunc};
+
+    /// granite-3.1-8b's attention class.
+    fn granite_8b() -> HeadGeometry {
+        HeadGeometry::new(
+            QueryHeads::new(32),
+            KvHeads::new(8),
+            HeadDim::new(128),
+            RotDim::new(128),
+            BlockSize::new(SchedulerBlockTokens::REFERENCE.get()),
+        )
+    }
+
+    /// What a read lowers to: its emitted descriptors, in order, each named by its op kind (its name
+    /// without the buffer number it ends in) beside the device op it computes (its first
+    /// `computeOp_`'s `opFuncName`, `None` for a KTIR op), and how the scratchpad plan divided its
+    /// walk.
+    type Read = (
+        Vec<(String, Option<String>)>,
+        Option<ktir_superdsc::placement::WalkDivision>,
+    );
+
+    /// A program's [`Read`].
+    fn kinds(node: &KtirNode) -> Read {
+        let layout = triton_ktir_superdsc::layout::for_node(node).expect("the program places");
+        allocate_paged_cache(node, &layout).expect("the pools allocate");
+        let mut sym = 0i64;
+        let ops = ktir_superdsc::emit::whole_function::lower_walk::<
+            ktir_superdsc::collective::TpWorld<1>,
+        >(
+            node,
+            Some(&layout),
+            &mut sym,
+            &mut ktir_superdsc::emit::ktir_matmul_fp8::QuantizedActivations::default(),
+        )
+        .unwrap_or_else(|e| panic!("{}: the walk lowers: {}", node.func.name, e.message));
+        let kinds = ops
+            .iter()
+            .map(|e| {
+                let op =
+                    e.op.as_ref()
+                        .and_then(|o| o.dscs_.first())
+                        .and_then(|m| m.values().next())
+                        .and_then(|d| d.computeOp_.first())
+                        .map(|c| c.opFuncName.clone());
+                let kind = e
+                    .op_name
+                    .trim_end_matches(|c: char| c.is_ascii_digit())
+                    .to_string();
+                (kind, op)
+            })
+            .collect();
+        (kinds, layout.lx_division.get())
+    }
+
+    /// ⭐ THE fp8 PAGE READ IS THE 16-BIT READ, ITS PAGE GATHERS WIDENING AS THEY LAND: descriptor
+    /// for descriptor the same sequence — no float8 local and no separate widen — the one difference
+    /// a page gather leg's device op, an `identity` at 16 bits and one `fp8todl16` at fp8, a K and a
+    /// V leg a page fill; and the walk divided across the cores as the 16-bit walk is.
+    fn the_read_is_the_16_bit_read_widened_by_its_gathers((at16, div16): Read, (at8, div8): Read) {
+        assert_eq!(
+            div8, div16,
+            "the fp8 read divides its walk as the 16-bit read does"
+        );
+        let names = |r: &[(String, Option<String>)]| -> Vec<String> {
+            r.iter().map(|(kind, _)| kind.clone()).collect()
+        };
+        assert_eq!(
+            names(&at8),
+            names(&at16),
+            "the fp8 read is the 16-bit read, descriptor for descriptor"
+        );
+        let (identity, widen) = (
+            Some(OpFunc::Identity.name().to_string()),
+            Some(OpFunc::Fp8ToDl16.name().to_string()),
+        );
+        let widened: Vec<usize> = (0..at8.len()).filter(|&i| at8[i].1 != at16[i].1).collect();
+        assert!(
+            !widened.is_empty() && widened.len().is_multiple_of(2),
+            "a K and a V gather widen a page fill: {at8:?}"
+        );
+        for &i in &widened {
+            assert!(
+                at16[i].0.starts_with("gather") && at16[i].1 == identity && at8[i].1 == widen,
+                "descriptor {i}: {:?} at 16 bits, {:?} at fp8 — only a page gather's `identity` \
+                 becomes its `fp8todl16`",
+                at16[i],
+                at8[i]
+            );
+        }
+    }
+
+    /// The per-sequence kernels over a 16-page pool, each walking 8 pages (a 1024-token context): a
+    /// decode row, and a 64-row prefill chunk over that cached prefix.
+    #[test]
+    fn a_float8_sequence_read_is_the_16_bit_read_widened_by_its_gathers() {
+        let pages = 16;
+        for (name, seq, rows) in [
+            ("decode", PagedSequence::Decode, 1u32),
+            (
+                "prefill",
+                PagedSequence::Prefill {
+                    padded_query_len: TokenRows::new(nz(64)),
+                },
+                64,
+            ),
+        ] {
+            let g = PagedAttnGeometry {
+                seq,
+                rows: TokenRows::new(nz(rows)),
+                heads: granite_8b(),
+                block: SchedulerBlockTokens::REFERENCE,
+                pages: PoolPages::new(nz(pages)),
+                blocks: WalkBlocks::new(nz(8)),
+                scale: AttnScale::new(1.0 / 128f32.sqrt()),
+            };
+            let at16 = kinds(&paged_attn_program::<Fp16>(g).expect(name));
+            let at8 = kinds(&paged_attn_program::<Fp8>(g).expect(name));
+            the_read_is_the_16_bit_read_widened_by_its_gathers(at16, at8);
+        }
+    }
+
+    /// The batched kernel at the decode batch rungs the kv-fp8 slowdown is measured at — two and four
+    /// sequences — each walking 8 pages of a 16-page pool.
+    #[test]
+    fn a_float8_batched_read_is_the_16_bit_read_widened_by_its_gathers() {
+        let (pages, heads) = (16, granite_8b());
+        for seqs in [2u32, 4] {
+            let g = BatchedDecodeGeometry {
+                rows: TokenRows::new(nz(seqs)),
+                heads,
+                block: SchedulerBlockTokens::REFERENCE,
+                pages: PoolPages::new(nz(pages)),
+                chunking: BatchChunking::of(
+                    seqs,
+                    8,
+                    heads.kv_heads().get(),
+                    heads.q_width(),
+                    heads.head_dim().get(),
+                ),
+                scale: AttnScale::new(1.0 / 128f32.sqrt()),
+            };
+            let at16 = kinds(&batched_decode_program::<Fp16>(g).expect("16-bit batch"));
+            let at8 = kinds(&batched_decode_program::<Fp8>(g).expect("fp8 batch"));
+            the_read_is_the_16_bit_read_widened_by_its_gathers(at16, at8);
+        }
     }
 }

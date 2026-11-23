@@ -85,10 +85,11 @@ fn dtype(d: DType) -> Result<KDType> {
         // that lights the fp8 door: a weight view whose elem maps through here stamps
         // `AttrKey::Dtype = Fp8E4m3` (via `state_shape_and_dtype`), which
         // `ktir-superdsc`'s `regions()` reads to set `is_fp8` and the arity-3
-        // `matmul_fp8_descriptors` door keys on. A load's RESULT never takes this arm:
-        // the kernel widens with `.to(tl.float16)` (the frontend refuses a mixed
+        // `matmul_fp8_descriptors` door keys on. A W8A8 weight load's RESULT never takes
+        // this arm: the kernel widens with `.to(tl.float16)` (the frontend refuses a mixed
         // `tl.dot`), so results are F16 exactly as in scratchy's own producer
-        // (`KTIR_ELEM`).
+        // (`KTIR_ELEM`). A float8 KV page's gathered load and its reshape DO, and their one
+        // reader is the widen the emitter's page arm lands with the page.
         DType::Fp8E4m3 => KDType::Fp8E4m3,
         DType::Index => {
             return Err(refuse(

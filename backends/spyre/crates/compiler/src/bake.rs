@@ -104,16 +104,35 @@ type BakeTape = scratchy_subtile::handoff::LoweredDecode<scratchy_subtile::hando
 
 /// The bridge's tape as a spyre bake's ([`BakeTape`]): a decoder gathers an embed row, and a tape
 /// that gathers none is no decoder this bake serves — a build error naming the model.
+///
+/// ⭐ THE KV CACHE'S STEPS ARE THE SHARED CODEC FACT'S, TAKEN HERE ONCE FOR EVERY RUNG. A float8
+/// cache (`KvCodec::Fp8E4m3`, the spyre emitter's `kv_store`) takes the shared expansion's steps
+/// ([`scratchy_subtile::kv_codec::expand_kv_quantize`]); a dense model's tape is the bridge's own,
+/// untouched. Spyre stores no int8 cache (its emitter never selects one), so a model built with one
+/// is a build error by name.
 fn bake_tape(
     stem: &str,
     l: scratchy_forward_compiler_macro::to_wavefront::LoweredDecode,
+    kv_codec: scratchy_ir::KvCodec,
 ) -> BakeTape {
-    l.into_decode().unwrap_or_else(|scratchy_subtile::handoff::NoEmbedRow| {
+    let tape = l.into_decode().unwrap_or_else(|scratchy_subtile::handoff::NoEmbedRow| {
         panic!(
             "[spyre-superdsc] {stem}: the lowered tape gathers no embed row — a spyre bake lowers \
              a decoder, whose host gather lands in its one EmbeddedHidden source"
         )
-    })
+    });
+    match kv_codec {
+        scratchy_ir::KvCodec::Dense => tape,
+        scratchy_ir::KvCodec::Fp8E4m3(scales) => {
+            scratchy_subtile::kv_codec::expand_kv_quantize(&tape, scales).unwrap_or_else(|e| {
+                panic!("[spyre-superdsc] {stem}: the float8 KV cache's steps do not expand: {e}")
+            })
+        }
+        scratchy_ir::KvCodec::Int8 => panic!(
+            "[spyre-superdsc] {stem}: an int8 KV cache — spyre stores none (its emitter's \
+             `kv_store` never selects one)"
+        ),
+    }
 }
 
 fn chained_row_gathers(
@@ -2615,7 +2634,7 @@ pub(crate) fn dump_wavefront_mega(
             );
             return;
         }
-        Ok(l) => bake_tape(stem, l),
+        Ok(l) => bake_tape(stem, l, facts.kv_codec()),
         Err(to_wavefront::BridgeError::UnsupportedWeight { detail, .. }) => {
             eprintln!(
                 "[wavefront] {stem}: no superdsc bundle — weight scheme unsupported here \
@@ -4741,7 +4760,7 @@ pub(crate) fn dump_wavefront_mega(
                     seqs,
                 ) {
                     Ok(lwd_b) => {
-                        let lwd_b = bake_tape(stem, lwd_b);
+                        let lwd_b = bake_tape(stem, lwd_b, facts.kv_codec());
                         emit_bundle(
                             &lwd_b,
                             format!("ktir_decode_{stem_id}"),
@@ -5078,7 +5097,7 @@ pub(crate) fn dump_wavefront_mega(
             );
             match lowered {
                 Ok(lwd_p) => {
-                    let lwd_p = bake_tape(stem, lwd_p);
+                    let lwd_p = bake_tape(stem, lwd_p, facts.kv_codec());
                     // One rung's bake, stamped for each world `lwd` may be lowered for.
                     macro_rules! bake_rung_with {
                         ($bake:ident) => {
@@ -5236,7 +5255,7 @@ pub(crate) fn dump_wavefront_mega(
                     m,
                 ) {
                     Ok(lwd_p) => {
-                        let lwd_p = bake_tape(stem, lwd_p);
+                        let lwd_p = bake_tape(stem, lwd_p, facts.kv_codec());
                         emit_bundle(
                             &lwd_p,
                             format!("ktir_prefill_{stem_id}"),
@@ -5309,7 +5328,7 @@ pub(crate) fn dump_wavefront_mega(
                     w * s,
                 ) {
                     Ok(lwd_p) => {
-                        let lwd_p = bake_tape(stem, lwd_p);
+                        let lwd_p = bake_tape(stem, lwd_p, facts.kv_codec());
                         emit_bundle(
                             &lwd_p,
                             format!("ktir_prefill_{stem_id}"),
@@ -5560,7 +5579,7 @@ pub(crate) fn dump_wavefront_mega(
                 decode_mq,
             ) {
                 Ok(lwd_cb) => {
-                    let lwd_cb = bake_tape(stem, lwd_cb);
+                    let lwd_cb = bake_tape(stem, lwd_cb, facts.kv_codec());
                     let (sg, groups) = emit_bundle(
                         &lwd_cb,
                         format!("ktir_decode_cb_{stem_id}"),
