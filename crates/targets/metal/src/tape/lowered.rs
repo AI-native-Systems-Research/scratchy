@@ -3096,7 +3096,7 @@ impl GenClass {
     /// lowering tells every other reader to flip them back
     /// ([`AffineCodes`](super::kernel_constants::AffineCodes)) — one fact,
     /// read by both.
-    pub fn stores_affine_b4_offset8(self) -> bool {
+    pub const fn stores_affine_b4_offset8(self) -> bool {
         matches!(self, GenClass::M5 | GenClass::M5Wide)
     }
 }

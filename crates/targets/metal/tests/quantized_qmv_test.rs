@@ -1094,12 +1094,15 @@ fn a_narrow_projection_fast_matvec_row_is_the_one_row_bits() {
     let (n, k, gs) = (48usize, 5120usize, 64usize);
     let m_max = 64usize;
     let (packed, scales, biases, x) = make_inputs_bf16(0x27BA_B5EED, n, k, m_max, gs);
-    // The tape's codes on this chip: offset-8 (`AffineCodes::of`), stored XOR 0x88.
-    let codes = AffineCodes::of(Some(&dev.profile), 4);
+    // The tape's codes on this chip: offset-8 (`AffineCodes::rows`), stored XOR 0x88.
+    let codes = AffineCodes::rows(
+        scratchy_target_metal::tape::lowered::GenClass::of(dev.profile.generation),
+        4,
+    );
     let stored: Vec<u8> = match codes {
         AffineCodes::Offset8 => packed.iter().map(|b| b ^ 0x88).collect(),
         AffineCodes::AsWritten => packed.clone(),
-        AffineCodes::Planes { .. } => unreachable!("`AffineCodes::of` never stores planes"),
+        AffineCodes::Planes { .. } => unreachable!("`AffineCodes::rows` never stores planes"),
     };
     let as_bytes =
         |v: &[half::f16]| -> Vec<u8> { v.iter().flat_map(|h| h.to_le_bytes()).collect() };

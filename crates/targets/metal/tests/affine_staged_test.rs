@@ -445,7 +445,10 @@ fn staged_tiles_on_a_chip_emulated_by_width() {
         .get() as usize;
     let width = EMULATED / cores;
     let cache = SpecializedPipelineCache::new(device.clone(), &[]).expect("pipeline cache");
-    let codes = AffineCodes::of(Some(&di.profile), 4);
+    let codes = AffineCodes::rows(
+        scratchy_target_metal::tape::lowered::GenClass::of(di.profile.generation),
+        4,
+    );
     let wide = |n: usize, k: usize, bucket: u32| {
         let kernel = pick_qmv_kernel_wide(n as u32, k as u32, 4, bucket, true);
         let name = qmv_kernel_static_name(
@@ -1039,7 +1042,10 @@ fn register_tile_on_a_chip_emulated_by_width() {
         .get() as usize;
     let width = EMULATED / cores;
     let cache = SpecializedPipelineCache::new(device.clone(), &[]).expect("pipeline cache");
-    let codes = AffineCodes::of(Some(&di.profile), 4);
+    let codes = AffineCodes::rows(
+        scratchy_target_metal::tape::lowered::GenClass::of(di.profile.generation),
+        4,
+    );
     let bucket = 8u32;
     println!(
         "µs a dispatch, min/median/max of {ROUNDS} rounds, bucket {bucket}, a {EMULATED}-core chip emulated by \

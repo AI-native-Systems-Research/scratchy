@@ -32,8 +32,8 @@ use scratchy_target_metal::op_abi::{
 use scratchy_target_metal::tape::ids::{ArenaSlotIdx, SourceIx};
 use scratchy_target_metal::tape::lowered::Fence;
 use scratchy_target_metal::tape::step::{
-    AffineBits, AffineGroupSize, HiddenSize, IntermediateSize, LayerId, MetalStep, MetalStepTape,
-    RotaryTables, RowSource, StepRow,
+    AffineBits, AffineGroupSize, HiddenSize, IntermediateSize, LayerId, MetalStepTape,
+    RotaryTables, RowSource,
 };
 
 use scratchy_target_metal::tape::lowering::TapeHalf;
@@ -316,8 +316,8 @@ pub struct MetalStepFacts<'a> {
     /// The head weight the model's logits read (`codegen::head_weight`: a decoder's terminal
     /// gemm), `None` for an encoder. The head is the one weight a drafter borrows of its target
     /// (`LentWeight::LmHead`), reading its codes as the device stores them — and a tied head is
-    /// the table's weight under another name — so the family reading it votes as-stored
-    /// (`MetalStepTape::as_stored_sources`), whichever half reads it. A weight id, not a role:
+    /// the table's weight under another name — so its family's codes are the head's
+    /// (`MetalStepTape::head_source`), whichever half reads it. A weight id, not a role:
     /// the rows' recordings name the ids they read, so the family resolves from them.
     pub head_weight: Option<WeightId>,
     pub mlp: MlpForm,
@@ -687,32 +687,13 @@ pub fn lower_canonical(
         .iter()
         .map(|s| sources.row(s, facts.embed_base))
         .collect();
-    // One weight, one vote: the source families whose codes some reader reads as the device
-    // stores them, never planes — the head (a drafter borrows it of its target, reading
-    // as-stored; a tied head is the table's weight under another name) and the embedding tables
-    // this band's gathers read row-whole. Resolved from the model's own facts — the head's
-    // weight id, matched against the rows' recorded reads; the tables, against the gather rows'
-    // sites — never from where a reader sits: every band and bucket resolves the same families
-    // for the same weights, so every command's vote (`tape::lowering::codes_for`) reads one
-    // weight one way. A head no read names is a head no row binds: the family and the id come
-    // from the same recording, so a miss means this band votes no head family at all.
-    let head = facts.head_weight.and_then(|head| {
+    // The head family: the head's weight id matched against the rows' recorded reads.
+    let head_source = facts.head_weight.and_then(|head| {
         (backbone_weights.iter().chain(&rolled.lm_weights))
             .flat_map(|r| r.iter())
             .find(|(_, id)| *id == head.0)
             .and_then(|(slot, _)| sources.family(slot))
     });
-    let mut as_stored_sources = head.into_iter().collect::<Vec<SourceIx>>();
-    for (row, sources_of_row) in backbone.iter().zip(&backbone_sources) {
-        if matches!(row, StepRow::Step(MetalStep::AffineEmbed(..), _)) {
-            as_stored_sources.extend(
-                sources_of_row
-                    .iter()
-                    .filter(|s| s.kind == WeightKind::AffineQuantEmbedding)
-                    .map(|s| s.ix),
-            );
-        }
-    }
     Ok(MetalCanonical {
         steps: MetalStepTape {
             backbone,
@@ -723,7 +704,7 @@ pub fn lower_canonical(
             lm_head_barriers,
             lm_head_sources,
             lm_head_live,
-            as_stored_sources,
+            head_source,
         },
         operands: StepOperands {
             backbone: backbone_operands,

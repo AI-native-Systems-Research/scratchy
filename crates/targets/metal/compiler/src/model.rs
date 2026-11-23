@@ -706,8 +706,8 @@ pub(crate) fn emit(cx: &ModelCx<'_>) -> ModelEmission {
     // The head weight the model's logits read — the one statement of which weight the head is
     // (`codegen::head_weight`, the terminal walk `backbone_layout` classifies by): the weight a
     // drafter borrows of its target (`LentWeight::LmHead`) and a tied head shares with the
-    // embedding table, so its family's codes vote the way every reader of it reads them
-    // (`MetalStepFacts::head_weight` → `MetalStepTape::as_stored_sources`).
+    // embedding table, so its family's codes are the head's
+    // (`MetalStepFacts::head_weight` → `MetalStepTape::head_source`).
     let head_weight = scratchy_forward_compiler_macro::codegen::head_weight(fuf, program);
     for (canonical, (_, ns_field, bb_slot_field, term_field, slots_dec)) in
         canonical_lowered.iter_mut()
@@ -1647,7 +1647,15 @@ pub(crate) fn emit(cx: &ModelCx<'_>) -> ModelEmission {
 
     {
         let table = metal_tape_cmds
-            .into_tokens(&resolver.typed, &resolver.named, &dims.weight_markers)
+            .into_tokens(
+                &resolver.typed,
+                &resolver.named,
+                &dims.weight_markers,
+                scratchy_forward_compiler_macro::quantization::is_tied_head(
+                    model,
+                    scratchy_forward_compiler_macro::config::LM_HEAD_ROLE,
+                ),
+            )
             .unwrap_or_else(|e| {
                 panic!(
                     "[metal static tape] {}: command table: {e}",
