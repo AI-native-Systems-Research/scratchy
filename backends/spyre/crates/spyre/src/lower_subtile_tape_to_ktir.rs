@@ -961,7 +961,12 @@ pub(crate) fn lower_one_node<T: ktir_superdsc::collective::Tp, F: RopeForm>(
         | SubOp::GatedDeltaNet
         | SubOp::Mamba2 { .. }
         | SubOp::ExpertAct { .. }
-        | SubOp::Mean => Unhandled(format!("{:?} has no SuperDSC kernel", node.op)),
+        | SubOp::Mean
+        | SubOp::SliceCols { .. }
+        | SubOp::MlaRopeQ { .. }
+        | SubOp::MlaAppend { .. }
+        | SubOp::HeadMatmul { .. }
+        | SubOp::MlaAttend { .. } => Unhandled(format!("{:?} has no SuperDSC kernel", node.op)),
         // ⭐ THE ALL-REDUCE'S CONSUMES. The exchange itself is not a program — the bundle's CB
         // pipeline sends this rank's running sum into its round's partner's window and waits for
         // the partner's before the round's consume launches (`bundle::collective::cb_pipeline`).

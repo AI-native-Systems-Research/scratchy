@@ -349,6 +349,19 @@ pub enum MetalStep {
     GatedDeltaNet(Slot, Slot, Slot, Slot, Slot, LayerId),
     /// `(zxbcdt, out, layer)`: Mamba-2 selective state-space mixer over the whole in-projection.
     Mamba2(Slot, Slot, LayerId),
+    /// `(in, out, offset, in_width, width)`: each `in_width`-wide row's column window
+    /// `in[t][offset .. offset + width]`.
+    SliceCols(Slot, Slot, ColOffset, ActivationWidth, ActivationWidth),
+    /// `(q, out, mla)`: multi-head latent attention's query rotation, each head's rope part
+    /// rotated at its row's position, into `out`.
+    MlaRopeQ(Slot, Slot, Mla),
+    /// `(latent, k_pe, out, layer, mla)`: MLA's cache write — the shared rope key rotated into
+    /// `out`, and each row's `[latent | rotated key]` written to the layer's paged cache.
+    MlaAppend(Slot, Slot, Slot, LayerId, Mla),
+    /// A matmul per head ([`HeadMatmul`]).
+    HeadMatmul(HeadMatmul),
+    /// `(q_latent, q, out, layer, mla)`: MLA's absorbed attention over the layer's paged cache.
+    MlaAttend(Slot, Slot, Slot, LayerId, Mla),
     /// One step of a MoE block.
     Moe(MoeBlock, MoeStep),
     /// `(operand, layer, class)`: the layer's cached `operand` rows staged out of its int8 store
@@ -365,6 +378,69 @@ pub enum MetalStep {
     RowProgram(Box<RowProgram>),
     /// A one-row step's decode attention that runs its KV writer (`MetalFusion::RopedAttention`).
     RopedAttention(Box<RopedAttention>),
+}
+
+/// A multi-head latent attention's geometry: the model facts' own value.
+pub use scratchy_ir::model_facts::Mla;
+
+/// A column window's first column.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ColOffset(pub u32);
+
+/// How a per-head matmul's weight blocks are stored.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HeadWeight {
+    /// Dense rows in the activation dtype.
+    Dense,
+    /// MLX-affine rows packed `bits` wide in groups of `group_size`.
+    Affine {
+        group_size: AffineGroupSize,
+        bits: AffineBits,
+    },
+}
+
+/// A matmul per head: head `h` of `input` (the first `k` lanes of each of its `heads` equal
+/// parts) times the layer's weight block `h` (`n / heads` rows of `k`), into head `h`'s
+/// `n / heads` lanes of `output`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HeadMatmul {
+    pub input: Slot,
+    pub output: Slot,
+    pub layer: LayerId,
+    pub heads: super::ids::NumQHeads,
+    pub lanes: HeadLanes,
+    pub n: NDim,
+    pub weight: HeadWeight,
+}
+
+/// A head's part of a per-head matmul's input row: its `stride` lanes, the first `k` of them
+/// dotted. Minted only where `0 < k <= stride`, so a head's dot never reads its neighbour's lanes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HeadLanes {
+    k: KDim,
+    stride: super::ids::RowStride,
+}
+
+impl HeadLanes {
+    /// The lanes of each of `heads` equal parts of a `cols`-wide row, the first `k` dotted; `None`
+    /// unless the parts are equal and each holds its `k`.
+    pub const fn of(k: u32, cols: u32, heads: u32) -> Option<Self> {
+        match heads > 0 && cols.is_multiple_of(heads) && 0 < k && k <= cols / heads {
+            true => Some(Self {
+                k: KDim(k),
+                stride: super::ids::RowStride(cols / heads),
+            }),
+            false => None,
+        }
+    }
+
+    pub const fn k(self) -> KDim {
+        self.k
+    }
+
+    pub const fn stride(self) -> super::ids::RowStride {
+        self.stride
+    }
 }
 
 /// A captured layer's block of the rows a drafter reads: block `slot` of `slots`.
@@ -745,6 +821,9 @@ impl MetalStep {
             | S::KvAppend(_, _, l, ..)
             | S::GatedDeltaNet(_, _, _, _, _, l)
             | S::Mamba2(_, _, l)
+            | S::MlaAppend(_, _, _, l, _)
+            | S::HeadMatmul(HeadMatmul { layer: l, .. })
+            | S::MlaAttend(_, _, _, l, _)
             | S::DraftConv(DraftConv { layer: l, .. })
             | S::DraftAttention(_, _, l)
             | S::DraftContextKv(_, l)
@@ -798,6 +877,8 @@ impl MetalStep {
             | S::EmbeddingGather(..)
             | S::GateSplit(..)
             | S::GateApply(..)
+            | S::SliceCols(..)
+            | S::MlaRopeQ(..)
             | S::Concat(..)
             | S::GateScale(..)
             | S::CaptureHidden(..)

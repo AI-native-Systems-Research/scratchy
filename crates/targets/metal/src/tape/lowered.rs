@@ -274,6 +274,21 @@ pub enum KernelId {
     /// Qwen3.5 / Qwen3-Next Gated-DeltaNet linear-attention core. Maps to
     /// the `gated_delta_*` kernels in `gated_delta.metallib`.
     GatedDeltaNet,
+    /// Each row's column window (`slice_cols_<dtype>`, `slice_cols.metal`).
+    SliceCols,
+    /// A matmul per head (`head_qmv_<dtype>_s_<scale>` / `head_mv_<dtype>`,
+    /// `head_matmul.metal`).
+    HeadMatmul,
+    /// Multi-head latent attention's query rotation (`mla_rope_q_<dtype>`, `mla.metal`).
+    MlaRopeQ,
+    /// Multi-head latent attention's cache write (`mla_append_<dtype>`, `mla.metal`).
+    MlaAppend,
+    /// Multi-head latent attention's absorbed attention over the cache
+    /// (`mla_attend_<dtype>`, `mla.metal`).
+    MlaAttend,
+    /// The merge of a partitioned MLA attention's partials (`mla_attend_merge_<dtype>`,
+    /// `mla.metal`).
+    MlaAttendMerge,
     /// Sum-along-axis-0 reduce for the `[split_k, M, N]` intermediate
     /// `AffineQmmTSplitK` produces. Maps to
     /// `splitk_reduce_sum_<dtype>` in `quantized_splitk_reduce.metallib`.
@@ -614,7 +629,15 @@ impl KernelId {
             | Self::DraftSelectTop16
             | Self::DraftSelectEdges
             | Self::DraftSelectWalk
-            | Self::DraftVerifyRows => SeqScope::AllRows,
+            | Self::DraftVerifyRows
+            // Each row is a token of its own sequence: the attention reads its sequence's rows
+            // through `cu_seqlens_q`.
+            | Self::SliceCols
+            | Self::HeadMatmul
+            | Self::MlaRopeQ
+            | Self::MlaAppend
+            | Self::MlaAttend
+            | Self::MlaAttendMerge => SeqScope::AllRows,
         }
     }
 }
@@ -2870,6 +2893,10 @@ pub enum Lacked {
     FinalSoftcap,
     /// The target a head reads.
     Target,
+    /// A multi-head latent attention's cached rows.
+    Latent,
+    /// A roped attention's rotary facts, in a lane pairing its kernels take.
+    Rope,
 }
 
 /// Errors produced by the lowering pass. Every step kind lowers (the
@@ -2941,6 +2968,9 @@ pub enum LoweringError {
     /// A GDN conv whose `kernel` taps or `drafts` drafted tokens a step its kernel's token block
     /// ([`crate::tape::ids::GdnConvBlock`]) does not cover.
     GdnConvBlockShort { kernel: u32, drafts: u32 },
+    /// An MLA attention whose `latent` lanes of f32 partials, for even one simdgroup, overflow
+    /// the merge's threadgroup `budget` bytes.
+    MlaMergeOverflow { latent: u32, budget: u32 },
 }
 
 /// A scratch buffer whose size scales with the KV cap rung: of the [`ScratchKind`]s, the ones a
@@ -2954,6 +2984,12 @@ pub enum RungScratch {
 impl std::fmt::Display for LoweringError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::MlaMergeOverflow { latent, budget } => write!(
+                f,
+                "an MLA attention's merge holds a simdgroup's {latent} latent lanes as f32 \
+                 ({} bytes), past its {budget}-byte threadgroup budget",
+                4 * latent
+            ),
             Self::UnstagedHeadDim { head_dim } => write!(
                 f,
                 "RopeAppendNormed's threadgroup staging holds a head of at most {} (got {head_dim})",

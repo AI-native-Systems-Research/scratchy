@@ -435,7 +435,7 @@ fn the_typed_qwen2_vl_unrolls_on_every_config() {
 fn every_typed_carrier_unrolls_on_every_config() {
     let arch = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models/arch");
     let carriers = carriers(&arch);
-    assert_eq!(carriers.len(), 30, "the carriers under dsl/");
+    assert_eq!(carriers.len(), 31, "the carriers under dsl/");
     let mut configs = 0;
     let mut failed = Vec::new();
     for (stem, vision) in &carriers {
@@ -480,7 +480,8 @@ fn head_facts(
     crate::codegen::fill_canonical_params(
         model,
         1,
-        false,
+        None,
+        None,
         &Default::default(),
         Some(width),
         crate::target::KvStore::Dense,

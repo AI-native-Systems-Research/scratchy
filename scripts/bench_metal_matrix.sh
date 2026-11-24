@@ -127,13 +127,15 @@ ROOT="$(cd -- "${HERE}/.." &>/dev/null && pwd)"
 # Every id verified against the HuggingFace API with its download size.
 MODELS_ALL=(
   # One model per class, small for a 36 GB Mac and large for a 64 GB one:
-  # sliding-window attention, Mamba-2 hybrid, Gated DeltaNet hybrid, dense.
+  # sliding-window attention, Mamba-2 hybrid, Gated DeltaNet hybrid, dense, multi-head latent
+  # attention.
   "gpt-oss-20b=scratchery/gpt-oss-20b-4bit:mlx-affine-b4-g64-qembed"                  # 11.8 GB, MoE, alternating sliding window
   "gpt-oss-120b-3bit=scratchery/gpt-oss-120b-3bit:"                                    # 51.4 GB, MoE, alternating sliding window, 3-bit
   "nemotron-3-nano-30b-a3b=mlx-community/NVIDIA-Nemotron-3-Nano-30B-A3B-4bit:mlx-affine-b4-g64-qembed"             # 17.8 GB, MoE, Mamba-2 hybrid
   "nemotron-3-super-120b-a12b=mlx-community/NVIDIA-Nemotron-3-Super-120B-A12B-OptiQ-2bit:mlx-affine-b4-g64-qembed" # 47.5 GB, latent MoE, Mamba-2 hybrid, OptiQ 2-bit
   "qwen3.6-35b-a3b=mlx-community/Qwen3.6-35B-A3B-4bit:mlx-affine-b4-g64-qembed"        # 20.4 GB, MoE, GDN hybrid
   "qwen3.5-122b-a10b=scratchery/Qwen3.5-122B-A10B-OptiQ-2bit-mtp:mlx-affine-b4-g64-qembed" # 48.3 GB, MoE, GDN hybrid, OptiQ 2-bit, MTP head
+  "glm-4.7-flash=mlx-community/GLM-4.7-Flash-4bit:mlx-affine-b4-g64-qembed"            # 16.9 GB, MoE, multi-head latent attention
   "qwen2.5-3b=mlx-community/Qwen2.5-3B-Instruct-4bit:mlx-affine-b4-g64-qembed"           # 1.7 GB, dense
   "granite-4.2-8b=ibm-granite/granite-4.2-8b-q4-mlx:mlx-affine-b4-g64-qembed"             # 4.9 GB, dense
   "granite-4.2-30b=ibm-granite/granite-4.2-30b-q4-mlx:mlx-affine-b4-g64-qembed"           # 16.5 GB, dense
@@ -158,12 +160,14 @@ CLASSES=(
   "Mamba-2|nemotron-3-nano-30b-a3b|nemotron-3-super-120b-a12b"
   "Gated DeltaNet|qwen3.6-35b-a3b|qwen3.5-122b-a10b"
   "Dense|qwen2.5-3b|granite-4.2-30b"
+  "MLA|glm-4.7-flash|glm-4.7-flash"
 )
 MODELS_SMALL="$(for c in "${CLASSES[@]}"; do IFS='|' read -r _ s _ <<<"${c}"; echo "${s}"; done | paste -sd, -)"
 MODELS_LARGE="$(for c in "${CLASSES[@]}"; do IFS='|' read -r _ _ l <<<"${c}"; echo "${l}"; done | paste -sd, -)"
-MODELS_FULL="${MODELS_SMALL},${MODELS_LARGE}"
+# A class whose one model fits every Mac names it in both sets; the full set lists it once.
+MODELS_FULL="$(printf '%s\n' ${MODELS_SMALL//,/ } ${MODELS_LARGE//,/ } | awk '!seen[$0]++' | paste -sd, -)"
 # The MoE models: mistral.rs runs out of memory in its MoE expert path.
-MODELS_MOE="gpt-oss-20b,gpt-oss-120b-3bit,nemotron-3-nano-30b-a3b,nemotron-3-super-120b-a12b,qwen3.6-35b-a3b,qwen3.5-122b-a10b,gemma-4-26b-a4b-it,glm-4.5-air"
+MODELS_MOE="gpt-oss-20b,gpt-oss-120b-3bit,nemotron-3-nano-30b-a3b,nemotron-3-super-120b-a12b,qwen3.6-35b-a3b,qwen3.5-122b-a10b,gemma-4-26b-a4b-it,glm-4.5-air,glm-4.7-flash"
 
 # What each engine serves per stem; no entry, no column for that engine.
 # ollama runs its MLX engine (the -mlx tags), as scratchy and mlx-lm do.

@@ -28,6 +28,16 @@ pub(crate) fn vision(p: &ModelFacts) -> Result<Vision, LoweringError> {
     p.vision().ok_or(LoweringError::ModelLacks(Lacked::Vision))
 }
 
+/// The latent rows a multi-head latent attention caches its KV as.
+pub(crate) fn latent(p: &ModelFacts) -> Result<scratchy_ir::model_facts::Mla, LoweringError> {
+    (attention(p)?.latent()).ok_or(LoweringError::ModelLacks(Lacked::Latent))
+}
+
+/// How the attention's keys and queries are rotated.
+pub(crate) fn rope(p: &ModelFacts) -> Result<scratchy_ir::model_facts::Rope, LoweringError> {
+    (attention(p)?.rope()).ok_or(LoweringError::ModelLacks(Lacked::Rope))
+}
+
 /// The Gated-DeltaNet layers.
 pub(crate) fn gdn(p: &ModelFacts) -> Result<Gdn, LoweringError> {
     p.gdn().ok_or(LoweringError::ModelLacks(Lacked::Gdn))

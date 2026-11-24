@@ -28,6 +28,14 @@ impl LentWeight {
     pub const ALL: [Self; 2] = [Self::EmbedTokens, Self::LmHead];
 }
 
+/// One token's KV row in one layer of the paged pool, in each of its K and V stores: `kv_heads`
+/// heads of `head_size` lanes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KvRow {
+    pub kv_heads: usize,
+    pub head_size: usize,
+}
+
 /// Arch-agnostic handle for a loaded model. Every
 /// `#[forward] fn <arch>()` emits an `impl ScratchyWeights` for
 /// its per-arch `Weights` type; callers hold
@@ -73,6 +81,15 @@ pub trait ScratchyWeights: Send + Sync {
     /// of their own) and the scheduler allocates by it; the default `None` (no sliding layer)
     /// keeps the one uniform pool.
     fn kv_layer_geometry(&self) -> Option<Vec<scratchy_core_config::LayerKvGeometry>> {
+        None
+    }
+
+    /// The rows this model's KV pool holds a token of each latent layer as, when they are not
+    /// its attention's per-head keys and values: a multi-head latent attention's cached row,
+    /// as the pool's K and V halves of one kv head (`ModelFacts`' latent attention). The macro
+    /// emits it from the same mint as the facts; the default `None` keeps every other model's
+    /// pool at its `num_key_value_heads` × `head_dim`.
+    fn latent_kv_row(&self) -> Option<KvRow> {
         None
     }
 

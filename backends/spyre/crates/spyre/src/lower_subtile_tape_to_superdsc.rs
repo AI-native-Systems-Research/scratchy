@@ -4421,6 +4421,9 @@ pub fn numeric_gate<T: ktir_superdsc::collective::Tp, F: RopeForm>(
                 | SubOp::VarlenAttention { .. }
                 | SubOp::GatedDeltaNet
                 | SubOp::Mamba2 { .. }
+                | SubOp::MlaRopeQ { .. }
+                | SubOp::MlaAppend { .. }
+                | SubOp::MlaAttend { .. }
                 | SubOp::KvEncode { .. }
                 | SubOp::KvStage { .. }
                 | SubOp::AttnPackedKv
