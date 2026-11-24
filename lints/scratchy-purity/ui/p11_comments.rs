@@ -2,7 +2,7 @@
 
 // Flagged, one per comment form.
 
-// This helper moved from the old module.
+// This helper moved from `old::module`.
 fn a() {}
 
 /// The table used to be a Vec.

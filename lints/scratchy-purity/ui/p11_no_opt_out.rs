@@ -1,7 +1,7 @@
 // A site never opts out of a purity lint: an allow is itself an error.
 #![allow(p11_tombstone_comment, p11_escape_hatch_constructor)]
 
-// This helper moved from the old module.
+// This helper moved from `old::module`.
 pub struct Heads(u32);
 
 impl Heads {

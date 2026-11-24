@@ -17,8 +17,8 @@ LL | #![allow(p11_tombstone_comment, p11_escape_hatch_constructor)]
 error: P11: this comment narrates history (`moved from`); comments describe the code as it is, in the present tense
   --> $DIR/p11_no_opt_out.rs:4:1
    |
-LL | // This helper moved from the old module.
-   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+LL | // This helper moved from `old::module`.
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
    |
    = help: say what the code does now, or delete the comment
    = note: `#[forbid(p11_tombstone_comment)]` on by default

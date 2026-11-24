@@ -35,11 +35,9 @@ use scratchy_tensors::GpuTensor;
 // reach through the same prefix every other wiring type uses.
 pub use ktir_superdsc::sdsc_abstract::{QueryExtent, RungCap, RungWidth};
 
-// ⭐ `act_name` MOVED TO `ktir_superdsc::place`, BESIDE THE `PlaceId` WHOSE `Display` IT CALLS. Its
-// whole body was `bundle::PlaceId::Act(tid).to_string()`, and that module's header already claimed
-// to hold "the ONE site that spells an operand" — so this was simply left behind when `PlaceId` and
-// the `SynthRole` vocabulary went. Its 22 call sites are all in the lowering, which is now in that
-// crate too.
+// ⭐ `act_name` LIVES IN `ktir_superdsc::place`, BESIDE THE `PlaceId` WHOSE `Display` IT CALLS:
+// that module is the one site that spells an operand, and every caller is in the lowering, in
+// that crate.
 
 /// The staged tensor of a linear layer, whatever its quant variant.
 ///

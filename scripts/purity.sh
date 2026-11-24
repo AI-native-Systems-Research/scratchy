@@ -27,7 +27,9 @@ SPYRE_FEATURES=scratchy-models/granite-3.1-8b-instruct,scratchy-target-spyre-mod
 # The card workspace's own alias for the models crate; it panics at build time with zero models.
 SPYRE_HW_FEATURES=model/granite-3.1-8b-instruct,snt1p0
 METAL_FEATURES=scratchy-models/qwen3-0.6b
-METAL_ALL_FEATURES=scratchy-models/all,scratchy-models/mtp,scratchy-target-metal-models/turboquant,scratchy-target-metal-models/vision
+# One file at a time (the edit hook) checks with the smallest model, as CLAUDE.md asks when iterating.
+FILE_FEATURES=scratchy-models/smollm2-135m
+METAL_ALL_FEATURES=scratchy-models/all,scratchy-models/mtp,scratchy-target-metal-models/vision
 
 say() { echo "scratchy-purity: $*" >&2; }
 
@@ -132,11 +134,11 @@ file() { # path
             for c in "${METAL_CRATES[@]}"; do
                 if [[ "${c}" == "${name}" ]]; then
                     macos || { say "${name} builds only on macOS; skipped"; return 0; }
-                    while IFS= read -r a; do feat+=("${a}"); done < <(with_model "${name}" scratchy-models "${METAL_FEATURES}")
+                    while IFS= read -r a; do feat+=("${a}"); done < <(with_model "${name}" scratchy-models "${FILE_FEATURES}")
                     lint . "${feat[@]}"; return
                 fi
             done
-            while IFS= read -r a; do feat+=("${a}"); done < <(with_model "${name}" scratchy-models "${ROOT_FEATURES}")
+            while IFS= read -r a; do feat+=("${a}"); done < <(with_model "${name}" scratchy-models "${FILE_FEATURES}")
             lint . "${feat[@]}" ;;
         /backends/spyre)
             while IFS= read -r a; do feat+=("${a}"); done < <(with_model "${name}" scratchy-target-spyre-models "${SPYRE_FEATURES}")

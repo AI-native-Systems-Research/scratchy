@@ -697,10 +697,10 @@ impl<T: ktir_superdsc::collective::Tp> LaunchGroup<'_, T> {
     /// ⭐⭐⭐⭐⭐ WHERE THIS PROGRAM SITS INSIDE ITS OWN ALLOCATION AND HOW BIG THAT ALLOCATION IS — ONE
     /// value, minted from [`Self::job_bin_ptr`] alone.
     ///
-    /// 🛑 **ONE SUBTRACTION, NOT TWO WITH DIFFERENT FAILURE BEHAVIOURS.** Spelled at the allocation
-    /// path as `job_bin_ptr.checked_sub(prog_offset_base())` it refuses an underflow; spelled bare at
-    /// the launch as `job_bin_ptr - prog_offset_base()` it wraps in release and panics in debug. Both are "the prologue dxp reserved", and the device starts
-    /// executing where the image was uploaded only because they agree.
+    /// 🛑 **ONE SUBTRACTION, HERE.** `job_bin_ptr.checked_sub(prog_base)` is the prologue dxp
+    /// reserved, and both the allocation path and the launch read it from this one place, so an
+    /// underflow is refused once for both. The device starts executing where the image was uploaded
+    /// because the two can't disagree.
     ///
     /// ⛔ THIS IS THE QUANTITY DXP DECLARES TWICE. `ComputeOnDevice.job_bin_ptr` and
     /// `InitTransfer.dev_ptr` are the same device VA — `parse_spyrecode` refuses a plan where they

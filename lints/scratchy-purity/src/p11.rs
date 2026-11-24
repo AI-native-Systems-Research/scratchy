@@ -2,9 +2,9 @@
 
 use crate::comments;
 use clippy_utils::diagnostics::span_lint_and_help;
-use std::path::Path;
 use rustc_lint::{EarlyContext, EarlyLintPass, LintContext};
 use rustc_session::{declare_lint, declare_lint_pass};
+use std::path::Path;
 
 declare_lint! {
     /// P11: no escape-hatch constructors. A checked type has one checking constructor, and it is
@@ -40,21 +40,33 @@ declare_lint! {
 
 declare_lint_pass!(P11 => [P11_ESCAPE_HATCH_CONSTRUCTOR, P11_TOMBSTONE_COMMENT, P11_TMP_PATH_COMMENT, P11_LINT_OPT_OUT]);
 
-pub static LINTS: &[&rustc_lint::Lint] =
-    &[P11_ESCAPE_HATCH_CONSTRUCTOR, P11_TOMBSTONE_COMMENT, P11_TMP_PATH_COMMENT, P11_LINT_OPT_OUT];
+pub static LINTS: &[&rustc_lint::Lint] = &[
+    P11_ESCAPE_HATCH_CONSTRUCTOR,
+    P11_TOMBSTONE_COMMENT,
+    P11_TMP_PATH_COMMENT,
+    P11_LINT_OPT_OUT,
+];
 
 /// The package's manifest, then the nearest manifest above it with a `[workspace]` table.
 fn manifests(manifest_dir: &Path) -> Vec<std::path::PathBuf> {
     let mut found = vec![manifest_dir.join("Cargo.toml")];
-    let workspace = manifest_dir.ancestors().skip(1).map(|d| d.join("Cargo.toml")).find(|m| {
-        std::fs::read_to_string(m).is_ok_and(|t| t.parse::<toml::Table>().is_ok_and(|t| t.contains_key("workspace")))
-    });
+    let workspace = manifest_dir
+        .ancestors()
+        .skip(1)
+        .map(|d| d.join("Cargo.toml"))
+        .find(|m| {
+            std::fs::read_to_string(m).is_ok_and(|t| {
+                t.parse::<toml::Table>()
+                    .is_ok_and(|t| t.contains_key("workspace"))
+            })
+        });
     found.extend(workspace);
     found
 }
 
 const TOMBSTONE_HELP: &str = "say what the code does now, or delete the comment";
-const TMP_HELP: &str = "cite the in-tree source, or use a placeholder such as <out-dir> in a command example";
+const TMP_HELP: &str =
+    "cite the in-tree source, or use a placeholder such as <out-dir> in a command example";
 
 /// The text of a comment token, without its markers.
 fn comment_body(token: &str) -> &str {
@@ -76,7 +88,8 @@ pub fn check_comment(cx: &EarlyContext<'_>, span: rustc_span::Span, body: &str, 
             P11_TOMBSTONE_COMMENT,
             span,
             format!(
-                "P11: this comment narrates history (`{phrase}`); comments describe the code as it is, in the present tense{suffix}"
+                "P11: this comment narrates history (`{}`); comments describe the code as it is, in the present tense{suffix}",
+                phrase.trim_end_matches(['`', ' '])
             ),
             None,
             TOMBSTONE_HELP,
@@ -88,7 +101,7 @@ pub fn check_comment(cx: &EarlyContext<'_>, span: rustc_span::Span, body: &str, 
             P11_TMP_PATH_COMMENT,
             span,
             format!(
-                "P11: this comment cites a scratch path (`/tmp/`); a comment never points at scratch files{suffix}"
+                "P11: this comment cites a path under the temp directory; a comment never points at scratch files{suffix}"
             ),
             None,
             TMP_HELP,
@@ -117,7 +130,8 @@ fn file_tokens(file: &rustc_span::SourceFile, found: &mut Found) {
         let lo = file.start_pos + rustc_span::BytePos(offset);
         let span = rustc_span::Span::with_root_ctxt(lo, lo + rustc_span::BytePos(len));
         match token.kind {
-            rustc_lexer::TokenKind::LineComment { .. } | rustc_lexer::TokenKind::BlockComment { .. } => {
+            rustc_lexer::TokenKind::LineComment { .. }
+            | rustc_lexer::TokenKind::BlockComment { .. } => {
                 found.comments.push((span, comment_body(text).to_owned()));
             }
             rustc_lexer::TokenKind::Whitespace => {}
@@ -152,14 +166,21 @@ impl EarlyLintPass for P11Track {
             return;
         }
         let mut depinfo = sess.file_depinfo.borrow_mut();
-        for path in comments::package_files(manifest_dir).into_iter().chain(manifests(manifest_dir)) {
+        for path in comments::package_files(manifest_dir)
+            .into_iter()
+            .chain(manifests(manifest_dir))
+        {
             depinfo.insert(rustc_span::Symbol::intern(&path.to_string_lossy()));
         }
     }
 }
 
 /// Whether this crate is its package's owner target, the one that checks the whole package.
-fn owns_package(sess: &rustc_session::Session, owner: &Option<std::path::PathBuf>, root: &Path) -> bool {
+fn owns_package(
+    sess: &rustc_session::Session,
+    owner: &Option<std::path::PathBuf>,
+    root: &Path,
+) -> bool {
     !sess.opts.test && owner.as_deref() == Some(root)
 }
 
@@ -167,7 +188,11 @@ fn owns_package(sess: &rustc_session::Session, owner: &Option<std::path::PathBuf
 fn crate_root(sess: &rustc_session::Session, manifest_dir: &Path) -> Option<std::path::PathBuf> {
     let cwd = std::env::current_dir().unwrap_or_default();
     let root = cwd.join(sess.local_crate_source_file()?.local_path()?);
-    Some(root.strip_prefix(manifest_dir).map(Path::to_path_buf).unwrap_or(root))
+    Some(
+        root.strip_prefix(manifest_dir)
+            .map(Path::to_path_buf)
+            .unwrap_or(root),
+    )
 }
 
 /// The tokens this crate checks. The package's owner target (`comments::owner_target`) reads
@@ -193,7 +218,10 @@ fn checked_tokens(cx: &EarlyContext<'_>, manifest_dir: &Path) -> Found {
             let rustc_span::FileName::Real(real) = &file.name else {
                 continue;
             };
-            let local = !file.is_imported() && real.local_path().is_some_and(|p| comments::scanned(&cwd.join(p), manifest_dir));
+            let local = !file.is_imported()
+                && real
+                    .local_path()
+                    .is_some_and(|p| comments::scanned(&cwd.join(p), manifest_dir));
             if local {
                 file_tokens(file, &mut found);
             }
@@ -230,7 +258,8 @@ impl EarlyLintPass for P11 {
         }
         let manifest = std::fs::read_to_string(manifest_dir.join("Cargo.toml")).unwrap_or_default();
         let owner = comments::owner_target(&manifest, |p| manifest_dir.join(p).exists());
-        let owns = crate_root(cx.sess(), manifest_dir).is_some_and(|root| owns_package(cx.sess(), &owner, &root));
+        let owns = crate_root(cx.sess(), manifest_dir)
+            .is_some_and(|root| owns_package(cx.sess(), &owner, &root));
         if owns {
             let at = krate.spans.inner_span.shrink_to_lo();
             for (line, body) in comments::toml_comments(&manifest) {
@@ -243,7 +272,10 @@ impl EarlyLintPass for P11 {
                         cx,
                         P11_LINT_OPT_OUT,
                         at,
-                        format!("P11: `{}` sets the level of `{name}`; no site opts out of a purity rule", path.display()),
+                        format!(
+                            "P11: `{}` sets the level of `{name}`; no site opts out of a purity rule",
+                            path.display()
+                        ),
                         None,
                         "delete the entry, and fix the code the lint flags",
                     );
@@ -251,5 +283,4 @@ impl EarlyLintPass for P11 {
             }
         }
     }
-
 }

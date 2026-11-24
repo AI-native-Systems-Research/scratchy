@@ -124,7 +124,7 @@ pub enum WeightTail {
     /// Every weight sits in the weight segment: it fits one device region.
     #[default]
     InPlace,
-    /// The tail was moved to `segment` (one of [`WEIGHT_SPILL_SEGS`]) at `[0, bytes)`, which every
+    /// The tail sits in `segment` (one of [`WEIGHT_SPILL_SEGS`]) at `[0, bytes)`, which every
     /// borrowing session has to be handed its own copy of.
     Spilled { segment: u32, bytes: u64 },
 }
