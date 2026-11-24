@@ -40,8 +40,8 @@ use ktir_superdsc::reserved_tids::{PAGED_INT32_ZERO_TID, RESERVED_TID_FLOOR};
 use ktir_superdsc::superdsc_opspec::{Df, Fp8, Fp16, StickExtent};
 use scratchy_target_spyre::superdsc_bake::{ChunkExplore, DxpTool};
 use scratchy_triton_splice::{
-    AttnScale, BlockSize, HeadDim, HeadGeometry, HeadWidth, KvHeads, KvQuantizeGeometry,
-    KvWriteGeometry, PagedAttnGeometry, PagedSequence, ContextPages, QueryHeads, RotDim,
+    AttnScale, BlockSize, ContextPages, HeadDim, HeadGeometry, HeadWidth, KvHeads,
+    KvQuantizeGeometry, KvWriteGeometry, PagedAttnGeometry, PagedSequence, QueryHeads, RotDim,
     SchedulerBlockTokens, TokenRows, WalkBlocks, allocate_paged_cache, kv_quantize_program,
     kv_write_program, paged_attn_program,
 };

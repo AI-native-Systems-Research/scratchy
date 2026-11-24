@@ -402,16 +402,11 @@ impl HostShadow {
     }
 }
 
-/// ⭐ THE SEGMENTS A BORROWER ADOPTS INSTEAD OF FILLING — the resident ones. Three sites read this
-/// (host-shadow sizing, device sizing, H2D) and they MUST agree: a segment sized as a placeholder but
-/// then H2D'd from that placeholder writes 128 B of zeros over the owner's live data. Spelling the
-/// set once is what keeps the three in step, and it is the list to extend if the weights ever occupy
-/// more than one segment (see `scratchy_spyre_bundle::MAX_SEGMENT_BYTES`).
-pub const SEG_RESIDENT: [SegIdx; 2] = [SEG_WEIGHT, SEG_KV];
-
-/// Whether `i` names a resident segment (see [`SEG_RESIDENT`]).
+/// Whether `i` names a resident segment ([`scratchy_spyre_bundle::RESIDENT_SEGMENTS`]) — the segments a borrower adopts instead of filling. Host-shadow sizing, device sizing and H2D all read this one set, so a segment sized as a placeholder is never H2D'd over the owner's live data.
 fn is_resident_seg(i: usize) -> bool {
-    SEG_RESIDENT.iter().any(|s| s.get() == i)
+    scratchy_spyre_bundle::RESIDENT_SEGMENTS
+        .iter()
+        .any(|r| r.segment() == i)
 }
 
 /// Logits column count.
@@ -1111,7 +1106,9 @@ fn send_premapped<'a, 'ctx>(
 
 /// The smallest page a host maps. One write per this many bytes faults in every page of a buffer,
 /// whatever page size the host actually uses.
-const HOST_PAGE: usize = 4096;
+///
+/// The card's spelling of `scratchy_spyre_bundle::HOST_PAGE_BYTES`.
+const HOST_PAGE: usize = scratchy_spyre_bundle::HOST_PAGE_BYTES as usize;
 
 /// ⭐ THE HOST PAGE LAW — a byte extent rounded up to whole [`HOST_PAGE`]s, its ONE statement. A
 /// host shadow is mapped at it ([`pages_of`]), the device region a host-owned slot sends to is
@@ -1125,7 +1122,7 @@ struct PageExtent(usize);
 impl PageExtent {
     /// The whole pages covering `bytes`.
     const fn covering(bytes: usize) -> Self {
-        Self(bytes.div_ceil(HOST_PAGE) * HOST_PAGE)
+        Self(scratchy_spyre_bundle::page_cover(bytes as u64) as usize)
     }
 
     /// The extent in bytes.
@@ -2739,7 +2736,7 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
         for i in 0..NUM_SEGMENTS {
             // A BORROWED segment is never staged or H2D'd by this session, so its host side is
             // dead too (an alias repoints the region at the owner's). ...but ONLY for the
-            // segments an alias replaces ([`SEG_RESIDENT`]). The ACTIVATION segment is bound
+            // segments an alias replaces ([`scratchy_spyre_bundle::RESIDENT_SEGMENTS`]). The ACTIVATION segment is bound
             // per-forward by this very session and must keep its real size.
             let aliased_later = reserve_only && is_resident_seg(i);
             if self.seg_borrowed[i] || aliased_later || !self.host_owned_seg(i) {
@@ -3087,19 +3084,12 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
         // consistent with the recorded finding that flex exposes no placement input and only the region
         // table is readable.
         for i in 0..NUM_SEGMENTS {
-            let bytes = if self.seg_borrowed[i] {
-                // A BORROWED segment gets the same 128 B placeholder an empty one does: `alias_seg`
-                // replaces this address with the owner's region, so allocating the full extent
-                // would reserve device memory only to drop it immediately.
-                128
-            } else if self.segment_bytes[i] > 0 {
-                self.segment_bytes[i]
+            let hold = if self.seg_borrowed[i] {
+                scratchy_spyre_bundle::SegmentHold::Borrowed
             } else {
-                128
+                scratchy_spyre_bundle::SegmentHold::Allocated
             };
-            // ⭐ AT THE HOST PAGE LAW ([`PageExtent`]) — the extent the slot's shadow is mapped at, so
-            // a boot send's page cover never passes the region.
-            let bytes = PageExtent::covering(bytes as usize).bytes() as u64;
+            let bytes = hold.alloc_bytes(self.segment_bytes[i]);
             self.seg_addr[i] = Some(
                 DevAddr::alloc(self.card, ByteSize(bytes), MemoryType::Tensor)
                     .map_err(|e| anyhow!("prepare: seg{i} alloc of {bytes} B failed: {e}"))?,
@@ -3115,12 +3105,12 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
             // of this loop above): a borrowed bank gets a minimal alloc so the
             // address exists — an owner's region replaces it. Either way the region is at the host
             // page law ([`PageExtent`]), the extent the bank's shadow is mapped at.
-            let bytes = if self.seg_borrowed[SEG_WEIGHT.get()] {
-                128
+            let hold = if self.seg_borrowed[SEG_WEIGHT.get()] {
+                scratchy_spyre_bundle::SegmentHold::Borrowed
             } else {
-                self.weight_bank_bytes[b].max(128)
+                scratchy_spyre_bundle::SegmentHold::Allocated
             };
-            let bytes = PageExtent::covering(bytes as usize).bytes() as u64;
+            let bytes = hold.alloc_bytes(self.weight_bank_bytes[b]);
             self.weight_bank_addr[b] = Some(
                 DevAddr::alloc(self.card, ByteSize(bytes), MemoryType::Tensor).map_err(|e| {
                     anyhow!(

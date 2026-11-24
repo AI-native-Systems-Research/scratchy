@@ -9,6 +9,9 @@ use quote::quote;
 use scratchy_forward_compiler_frontend::classified::{OpKind, Program, WeightId};
 use scratchy_forward_compiler_macro::config::ModelParams;
 use scratchy_forward_compiler_macro::fuf::{Fuf, FufInput, TileId};
+use scratchy_target_spyre::pool_pages::{
+    BakedPool, ContextPages, PageBytes, PoolPages, Residency, SessionRole, of_bake,
+};
 
 /// PD-wavefront macro-emission (env-gated, diagnostic): route the solved
 /// decode FUF through the FULL compile-time wavefront pipeline — bridge
@@ -2506,6 +2509,155 @@ fn fuf_row_local_tail_op(op: OpKind) -> bool {
     )
 }
 
+/// The walk a session's declare pass leaves its real pass — the ceiling's roll and every sweep rung's own, or the re-roll's refusal, raised by the real pass.
+type Walked<T> = Result<
+    (
+        scratchy_target_spyre::lower_subtile_tape_to_superdsc::RolledSuperDsc<T>,
+        Vec<(
+            scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap,
+            u32,
+            scratchy_target_spyre::lower_subtile_tape_to_superdsc::RolledSuperDsc<T>,
+        )>,
+    ),
+    scratchy_target_spyre::lower_subtile_tape_to_superdsc::SuperDscError,
+>;
+
+/// ⭐ ONE SESSION BETWEEN ITS DECLARE PASS AND ITS REAL PASS — what `world_bake!`'s walk leaves its real pass: the call the session is baked for, its minted graph and wiring, and its walk (the ceiling and every sweep rung, each layout declared at the context's pool). Phase 2 reads its residency, phase 3 places it at the bake's one pool ([`PooledSession`]), and its real pass consumes it.
+struct Declared<T: ktir_superdsc::collective::Tp> {
+    base: String,
+    cap: u32,
+    prefill_mq: Option<u32>,
+    prefill_seqs: u32,
+    active_cap: scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap,
+    decode_rows: u32,
+    /// The slice law of every source when the session is one rank of a sharded world — the emulator's numeric gate runs such a bundle on both ranks at once.
+    #[cfg(feature = "spyre-emu")]
+    shards: Option<Vec<scratchy_subtile::tensor_parallel::SourceShard>>,
+    /// The rung's query extents, which the emulator's numeric gate stages its rung by.
+    #[cfg(feature = "spyre-emu")]
+    query_rows: ktir_superdsc::sdsc_abstract::QueryExtent,
+    krg: scratchy_subtile::subtile_ir::SubtileIR,
+    weight_ids: std::collections::HashSet<u32>,
+    gk: scratchy_target_spyre::lower_subtile_tape_to_superdsc::BundleWiring,
+    /// The pages the ceiling body walks.
+    ceiling_walk: u32,
+    /// The ceiling and each sweep rung `(sweep, swept slots, walk)`, or the re-roll's refusal, raised by the real pass.
+    walked: Walked<T>,
+}
+
+/// ⭐ A SESSION THE BAKE'S POOL IS COMPUTED OVER AND PLACED AT ([`pool_every_session`]).
+trait PooledSession {
+    /// What the session costs the card at `role` — `None` when its walk did not lower (its real pass fails the build).
+    fn residency(&self, role: SessionRole) -> Option<Residency>;
+    /// The session at the bake's pool: its step's pages and every layout's pools.
+    fn place(&mut self, pool: PoolPages);
+}
+
+impl<T: ktir_superdsc::collective::Tp> PooledSession for Declared<T> {
+    fn residency(&self, role: SessionRole) -> Option<Residency> {
+        let (rolled, rungs) = self.walked.as_ref().ok()?;
+        Some(scratchy_target_spyre::pool_pages::session_residency(
+            role,
+            &rolled.layout,
+            rungs.iter().map(|(_, _, rung)| &rung.layout),
+            &rolled.kv_pools,
+            self.gk.paged,
+        ))
+    }
+    fn place(&mut self, pool: PoolPages) {
+        self.gk.paged = self.gk.paged.map(|step| step.over_pool(pool));
+        let step = self.gk.paged;
+        let placed = match &mut self.walked {
+            Ok((rolled, rungs)) => std::iter::once(rolled)
+                .chain(rungs.iter_mut().map(|(_, _, rung)| rung))
+                .try_for_each(|walk| {
+                    scratchy_target_spyre::lower_subtile_tape_to_superdsc::place_kv_pools_at(
+                        walk, step, pool,
+                    )
+                }),
+            Err(_) => Ok(()),
+        };
+        if let Err(e) = placed {
+            self.walked = Err(e);
+        }
+    }
+}
+
+impl<T: ktir_superdsc::collective::Tp> Declared<T> {
+    /// The pool this session's world is stamped with: the bake's pages at one page of this session's pools. A forward whose decode places no pool has none to stamp, and FAILS THE BUILD here, naming its bundle — so no wiring without a pool is ever emitted ([`scratchy_target_spyre::wiring::Wirings::pool`]).
+    fn baked_pool(&self, pages: PoolPages) -> BakedPool {
+        let page = self
+            .walked
+            .as_ref()
+            .map_err(ToString::to_string)
+            .and_then(|(rolled, _)| {
+                PageBytes::of(scratchy_target_spyre::pool_pages::pools_page_bytes(
+                    &rolled.kv_pools,
+                ))
+                .ok_or_else(|| {
+                    "the decode places no KV pool — its attention reads none, so its \
+                     wiring has no pool to bake"
+                        .to_string()
+                })
+            });
+        match page {
+            Ok(page) => BakedPool::new(pages, page),
+            Err(why) => panic!("[spyre-superdsc] {}: {why}", self.base),
+        }
+    }
+}
+
+/// Every declared session among `sessions`, at `role`, as a session the pool is computed over.
+fn pooled<'s, T: ktir_superdsc::collective::Tp + 's>(
+    role: SessionRole,
+    sessions: impl IntoIterator<Item = &'s mut Option<Declared<T>>>,
+) -> impl Iterator<Item = (SessionRole, &'s mut dyn PooledSession)> {
+    sessions
+        .into_iter()
+        .filter_map(move |d| d.as_mut().map(|d| (role, d as &mut dyn PooledSession)))
+}
+
+/// ⭐ THE BAKE'S POOL, ONCE — one pool per world, the narrower of the two, every session of both placed at it (phases 2 and 3).
+///
+/// A run serves ONE world: the one-rank world on one card, or the tp world spread across its ranks' cards — never both on one card's budget. So each world's pool is [`PoolPages::of_bake`] over that world's own sessions at their roles, its decode the owner, against one card. The tp world shards the one-rank decode's pool (`shard_lowered`) and inherits its rows, so one pool serves both worlds: the narrower one. With no tp world baked (`sharded` is empty), it is the one-rank pool.
+fn pool_every_session<'a>(
+    one_rank: &mut [(SessionRole, &'a mut dyn PooledSession)],
+    sharded: &mut [(SessionRole, &'a mut dyn PooledSession)],
+    context: ContextPages,
+) -> PoolPages {
+    let of_world = |world: &[(SessionRole, &mut dyn PooledSession)]| {
+        of_bake(
+            world
+                .iter()
+                .filter_map(|(role, s)| s.residency(*role))
+                .sum(),
+            context,
+        )
+    };
+    let one = of_world(one_rank);
+    let pool = if sharded.is_empty() {
+        one
+    } else {
+        one.min(of_world(sharded))
+    };
+    for (_, s) in one_rank.iter_mut().chain(sharded.iter_mut()) {
+        s.place(pool);
+    }
+    pool
+}
+
+/// The tokens `Wirings::pool` is stamped with — each count one past its stated literal, so the static needs no fallible constructor.
+fn baked_pool_tokens(pool: BakedPool) -> proc_macro2::TokenStream {
+    let pages = proc_macro2::Literal::u32_unsuffixed(pool.pages().get() - 1);
+    let page = proc_macro2::Literal::u64_unsuffixed(pool.page().get().get() - 1);
+    quote! {
+        ::scratchy_target_spyre::pool_pages::BakedPool::new(
+            ::scratchy_target_spyre::pool_pages::PoolPages::of_nonzero(::core::num::NonZeroU32::MIN.saturating_add(#pages)),
+            ::scratchy_target_spyre::pool_pages::PageBytes::new(::core::num::NonZeroU64::MIN.saturating_add(#page)),
+        )
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 // `program` and `ktir_bundle_out` are only
 // read inside the spyre cfg block below; without that feature the
@@ -2808,7 +2960,7 @@ pub(crate) fn dump_wavefront_mega(
             weight_seg_ledger: &tp_weight_seg_ledger,
         };
         // ⭐ WHAT ONE BAKE DOES TO THE EXPANSION'S SHARED STATE, recorded in the order it happens and
-        // applied by `commit_bake` — so the heavy part of a bake (`emit_bundle_deferred`) touches no
+        // applied by `commit_bake` — so a bake's real pass (`world_bake!`'s second closure) touches no
         // shared state at all, and can run on any thread, while the expansion still sees exactly the
         // writes, in exactly the order, that a serial loop made.
         enum BakeEffect {
@@ -2883,12 +3035,12 @@ pub(crate) fn dump_wavefront_mega(
         // rows of `prefill_seqs` requests). `None` = decode.
         // `prefill_seqs`: how many requests the prefill rung packs — 1 for every solo rung, the
         // pair's count for a packed one (`PagedKvPool::packed_prefix_rungs`).
-        // ⭐ ONE BAKE BODY, STAMPED PER WORLD. A bake's ops, launch groups and bundle are its
-        // world's types and a closure cannot be generic, so the body is stated ONCE here and
-        // instantiated for each world this expansion bakes: the one-rank forward's (`TpWorld<1>`)
-        // and the build's one `tp/N` (`Build`). `$W` is that world inside the body.
+        // ⭐ ONE BAKE BODY, STAMPED PER WORLD, IN TWO CLOSURES SPLIT WHERE THE POOL IS DECIDED. A bake's ops, launch groups and bundle are its world's types and a closure cannot be generic, so the body is stated ONCE and instantiated per world (`TpWorld<1>`, the build's `tp/N` `Build`); `$W` is that world. The first closure is the session's walk and declare pass at the context's pool, returning [`Declared`]; the second is its real pass — fp, real pass, render, dxp submit — run once every session is placed at the bake's one pool.
+        // The card's lowering — the device the bake's rolled bodies, twins, prefix and suffix bundles are for.
+        let card = cfg!(feature = "spyre-lower");
         macro_rules! world_bake {
             ($W:ty) => {
+            (
             |lwd: &BakeTape,
              base: String,
              // The capacity THIS bundle is baked for. Decode cap buckets vary it;
@@ -2906,11 +3058,10 @@ pub(crate) fn dump_wavefront_mega(
              // The slice law of every source when `lwd` is one rank of a sharded world — the
              // numeric gate runs such a bundle on both ranks at once. `None` for a world of one.
              shards: Option<&[scratchy_subtile::tensor_parallel::SourceShard]>|
-             -> (BakeOut, Vec<BakeEffect>) {
+             -> Option<Declared<$W>> {
                 // Only the emulator's numeric gate reads the slice laws.
                 #[cfg(not(feature = "spyre-emu"))]
                 let _ = shards;
-                let mut fx: Vec<BakeEffect> = Vec::new();
                 let is_prefill = prefill_mq.is_some();
                 // A prefill chunk's rows are one prompt's positions; a decode bundle's are one token
                 // each of the running requests, at any width — one row is one request's token, and
@@ -2952,25 +3103,6 @@ pub(crate) fn dump_wavefront_mega(
                          overflowing count is a bake bug, named here at the mint"
                     )
                 });
-                // ⛔ THE WIRING MUST NOT DESCRIBE A PROGRAM THAT DID NOT SHIP. A prefill
-                // rung whose reroll fails PANICS (no rung may fail to lower), but this
-                // closure's KTIR emission and wiring stamp run AFTER the reroll and
-                // OUTLIVE its failure — so an
-                // unqualified `slot.1 = Some(w)` shipped a wiring promising an m=31
-                // batched prefill no bundle carried. The worker keys `prefill_prog` on
-                // the wiring alone (`spyre_load.rs`, `pparsed.is_some() ⇒ Some(0)`) and
-                // pushes the prefill program only when the bundle has one, so the
-                // mismatch routed the prompt into DECODE program 0 and staged `m_cap`
-                // rows into an m=1 program — ten unchecked set_source OVERFLOW clobbers,
-                // silently wrong output (MEASURED: gemma-4-26b and the tiny MoE fixture
-                // on the emulator, t0/t10-13/t187-190/t2405 at x31; the dense granite,
-                // whose m=31 rung DID bake, staged clean). This flag is the per-call
-                // record of "this prefill bundle actually baked", set at the only two
-                // sites that stamp a prefill fp and read at the wiring stamp below — a
-                // rung that did not bake leaves the wiring unstamped, `pparsed` parses
-                // nothing, and the worker falls to its sequential per-token prefill
-                // (slower, never wrong).
-                let mut prefill_fp_stamped = false;
                 let fused = scratchy_subtile::lower::fuse_silu_mul(&lwd.input);
                 let mut krg = scratchy_subtile::subtile_ir::lower_region(&fused, knb);
                 // ⭐⭐⭐ THE CHAINED HEAD'S WIDENING PASS — ABOVE every mint, tie-gated
@@ -3115,12 +3247,8 @@ pub(crate) fn dump_wavefront_mega(
                 }
                 if let Err(e) = scratchy_subtile::subtile_ir::ValidatedGraph::new(&krg) {
                     eprintln!("[spyre-ktir] {stem}: SubtileIR rejected by validate() — {e:?}");
-                    return ((String::new(), Vec::new()), fx);
+                    return None;
                 }
-                // No sengraph is lowered: the runnable artifact is the SuperDSC bundle
-                // the reroll below bakes, and `group_graphs` stays empty — the caller
-                // synthesizes a placeholder group to carry the SUPERDSC_BUNDLE sentinel.
-                let group_graphs: Vec<(u32, u32, u32, String)> = Vec::new();
                 // WEIGHT IDS for the fold pass: the sengraph source tensor id `t{i}` is a
                 // model WEIGHT iff `lwd.bindings()[i]` is `SourceBinding::Weight` (the
                 // binding index == the sengraph source id — both from the same
@@ -3183,27 +3311,140 @@ pub(crate) fn dump_wavefront_mega(
                 use scratchy_subtile::subtile_tape::{
                     lower_dag_to_tape, reroll_layer_classes, reroll_subtile_tape,
                 };
-                match ValidatedGraph::new(&krg) {
-                    Ok(valid) => {
-                        let tape_unrolled = lower_dag_to_tape(&valid);
-                        // ⭐ THE CLASS-SPLIT ROLL FIRST. A hybrid-attention model (gemma-4:
-                        // alternating sliding/global layers) has TWO distinct layer shapes, and
-                        // the welded roll's smallest repeat unit is the whole 6-layer cell — a
-                        // bake-unit ~6× larger than either class's body. `reroll_layer_classes`
-                        // splits it into one sibling loop per class; `reroll_subtile_tape`
-                        // remains the single-class roll every other model takes, byte-identical.
-                        let tape_rolled = reroll_layer_classes(&tape_unrolled, &krg)
-                            .unwrap_or_else(|| reroll_subtile_tape(&tape_unrolled, &krg));
-                        match superdsc::lower_subtile_tape_to_superdsc::<$W, _>(
-                            &tape_rolled,
-                            &krg,
-                            &weight_ids,
-                            active_cap, // decode: FULL (sk_bucket rungs land below). prefill: NONE for a
-                            // start==0 chunk, FULL for the continuation bundle.
-                            rows_are_requests,
-                            query_rows,
-                        ) {
-                            Ok(rolled) => {
+                let valid = ValidatedGraph::new(&krg).unwrap_or_else(|e| {
+                    panic!(
+                        "[spyre-superdsc] {base}: SubtileIR invalid for reroll — {e:?} (previously \
+                         swallowed by an eprintln, leaving superdsc_fp unset and shipping a ZERO-group \
+                         bundle that only crashed at pod load.)"
+                    )
+                });
+                let tape_unrolled = lower_dag_to_tape(&valid);
+                // ⭐ THE CLASS-SPLIT ROLL FIRST. A hybrid-attention model (gemma-4:
+                // alternating sliding/global layers) has TWO distinct layer shapes, and
+                // the welded roll's smallest repeat unit is the whole 6-layer cell — a
+                // bake-unit ~6× larger than either class's body. `reroll_layer_classes`
+                // splits it into one sibling loop per class; `reroll_subtile_tape`
+                // remains the single-class roll every other model takes, byte-identical.
+                let tape_rolled = reroll_layer_classes(&tape_unrolled, &krg)
+                    .unwrap_or_else(|| reroll_subtile_tape(&tape_unrolled, &krg));
+                // ⭐ THE PAGE WALK'S RUNGS — spyre-inference's
+                // `num_blocks` buckets over this bundle's pool
+                // (`scratchy_target_spyre::paged_step::walk_buckets`). The body just
+                // baked walks `ceiling_walk` pages — the whole context for a
+                // decode bake, the chunk's own pages for a prompt chunk
+                // baked with no resident prefix — and every other bucket
+                // is a rung, so each step walks the fewest pages that
+                // reach its context.
+                let context_pages = ContextPages::of_slots(prefix_len).get();
+                let ceiling_walk = scratchy_target_spyre::paged_step::walk_pages(
+                    prefix_len.get(), prefill_mq.unwrap_or(decode_rows), active_cap);
+                let walked = superdsc::lower_subtile_tape_to_superdsc::<$W, _>(
+                    &tape_rolled,
+                    &krg,
+                    &weight_ids,
+                    active_cap, // decode: FULL (sk_bucket rungs land below). prefill: NONE for a
+                    // start==0 chunk, FULL for the continuation bundle.
+                    rows_are_requests,
+                    query_rows,
+                )
+                .map(|rolled| {
+                    // The walk rungs: every bucket below a whole-pool walk — a
+                    // decode body's, and a prefix-capable prompt chunk's on the
+                    // card, which runs every chunk past a prompt's first — and,
+                    // off the card, where a prompt chunk past its first page
+                    // runs on the prefill ladder, every bucket above a
+                    // prefix-free chunk's own pages.
+                    let prefix_free_chunk = is_prefill
+                        && active_cap
+                            == scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::NONE;
+                    let sweep = scratchy_target_spyre::paged_step::walk_buckets(context_pages)
+                        .into_iter()
+                        .filter(|&b| {
+                            if prefix_free_chunk {
+                                !card && b > ceiling_walk
+                            } else {
+                                b < ceiling_walk
+                            }
+                        })
+                        .map(|b| {
+                            let slots = b * scratchy_target_spyre::paged_step::SchedulerBlockTokens::REFERENCE.get();
+                            (
+                                scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::new(slots),
+                                slots,
+                            )
+                        });
+                    let ladder: Vec<(
+                        scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap,
+                        u32,
+                    )> = sweep.collect();
+                    // ⭐ EVERY RUNG IS ITS OWN LOWERING of the same tape at its own sweep, reading nothing another rung writes — so they lower in parallel.
+                    let rungs: Vec<(superdsc::ActiveCap, u32, superdsc::RolledSuperDsc<$W>)> = {
+                        use rayon::prelude::*;
+                        ladder.into_par_iter().map(|(rung, rung_swept)| {
+                            match superdsc::lower_subtile_tape_to_superdsc::<$W, _>(
+                                &tape_rolled, &krg, &weight_ids, rung, rows_are_requests, query_rows,
+                            ) {
+                                Ok(rr) => (rung, rung_swept, rr),
+                                // ⛔ A RUNG THE LADDER ASKED FOR MUST LOWER (#1023). Dropping it
+                                // served its positions on the next rung up with no sign
+                                // anywhere (a proc macro's stderr is swallowed on success),
+                                // which hid a broken one-chunk lowering for a whole bisect.
+                                // A ladder that wants fewer rungs states so where it is built.
+                                Err(e) => panic!(
+                                    "[spyre-superdsc] {base}: ladder rung {} does not lower: {e}",
+                                    rung.get()
+                                ),
+                            }
+                        }).collect()
+                    };
+                    (rolled, rungs)
+                });
+                Some(Declared {
+                    base, cap, prefill_mq, prefill_seqs, active_cap, decode_rows,
+                    #[cfg(feature = "spyre-emu")]
+                    shards: shards.map(<[_]>::to_vec),
+                    #[cfg(feature = "spyre-emu")]
+                    query_rows,
+                    krg, weight_ids, gk, ceiling_walk, walked,
+                })
+            },
+            |lwd: &BakeTape, declared: Declared<$W>| -> (BakeOut, Vec<BakeEffect>) {
+                let Declared {
+                    base, cap, prefill_mq, prefill_seqs, active_cap, decode_rows,
+                    #[cfg(feature = "spyre-emu")]
+                    shards,
+                    #[cfg(feature = "spyre-emu")]
+                    query_rows,
+                    krg, weight_ids, gk, ceiling_walk, walked,
+                } = declared;
+                let is_prefill = prefill_mq.is_some();
+                let mut fx: Vec<BakeEffect> = Vec::new();
+                // ⛔ THE WIRING MUST NOT DESCRIBE A PROGRAM THAT DID NOT SHIP. A prefill
+                // rung whose reroll fails PANICS (no rung may fail to lower), but this
+                // closure's KTIR emission and wiring stamp run AFTER the reroll and
+                // OUTLIVE its failure — so an
+                // unqualified `slot.1 = Some(w)` shipped a wiring promising an m=31
+                // batched prefill no bundle carried. The worker keys `prefill_prog` on
+                // the wiring alone (`spyre_load.rs`, `pparsed.is_some() ⇒ Some(0)`) and
+                // pushes the prefill program only when the bundle has one, so the
+                // mismatch routed the prompt into DECODE program 0 and staged `m_cap`
+                // rows into an m=1 program — ten unchecked set_source OVERFLOW clobbers,
+                // silently wrong output (MEASURED: gemma-4-26b and the tiny MoE fixture
+                // on the emulator, t0/t10-13/t187-190/t2405 at x31; the dense granite,
+                // whose m=31 rung DID bake, staged clean). This flag is the per-call
+                // record of "this prefill bundle actually baked", set at the only two
+                // sites that stamp a prefill fp and read at the wiring stamp below — a
+                // rung that did not bake leaves the wiring unstamped, `pparsed` parses
+                // nothing, and the worker falls to its sequential per-token prefill
+                // (slower, never wrong).
+                let mut prefill_fp_stamped = false;
+                // No sengraph is lowered: the runnable artifact is the SuperDSC bundle
+                // the reroll below bakes, and `group_graphs` stays empty — the caller
+                // synthesizes a placeholder group to carry the SUPERDSC_BUNDLE sentinel.
+                let group_graphs: Vec<(u32, u32, u32, String)> = Vec::new();
+                use scratchy_target_spyre::lower_subtile_tape_to_superdsc as superdsc;
+                match walked {
+                    Ok((rolled, rungs)) => {
                                 // ⭐ AND THE PARITY LEDGER'S ENTRY FOR THIS BUNDLE — the
                                 // ceiling's packed weight segment, as the runtime's alias
                                 // guard reads it. One entry per baked bundle; the ledger is
@@ -3271,7 +3512,6 @@ pub(crate) fn dump_wavefront_mega(
                                 // applied upstream of both consumers, moved to the consumer that
                                 // wants it.
                                 let unrolled = superdsc::unroll_layers::<$W>(&rolled);
-                                let card = cfg!(feature = "spyre-lower");
                                 let unrolled_params = rolled.attn_params;
                                 let pre = if card {
                                     superdsc::emit_bundle::<$W>(
@@ -3431,22 +3671,6 @@ pub(crate) fn dump_wavefront_mega(
                                                     .collect::<Vec<_>>(),
                                             )
                                         };
-                                        // ⭐ THE PAGE WALK'S RUNGS — spyre-inference's
-                                        // `num_blocks` buckets over this bundle's pool
-                                        // (`scratchy_target_spyre::paged_step::walk_buckets`). The body just
-                                        // baked walks `ceiling_walk` pages — the whole context for a
-                                        // decode bake, the chunk's own pages for a prompt chunk
-                                        // baked with no resident prefix — and every other bucket
-                                        // is a rung, so each step walks the fewest pages that
-                                        // reach its context.
-                                        let context_pages =
-                                            cap / scratchy_target_spyre::paged_step::SchedulerBlockTokens::REFERENCE.get();
-                                        let ceiling_walk =
-                                            scratchy_target_spyre::paged_step::walk_pages(
-                                                cap,
-                                                prefill_mq.unwrap_or(decode_rows),
-                                                active_cap,
-                                            );
                                         let mut decode_rungs: Vec<
                                             superdsc::bundle::LadderRung<'static>,
                                         > = vec![superdsc::bundle::LadderRung {
@@ -3490,43 +3714,8 @@ pub(crate) fn dump_wavefront_mega(
                                                     .any(|f| !f.is_none()),
                                             },
                                         )];
-                                        // The walk rungs: every bucket below a whole-pool walk — a
-                                        // decode body's, and a prefix-capable prompt chunk's on the
-                                        // card, which runs every chunk past a prompt's first — and,
-                                        // off the card, where a prompt chunk past its first page
-                                        // runs on the prefill ladder, every bucket above a
-                                        // prefix-free chunk's own pages.
-                                        let prefix_free_chunk = is_prefill
-                                            && active_cap
-                                                == scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::NONE;
-                                        let sweep = scratchy_target_spyre::paged_step::walk_buckets(context_pages)
-                                            .into_iter()
-                                            .filter(|&b| {
-                                                if prefix_free_chunk {
-                                                    !card && b > ceiling_walk
-                                                } else {
-                                                    b < ceiling_walk
-                                                }
-                                            })
-                                            .map(|b| {
-                                                let slots = b * scratchy_target_spyre::paged_step::SchedulerBlockTokens::REFERENCE.get();
-                                                (
-                                                    scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::new(slots),
-                                                    slots,
-                                                )
-                                            });
-                                        let ladder: Vec<(
-                                            scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap,
-                                            u32,
-                                        )> = sweep.collect();
-                                        if !ladder.is_empty() {
-                                            // ⭐ EVERY RUNG IS ITS OWN LOWERING of the same tape at
-                                            // its own sweep/chunk, reading nothing another rung
-                                            // writes — so they lower in parallel and are recorded in
-                                            // ladder order (the vectors are sorted below either way).
-                                            // The rung's own layout rides back with its record: the
-                                            // one-layout check reads the ceiling's layout, which
-                                            // holds interior cells and stays on this thread.
+                                        if !rungs.is_empty() {
+                                            // ⭐ EVERY RUNG'S REAL PASS IS ITS OWN EMIT of the walk its declare pass left, reading nothing another rung writes — so they emit in parallel and are recorded in ladder order (sorted below either way). The rung's own layout rides back with its record: the one-layout check reads the ceiling's, which holds interior cells and stays on this thread.
                                             type RungRecord = (
                                                 superdsc::bundle::LadderRung<'static>,
                                                 (
@@ -3540,22 +3729,12 @@ pub(crate) fn dump_wavefront_mega(
                                             );
                                             let per_rung: Vec<Option<RungRecord>> = {
                                                 use rayon::prelude::*;
-                                                ladder
-                                                    .into_par_iter()
-                                                    .map(|(rung, rung_swept)| -> Option<RungRecord> {
-                                                match superdsc::lower_subtile_tape_to_superdsc::<$W, _>(
-                                                    &tape_rolled,
-                                                    &krg,
-                                                    &weight_ids,
-                                                    rung,
-                                                    rows_are_requests,
-                                                    query_rows,
-                                                ) {
-                                                    // Same device split as the ceiling rung above: the
-                                                    // card bakes the ROLLED body, the emulator the
-                                                    // single unrolled one. Without this each of the
-                                                    // three interior rungs pays the same 40x.
-                                                    Ok(rr) => {
+                                                rungs.into_par_iter()
+                                                    .map(|(rung, rung_swept, rr)| -> Option<RungRecord> {
+                                                        // Same device split as the ceiling rung above: the
+                                                        // card bakes the ROLLED body, the emulator the
+                                                        // single unrolled one. Without this each of the
+                                                        // three interior rungs pays the same 40x.
                                                         let rung_unrolled = if card {
                                                             Vec::new()
                                                         } else {
@@ -3673,17 +3852,6 @@ pub(crate) fn dump_wavefront_mega(
                                                             ),
                                                             (rung, rr.layout),
                                                         ))
-                                                    }
-                                                    // ⛔ A RUNG THE LADDER ASKED FOR MUST LOWER (#1023). Dropping it
-                                                    // served its positions on the next rung up with no sign
-                                                    // anywhere (a proc macro's stderr is swallowed on success),
-                                                    // which hid a broken one-chunk lowering for a whole bisect.
-                                                    // A ladder that wants fewer rungs states so where it is built.
-                                                    Err(e) => panic!(
-                                                        "[spyre-superdsc] {base}: ladder rung {} does not lower: {e}",
-                                                        rung.get()
-                                                    ),
-                                                }
                                                     })
                                                     .collect()
                                             };
@@ -3988,7 +4156,7 @@ pub(crate) fn dump_wavefront_mega(
                                                 cap,
                                                 active_cap,
                                                 query_rows,
-                                                shards,
+                                                shards: shards.as_deref(),
                                             };
                                             // ⭐ THE SHIPPED BUNDLE'S OWN PIN WINDOW — read
                                             // from its emitted layout, so the twin's minted
@@ -4194,15 +4362,6 @@ pub(crate) fn dump_wavefront_mega(
                                 );
                             }
                         }
-                    }
-                    Err(e) => {
-                        panic!(
-                            "[spyre-superdsc] {base}: SubtileIR invalid for reroll — {e:?} (previously \
-                         swallowed by an eprintln, leaving superdsc_fp unset and shipping a ZERO-group \
-                         bundle that only crashed at pod load.)"
-                        )
-                    }
-                }
                 // Sengraph lowering DELETED (dead end — SDSC-native only). The sdsc bundle rides the
                 // reroll bake (`superdsc_fp`) above; this decode graph_json stays empty and is
                 // overridden by the SUPERDSC_BUNDLE sentinel downstream. `group_graphs` stays empty
@@ -4291,11 +4450,12 @@ pub(crate) fn dump_wavefront_mega(
                 }
                 ((sengraph_json, group_graphs), fx)
             }
+            )
             };
         }
-        let emit_bundle_deferred =
+        let (declare_one, real_one) =
             world_bake!(scratchy_target_spyre::bundle_code::collective::TpWorld<1>);
-        let emit_bundle_deferred_sharded =
+        let (declare_sharded, real_sharded) =
             world_bake!(scratchy_target_spyre::bundle_code::collective::Build);
         // Apply one bake's effects to `world`'s state, in the order the bake recorded them. Serial,
         // and the only code that touches the expansion's shared state.
@@ -4420,33 +4580,18 @@ pub(crate) fn dump_wavefront_mega(
                 }
             }
         };
-        let emit_bundle =
-            |lwd: &BakeTape,
-             base: String,
-             cap: u32,
-             prefill_mq: Option<u32>,
-             prefill_seqs: u32,
-             active_cap: scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap,
-             decode_rows: u32| {
-                let (r, fx) = emit_bundle_deferred(
-                    lwd,
-                    base,
-                    cap,
-                    prefill_mq,
-                    prefill_seqs,
-                    active_cap,
-                    decode_rows,
-                    None,
-                );
-                commit_bake(&one_rank, lwd, fx);
-                r
-            };
-
+        // ⭐ THE BAKE IN FOUR PHASES, each session's work done once: every session's walk and declare pass at the context's pool; each world's pool ONCE over its sessions' residency; every session placed at the bake's pool; every session's real pass, committed in the order below.
+        type One = scratchy_target_spyre::bundle_code::collective::TpWorld<1>;
+        type Sharded = scratchy_target_spyre::bundle_code::collective::Build;
+        /// A session's sharded twin — its rank-local tape and declare — present iff the build bakes a world.
+        type Twin = Option<(BakeTape, Option<Declared<Sharded>>)>;
+        /// One session of the one-rank world, with its twin.
+        type Session = (BakeTape, Option<Declared<One>>, Twin);
         // Decode bundle (m = 1): the worker's fast per-token path, emitted from THIS
         // m=1 decode tape and baked as the sendnn bundle. This is the only sendnn
         // lowering. This is also the TOP decode cap bucket (cap == prefix_len); the
         // narrower buckets are baked below.
-        let (_decode_graph_unused, mut default_decode_groups) = emit_bundle(
+        let mut decode_declared = declare_one(
             &lowered,
             format!("ktir_decode_{stem_id}"),
             prefix_len.get(),
@@ -4454,6 +4599,7 @@ pub(crate) fn dump_wavefront_mega(
             1,    // no prefill rung: no packed count to state
             scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::FULL,
             SOLO_DECODE_ROWS,
+            None,
         );
 
         // ⭐ THE SHARDED WORLD — the same decode forward, sharded `TP_WORLD` ways by the shared
@@ -4463,11 +4609,14 @@ pub(crate) fn dump_wavefront_mega(
         //
         // ⭐ BAKED ONLY WHEN THE BUILD NAMES IT (`tp/<W>` → this crate's `tp-<W>`, read once as
         // `TP_WORLD`): a build that names no world bakes none, and ships an empty `SUPERDSC_TP`.
-        let tp_sources: Option<Vec<scratchy_subtile::tensor_parallel::SourceShard>> = if !<
+        let (tp_sources, mut tp_decode): (
+            Option<Vec<scratchy_subtile::tensor_parallel::SourceShard>>,
+            Twin,
+        ) = if !<
             scratchy_target_spyre::bundle_code::collective::Build as scratchy_target_spyre::bundle_code::collective::World
         >::SHARDED
         {
-            None
+            (None, None)
         } else {
             let (tp_lwd, sf) = scratchy_subtile::tensor_parallel::shard_lowered::<
                 scratchy_target_spyre::bundle_code::collective::Build,
@@ -4558,18 +4707,9 @@ pub(crate) fn dump_wavefront_mega(
                     g.row, g.table
                 );
             }
-            let (_, fx) = emit_bundle_deferred_sharded(
-                &tp_lwd,
-                format!("ktir_decode_tp{TP_WORLD}_{stem_id}"),
-                prefix_len.get(),
-                None,
-                1,
-                scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::FULL,
-                SOLO_DECODE_ROWS,
-                Some(&sf.sources),
-            );
-            commit_bake(&sharded_world, &tp_lwd, fx);
-            Some(sf.sources)
+            let declared = declare_sharded(&tp_lwd, format!("ktir_decode_tp{TP_WORLD}_{stem_id}"), prefix_len.get(),
+                None, 1, scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::FULL, SOLO_DECODE_ROWS, Some(&sf.sources));
+            (Some(sf.sources), Some((tp_lwd, declared)))
         };
         // The decode's source bindings, named apart: every later rung of the sharded world checks
         // its cuts against them (`refuse_if_staged_cut_apart`), and the prefill ladder's own
@@ -4593,6 +4733,7 @@ pub(crate) fn dump_wavefront_mega(
         // through `superdsc_decode_rungs` / `BatchSlot`, which it consults under `spyre-hw` alone —
         // an emulator build sets `batched_prefill: None` (`spyre_load.rs:1713`) and never runs one.
         // Five more whole-model bakes for nothing.
+        let mut batch_sessions: Vec<Session> = Vec::new();
         if cfg!(feature = "spyre-lower") {
             // RUNGS PAST 8. A decode step's cost is dominated by a FIXED penalty for leaving the
             // mq==1 fast path — the body goes 271 ops/layer at one request to 612 at two, then only
@@ -4629,7 +4770,7 @@ pub(crate) fn dump_wavefront_mega(
                 ) {
                     Ok(lwd_b) => {
                         let lwd_b = bake_tape(stem, lwd_b, facts.kv_codec());
-                        emit_bundle(
+                        let declared = declare_one(
                             &lwd_b,
                             format!("ktir_decode_{stem_id}"),
                             // `cap`: this bundle is baked for the full prefix.
@@ -4639,10 +4780,11 @@ pub(crate) fn dump_wavefront_mega(
                             1,
                             scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::FULL,
                             seqs,
+                            None,
                         );
                         // ⭐ AND THE RUNG IN THE SHARDED WORLD: a sharded session serves every live
                         // request count on its own world's rung, never the one-rank ladder's.
-                        if let Some(shards) = tp_sources.as_deref() {
+                        let tp = tp_sources.as_deref().map(|shards| {
                             let (tp_lwd, sf_b) =
                                 scratchy_subtile::tensor_parallel::shard_lowered::<
                                     scratchy_target_spyre::bundle_code::collective::Build,
@@ -4664,18 +4806,11 @@ pub(crate) fn dump_wavefront_mega(
                                 (lowered.bindings(), shards),
                                 (lwd_b.bindings(), &sf_b.sources),
                             );
-                            let (_, fx) = emit_bundle_deferred_sharded(
-                                &tp_lwd,
-                                format!("ktir_decode_tp{TP_WORLD}_{stem_id}"),
-                                prefix_len.get(),
-                                None,
-                                1,
-                                scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::FULL,
-                                seqs,
-                                Some(&sf_b.sources),
-                            );
-                            commit_bake(&sharded_world, &tp_lwd, fx);
-                        }
+                            let declared = declare_sharded(&tp_lwd, format!("ktir_decode_tp{TP_WORLD}_{stem_id}"), prefix_len.get(),
+                                None, 1, scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::FULL, seqs, Some(&sf_b.sources));
+                            (tp_lwd, declared)
+                        });
+                        batch_sessions.push((lwd_b, declared, tp));
                     }
                     Err(e) => panic!(
                         "[spyre-superdsc] {stem}: decode batch rung seqs={seqs} NOT LOWERED — {e}. \
@@ -4684,16 +4819,6 @@ pub(crate) fn dump_wavefront_mega(
                     ),
                 }
             }
-        }
-        // SuperDSC replaces the sengraph ENTIRELY: `emit_bundle` above baked the work-divided dxp bundle
-        // and set `superdsc_fp`, but the SENGRAPH decode lowering is REFUSED for granite (the lm_head
-        // vocab-slice `t65` non-whole-region) so `default_decode_groups` is EMPTY. The SengraphBundle still
-        // needs ONE [prefill,decode] group to carry the `SUPERDSC_BUNDLE:{fp}` sentinel (both slots are
-        // overridden to it below), so synthesize a placeholder. `in_t`/`res_t` are UNUSED by the superdsc
-        // worker path (it reads the generated `Wiring`); the graph_json is the sentinel. This
-        // is the group STRUCTURE only — the actual compute is the proven dxp bundle, not a sengraph.
-        if default_decode_groups.is_empty() && superdsc_fp.borrow().is_some() {
-            default_decode_groups.push((0u32, 0u32, 0u32, String::new()));
         }
 
         // ⭐ THE HEAD WIDTH IS MINTED AS A TYPE at the bake's one door: whole sticks or a BUILD
@@ -4765,24 +4890,10 @@ pub(crate) fn dump_wavefront_mega(
         } else {
             Some(prefill_m).filter(|&v| v > 1).into_iter().collect()
         };
-        // ⭐ THE RUNGS ARE BAKED IN PARALLEL AND COMMITTED IN ORDER. Each rung is a whole-model lowering
-        // that reads nothing another rung writes — `emit_bundle_deferred` records its effects instead of
-        // applying them — so the 25 bakes run side by side and `commit_bake` then applies their effects
-        // rung by rung, ascending, exactly as the serial loop did (the last rung that lowered is still
-        // the ceiling).
-        //
-        // A rung that does not lower PANICS inside its own bake — every entry that reaches
-        // the commit below is `Ok`, so the committed ladder is every rung asked for.
-        // A rung's bake in each world: the one-rank lowering and its effects, and — when the
-        // sharded world baked its decode — the rung's sharded lowering and effects.
-        type RungBake = (
-            BakeTape,
-            Vec<BakeEffect>,
-            Option<(BakeTape, Vec<BakeEffect>)>,
-        );
-        let per_rung: Vec<RungBake> = {
+        // ⭐ THE RUNGS ARE DECLARED IN PARALLEL — each is a whole-model walk reading nothing another writes. A rung that does not lower PANICS inside its own walk.
+        let mut prefill_sessions: Vec<(u32, Session)> = {
             use rayon::prelude::*;
-            prefill_rung_widths.par_iter().map(|&pl| -> RungBake {
+            prefill_rung_widths.par_iter().map(|&pl| -> (u32, Session) {
             let lowered = to_wavefront::lower_decode_to_wavefront(
                 fuf,
                 inferred,
@@ -4847,9 +4958,9 @@ pub(crate) fn dump_wavefront_mega(
                     )
                         };
                     }
-                    let bake_rung = bake_rung_with!(emit_bundle_deferred);
-                    let bake_rung_sharded = bake_rung_with!(emit_bundle_deferred_sharded);
-                    let (_, fx) = bake_rung(&lwd_p, format!("ktir_prefill_{stem_id}"), None);
+                    let bake_rung = bake_rung_with!(declare_one);
+                    let bake_rung_sharded = bake_rung_with!(declare_sharded);
+                    let declared = bake_rung(&lwd_p, format!("ktir_prefill_{stem_id}"), None);
                     // ⭐ AND THE RUNG IN THE TWO-RANK WORLD, iff that world baked its decode — a
                     // world ships whole or not at all.
                     let tp2 = tp_sources.as_deref().map(|decode_cuts| {
@@ -4870,14 +4981,10 @@ pub(crate) fn dump_wavefront_mega(
                             (decode_bindings, decode_cuts),
                             (lwd_p.bindings(), &sf_p.sources),
                         );
-                        let (_, fx) = bake_rung_sharded(
-                            &tp_lwd,
-                            format!("ktir_prefill_tp{TP_WORLD}_{stem_id}"),
-                            Some(&sf_p.sources),
-                        );
-                        (tp_lwd, fx)
+                        let declared = bake_rung_sharded(&tp_lwd, format!("ktir_prefill_tp{TP_WORLD}_{stem_id}"), Some(&sf_p.sources));
+                        (tp_lwd, declared)
                     });
-                    (lwd_p, fx, tp2)
+                    (pl, (lwd_p, declared, tp2))
                 }
                 Err(e) => {
                     panic!(
@@ -4889,7 +4996,248 @@ pub(crate) fn dump_wavefront_mega(
             }
             }).collect()
         };
-        for (lwd_p, fx, tp2) in per_rung {
+        // The prefill widths whose walk lowered — each one bakes, or its real pass fails the build — the ladder the prefix-capable rungs are asked from.
+        let lowered_widths: Vec<u32> = prefill_sessions
+            .iter()
+            .filter(|(_, (_, declared, _))| declared.is_some())
+            .map(|&(pl, _)| pl)
+            .collect();
+        // ── PREFIX-CAPABLE PREFILL LADDER ── the prefill bakes with a full resident-prefix sweep. The
+        // ladder rungs above are all prefix-FREE, which is correct only for a chunk with start==0; a
+        // continuation chunk has resident KV to attend and must run on one of these.
+        // ⛔ AND IT IS CARD-ONLY TOO: it is reached through `prefill_prefix`, which the worker reads
+        // under `spyre-hw` alone. An emulator build baked this whole extra model and could never
+        // launch it.
+        // ⭐ AT THE PAGE AND AT THE WINDOW — `PagedKvPool::prefix_rungs`, over the widths that baked.
+        // Every mid-prompt continuation chunk is a whole window (the step-back leaves it room for one),
+        // so only a prompt's LAST chunk can be narrower, and a page is the narrowest a padded write can
+        // be placed in without stepping back into the previous chunk's page. Their attention is the
+        // whole-chunk continuation, whose program is flat in the rows (`attn_program_is_flat_in_rows`
+        // refuses anything else at the door), so the widest rung costs no more to lower than the
+        // narrowest.
+        // ⛔ ONE WIDTH WAS THE MEASURED COST. This baked the widest rung alone, and a 52-row tail ran a
+        // full 512-row chunk — granite-3.1-2b at ~2k tokens: 460 ms against 384 ms on the 256-row build.
+        let mut prefix_sessions: Vec<Session> = Vec::new();
+        let mut packed_sessions: Vec<Session> = Vec::new();
+        let (asked, packed_asked) = if cfg!(feature = "spyre-lower") {
+            let asked = ktir_superdsc::sdsc_abstract::PagedKvPool::prefix_rungs(&lowered_widths);
+            for &m in &asked {
+                match scratchy_forward_compiler_macro::to_wavefront::lower_decode_to_wavefront(
+                    fuf,
+                    inferred,
+                    decode_bounds,
+                    &bridge,
+                    scratchy_forward_compiler_macro::to_wavefront::KvPool::at_context(
+                        scratchy_forward_compiler_macro::to_wavefront::PrefixCapacity::new(
+                            prefix_len,
+                        ),
+                    ),
+                    m,
+                ) {
+                    Ok(lwd_p) => {
+                        let lwd_p = bake_tape(stem, lwd_p, facts.kv_codec());
+                        let declared = declare_one(
+                            &lwd_p,
+                            format!("ktir_prefill_{stem_id}"),
+                            prefix_len.get(),
+                            Some(m),
+                            1, // a prompt chunk is one request
+                            scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::FULL,
+                            1,
+                            None,
+                        );
+                        // ⭐ AND THE RUNG IN THE SHARDED WORLD — a world ships whole or not at all: a
+                        // continuation chunk on a sharded session runs on ITS world's prefix rung.
+                        let tp = tp_sources.as_deref().map(|decode_cuts| {
+                            let (tp_lwd, sf_p) = scratchy_subtile::tensor_parallel::shard_lowered::<
+                                scratchy_target_spyre::bundle_code::collective::Build,
+                            _,
+                        >(
+                                &lwd_p,
+                                scratchy_target_spyre::tp_plan::SPYRE_SPLIT_GRANULE,
+                                &[],
+                            )
+                            .unwrap_or_else(|e| {
+                                panic!(
+                                    "[spyre-tp] {stem}: the {TP_WORLD}-rank prefix prefill m={m} \
+                                     is malformed — {e:?}"
+                                )
+                            });
+                            // The rung's OWN slice laws, as the prefix-free ladder passes its own:
+                            // a prompt's rows are staged whole, never the decode's gathered row.
+                            refuse_if_staged_cut_apart(
+                                stem,
+                                &format!("ktir_prefill_tp{TP_WORLD}_{stem_id} prefix m={m}"),
+                                (decode_bindings, decode_cuts),
+                                (lwd_p.bindings(), &sf_p.sources),
+                            );
+                            let declared = declare_sharded(&tp_lwd, format!("ktir_prefill_tp{TP_WORLD}_{stem_id}"), prefix_len.get(),
+                                Some(m), 1, scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::FULL, 1, Some(&sf_p.sources));
+                            (tp_lwd, declared)
+                        });
+                        prefix_sessions.push((lwd_p, declared, tp));
+                    }
+                    Err(e) => panic!(
+                        "[spyre-superdsc] {stem}: prefix-capable prefill rung m={m} NOT LOWERED — \
+                         {e}. Every rung the bake was asked for must lower"
+                    ),
+                }
+            }
+            // ⭐⭐ THE PACKED RUNGS — `PagedKvPool::packed_prefix_rungs`, the same ladder's
+            // products at more than one sequence. A cache-hit tail is a whole continuation
+            // chunk (start>0) of its own; a wave of k concurrent tails is ONE launch of a
+            // (w, s) rung — s windows of w rows over s requests' resident prefixes, the
+            // attention spliced s times at window-local tables (the U1 unroll). The rung's
+            // graph is the PRODUCT's (w·s rows, lowered here), its per-request width stated
+            // by the pair, not divided back out of the rows.
+            let packed_asked =
+                ktir_superdsc::sdsc_abstract::PagedKvPool::packed_prefix_rungs(&lowered_widths);
+            for &(w, s) in &packed_asked {
+                match scratchy_forward_compiler_macro::to_wavefront::lower_decode_to_wavefront(
+                    fuf,
+                    inferred,
+                    decode_bounds,
+                    &bridge,
+                    scratchy_forward_compiler_macro::to_wavefront::KvPool::at_context(
+                        scratchy_forward_compiler_macro::to_wavefront::PrefixCapacity::new(
+                            prefix_len,
+                        ),
+                    ),
+                    w * s,
+                ) {
+                    Ok(lwd_p) => {
+                        let lwd_p = bake_tape(stem, lwd_p, facts.kv_codec());
+                        let declared = declare_one(
+                            &lwd_p,
+                            format!("ktir_prefill_{stem_id}"),
+                            prefix_len.get(),
+                            Some(w),
+                            s,
+                            scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::FULL,
+                            1,
+                            None,
+                        );
+                        // ⭐ AND THE RUNG IN THE SHARDED WORLD — a wave on a sharded session
+                        // runs on ITS world's packed rung.
+                        let tp = tp_sources.as_deref().map(|decode_cuts| {
+                            let (tp_lwd, sf_p) =
+                                scratchy_subtile::tensor_parallel::shard_lowered::<
+                                    scratchy_target_spyre::bundle_code::collective::Build,
+                                    _,
+                                >(
+                                    &lwd_p,
+                                    scratchy_target_spyre::tp_plan::SPYRE_SPLIT_GRANULE,
+                                    &[],
+                                )
+                                .unwrap_or_else(|e| {
+                                    panic!(
+                                        "[spyre-tp] {stem}: the {TP_WORLD}-rank packed prefill \
+                                         (w={w}, s={s}) is malformed — {e:?}"
+                                    )
+                                });
+                            refuse_if_staged_cut_apart(
+                                stem,
+                                &format!(
+                                    "ktir_prefill_tp{TP_WORLD}_{stem_id} packed (w={w}, s={s})"
+                                ),
+                                (decode_bindings, decode_cuts),
+                                (lwd_p.bindings(), &sf_p.sources),
+                            );
+                            let declared = declare_sharded(&tp_lwd, format!("ktir_prefill_tp{TP_WORLD}_{stem_id}"), prefix_len.get(),
+                                Some(w), s, scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::FULL, 1, Some(&sf_p.sources));
+                            (tp_lwd, declared)
+                        });
+                        packed_sessions.push((lwd_p, declared, tp));
+                    }
+                    Err(e) => panic!(
+                        "[spyre-superdsc] {stem}: packed prefill rung (w={w}, s={s}) NOT \
+                         LOWERED — {e}. Every rung the bake was asked for must lower"
+                    ),
+                }
+            }
+            (asked, packed_asked)
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        // ⭐ THE POOL, ONCE — each world's sessions apart, each world's decode its owner (`pool_every_session`).
+        let pool = {
+            let mut one_rank_sessions: Vec<(SessionRole, &mut dyn PooledSession)> =
+                pooled(SessionRole::Owner, [&mut decode_declared]).collect();
+            let mut sharded_sessions: Vec<(SessionRole, &mut dyn PooledSession)> =
+                pooled(SessionRole::Owner, tp_decode.iter_mut().map(|(_, d)| d)).collect();
+            for (_, declared, tp) in batch_sessions
+                .iter_mut()
+                .chain(prefill_sessions.iter_mut().map(|(_, s)| s))
+                .chain(prefix_sessions.iter_mut())
+                .chain(packed_sessions.iter_mut())
+            {
+                one_rank_sessions.extend(pooled(SessionRole::Borrower, [declared]));
+                sharded_sessions
+                    .extend(pooled(SessionRole::Borrower, tp.iter_mut().map(|(_, d)| d)));
+            }
+            pool_every_session(
+                &mut one_rank_sessions,
+                &mut sharded_sessions,
+                ContextPages::of_slots(prefix_len),
+            )
+        };
+        // Each world's stamped pool — `None` only for a world whose decode never declared, which commits no decode wiring to stamp.
+        let one_rank_pool = decode_declared.as_ref().map(|d| d.baked_pool(pool));
+        let tp_pool = tp_decode
+            .as_ref()
+            .and_then(|(_, d)| d.as_ref())
+            .map(|d| d.baked_pool(pool));
+        // ── EVERY SESSION'S REAL PASS, committed in the bake's order ──
+        let real_one_session = |lwd: &BakeTape, declared: Option<Declared<One>>| -> GroupGraphs {
+            declared.map_or_else(Vec::new, |d| {
+                let ((_, groups), fx) = real_one(lwd, d);
+                commit_bake(&one_rank, lwd, fx);
+                groups
+            })
+        };
+        let real_sharded_session = |twin: Twin| {
+            if let Some((tp_lwd, Some(d))) = twin {
+                let (_, fx) = real_sharded(&tp_lwd, d);
+                commit_bake(&sharded_world, &tp_lwd, fx);
+            }
+        };
+        let mut default_decode_groups = real_one_session(&lowered, decode_declared);
+        real_sharded_session(tp_decode);
+        for (lwd_b, declared, tp) in batch_sessions {
+            real_one_session(&lwd_b, declared);
+            real_sharded_session(tp);
+        }
+        // SuperDSC replaces the sengraph ENTIRELY: `emit_bundle` above baked the work-divided dxp bundle
+        // and set `superdsc_fp`, but the SENGRAPH decode lowering is REFUSED for granite (the lm_head
+        // vocab-slice `t65` non-whole-region) so `default_decode_groups` is EMPTY. The SengraphBundle still
+        // needs ONE [prefill,decode] group to carry the `SUPERDSC_BUNDLE:{fp}` sentinel (both slots are
+        // overridden to it below), so synthesize a placeholder. `in_t`/`res_t` are UNUSED by the superdsc
+        // worker path (it reads the generated `Wiring`); the graph_json is the sentinel. This
+        // is the group STRUCTURE only — the actual compute is the proven dxp bundle, not a sengraph.
+        if default_decode_groups.is_empty() && superdsc_fp.borrow().is_some() {
+            default_decode_groups.push((0u32, 0u32, 0u32, String::new()));
+        }
+        // ⭐ THE PREFILL RUNGS' REAL PASSES RUN IN PARALLEL AND COMMIT IN ORDER — a real pass records its effects and `commit_bake` alone applies them, rung by rung, ascending: the last rung that baked is the ceiling.
+        type RungFx = (
+            BakeTape,
+            Vec<BakeEffect>,
+            Option<(BakeTape, Vec<BakeEffect>)>,
+        );
+        let prefill_real: Vec<RungFx> = {
+            use rayon::prelude::*;
+            prefill_sessions
+                .into_par_iter()
+                .map(|(_, (lwd_p, declared, tp))| -> RungFx {
+                    let fx = declared.map_or_else(Vec::new, |d| real_one(&lwd_p, d).1);
+                    let tp2 = tp.map(|(tp_lwd, declared)| {
+                        let fx = declared.map_or_else(Vec::new, |d| real_sharded(&tp_lwd, d).1);
+                        (tp_lwd, fx)
+                    });
+                    (lwd_p, fx, tp2)
+                })
+                .collect()
+        };
+        for (lwd_p, fx, tp2) in prefill_real {
             commit_bake(&one_rank, &lwd_p, fx);
             if let Some((tp_lwd, fx)) = tp2 {
                 commit_bake(&sharded_world, &tp_lwd, fx);
@@ -4917,172 +5265,11 @@ pub(crate) fn dump_wavefront_mega(
             }
         }
 
-        // ── PREFIX-CAPABLE PREFILL LADDER ── the prefill bakes with a full resident-prefix sweep. The
-        // ladder rungs above are all prefix-FREE, which is correct only for a chunk with start==0; a
-        // continuation chunk has resident KV to attend and must run on one of these.
-        // ⛔ AND IT IS CARD-ONLY TOO: it is reached through `prefill_prefix`, which the worker reads
-        // under `spyre-hw` alone. An emulator build baked this whole extra model and could never
-        // launch it.
-        // ⭐ AT THE PAGE AND AT THE WINDOW — `PagedKvPool::prefix_rungs`, over the widths that baked.
-        // Every mid-prompt continuation chunk is a whole window (the step-back leaves it room for one),
-        // so only a prompt's LAST chunk can be narrower, and a page is the narrowest a padded write can
-        // be placed in without stepping back into the previous chunk's page. Their attention is the
-        // whole-chunk continuation, whose program is flat in the rows (`attn_program_is_flat_in_rows`
-        // refuses anything else at the door), so the widest rung costs no more to lower than the
-        // narrowest.
-        // ⛔ ONE WIDTH WAS THE MEASURED COST. This baked the widest rung alone, and a 52-row tail ran a
-        // full 512-row chunk — granite-3.1-2b at ~2k tokens: 460 ms against 384 ms on the 256-row build.
+        for (lwd_p, declared, tp) in prefix_sessions.into_iter().chain(packed_sessions) {
+            real_one_session(&lwd_p, declared);
+            real_sharded_session(tp);
+        }
         if cfg!(feature = "spyre-lower") {
-            let baked: Vec<u32> = superdsc_prefill_rungs
-                .borrow()
-                .iter()
-                .map(|(m, _)| *m)
-                .collect();
-            let asked = ktir_superdsc::sdsc_abstract::PagedKvPool::prefix_rungs(&baked);
-            for &m in &asked {
-                match scratchy_forward_compiler_macro::to_wavefront::lower_decode_to_wavefront(
-                    fuf,
-                    inferred,
-                    decode_bounds,
-                    &bridge,
-                    scratchy_forward_compiler_macro::to_wavefront::KvPool::at_context(
-                        scratchy_forward_compiler_macro::to_wavefront::PrefixCapacity::new(
-                            prefix_len,
-                        ),
-                    ),
-                    m,
-                ) {
-                    Ok(lwd_p) => {
-                        let lwd_p = bake_tape(stem, lwd_p, facts.kv_codec());
-                        emit_bundle(
-                            &lwd_p,
-                            format!("ktir_prefill_{stem_id}"),
-                            prefix_len.get(),
-                            Some(m),
-                            1, // a prompt chunk is one request
-                            scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::FULL,
-                            1,
-                        );
-                        // ⭐ AND THE RUNG IN THE SHARDED WORLD — a world ships whole or not at all: a
-                        // continuation chunk on a sharded session runs on ITS world's prefix rung.
-                        if let Some(decode_cuts) = tp_sources.as_deref() {
-                            let (tp_lwd, sf_p) = scratchy_subtile::tensor_parallel::shard_lowered::<
-                                scratchy_target_spyre::bundle_code::collective::Build,
-                            _,
-                        >(
-                                &lwd_p,
-                                scratchy_target_spyre::tp_plan::SPYRE_SPLIT_GRANULE,
-                                &[],
-                            )
-                            .unwrap_or_else(|e| {
-                                panic!(
-                                    "[spyre-tp] {stem}: the {TP_WORLD}-rank prefix prefill m={m} \
-                                     is malformed — {e:?}"
-                                )
-                            });
-                            // The rung's OWN slice laws, as the prefix-free ladder passes its own:
-                            // a prompt's rows are staged whole, never the decode's gathered row.
-                            refuse_if_staged_cut_apart(
-                                stem,
-                                &format!("ktir_prefill_tp{TP_WORLD}_{stem_id} prefix m={m}"),
-                                (decode_bindings, decode_cuts),
-                                (lwd_p.bindings(), &sf_p.sources),
-                            );
-                            let (_, fx) = emit_bundle_deferred_sharded(
-                                &tp_lwd,
-                                format!("ktir_prefill_tp{TP_WORLD}_{stem_id}"),
-                                prefix_len.get(),
-                                Some(m),
-                                1,
-                                scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::FULL,
-                                1,
-                                Some(&sf_p.sources),
-                            );
-                            commit_bake(&sharded_world, &tp_lwd, fx);
-                        }
-                    }
-                    Err(e) => panic!(
-                        "[spyre-superdsc] {stem}: prefix-capable prefill rung m={m} NOT LOWERED — \
-                         {e}. Every rung the bake was asked for must lower"
-                    ),
-                }
-            }
-            // ⭐⭐ THE PACKED RUNGS — `PagedKvPool::packed_prefix_rungs`, the same ladder's
-            // products at more than one sequence. A cache-hit tail is a whole continuation
-            // chunk (start>0) of its own; a wave of k concurrent tails is ONE launch of a
-            // (w, s) rung — s windows of w rows over s requests' resident prefixes, the
-            // attention spliced s times at window-local tables (the U1 unroll). The rung's
-            // graph is the PRODUCT's (w·s rows, lowered here), its per-request width stated
-            // by the pair, not divided back out of the rows.
-            for &(w, s) in &ktir_superdsc::sdsc_abstract::PagedKvPool::packed_prefix_rungs(&baked) {
-                match scratchy_forward_compiler_macro::to_wavefront::lower_decode_to_wavefront(
-                    fuf,
-                    inferred,
-                    decode_bounds,
-                    &bridge,
-                    scratchy_forward_compiler_macro::to_wavefront::KvPool::at_context(
-                        scratchy_forward_compiler_macro::to_wavefront::PrefixCapacity::new(
-                            prefix_len,
-                        ),
-                    ),
-                    w * s,
-                ) {
-                    Ok(lwd_p) => {
-                        let lwd_p = bake_tape(stem, lwd_p, facts.kv_codec());
-                        emit_bundle(
-                            &lwd_p,
-                            format!("ktir_prefill_{stem_id}"),
-                            prefix_len.get(),
-                            Some(w),
-                            s,
-                            scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::FULL,
-                            1,
-                        );
-                        // ⭐ AND THE RUNG IN THE SHARDED WORLD — a wave on a sharded session
-                        // runs on ITS world's packed rung.
-                        if let Some(decode_cuts) = tp_sources.as_deref() {
-                            let (tp_lwd, sf_p) =
-                                scratchy_subtile::tensor_parallel::shard_lowered::<
-                                    scratchy_target_spyre::bundle_code::collective::Build,
-                                    _,
-                                >(
-                                    &lwd_p,
-                                    scratchy_target_spyre::tp_plan::SPYRE_SPLIT_GRANULE,
-                                    &[],
-                                )
-                                .unwrap_or_else(|e| {
-                                    panic!(
-                                        "[spyre-tp] {stem}: the {TP_WORLD}-rank packed prefill \
-                                     (w={w}, s={s}) is malformed — {e:?}"
-                                    )
-                                });
-                            refuse_if_staged_cut_apart(
-                                stem,
-                                &format!(
-                                    "ktir_prefill_tp{TP_WORLD}_{stem_id} packed (w={w}, s={s})"
-                                ),
-                                (decode_bindings, decode_cuts),
-                                (lwd_p.bindings(), &sf_p.sources),
-                            );
-                            let (_, fx) = emit_bundle_deferred_sharded(
-                                &tp_lwd,
-                                format!("ktir_prefill_tp{TP_WORLD}_{stem_id}"),
-                                prefix_len.get(),
-                                Some(w),
-                                s,
-                                scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::FULL,
-                                1,
-                                Some(&sf_p.sources),
-                            );
-                            commit_bake(&sharded_world, &tp_lwd, fx);
-                        }
-                    }
-                    Err(e) => panic!(
-                        "[spyre-superdsc] {stem}: packed prefill rung (w={w}, s={s}) NOT \
-                         LOWERED — {e}. Every rung the bake was asked for must lower"
-                    ),
-                }
-            }
             // ⛔⛔⛔ EVERY WORLD'S PREFIX TABLES SHIP WHOLE — the one-rank world's and, when the
             // bake sharded one, the sharded world's OWN. A rung the bake asked for that a world
             // silently dropped (an emitter path that returns early instead of failing the build)
@@ -5106,8 +5293,6 @@ pub(crate) fn dump_wavefront_mega(
             // tail, live count); a pair that did not bake is silent — the wave falls to
             // serialized solo chunks, the 878.7 ms this exists to kill. All checked against
             // what BAKED, not the widths asked for, both directions.
-            let packed_asked =
-                ktir_superdsc::sdsc_abstract::PagedKvPool::packed_prefix_rungs(&baked);
             let worlds: &[(&str, &WorldBake)] = if tp_sources.is_some() {
                 &[
                     ("one-rank world", &one_rank),
@@ -5428,7 +5613,8 @@ pub(crate) fn dump_wavefront_mega(
         // `wm.q_proj`, instead of a disk-key string resolved at load.
         {
             let cells = wiring_tokens.borrow();
-            if let Some(dec) = &cells.decode {
+            if let (Some(dec), Some(pool)) = (&cells.decode, one_rank_pool) {
+                let pool = baked_pool_tokens(pool);
                 let pre = match &cells.prefill {
                     Some(p) => quote! { ::core::option::Option::Some(#p) },
                     None => quote! { ::core::option::Option::None },
@@ -5455,6 +5641,7 @@ pub(crate) fn dump_wavefront_mega(
                             decode: #dec,
                             prefill: #pre,
                             packed_prefill: &[#(#packed_lits),*],
+                            pool: #pool,
                         };
                 });
             }
@@ -5468,6 +5655,7 @@ pub(crate) fn dump_wavefront_mega(
                 tp_fp.borrow().clone(),
                 tp_wiring.borrow().clone(),
                 tp_sources.as_ref(),
+                tp_pool,
             ) {
                 (
                     Some(fp),
@@ -5477,6 +5665,7 @@ pub(crate) fn dump_wavefront_mega(
                         packed_prefill: tp_packed,
                     },
                     Some(sources),
+                    Some(tp_pool),
                 ) => {
                     let fp = proc_macro2::Literal::string(&fp);
                     // The prefill bundle and its wiring ship together or not at all, as the
@@ -5558,6 +5747,7 @@ pub(crate) fn dump_wavefront_mega(
                             }
                         }
                     });
+                    let tp_pool_lit = baked_pool_tokens(tp_pool);
                     vec![quote! {
                         ::scratchy_target_spyre::wiring::TpForward::<
                             ::scratchy_target_spyre::bundle_code::collective::Build,
@@ -5571,6 +5761,7 @@ pub(crate) fn dump_wavefront_mega(
                                 decode: #wiring,
                                 prefill: #prefill_wiring,
                                 packed_prefill: &[#(#tp_packed_lits),*],
+                                pool: #tp_pool_lit,
                             },
                             sources: &[#(#sources),*],
                             world: ::core::marker::PhantomData,
@@ -5662,6 +5853,153 @@ mod tests {
                 12,
                 "{stem}: a prefix shorter than the derived rung must bake at the prefix"
             );
+        }
+    }
+
+    /// ⭐ THE BAKE'S POOL IS COMPUTED ONCE PER WORLD AND EVERY SESSION RUNS AT ONE POOL. Each world's residency is read once per session, at its own role, against one card. The bake's pool is the one-rank world's when no tp world is baked, and the narrower of the two when one is. Every session of every world is placed at it exactly once: past the context on a card build, the context's own pages off it.
+    #[test]
+    fn the_pool_is_computed_once_per_world_and_every_session_runs_at_it() {
+        use super::{PooledSession, pool_every_session};
+        use ktir_superdsc::placement::BundleLayout;
+        use scratchy_target_spyre::pool_pages::{
+            ContextPages, PoolPages, Residency, SessionRole, session_residency,
+        };
+        use scratchy_target_spyre::wiring::{PagedStep, QueryExtent, RungCap, RungWidth};
+        use std::cell::RefCell;
+        use std::num::NonZeroU32;
+        struct Fake {
+            layout: BundleLayout,
+            at_context: PagedStep,
+            step: PagedStep,
+            asked: RefCell<Vec<SessionRole>>,
+            places: u32,
+        }
+        impl Fake {
+            fn at(&self, role: SessionRole) -> Residency {
+                let fp = |cols| scratchy_target_spyre::wiring::KvPool {
+                    tid: 0,
+                    cols,
+                    format: scratchy_triton_splice::KvPoolFormat::Fp16,
+                };
+                session_residency(
+                    role,
+                    &self.layout,
+                    [],
+                    &[fp(512), fp(512)],
+                    Some(self.at_context),
+                )
+            }
+        }
+        impl PooledSession for Fake {
+            fn residency(&self, role: SessionRole) -> Option<Residency> {
+                self.asked.borrow_mut().push(role);
+                Some(self.at(role))
+            }
+            fn place(&mut self, pool: PoolPages) {
+                self.step = self.step.over_pool(pool);
+                self.places += 1;
+            }
+        }
+        let slots = scratchy_target_spyre::paged_step::SchedulerBlockTokens::REFERENCE.get();
+        let context =
+            ContextPages::of_slots(NonZeroU32::new(16 * slots).expect("a nonzero context"));
+        let step = |rows: u32| {
+            let tids = scratchy_triton_splice::PagedStepTids::RESERVED;
+            PagedStep {
+                mask: tids.mask,
+                page_table: tids.page_table,
+                write_rows: tids.write_rows,
+                query_rows: tids.query_rows,
+                kv_row_pool: tids.kv_row_pool,
+                rep_rows: tids.rep_rows,
+                chunk_pages: tids.chunk_pages,
+                chunk_masks: tids.chunk_masks,
+                int32_zero: tids.int32_zero,
+                pages: 16,
+                page_slots: slots,
+                rows,
+                nkvh: 8,
+                q_width: 32 * 64,
+                head_size: 64,
+                walk: 16,
+                paged_rows: scratchy_target_spyre::paged_step::PagedRows::Sequence,
+                extent: QueryExtent::of_baked_rung(
+                    RungWidth::of_baked_rows(rows).expect("nonzero rows"),
+                    RungCap::ONE,
+                )
+                .expect("fits"),
+            }
+        };
+        let fake = |intermediate: u64, rows: u32| {
+            let mut layout = BundleLayout::default();
+            layout.segment_bytes = [intermediate, 1_000_000, 3072, 400, 0, 0, 0];
+            layout.weight_bank_bytes = vec![500_000];
+            Fake {
+                layout,
+                at_context: step(rows),
+                step: step(rows),
+                asked: RefCell::new(Vec::new()),
+                places: 0,
+            }
+        };
+        let roles = [
+            SessionRole::Owner,
+            SessionRole::Borrower,
+            SessionRole::Borrower,
+        ];
+        let world = |base: u64| [fake(base, 1), fake(base + 8192, 1), fake(base + 4096, 64)];
+        let of_world = |w: &[Fake; 3]| {
+            scratchy_target_spyre::pool_pages::of_bake(
+                w.iter().zip(roles).map(|(s, role)| s.at(role)).sum(),
+                context,
+            )
+        };
+        let pool_of = |one: &mut [Fake; 3], tp: &mut [Fake]| {
+            let mut one_rank: Vec<(SessionRole, &mut dyn PooledSession)> = roles
+                .into_iter()
+                .zip(one.iter_mut().map(|s| s as &mut dyn PooledSession))
+                .collect();
+            let mut sharded: Vec<(SessionRole, &mut dyn PooledSession)> = roles
+                .into_iter()
+                .zip(tp.iter_mut().map(|s| s as &mut dyn PooledSession))
+                .collect();
+            pool_every_session(&mut one_rank, &mut sharded, context)
+        };
+        let check = |sessions: &[Fake], pool: PoolPages| {
+            for (s, role) in sessions.iter().zip(roles) {
+                assert_eq!(
+                    *s.asked.borrow(),
+                    vec![role],
+                    "each residency is read once, at its own role"
+                );
+                assert_eq!(s.places, 1, "each session is placed once");
+                assert_eq!(
+                    s.step.pages,
+                    pool.get(),
+                    "every session runs at the one pool"
+                );
+            }
+        };
+        // No tp world: the one-rank world's pool.
+        let mut one = world(8192);
+        let pool = pool_of(&mut one, &mut []);
+        assert_eq!(pool, of_world(&one));
+        check(&one, pool);
+        // A tp world whose own sessions hold a GiB more: each world is its own; the bake takes the narrower.
+        let (mut one, mut tp) = (world(8192), world(1 << 30));
+        let pool = pool_of(&mut one, &mut tp);
+        assert_eq!(
+            pool,
+            of_world(&one).min(of_world(&tp)),
+            "one pool, the narrower world's"
+        );
+        check(&one, pool);
+        check(&tp, pool);
+        if cfg!(feature = "spyre-lower") {
+            assert_eq!(pool, of_world(&tp), "the heavier world bounds the pool");
+            assert!(of_world(&tp) < of_world(&one) && pool.get() > context.get());
+        } else {
+            assert_eq!(pool.get(), context.get());
         }
     }
 }

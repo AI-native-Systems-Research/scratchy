@@ -3561,12 +3561,15 @@ pub fn lower_subtile_tape_to_ktir<T: ktir_superdsc::collective::Tp, F: RopeForm>
         }
     }
     let kv_request_stride = bundle_layout.kv_request_stride_bytes;
+    let kv_pools = crate::lower_subtile_tape_to_superdsc::kv_pools(ir)?;
     Ok(RolledSuperDsc {
         prefix,
         bodies,
         suffix,
         layout: bundle_layout,
         per_layer,
+        per_layer_ext,
+        kv_pools,
         launches,
         launch_w,
         launch_kv,

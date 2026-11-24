@@ -703,14 +703,27 @@ pub struct PagedStep {
 pub const KV_ROW_POOL_PAGE_BYTES: u64 =
     ktir_superdsc::emit::lower_ktir_to_superdsc::INDEX_RUN_WORDS as u64 * 4;
 
-/// ⭐ THE POOL'S PAGE — the bytes one page of a KV pool at `cols` columns holds on the card:
-/// the scheduler's own block ([`SchedulerBlockTokens::REFERENCE`] slots) of rows, each at the
-/// fp16 row footprint ([`row_footprint_bytes`]) every pool placement is sized at. The ONE
-/// statement both the layout's pool sizing and the session's per-page residency
-/// ([`crate::pool_pages`]) read — a pool's bytes are its pages times this, never its rows
-/// times the footprint re-derived.
-pub fn pool_page_bytes(cols: u32) -> u64 {
-    u64::from(SchedulerBlockTokens::REFERENCE.get()) * row_footprint_bytes(cols, Df::Fp16)
+/// ⭐ ONE KV POOL AS THE TAPE STATES IT — its tensor, its columns and its element format
+/// ([`scratchy_triton_splice::KvPoolFormat`], read off the writer that fills it by
+/// [`scratchy_triton_splice::kv_pool_formats`], the one statement every paged kernel's pool pointers
+/// and the layout's placement read).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct KvPool {
+    pub tid: u32,
+    pub cols: u32,
+    pub format: scratchy_triton_splice::KvPoolFormat,
+}
+
+impl KvPool {
+    /// ⭐ THE POOL'S PAGE — the bytes one page of this pool holds on the card: the scheduler's own
+    /// block ([`SchedulerBlockTokens::REFERENCE`] slots) of rows, each at its format's row footprint
+    /// ([`row_footprint_bytes`] at [`scratchy_triton_splice::KvPoolFormat::df`]) the layout's pool
+    /// placement is sized at. The ONE statement both the bake's re-placement at its pool and the
+    /// session's per-page residency ([`crate::pool_pages`]) read.
+    pub fn page_bytes(self) -> u64 {
+        u64::from(SchedulerBlockTokens::REFERENCE.get())
+            * row_footprint_bytes(self.cols, self.format.df())
+    }
 }
 
 impl PagedStep {
@@ -723,6 +736,18 @@ impl PagedStep {
     /// The pool's token capacity: every page's slots.
     pub const fn capacity(self) -> usize {
         self.pages as usize * self.page_slots as usize
+    }
+
+    /// ⭐ THE STEP OVER THE BAKE'S POOL — this step at the pool's pages
+    /// ([`crate::pool_pages::of_bake`]), every other field its own. A graph's step states its
+    /// context's pages ([`crate::lower_subtile_tape_to_ktir::paged_step_of_ir`]); the pool holds
+    /// the context by [`crate::pool_pages::within`]'s floor, so every walk the step names lies
+    /// inside it.
+    pub const fn over_pool(self, pool: crate::pool_pages::PoolPages) -> Self {
+        PagedStep {
+            pages: pool.get(),
+            ..self
+        }
     }
 
     /// ⭐ THE BUNDLE'S REACH — the positions its attention's walk covers. A step whose positions end at
@@ -1995,6 +2020,11 @@ pub struct Wirings {
     /// entry whose pair matches the rung it loaded. EMPTY ⇒ no packed rungs baked (every model
     /// whose ladder bakes none, and every build before the packed table existed).
     pub packed_prefill: &'static [(u32, u32, Wiring)],
+    /// ⭐ THE KV POOL THE BAKE PLACED — its pages (every wiring's [`PagedStep::pages`]) and one
+    /// page of this world's pools: the serving step's KV budget and block. Every forward the bake
+    /// ships places one; a forward whose decode places none fails the BUILD (the bake's
+    /// `Declared::baked_pool`), so a pool-less wiring is unrepresentable.
+    pub pool: crate::pool_pages::BakedPool,
 }
 
 /// How each rank loads a source — the shared analysis's slice law, re-exported so the tokens

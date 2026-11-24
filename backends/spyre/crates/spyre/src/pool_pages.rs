@@ -26,6 +26,7 @@ use ktir_superdsc::sdsc_abstract::SchedulerBlockTokens;
 
 /// The context's pages and the pool's pages — each one type, beside the scheduler's block.
 pub use ktir_superdsc::sdsc_abstract::{ContextPages, PoolPages};
+pub use scratchy_spyre_bundle::{SegmentHold, SessionRole};
 
 /// ⭐ THE CARD'S BUDGET — the tensor memory a session's pools are sized within: the card
 /// generation's own tensor memory at the serving step's utilization fraction. A newtype, not
@@ -158,6 +159,19 @@ impl Add for Residency {
     }
 }
 
+impl std::iter::Sum for Residency {
+    /// What every session of a world costs the card together.
+    fn sum<I: Iterator<Item = Residency>>(sessions: I) -> Residency {
+        sessions.fold(
+            Residency {
+                fixed: FixedBytes::new(0),
+                page: PerPageBytes::new(0),
+            },
+            Add::add,
+        )
+    }
+}
+
 /// ⭐ THE LAW — the pages the budget's remainder holds at the page's bytes, never fewer
 /// than the context's own pages. [`blocks_within`] is the serving step's own division
 /// (its sixteen-page floor and its zero-page fallback included — the page's own zero law
@@ -190,41 +204,113 @@ pub const fn extra_rows(pool: PoolPages, context: ContextPages) -> u32 {
     pool.get().saturating_sub(context.get()) * SchedulerBlockTokens::REFERENCE.get()
 }
 
-/// ⭐ THE SESSION'S RESIDENCY, READ OFF THE BAKE'S OWN LAYOUT AND STEP — the fixed bytes are
-/// every segment's extent but the KV segment's ([`BundleLayout::segment_extents`]: the
-/// intermediate segment covers every synthetic the door declared; the pools are the pages,
-/// charged per page), minus
-/// the row pool's bytes when the session's step reads it (those bytes ride inside its colour
-/// segment's extent, which the fixed bytes sum, and they are per-page too — the step's own
-/// [`card_kv_row_pool_bytes`](crate::wiring::PagedStep::card_kv_row_pool_bytes), never a
-/// layout lookup); the per-page bytes are every pool's page
-/// ([`crate::wiring::pool_page_bytes`] at each pool's columns) plus the row pool's page
-/// ([`crate::wiring::KV_ROW_POOL_PAGE_BYTES`]) when the step reads it. It reads the layout's
-/// own numbers and the step's own bytes, and computes nothing else.
-pub fn session_residency(
-    layout: &BundleLayout,
-    page_cols: &[u32],
+/// ⭐ THE BAKE'S POOL — the pages a world's sessions run at, read once off their summed residency.
+/// On a card build (`spyre-lower`) it is [`within`] at the generation the bake targets. Off the card
+/// the KV cache is the emulator's KTIR buffers, host memory no card budget sizes, so the pool is the
+/// context's own pages — as it is for a residency that costs no page ([`PageBytes::of`]'s `None`).
+/// The ONE statement of which pool a world places.
+pub fn of_bake(residency: Residency, context: ContextPages) -> PoolPages {
+    match PageBytes::of(residency.page()) {
+        Some(page) if cfg!(feature = "spyre-lower") => within(
+            CardBudget::of::<ktir_core::ddl_binds::Baked>(),
+            residency.fixed(),
+            page,
+            context,
+        ),
+        _ => PoolPages::of_nonzero(context.nonzero()),
+    }
+}
+
+/// ⭐ THE POOL THE BAKE PLACED — its pages ([`of_bake`]) and one page of the world's pools
+/// ([`pools_page_bytes`]): the serving step's KV budget and the block it is cut into, carried in the
+/// wiring.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct BakedPool {
+    pages: PoolPages,
+    page: PageBytes,
+}
+
+impl BakedPool {
+    pub const fn new(pages: PoolPages, page: PageBytes) -> Self {
+        Self { pages, page }
+    }
+
+    pub const fn pages(self) -> PoolPages {
+        self.pages
+    }
+
+    pub const fn page(self) -> PageBytes {
+        self.page
+    }
+
+    /// The pool's bytes: its pages at its page.
+    pub const fn bytes(self) -> u64 {
+        self.pages.get() as u64 * self.page.get().get()
+    }
+}
+
+/// The bytes one page of a session's pools holds — every pool's page
+/// ([`crate::wiring::KvPool::page_bytes`]), summed.
+pub fn pools_page_bytes(pools: &[crate::wiring::KvPool]) -> PerPageBytes {
+    PerPageBytes::new(pools.iter().map(|p| p.page_bytes()).sum())
+}
+
+/// ⭐ THE SESSION'S RESIDENCY, READ OFF THE BAKE'S OWN LAYOUTS AND STEP, AT THE SESSION'S ROLE.
+///
+/// The fixed bytes are what the session allocates on the card ([`SessionRole::holds`] and
+/// [`SegmentHold::alloc_bytes`], the card's own rule, its host page cover included). That is every
+/// segment at the largest extent any layout the session launches declares
+/// ([`session_segment_bytes`](crate::lower_subtile_tape_to_superdsc::session_segment_bytes), over
+/// the ceiling and every sweep rung; [`BundleLayout::segment_extents`] covers every declared
+/// synthetic), plus every extra weight bank.
+/// - The OWNER allocates the weights and their banks, and its pool is its pages, so its KV segment
+///   is charged per page.
+/// - A BORROWER pays a placeholder for each resident segment and each bank it aliases. Its spilled
+///   weight tail sits in its own non-resident segment, so it is its own.
+///
+/// The per-page bytes are the pool's page ([`pools_page_bytes`]), paid by the owner alone because
+/// every borrower aliases its pool, plus this session's own row pool page
+/// ([`crate::wiring::KV_ROW_POOL_PAGE_BYTES`]) when its step reads one. That row pool's bytes sit
+/// inside its segment's extent and leave the fixed total to ride per page, charged one host page of
+/// cover past its bytes ([`crate::bundle_code::HOST_PAGE_BYTES`]). Two sessions' residencies add
+/// ([`impl Add`]) to what they cost together.
+pub fn session_residency<'a>(
+    role: SessionRole,
+    ceiling: &BundleLayout,
+    rungs: impl IntoIterator<Item = &'a BundleLayout>,
+    pools: &[crate::wiring::KvPool],
     step: Option<crate::wiring::PagedStep>,
 ) -> Residency {
     let kv_seg = SegRole::Kv.segment();
-    let mut fixed: u64 = layout
-        .segment_extents()
+    let extents = crate::lower_subtile_tape_to_superdsc::session_segment_bytes(
+        ceiling.segment_extents(),
+        rungs.into_iter().map(BundleLayout::segment_extents),
+    );
+    let banks = role.holds(SegRole::Weight.segment());
+    let mut fixed: u64 = extents
         .into_iter()
         .enumerate()
-        .filter(|&(seg, _)| seg != kv_seg)
-        .map(|(_, bytes)| bytes)
-        .sum();
-    let mut page: u64 = page_cols
-        .iter()
-        .map(|&cols| crate::wiring::pool_page_bytes(cols))
-        .sum();
+        .map(|(seg, extent)| match (seg == kv_seg, role.holds(seg)) {
+            // The pool this session allocates is its pages, charged per page below.
+            (true, SegmentHold::Allocated) => 0,
+            (_, hold) => hold.alloc_bytes(extent),
+        })
+        .sum::<u64>()
+        + ceiling
+            .weight_bank_bytes
+            .iter()
+            .map(|&bank| banks.alloc_bytes(bank))
+            .sum::<u64>();
+    let mut page: u64 = match role.holds(kv_seg) {
+        SegmentHold::Allocated => pools_page_bytes(pools).get(),
+        SegmentHold::Borrowed => 0,
+    };
     if let Some(step) = step
         && step.reads_kv_row_pool()
     {
-        // The row pool's bytes sit inside its colour segment's extent, which the fixed bytes
-        // sum — take them out and charge the run per page instead, both figures the step itself
-        // states (`card_kv_row_pool_bytes` is its pages at the one page law).
-        fixed -= step.card_kv_row_pool_bytes();
+        // The row pool sits inside its segment's extent; charge its run per page instead, and its
+        // region one host page past the run — the most its page cover can add as the run grows.
+        fixed = fixed - step.card_kv_row_pool_bytes() + crate::bundle_code::HOST_PAGE_BYTES;
         page += crate::wiring::KV_ROW_POOL_PAGE_BYTES;
     }
     Residency {
@@ -280,6 +366,22 @@ mod tests {
             walk: pages,
             paged_rows: crate::paged_step::PagedRows::Sequence,
             extent: pair(rows, 1),
+        }
+    }
+
+    fn fp16(cols: u32) -> crate::wiring::KvPool {
+        crate::wiring::KvPool {
+            tid: 0,
+            cols,
+            format: scratchy_triton_splice::KvPoolFormat::Fp16,
+        }
+    }
+
+    fn fp8(cols: u32) -> crate::wiring::KvPool {
+        crate::wiring::KvPool {
+            tid: 0,
+            cols,
+            format: scratchy_triton_splice::KvPoolFormat::Fp8(scratchy_ir::KvCacheScales::Unscaled),
         }
     }
 
@@ -368,72 +470,246 @@ mod tests {
     ///   moves no byte.
     #[test]
     fn the_page_laws_are_byte_identical_to_the_row_spelling() {
-        use ktir_superdsc::superdsc_opspec::Df;
         assert_eq!(
             crate::wiring::KV_ROW_POOL_PAGE_BYTES,
             u64::from(ktir_superdsc::emit::lower_ktir_to_superdsc::INDEX_RUN_WORDS) * 4,
         );
-        for cols in [4u32, 64, 512, 576, 1024, 4224, 49152] {
-            let pages = 16u32;
-            let rows = pages * SchedulerBlockTokens::REFERENCE.get();
-            assert_eq!(
-                u64::from(pages) * crate::wiring::pool_page_bytes(cols),
-                u64::from(rows)
-                    * crate::lower_subtile_tape_to_superdsc::row_footprint_bytes(cols, Df::Fp16),
-                "cols {cols}: a whole-page pool's bytes are the same by page or by row"
-            );
+        for format in [
+            scratchy_triton_splice::KvPoolFormat::Fp16,
+            scratchy_triton_splice::KvPoolFormat::Fp8(scratchy_ir::KvCacheScales::Unscaled),
+        ] {
+            for cols in [4u32, 64, 512, 576, 1024, 4224, 49152] {
+                let pages = 16u32;
+                let rows = pages * SchedulerBlockTokens::REFERENCE.get();
+                assert_eq!(
+                    u64::from(pages)
+                        * crate::wiring::KvPool {
+                            tid: 0,
+                            cols,
+                            format
+                        }
+                        .page_bytes(),
+                    u64::from(rows)
+                        * crate::lower_subtile_tape_to_superdsc::row_footprint_bytes(
+                            cols,
+                            format.df(),
+                        ),
+                    "cols {cols}: a whole-page pool's bytes are the same by page or by row"
+                );
+            }
         }
     }
 
-    /// The session's residency charges the KV segment per page, never as fixed bytes, and
-    /// the row pool's bytes leave the fixed total to ride per page when the session's step
-    /// reads it — a step whose kernel does not, and a layout with no paged step at all, keep
-    /// every segment's extent whole and charge no run.
+    /// The owner's residency charges the KV segment per page, never as fixed bytes; an empty
+    /// segment costs its placeholder; and the row pool's bytes leave the fixed total to ride per
+    /// page when the step reads it.
     #[test]
     fn session_residency_charges_the_kv_segment_per_page() {
+        let a = |e: u64| SegmentHold::Allocated.alloc_bytes(e);
+        let run = crate::wiring::KV_ROW_POOL_PAGE_BYTES;
+        let grow = crate::bundle_code::HOST_PAGE_BYTES;
         // seg0 intermediate, seg1 weights, seg2 KV, seg3 activations.
         let layout = BundleLayout {
             segment_bytes: [8192, 200, 3072, 400, 0, 0, 0],
             ..BundleLayout::default()
         };
-        let reading = session_residency(&layout, &[512, 512], Some(step(2, 1)));
-        assert_eq!(
-            reading.fixed().get(),
-            8192 + 200 + 400 - 2 * crate::wiring::KV_ROW_POOL_PAGE_BYTES
+        let reading = session_residency(
+            SessionRole::Owner,
+            &layout,
+            [],
+            &[fp16(512), fp16(512)],
+            Some(step(2, 1)),
         );
-        assert_eq!(
-            reading.page().get(),
-            2 * crate::wiring::pool_page_bytes(512) + crate::wiring::KV_ROW_POOL_PAGE_BYTES
+        let unread = a(8192) + a(200) + a(400) + 3 * a(0);
+        assert_eq!(reading.fixed().get(), unread - 2 * run + grow);
+        assert_eq!(reading.page().get(), 2 * fp16(512).page_bytes() + run);
+        let not_reading = session_residency(
+            SessionRole::Owner,
+            &layout,
+            [],
+            &[fp16(512), fp16(512)],
+            Some(step(2, 2)),
         );
-        let not_reading = session_residency(&layout, &[512, 512], Some(step(2, 2)));
-        assert_eq!(not_reading.fixed().get(), 8192 + 200 + 400);
-        assert_eq!(
-            not_reading.page().get(),
-            2 * crate::wiring::pool_page_bytes(512)
+        assert_eq!(not_reading.fixed().get(), unread);
+        assert_eq!(not_reading.page().get(), 2 * fp16(512).page_bytes());
+        let no_step = session_residency(
+            SessionRole::Owner,
+            &layout,
+            [],
+            &[fp16(512), fp16(512)],
+            None,
         );
-        let no_step = session_residency(&layout, &[512, 512], None);
         assert_eq!(no_step.fixed(), not_reading.fixed());
         assert_eq!(no_step.page(), not_reading.page());
     }
 
-    /// The residency's fixed bytes hold every synthetic the door declared: the intermediate
-    /// segment's extent is the synthetic allocator's high-water mark once the synthetics run past
-    /// the packed intermediates, and the packed extent while none is declared.
+    /// The residency's fixed bytes hold every synthetic the door declared.
     #[test]
     fn session_residency_charges_the_declared_synthetics() {
+        let a = |e: u64| SegmentHold::Allocated.alloc_bytes(e);
         let layout = BundleLayout {
             segment_bytes: [8192, 200, 3072, 400, 0, 0, 0],
             synth: std::cell::RefCell::new(ktir_superdsc::placement::SynthAlloc::new(8192)),
             ..BundleLayout::default()
         };
         assert_eq!(
-            session_residency(&layout, &[512], None).fixed().get(),
-            8192 + 200 + 400
+            session_residency(SessionRole::Owner, &layout, [], &[fp16(512)], None)
+                .fixed()
+                .get(),
+            a(8192) + a(200) + a(400) + 3 * a(0)
         );
         layout.synth(ktir_superdsc::place::SynthId::Act(900), &[4, 64]);
         assert_eq!(layout.segment_extents(), [8704, 200, 3072, 400, 0, 0, 0]);
-        let reading = session_residency(&layout, &[512], None);
-        assert_eq!(reading.fixed().get(), 8704 + 200 + 400);
-        assert_eq!(reading.page().get(), crate::wiring::pool_page_bytes(512));
+        let reading = session_residency(SessionRole::Owner, &layout, [], &[fp16(512)], None);
+        assert_eq!(reading.fixed().get(), a(8704) + a(200) + a(400) + 3 * a(0));
+        assert_eq!(reading.page().get(), fp16(512).page_bytes());
+    }
+
+    /// The session's fixed bytes are the widest extent any layout it launches declares.
+    #[test]
+    fn session_residency_charges_the_widest_layout_the_session_launches() {
+        let a = |e: u64| SegmentHold::Allocated.alloc_bytes(e);
+        let ceiling = BundleLayout {
+            segment_bytes: [8192, 200, 3072, 400, 0, 0, 0],
+            ..BundleLayout::default()
+        };
+        let rung = BundleLayout {
+            segment_bytes: [12288, 200, 3072, 300, 0, 0, 4096],
+            ..BundleLayout::default()
+        };
+        let r = session_residency(SessionRole::Owner, &ceiling, [&rung], &[fp16(512)], None);
+        assert_eq!(
+            r.fixed().get(),
+            a(12288) + a(200) + a(400) + a(0) + a(0) + a(4096)
+        );
+        assert_eq!(r.page().get(), fp16(512).page_bytes());
+    }
+
+    /// ⭐ THE RESIDENT BYTES ARE CHARGED ONCE — the owner allocates the weights (every bank) and the
+    /// KV pool. Each borrower charges its own segments and a placeholder for every resident segment
+    /// and bank it aliases, its spilled tail included as its own. The pool's page is paid once, by
+    /// the owner; each session that reads its own row pool pays that pool's page.
+    #[test]
+    fn the_owner_pays_the_resident_bytes_and_every_session_its_own() {
+        let a = |e: u64| SegmentHold::Allocated.alloc_bytes(e);
+        let ph = SegmentHold::Borrowed.alloc_bytes(0);
+        let run = crate::wiring::KV_ROW_POOL_PAGE_BYTES;
+        let grow = crate::bundle_code::HOST_PAGE_BYTES;
+        let pool_page = 2 * fp16(512).page_bytes();
+        let (weights, bank) = (1_000_000u64, 500_000u64);
+        let layout = |intermediate: u64, spill: u64| BundleLayout {
+            segment_bytes: [intermediate, weights, 3072, 400, 256, 256, spill],
+            weight_bank_bytes: vec![bank],
+            ..BundleLayout::default()
+        };
+        let (owner, reader, batch) = (layout(8192, 0), layout(16384, 4096), layout(12288, 0));
+        let cols = [fp16(512), fp16(512)];
+        let o = session_residency(SessionRole::Owner, &owner, [], &cols, Some(step(2, 1)));
+        let r = session_residency(SessionRole::Borrower, &reader, [], &cols, Some(step(2, 1)));
+        let b = session_residency(SessionRole::Borrower, &batch, [], &cols, Some(step(2, 2)));
+        assert_eq!(
+            o.fixed().get(),
+            a(8192) + a(weights) + a(400) + a(256) + a(256) + a(0) + a(bank) - 2 * run + grow
+        );
+        assert_eq!(o.page().get(), pool_page + run);
+        assert_eq!(
+            r.fixed().get(),
+            a(16384) + ph + ph + a(400) + a(256) + a(256) + a(4096) + ph - 2 * run + grow
+        );
+        assert_eq!(r.page().get(), run);
+        assert_eq!(
+            b.fixed().get(),
+            a(12288) + ph + ph + a(400) + a(256) + a(256) + a(0) + ph
+        );
+        assert_eq!(b.page().get(), 0);
+        let all = o + r + b;
+        assert!(
+            all.fixed().get() < 2 * weights,
+            "the weights and their bank are charged once"
+        );
+        assert_eq!(
+            all.fixed().get(),
+            o.fixed().get() + r.fixed().get() + b.fixed().get()
+        );
+        assert_eq!(
+            all.page().get(),
+            pool_page + 2 * run,
+            "one pool page; a row-pool page per reading session"
+        );
+    }
+
+    /// The bake's pool: the law's on a card, the context's off it, and the context's for a
+    /// residency that costs no page.
+    #[test]
+    fn the_bakes_pool_is_the_laws_on_the_card_and_the_context_off_it() {
+        let slots = SchedulerBlockTokens::REFERENCE.get();
+        assert_eq!(ContextPages::of_slots(nz32(slots + 1)).get(), 2);
+        let context = ContextPages::of_slots(nz32(16 * slots));
+        let layout = BundleLayout {
+            segment_bytes: [8192, 200, 3072, 400, 0, 0, 0],
+            ..BundleLayout::default()
+        };
+        let residency = session_residency(
+            SessionRole::Owner,
+            &layout,
+            [],
+            &[fp16(512), fp16(512)],
+            None,
+        );
+        let pool = of_bake(residency, context);
+        if cfg!(feature = "spyre-lower") {
+            let page = PageBytes::of(residency.page()).expect("two pools cost a page");
+            assert_eq!(
+                pool,
+                within(
+                    CardBudget::of::<ktir_core::ddl_binds::Baked>(),
+                    residency.fixed(),
+                    page,
+                    context
+                )
+            );
+            assert!(pool.get() > context.get());
+        } else {
+            assert_eq!(pool.get(), context.get());
+        }
+        let no_page = session_residency(
+            SessionRole::Borrower,
+            &layout,
+            [],
+            &[fp16(512), fp16(512)],
+            None,
+        );
+        assert_eq!(of_bake(no_page, context).get(), context.get());
+        let page = PageBytes::new(nz64(1024));
+        assert_eq!(
+            BakedPool::new(pool, page).bytes(),
+            u64::from(pool.get()) * 1024
+        );
+    }
+
+    /// ⭐ A FLOAT8 POOL PAYS ITS OWN FORMAT'S PAGE — the tape's format, at its row footprint.
+    #[test]
+    fn a_float8_pool_pays_its_own_page() {
+        use ktir_superdsc::superdsc_opspec::Df;
+        for cols in [512u32, 1024] {
+            assert_eq!(
+                fp8(cols).page_bytes(),
+                u64::from(SchedulerBlockTokens::REFERENCE.get())
+                    * crate::lower_subtile_tape_to_superdsc::row_footprint_bytes(cols, Df::Fp8)
+            );
+            assert!(fp8(cols).page_bytes() < fp16(cols).page_bytes());
+        }
+        let layout = BundleLayout {
+            segment_bytes: [8192, 200, 3072, 400, 0, 0, 0],
+            ..BundleLayout::default()
+        };
+        let r = session_residency(
+            SessionRole::Owner,
+            &layout,
+            [],
+            &[fp8(1024), fp8(1024)],
+            None,
+        );
+        assert_eq!(r.page().get(), 2 * fp8(1024).page_bytes());
     }
 }

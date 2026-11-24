@@ -738,6 +738,22 @@ pub fn kv_pool_tids<F: RopeForm>(ir: &SubtileIR<F>) -> Vec<u32> {
     pools
 }
 
+/// ⭐ EVERY KV POOL, AS THE TAPE STATES IT — each pool [`kv_pool_tids`] names, in the same order, at
+/// its columns and the format its writer fills it at ([`scratchy_triton_splice::kv_pool_formats`]).
+pub fn kv_pools<F: RopeForm>(
+    ir: &SubtileIR<F>,
+) -> Result<Vec<crate::wiring::KvPool>, SuperDscError> {
+    Ok(scratchy_triton_splice::kv_pool_formats(ir)
+        .map_err(SuperDscError)?
+        .into_iter()
+        .map(|(tid, format)| crate::wiring::KvPool {
+            tid,
+            cols: ir.tensors[tid as usize].cols,
+            format,
+        })
+        .collect())
+}
+
 pub fn compute_bundle_layout<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     ir: &SubtileIR<F>,
     weight_ids: &std::collections::HashSet<u32>,
@@ -994,10 +1010,10 @@ pub fn compute_bundle_layout<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     let (kv_bank_bytes, kv_block_banks) = place_kv_pools(
         &pools,
         per_layer_ext,
-        nbytes,
+        |tid| Ok(nbytes(tid)),
         &mut seg_bytes,
         &mut placements,
-    );
+    )?;
     // Logits (seg4) — the graph result (it is also produced by an op, but its role
     // is OUTPUT; classify it before intermediates so it is not pool-coalesced).
     let result = ir.result.index() as u32;
@@ -1986,16 +2002,18 @@ mod weight_tail_tests {
 ///
 /// Returns the extra banks' bytes (banks `1..N`; bank 0's are written to `seg_bytes`) and each
 /// pool table's bank per iteration, keyed by the table's layer-0 tid.
+type KvPoolBanks = (Vec<u64>, std::collections::BTreeMap<u32, Vec<KvBank>>);
+
 fn place_kv_pools(
     pools: &[u32],
     per_layer_ext: &[std::collections::BTreeMap<u32, Vec<u32>>],
-    size_of: impl Fn(u32) -> u64,
+    size_of: impl Fn(u32) -> Result<u64, SuperDscError>,
     seg_bytes: &mut [u64; 7],
     placements: &mut std::collections::BTreeMap<u32, TensorPlacement>,
-) -> (Vec<u64>, std::collections::BTreeMap<u32, Vec<KvBank>>) {
+) -> Result<KvPoolBanks, SuperDscError> {
     let kv_seg = SegRole::Kv.segment();
     let is_pool: std::collections::BTreeSet<u32> = pools.iter().copied().collect();
-    let mut place = |tid: u32, bank: KvBank, offset: u64| {
+    let mut place = |tid: u32, bank: KvBank, offset: u64| -> Result<(), SuperDscError> {
         placements.insert(
             tid,
             TensorPlacement {
@@ -2004,9 +2022,10 @@ fn place_kv_pools(
                 segment: kv_seg,
                 bank: bank.get(),
                 offset,
-                size: size_of(tid),
+                size: size_of(tid)?,
             },
         );
+        Ok(())
     };
     let mut bank_bytes: Vec<u64> = Vec::new();
     let mut table_banks: std::collections::BTreeMap<u32, Vec<KvBank>> = Default::default();
@@ -2025,7 +2044,9 @@ fn place_kv_pools(
         let mut block = 0u64;
         for (_, tids) in &tables {
             intra.push(block);
-            let widest = tids.iter().map(|&t| size_of(t)).max().unwrap_or(0);
+            let widest = tids
+                .iter()
+                .try_fold(0u64, |w, &t| size_of(t).map(|s| w.max(s)))?;
             block = align128(block + widest);
         }
         let banks: Vec<KvBank> = (0..first.len())
@@ -2034,7 +2055,7 @@ fn place_kv_pools(
         bank_bytes.extend(std::iter::repeat_n(block, banks.len()));
         for ((t0, tids), &off) in tables.iter().zip(&intra) {
             for (&tid, &bank) in tids.iter().zip(&banks) {
-                place(tid, bank, off);
+                place(tid, bank, off)?;
             }
             table_banks.insert(*t0, banks.clone());
         }
@@ -2048,12 +2069,76 @@ fn place_kv_pools(
         .collect();
     let mut tail = bank_bytes[0];
     for &tid in pools.iter().filter(|t| !owned.contains(t)) {
-        place(tid, KvBank::BASE, tail);
-        tail = align128(tail + size_of(tid));
+        place(tid, KvBank::BASE, tail)?;
+        tail = align128(tail + size_of(tid)?);
     }
     bank_bytes[0] = tail;
     seg_bytes[kv_seg] = bank_bytes[0];
-    (bank_bytes.split_off(1), table_banks)
+    Ok((bank_bytes.split_off(1), table_banks))
+}
+
+/// ⭐ THE SESSION'S POOLS AT THE BAKE'S PAGES — every pool the layout placed, re-placed by [`place_kv_pools`] at `pages` pages of each pool's own page ([`crate::wiring::KvPool::page_bytes`], its format's), with the KV segment's banks and each table's banks. Each pool's row-outermost arrangement is re-sized with it ([`BundleLayout::resize_row_outermost`]). The row pool (`step`'s, at the bake's pages) is the LAST placement of its segment, so it grows in place at that segment's end; a row pool something sits after is refused. The pools are the KV segment's only tenants, so nothing else moves; a layout that placed no pool (every off-card bake) places none.
+pub fn place_kv_pools_at<T: ktir_superdsc::collective::Tp>(
+    rolled: &mut RolledSuperDsc<T>,
+    step: Option<crate::wiring::PagedStep>,
+    pages: crate::pool_pages::PoolPages,
+) -> Result<(), SuperDscError> {
+    let RolledSuperDsc {
+        layout,
+        per_layer_ext,
+        kv_pools,
+        ..
+    } = rolled;
+    let placed: Vec<crate::wiring::KvPool> = kv_pools
+        .iter()
+        .copied()
+        .filter(|p| {
+            layout
+                .placements
+                .get(&p.tid)
+                .is_some_and(|pl| matches!(pl.role, SegRole::Kv))
+        })
+        .collect();
+    let tids: Vec<u32> = placed.iter().map(|p| p.tid).collect();
+    let (kv_bank_bytes, kv_block_banks) = place_kv_pools(
+        &tids,
+        per_layer_ext,
+        |tid| {
+            placed
+                .iter()
+                .find(|p| p.tid == tid)
+                .map(|p| u64::from(pages.get()) * p.page_bytes())
+                .ok_or_else(|| {
+                    SuperDscError(format!(
+                        "t{tid}: a KV pool table names it at a layer, but the tape states no pool of it"
+                    ))
+                })
+        },
+        &mut layout.segment_bytes,
+        &mut layout.placements,
+    )?;
+    layout.kv_bank_bytes = kv_bank_bytes;
+    layout.kv_block_banks = kv_block_banks;
+    for &tid in &tids {
+        layout.resize_row_outermost(tid)?;
+    }
+    if let Some(step) = step.filter(|s| s.reads_kv_row_pool())
+        && let Some(p) = layout.placements.get_mut(&step.kv_row_pool)
+    {
+        if align128(p.offset + p.size) != layout.segment_bytes[p.segment] {
+            return Err(SuperDscError(format!(
+                "t{}: the row pool ends at {} of seg{}, which runs to {} — it grows in place only as \
+                 its segment's last placement",
+                p.tid,
+                align128(p.offset + p.size),
+                p.segment,
+                layout.segment_bytes[p.segment]
+            )));
+        }
+        p.size = step.card_kv_row_pool_bytes();
+        layout.segment_bytes[p.segment] = align128(p.offset + p.size);
+    }
+    Ok(())
 }
 
 /// ⭐ THE PER-LAYER EXTERNAL TID CLASSES, READ OFF THE RE-ROLLED TAPE **BEFORE** ANY PLACEMENT
@@ -7669,6 +7754,13 @@ pub struct RolledSuperDsc<T: ktir_superdsc::collective::Tp> {
     /// A table's length is ITS class's `iters` — two classes of different layer counts
     /// carry different-length tables under the same map.
     pub per_layer: std::collections::BTreeMap<u32, Vec<u32>>,
+    /// ⭐ THE PER-CLASS EXTERNAL TABLES THE LAYOUT WAS PLACED BY — [`per_layer_external_tids`]' one
+    /// map per attention class, the shape [`place_kv_pools`] reads, so a pool re-placed at the
+    /// bake's pages ([`place_kv_pools_at`]) is banked as the layout first banked it.
+    pub per_layer_ext: Vec<std::collections::BTreeMap<u32, Vec<u32>>>,
+    /// ⭐ THE SESSION'S POOLS AS THE TAPE STATES THEM ([`kv_pools`]) — what its residency charges a
+    /// page by and the bake's pool re-places ([`place_kv_pools_at`]).
+    pub kv_pools: Vec<crate::wiring::KvPool>,
     /// ⭐ THE LAYER SEQUENCE, IN TRUE ORDER — one entry per layer of the whole model,
     /// naming its body (index into `bodies`) and its class-relative iteration. The
     /// executor runs exactly this; a single-class roll degenerates to
@@ -10862,10 +10954,11 @@ mod kv_pool_placement_tests {
         let (extra, banks) = place_kv_pools(
             &pools,
             &per_layer_ext,
-            |_| pool,
+            |_| Ok(pool),
             &mut seg_bytes,
             &mut placements,
-        );
+        )
+        .expect("the pools place");
         let kv = SegRole::Kv.segment();
         assert_eq!(seg_bytes[kv], 2 * pool, "bank 0 holds one layer's K and V");
         assert_eq!(
@@ -10895,14 +10988,15 @@ mod kv_pool_placement_tests {
         let per_layer_ext = one_class(2);
         let pools = vec![1000, 1001, 2000, 2001];
         let (mut seg_bytes, mut placements) = ([0u64; 7], Default::default());
-        let size_of = |t: u32| if t == 1001 { 2048 } else { 1024 };
+        let size_of = |t: u32| Ok(if t == 1001 { 2048 } else { 1024 });
         place_kv_pools(
             &pools,
             &per_layer_ext,
             size_of,
             &mut seg_bytes,
             &mut placements,
-        );
+        )
+        .expect("the pools place");
         assert_eq!(placements[&2000].offset, 2048, "V starts past the widest K");
         assert_eq!(placements[&2001].offset, 2048);
     }
@@ -10919,10 +11013,11 @@ mod kv_pool_placement_tests {
         let (extra, _) = place_kv_pools(
             &pools,
             &per_layer_ext,
-            |_| pool,
+            |_| Ok(pool),
             &mut seg_bytes,
             &mut placements,
-        );
+        )
+        .expect("the pools place");
         let lone = placements[&9000];
         assert_eq!((lone.bank, lone.offset), (0, 2 * pool));
         assert_eq!(seg_bytes[SegRole::Kv.segment()], 3 * pool);
