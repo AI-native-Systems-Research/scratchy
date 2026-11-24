@@ -42,40 +42,6 @@ pub struct AttentionMetadata {
 }
 
 impl AttentionMetadata {
-    /// Create a new `AttentionMetadata`.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        num_reqs: usize,
-        total_tokens: usize,
-        query_start_loc: Vec<usize>,
-        q_lens: Vec<usize>,
-        seq_lens: Vec<usize>,
-        block_ids: Vec<Vec<usize>>,
-        tokens_before: Vec<usize>,
-        is_prefill: Vec<bool>,
-        req_ids: Vec<String>,
-    ) -> Self {
-        Self {
-            num_reqs,
-            total_tokens,
-            query_start_loc,
-            q_lens,
-            seq_lens,
-            block_ids,
-            sliding_groups: Vec::new(),
-            tokens_before,
-            is_prefill,
-            req_ids,
-        }
-    }
-
-    /// Attach the sliding KV-cache groups' per-request block tables (gemma4
-    /// SWA): `sliding[s][req][block]`. Empty keeps the single-group behavior.
-    pub fn with_sliding_groups(mut self, sliding: Vec<Vec<Vec<usize>>>) -> Self {
-        self.sliding_groups = sliding;
-        self
-    }
-
     /// Returns `(start_offset, q_len)` for request `req_idx` in the flat tensor.
     pub fn request_slice(&self, req_idx: usize) -> (usize, usize) {
         let start = self.query_start_loc[req_idx];
@@ -113,17 +79,18 @@ mod tests {
 
     fn sample_metadata() -> AttentionMetadata {
         // Batch: req0 is prefill with 5 tokens, req1 is decode with 1 token.
-        AttentionMetadata::new(
-            2,
-            6,
-            vec![0, 5, 6],
-            vec![5, 1],
-            vec![5, 10],
-            vec![vec![0, 1], vec![2, 3]],
-            vec![0, 9],
-            vec![true, false],
-            vec!["req-0".into(), "req-1".into()],
-        )
+        AttentionMetadata {
+            num_reqs: 2,
+            total_tokens: 6,
+            query_start_loc: vec![0, 5, 6],
+            q_lens: vec![5, 1],
+            seq_lens: vec![5, 10],
+            block_ids: vec![vec![0, 1], vec![2, 3]],
+            sliding_groups: Vec::new(),
+            tokens_before: vec![0, 9],
+            is_prefill: vec![true, false],
+            req_ids: vec!["req-0".into(), "req-1".into()],
+        }
     }
 
     #[test]
@@ -138,17 +105,18 @@ mod tests {
         let meta = sample_metadata();
         assert!(!meta.is_all_decode());
 
-        let all_decode = AttentionMetadata::new(
-            2,
-            2,
-            vec![0, 1, 2],
-            vec![1, 1],
-            vec![10, 20],
-            vec![vec![0], vec![1]],
-            vec![9, 19],
-            vec![false, false],
-            vec!["a".into(), "b".into()],
-        );
+        let all_decode = AttentionMetadata {
+            num_reqs: 2,
+            total_tokens: 2,
+            query_start_loc: vec![0, 1, 2],
+            q_lens: vec![1, 1],
+            seq_lens: vec![10, 20],
+            block_ids: vec![vec![0], vec![1]],
+            sliding_groups: Vec::new(),
+            tokens_before: vec![9, 19],
+            is_prefill: vec![false, false],
+            req_ids: vec!["a".into(), "b".into()],
+        };
         assert!(all_decode.is_all_decode());
     }
 
