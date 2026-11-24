@@ -12,8 +12,9 @@ use std::num::NonZeroU32;
 
 use scratchy_ir::model_facts::HeadDim;
 use scratchy_ir::model_facts::{
-    ActDtype, FactsParts, HiddenSize, KvCodec, ModelFacts, NormWeightOffset, RmsNormEps,
-    ScaleDtype, VocabSize,
+    ActDtype, Attention, AttnClass, AttnScale, BlockSize, FactsParts, HeadGeometry, HiddenSize,
+    KvCodec, KvHeads, KvRope, ModelFacts, NormWeightOffset, QueryHeads, RmsNormEps, Rope,
+    RopePairing, RotDim, ScaleDtype, VocabSize,
 };
 use scratchy_subtile::handoff::{
     LoweredDecode, SourceBinding, TargetBucket, TargetModelInput, TargetPoint,
@@ -26,17 +27,18 @@ use scratchy_subtile::subtile_tape::{ComputeInput, ComputeInputs, Instr};
 use scratchy_subtile::tape_colouring::{ColourFacts, ColourRule, colour_tape};
 use scratchy_subtile::tape_folding::FusedShape;
 use scratchy_target_cuda::op_abi::{CUDA_COLOUR_FACTS, CudaFusion, cuda_colour_rule};
-use scratchy_target_cuda::step::{CudaStep, EmbedBf16, GemmBf16, GemvBf16};
+use scratchy_target_cuda::step::{CudaStep, EmbedBf16, GemmBf16, GemvBf16, RopeLanes};
 use scratchy_target_cuda::tape::{ArenaOffset, ArenaSpan, TapeInput, WeightIx};
 use scratchy_target_cuda::weights::CudaWeight;
 use scratchy_target_cuda_compiler::canonical::AttnShapeRule;
 use scratchy_target_cuda_compiler::canonical::{
-    ArenaRefusal, CanonicalAt, CanonicalRefusal, CudaEmbedFacts, CudaModelFacts, CudaPlan,
-    EmbedShapeRule, GateShapeRule, GemmShapeRule, OperandRefusal, RopeShapeRule, SharedExpertOwner,
+    ArenaRefusal, CanonicalAt, CanonicalRefusal, CudaPlan, EmbedShapeRule, GateShapeRule,
+    GemmShapeRule, LoweringFacts, OperandRefusal, RopeShapeRule, SharedExpertOwner,
     lower_canonical, lower_plan, plan_canonical,
 };
 use scratchy_target_cuda_compiler::emit::{ModelRefusal, lower_model, static_tape};
 use scratchy_target_cuda_compiler::steps_from_tape::{StepCx, TapeStep, lower_fused, lower_step};
+use scratchy_tensors::RopeTheta;
 
 const AT: CanonicalAt<'static> = CanonicalAt {
     stem: "fixture",
@@ -56,17 +58,86 @@ const AT_256: CanonicalAt<'static> = CanonicalAt {
     rows: scratchy_subtile::sample_rows::ResultRows::Every,
 };
 
+/// The facts of a fixture model: a uniform roped attention of 8 query heads over 2 kv heads of
+/// `head_dim`, `rot_dim` of each rotated half-rotated; a token embedding of `vocab` rows (none: the
+/// input is the embedded hidden); `rope_theta` `theta`. The rest (the dtypes, a hidden of 2048,
+/// `rms_norm_eps` 1e-6) no lowering of these fixtures reads.
+const fn facts_of(head_dim: u32, rot_dim: u32, vocab: Option<usize>, theta: f64) -> LoweringFacts {
+    let g = HeadGeometry::new(
+        QueryHeads::new(8),
+        KvHeads::new(2),
+        HeadDim::new(head_dim),
+        RotDim::new(rot_dim),
+        BlockSize::new(64),
+    );
+    let rope = Rope::new(RopePairing::Standard, KvRope::AtWrite, None);
+    let attention = Attention::new(g, g, AttnScale::new(0.0625), None, None, Some(rope));
+    let vocab = match vocab {
+        Some(v) => Some(VocabSize::new(v)),
+        None => None,
+    };
+    LoweringFacts {
+        facts: ModelFacts::new(FactsParts {
+            act_dtype: ActDtype::Bf16,
+            scale_dtype: ScaleDtype::F16,
+            hidden: HiddenSize::new(2048),
+            intermediate: None,
+            vocab,
+            eps: RmsNormEps::new(1e-6),
+            norm_offset: NormWeightOffset::new(0.0),
+            final_softcap: None,
+            kv_codec: KvCodec::Dense,
+            kv_layers: None,
+            attention: Some(attention),
+            vision: None,
+            gdn: None,
+            drafter: None,
+            spec_drafts: None,
+            capture_slots: None,
+            target: None,
+        }),
+        rope_theta: Some(RopeTheta::try_new(theta).expect("a finite positive base")),
+        rope_local_theta: None,
+        shared_expert: SharedExpertOwner::Undeclared,
+    }
+}
+
+/// A rope no CUDA kernel pairs (multi-head latent attention's interleaved one) is refused at
+/// expansion, by its pairing; the pairings CUDA's rope kernels take convert to their lanes.
+#[test]
+fn a_rope_no_cuda_kernel_pairs_is_refused_at_expansion() {
+    let standard = facts_of(256, 64, None, 1e7);
+    assert!(matches!(
+        standard.lanes(AttnClass::Full),
+        Ok(RopeLanes::HalfRotated)
+    ));
+    let g = HeadGeometry::new(
+        QueryHeads::new(8),
+        KvHeads::new(2),
+        HeadDim::new(256),
+        RotDim::new(64),
+        BlockSize::new(64),
+    );
+    let rope = Rope::new(RopePairing::Interleaved, KvRope::AtWrite, None);
+    let attention = Attention::new(g, g, AttnScale::new(0.0625), None, None, Some(rope));
+    let interleaved = LoweringFacts {
+        facts: ModelFacts::new(FactsParts {
+            attention: Some(attention),
+            ..standard.facts.parts()
+        }),
+        ..standard
+    };
+    assert!(matches!(
+        interleaved.lanes(AttnClass::Full),
+        Err(CanonicalRefusal::RopeLanes {
+            pairing: RopePairing::Interleaved
+        })
+    ));
+}
+
 /// qwen3.5's model facts: `head_dim` 256, a quarter of it rotated, `rope_theta` 1e7. A fixture
 /// with no rope or gate reads none of them.
-const FACTS: CudaModelFacts = CudaModelFacts {
-    head_dim: 256,
-    rot_dim: 64,
-    rope_theta: Some(1e7),
-    gdn: None,
-    embed: None,
-    shared_expert: SharedExpertOwner::Undeclared,
-    classes: None,
-};
+const FACTS: LoweringFacts = facts_of(256, 64, None, 1e7);
 
 fn fixtures() -> Vec<(&'static str, LoweringInput)> {
     vec![
@@ -247,15 +318,7 @@ fn a_rope_on_the_hidden_with_the_global_table_lowers_to_one_rope() {
     let mut l = with_hidden(rope_rotate_only_input());
     rebind(&mut l, |b| b[1] = SourceBinding::Cos { local: false });
     rebind(&mut l, |b| b[2] = SourceBinding::Sin { local: false });
-    let facts = CudaModelFacts {
-        head_dim: 64,
-        rot_dim: 32,
-        rope_theta: Some(1e4),
-        gdn: None,
-        embed: None,
-        shared_expert: SharedExpertOwner::Undeclared,
-        classes: None,
-    };
+    let facts = facts_of(64, 32, None, 1e4);
     let c = lower_canonical(&l, facts, AT).expect("the rope lowers");
     let [CudaStep::Rope(rope)] = c.steps.as_slice() else {
         panic!("expected one Rope, got {:?}", c.steps);
@@ -270,7 +333,7 @@ fn a_rope_on_the_hidden_with_the_global_table_lowers_to_one_rope() {
     assert_eq!(rope.x.0, 0, "x is the embedded hidden, colour 0");
     assert_eq!(rope.table, table.span.offset);
     assert_eq!(table.span.bytes, 64, "one row of 32 bf16");
-    assert_eq!((table.rot_dim, table.theta()), (32, 1e4));
+    assert_eq!((table.rot_dim, table.theta.get()), (32, 1e4));
     assert_eq!(c.total_bytes, table.span.offset.0 + 256);
     assert_eq!(
         c.weight_bytes,
@@ -587,7 +650,7 @@ fn rope_only(tokens: u32, cols: u32, head_dim: u32) -> LoweredDecode {
     l
 }
 
-fn refusal(l: &LoweredDecode, facts: CudaModelFacts) -> CanonicalRefusal {
+fn refusal(l: &LoweredDecode, facts: LoweringFacts) -> CanonicalRefusal {
     match lower_canonical(l, facts, AT) {
         Err(e) => {
             eprintln!("refused: {e}");
@@ -655,10 +718,7 @@ fn a_rope_above_int_max_elements_is_refused() {
 /// A gate split whose model `head_dim` is not a whole number of 16-byte vectors.
 #[test]
 fn a_gate_split_off_the_vector_is_refused() {
-    let facts = CudaModelFacts {
-        head_dim: 12,
-        ..FACTS
-    };
+    let facts = facts_of(12, 12, None, 1e7);
     let e = refusal(&attn_gate(256), facts);
     assert!(e.to_string().contains("multiple of 8"), "{e}");
     assert!(matches!(
@@ -707,10 +767,7 @@ fn a_gate_split_above_int_max_elements_is_refused() {
 /// takes (#853), refuses it.
 #[test]
 fn a_gate_split_off_the_instantiated_head_dim_is_refused() {
-    let facts = CudaModelFacts {
-        head_dim: 128,
-        ..FACTS
-    };
+    let facts = facts_of(128, 64, None, 1e7);
     let e = refusal(&attn_gate(256), facts);
     assert!(e.to_string().contains("head_dim must be 256"), "{e}");
     assert!(matches!(
@@ -1127,10 +1184,7 @@ fn tied_model(ms: &[u32], head: &str, vocab: u32) -> TargetModelInput {
 fn a_model_with_a_table_embeds_its_token_ids_first() {
     let l = tied_head(128);
     let hidden = lower_canonical(&l, FACTS, AT_128).expect("the hidden-input tape lowers");
-    let facts = CudaModelFacts {
-        embed: Some(CudaEmbedFacts { vocab: 256 }),
-        ..FACTS
-    };
+    let facts = facts_of(256, 64, Some(256), 1e7);
     let c = lower_canonical(&l, facts, AT_128).expect("the token-id tape lowers");
     assert_eq!(c.steps.len(), hidden.steps.len() + 1, "one more step");
     assert_eq!(
@@ -1178,10 +1232,7 @@ fn a_model_with_a_table_embeds_its_token_ids_first() {
 /// An embed of a vocabulary above `i32::MAX` rows.
 #[test]
 fn an_embed_above_int_max_rows_is_refused() {
-    let facts = CudaModelFacts {
-        embed: Some(CudaEmbedFacts { vocab: 1 << 31 }),
-        ..FACTS
-    };
+    let facts = facts_of(256, 64, Some(1 << 31), 1e7);
     let e = match lower_canonical(&tied_head(128), facts, AT_128) {
         Err(e) => e,
         Ok(c) => panic!("lowered an embed the kernel cannot run: {c:?}"),

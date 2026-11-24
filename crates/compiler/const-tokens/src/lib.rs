@@ -189,9 +189,18 @@ impl<'t> ser::Serializer for Emitter<'t> {
         name: &'static str,
         v: &T,
     ) -> Result<TokenStream, Error> {
+        let inner = v.serialize(self)?;
+        // A newtype whose field is private behind a law names itself by the path of its checked
+        // constructor, a `const fn` returning `Option<Self>` (`scratchy_tensors::RopeTheta`): the
+        // value is that call, expected, so a baked value that breaks the law fails the build. A
+        // derived name is one identifier, never a path.
+        if name.contains("::") {
+            let try_new = TokenStream::from_str(name)
+                .map_err(|e| Error(format!("const_tokens: newtype path `{name}`: {e}")))?;
+            return Ok(quote!(#try_new(#inner).expect(#name)));
+        }
         let m = self.0.module_of(name)?;
         let ty = format_ident!("{name}");
-        let inner = v.serialize(self)?;
         Ok(quote!(#m::#ty(#inner)))
     }
     fn serialize_newtype_variant<T: Serialize + ?Sized>(
@@ -441,6 +450,26 @@ mod tests {
             .expect("emit")
             .to_string();
         assert_eq!(wrapped, "__a :: Kind :: Wrapped (__b :: Id (1u32))");
+    }
+
+    #[test]
+    fn a_newtype_named_by_a_path_is_emitted_as_its_checked_call() {
+        struct Lawful(f64);
+        impl Serialize for Lawful {
+            fn serialize<S: ser::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+                s.serialize_newtype_struct("::some_crate::Lawful::try_new", &self.0)
+            }
+        }
+        let toks = const_tokens(&TABLE, &Lawful(1e4))
+            .expect("emit")
+            .to_string();
+        assert_eq!(
+            toks,
+            format!(
+                ":: some_crate :: Lawful :: try_new (f64 :: from_bits ({}u64)) . expect (\"::some_crate::Lawful::try_new\")",
+                1e4f64.to_bits()
+            )
+        );
     }
 
     #[test]

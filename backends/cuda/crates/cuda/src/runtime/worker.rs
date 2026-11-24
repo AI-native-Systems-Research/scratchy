@@ -3583,7 +3583,7 @@ fn fill_table<'h>(
 ) -> Option<(ArenaSpan, &'h [u16])> {
     table.map(|r| {
         let rows = &mut host[..positions.len() * r.rot_dim as usize];
-        fill_rotary_rows_with_freq_dim(positions, r.rot_dim, r.freq_dim, r.theta(), rows);
+        fill_rotary_rows_with_freq_dim(positions, r.rot_dim, r.freq_dim, r.theta.get(), rows);
         (r.span, &*rows)
     })
 }

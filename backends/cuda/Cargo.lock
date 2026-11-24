@@ -2749,6 +2749,7 @@ dependencies = [
  "scratchy-ir",
  "scratchy-subtile",
  "scratchy-target-cuda",
+ "scratchy-tensors",
 ]
 
 [[package]]
@@ -2760,6 +2761,7 @@ dependencies = [
  "scratchy-core-model",
  "scratchy-forward-compiler",
  "scratchy-forward-compiler-macro",
+ "scratchy-ir",
  "scratchy-layers",
  "scratchy-models",
  "scratchy-models-build",
@@ -2796,6 +2798,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "memmap2",
+ "serde",
  "typenum",
 ]
 

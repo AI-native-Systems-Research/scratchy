@@ -32,6 +32,8 @@
 
 use std::num::NonZeroU32;
 
+use scratchy_ir::model_facts::RopePairing;
+use scratchy_ir::model_facts::{Attention, AttnWindow};
 use scratchy_ir::model_facts::{AttnScale, HeadDim, KvRope, Rope};
 use scratchy_subtile::fixtures::{fixture_head_geometry, rebind};
 use scratchy_subtile::handoff::{LoweredDecode, SourceBinding};
@@ -40,10 +42,10 @@ use scratchy_subtile::subtile_ir::RopeClass;
 use scratchy_subtile::subtile_ir::{
     AttnMask, GainConvention, RopeFormTag, RowScale, SourceShape, SubOp,
 };
-use scratchy_target_cuda::step::RopeLanes;
-use scratchy_target_cuda_compiler::canonical::{CudaAttnClass, CudaAttnClasses, CudaModelFacts};
+use scratchy_target_cuda_compiler::canonical::LoweringFacts;
+use scratchy_tensors::RopeTheta;
 
-use super::chains::{GEMMA4_FACTS, with_hidden};
+use super::chains::{GEMMA4_FACTS, class, with_attention, with_hidden};
 
 /// Gemma 4 26B-A4B's hidden size.
 pub const H: u32 = 2816;
@@ -79,29 +81,20 @@ pub const PREFIX_CAPACITY: u32 = 8192;
 /// Gemma 4's two attention classes over [`GEMMA4_FACTS`]: the sliding (base) class, 8 kv heads of
 /// 256 rotated in full at theta 1e4 under a window of 1024, and the global class, 2 kv heads of
 /// 512, 128 of each rotated (proportional, the half-head pairing) at theta 1e6, with no window.
-pub const GEMMA_ATTN_FACTS: CudaModelFacts = CudaModelFacts {
-    head_dim: HD,
-    rot_dim: R,
-    rope_theta: Some(THETA),
-    classes: Some(CudaAttnClasses {
-        base: CudaAttnClass {
-            head_dim: HD,
-            kv_heads: KV_HEADS,
-            rot_dim: R,
-            rope_theta: Some(THETA),
-            pairing: RopeLanes::HalfRotated,
-            window: Some(WINDOW),
-        },
-        global: CudaAttnClass {
-            head_dim: 512,
-            kv_heads: 2,
-            rot_dim: R_GLOBAL,
-            rope_theta: Some(THETA_GLOBAL),
-            pairing: RopeLanes::HalfHead,
-            window: None,
-        },
-    }),
-    ..GEMMA4_FACTS
+pub const GEMMA_ATTN_FACTS: LoweringFacts = LoweringFacts {
+    rope_theta: Some(RopeTheta::try_new(THETA_GLOBAL).expect("a finite positive base")),
+    rope_local_theta: Some(RopeTheta::try_new(THETA).expect("a finite positive base")),
+    ..with_attention(
+        GEMMA4_FACTS,
+        Some(Attention::new(
+            class(HEADS, KV_HEADS, HD, R),
+            class(HEADS, 2, 512, R_GLOBAL),
+            AttnScale::new(SCALE),
+            None,
+            Some(AttnWindow::new(WINDOW)),
+            Some(Rope::new(RopePairing::Proportional, KvRope::AtWrite, None)),
+        )),
+    )
 };
 
 /// The layer's ops at `m` rows (the module's table), over the module's sources.

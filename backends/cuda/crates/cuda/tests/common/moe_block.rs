@@ -42,7 +42,7 @@ use scratchy_subtile::subtile_ir::{
     EwKind, ExpertBundle, ExpertProj, GainConvention, GatedAct, NumExperts, RouterBundle,
     SharedExpertBound, SourceShape, SubOp, TopK,
 };
-use scratchy_target_cuda_compiler::canonical::{CudaModelFacts, SharedExpertOwner};
+use scratchy_target_cuda_compiler::canonical::{LoweringFacts, SharedExpertOwner};
 
 use super::chains::{QWEN3_5_FACTS, with_hidden};
 
@@ -56,7 +56,7 @@ pub const I: u32 = 512;
 pub const EPS: f32 = 1e-6;
 
 /// The 35B's model facts for the block: qwen3.5's, with the shared expert the DSL's own ops.
-pub const MOE_FACTS: CudaModelFacts = CudaModelFacts {
+pub const MOE_FACTS: LoweringFacts = LoweringFacts {
     shared_expert: SharedExpertOwner::Dsl,
     ..QWEN3_5_FACTS
 };

@@ -556,7 +556,7 @@ fn tape_header(stem: &str, t: &CudaTape) -> Value {
         r.map_or(Value::Null, |r| {
             json!({"span": {"offset": r.span.offset.0, "bytes": r.span.bytes},
                    "rot_dim": r.rot_dim, "freq_dim": r.freq_dim,
-                   "theta": {"f64": f64::from_bits(r.theta_bits), "bits": r.theta_bits}})
+                   "theta": {"f64": r.theta.get(), "bits": r.theta.get().to_bits()}})
         })
     };
     m.insert("rotary".into(), rotary(t.rotary));

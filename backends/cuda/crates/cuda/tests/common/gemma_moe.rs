@@ -21,7 +21,7 @@ use scratchy_subtile::subtile_ir::{
     ExpertBundle, ExpertProj, GatedAct, NumExperts, RouterBundle, SharedExpertBound, SourceShape,
     SubOp, TopK,
 };
-use scratchy_target_cuda_compiler::canonical::CudaModelFacts;
+use scratchy_target_cuda_compiler::canonical::LoweringFacts;
 
 use super::chains::{GEMMA4_FACTS, with_hidden};
 
@@ -36,7 +36,7 @@ pub const BANK: u32 = 21;
 pub const LAYER: u64 = 0;
 
 /// Gemma 4's facts for the block: its GEMMs also take the 64-column tile.
-pub const GEMMA_MOE_FACTS: CudaModelFacts = GEMMA4_FACTS;
+pub const GEMMA_MOE_FACTS: LoweringFacts = GEMMA4_FACTS;
 
 /// The block's ops at `m` rows, as the bridge emits them.
 pub fn gemma_moe_input(m: u32) -> LoweringInput {

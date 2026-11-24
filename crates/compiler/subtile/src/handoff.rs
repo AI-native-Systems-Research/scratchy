@@ -547,8 +547,8 @@ pub struct TargetModelInput {
     /// The rope base frequencies, which the facts do not state: `rope_theta` (the global class's,
     /// every class's on a uniform model) and a hybrid's sliding class's own
     /// (`rope_local_base_freq`); `None` where the model states none.
-    pub rope_theta: Option<f64>,
-    pub rope_local_theta: Option<f64>,
+    pub rope_theta: Option<scratchy_tensors::RopeTheta>,
+    pub rope_local_theta: Option<scratchy_tensors::RopeTheta>,
     /// The weight bases the DSL declares a `shared_expert` subtree under (`mlp`), ascending: an
     /// expert bundle whose shared expert the DSL states as ops of its own, which a target's
     /// expert combine therefore must not add again (the single-owner rule).

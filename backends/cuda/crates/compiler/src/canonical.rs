@@ -21,6 +21,7 @@
 
 use std::collections::BTreeMap;
 
+use scratchy_ir::model_facts::{Attention, AttnClass, HeadGeometry, ModelFacts, RopePairing};
 use scratchy_subtile::handoff::{BundleTensor, LoweredDecode, SourceBinding};
 use scratchy_subtile::lower::{ExpertWeight, GemmWeightKind};
 use scratchy_subtile::sample_rows::{ResultRows, SampleRowsError, expand_sample_rows};
@@ -46,106 +47,129 @@ use scratchy_target_cuda::tape::{
     ArenaOffset, ArenaSpan, CUDA_ACT_BYTES, CUDA_ARENA_ALIGN, GreedyArgmax, KvClass, MoeSortTape,
     MoeTape, RotaryTable, TapeInput, WeightIx, moe_region_bytes_at, moe_tiles_at, overlap,
 };
+use scratchy_tensors::RopeTheta;
 
 use crate::steps_from_tape::{StepCx, TapeStep, embed, gdn_bundle_layer, lower_driver, lower_step};
 
-/// The model facts CUDA's opcode lowering reads, beside the canonical: expansion-time constants,
-/// the counterpart of the `MetalModelConsts` fields metal's rope and gate lowerings read.
+/// What CUDA's opcode lowering reads beside the canonical: the model's typed facts (the handoff's
+/// own [`ModelFacts`]), and what the handoff states beside them, the rope's base frequencies and
+/// who computes the shared expert.
 ///
-/// `GateSplit` carries only `half_cols`, so its `head_dim` is this one; `RopeRotate` carries its
-/// `head_dim` but not its rotated width, so `rot_dim` (`partial_rotary_factor · head_dim`) is this
-/// one, and `rope_theta` builds the rotary table's rows. `GatedDeltaNet` carries none of its
-/// key-head geometry, so `gdn` is it, for a model with linear-attention layers. `embed` is the
-/// token-embedding table the forward gathers its input rows from, for a model whose input is token
-/// ids; with none, the input is the embedded hidden itself (the layer-level fixtures).
+/// `GateSplit` carries only `half_cols`, so its `head_dim` is the attention's; `RopeRotate` carries
+/// its `head_dim` but not its rotated width, so `rot_dim` is its class's ([`Self::table_class`]),
+/// and the class's base frequency ([`Self::theta`]) builds the rotary table's rows.
+/// `GatedDeltaNet` carries none of its key-head geometry, so that is the facts' `Gdn`. A model
+/// whose facts state a vocabulary takes token ids, embedded from a table of that many rows
+/// ([`Self::embed_vocab`]); one with none takes the embedded hidden itself (the layer-level
+/// fixtures).
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct CudaModelFacts {
-    pub head_dim: u32,
-    pub rot_dim: u32,
-    /// `None` for a config that declares none: a canonical with a rotary table is then refused
+pub struct LoweringFacts {
+    pub facts: ModelFacts,
+    /// The full class's rope base frequency, a uniform model's one class's. `None` for a config
+    /// that declares none: a canonical with a rotary table is then refused
     /// ([`CanonicalRefusal::NoRopeTheta`]).
-    pub rope_theta: Option<f64>,
-    pub gdn: Option<CudaGdnFacts>,
-    pub embed: Option<CudaEmbedFacts>,
+    pub rope_theta: Option<RopeTheta>,
+    /// A two-class model's sliding class's own base frequency, when its config states one; the
+    /// sliding class rotates by [`Self::rope_theta`] otherwise.
+    pub rope_local_theta: Option<RopeTheta>,
     /// Who computes the shared expert of the model's MoE bundles: the DSL, as ops of its own, or
     /// no one (CUDA's combine adds none). The single-owner rule metal's combine applies
     /// (`metal/compiler/src/steps_from_tape.rs`, `shared_expert_owned`), read off the handoff's
     /// `dsl_shared_expert_bases` by [`crate::emit::shared_expert_owner`].
     pub shared_expert: SharedExpertOwner,
-    /// The model's two attention classes, when it has two (Gemma 4's sliding and global layers):
-    /// the handoff's `attn_classes`. `None` for a uniform model, whose one class is `head_dim`,
-    /// `rot_dim` and `rope_theta`, with no window and the half-rotated pairing.
-    pub classes: Option<CudaAttnClasses>,
 }
 
-/// A two-class model's attention classes. `base` is `head_dim`, `rot_dim` and `rope_theta`'s, and
-/// the `Cos { local: true }` table's; `global` the `Cos { local: false }` table's.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct CudaAttnClasses {
-    pub base: CudaAttnClass,
-    pub global: CudaAttnClass,
+/// A class's head dim, kv heads and rotated width: what its KV pool and its rope read.
+fn shape(g: HeadGeometry) -> (u32, u32, u32) {
+    (g.head_dim().get(), g.kv_heads().get(), g.rot_dim().get())
 }
 
-/// One attention class: what a layer of it rotates (`rot_dim` of `head_dim` lanes, paired as
-/// `pairing`, by a table of `rope_theta`), caches (`kv_heads` heads) and masks (`window`).
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct CudaAttnClass {
-    pub head_dim: u32,
-    pub kv_heads: u32,
-    pub rot_dim: u32,
-    pub rope_theta: Option<f64>,
-    pub pairing: RopeLanes,
-    pub window: Option<u32>,
-}
+impl LoweringFacts {
+    /// The model's attention when it has two classes: its sliding (base) and full (global)
+    /// classes' shapes differ (Gemma 4's sliding and global layers). `None` for a uniform model,
+    /// whose one class is the global table's, and for a model with no attention.
+    pub fn two_classes(&self) -> Option<Attention> {
+        (self.facts.attention()).filter(|a| shape(a.base()) != shape(a.global()))
+    }
 
-impl CudaAttnClass {
-    /// The class's table's frequency denominator ([`RotaryTable::freq_dim`]): the rotated width
-    /// for the half-rotated pairing, the head dim for the half-head (proportional) one.
-    pub const fn freq_dim(&self) -> u32 {
-        match self.pairing {
-            RopeLanes::HalfRotated => self.rot_dim,
-            RopeLanes::HalfHead => self.head_dim,
+    /// The class whose rotary table is the `Cos { local }` one, and its geometry: the local table
+    /// is a two-class model's sliding class, and no class on a uniform model; the global table is
+    /// the full class, a uniform model's one class. `None` for a model with no attention.
+    pub fn table_class(&self, local: bool) -> Option<(AttnClass, HeadGeometry)> {
+        let attention = self.facts.attention()?;
+        let class = match local {
+            true => self.two_classes().map(|_| AttnClass::Sliding)?,
+            false => AttnClass::Full,
+        };
+        Some((class, attention.class(class)))
+    }
+
+    /// How class `class`'s rope kernels pair its rotated lanes: the full class by the facts' rope,
+    /// the sliding class half-rotated, as a CUDA rope kernel takes it ([`RopeLanes::of`], the one
+    /// conversion); refused when no CUDA rope kernel pairs the facts' way.
+    pub fn lanes(&self, class: AttnClass) -> Result<RopeLanes, CanonicalRefusal> {
+        let pairing = match class {
+            AttnClass::Sliding => RopePairing::Standard,
+            AttnClass::Full => (self.facts.attention())
+                .and_then(|a| a.rope())
+                .map_or(RopePairing::Standard, |r| r.pairing()),
+        };
+        RopeLanes::of(pairing).ok_or(CanonicalRefusal::RopeLanes { pairing })
+    }
+
+    /// Class `class`'s table's base frequency: the full class's `rope_theta`, the sliding class's
+    /// own when its config states one.
+    pub fn theta(&self, class: AttnClass) -> Option<RopeTheta> {
+        match class {
+            AttnClass::Sliding => self.rope_local_theta.or(self.rope_theta),
+            AttnClass::Full => self.rope_theta,
         }
+    }
+
+    /// The last keys class `class`'s queries see: the sliding class's window; `None` (every key)
+    /// for the full class.
+    pub fn window(&self, class: AttnClass) -> Option<u32> {
+        match class {
+            AttnClass::Sliding => (self.facts.attention())
+                .and_then(|a| a.window())
+                .map(|w| w.get()),
+            AttnClass::Full => None,
+        }
+    }
+
+    /// Class `class`'s table's frequency denominator ([`RotaryTable::freq_dim`]) at geometry `g`:
+    /// the rotated width for the half-rotated pairing, the head dim for the half-head
+    /// (proportional) one.
+    pub fn freq_dim(&self, class: AttnClass, g: HeadGeometry) -> Result<u32, CanonicalRefusal> {
+        Ok(match self.lanes(class)? {
+            RopeLanes::HalfRotated => g.rot_dim().get(),
+            RopeLanes::HalfHead => g.head_dim().get(),
+        })
+    }
+
+    /// The rows of the table the forward embeds its token ids from: the facts' vocabulary, when it
+    /// fits a `u32`.
+    pub fn embed_vocab(&self) -> Option<u32> {
+        (self.facts.vocab()).and_then(|v| u32::try_from(v.get()).ok())
     }
 }
 
-impl CudaModelFacts {
-    /// The class whose rotary table is the `Cos { local }` one: the global table is a uniform
-    /// model's one class, or a two-class model's global class; the local table is a two-class
-    /// model's base class, and `None` for a uniform model. A uniform class's `kv_heads` is 0: its
-    /// pool's are its `PrefixK` sources' (`kv_cache`).
-    pub fn table_class(&self, local: bool) -> Option<CudaAttnClass> {
-        match (self.classes, local) {
-            (Some(c), true) => Some(c.base),
-            (Some(c), false) => Some(c.global),
-            (None, true) => None,
-            (None, false) => Some(CudaAttnClass {
-                head_dim: self.head_dim,
-                kv_heads: 0,
-                rot_dim: self.rot_dim,
-                rope_theta: self.rope_theta,
-                pairing: RopeLanes::HalfRotated,
-                window: None,
-            }),
-        }
-    }
-}
-
-/// The rotary table at `span` of class `c`, when the arena placed one; refused when its class has
-/// no `rope_theta`.
+/// The rotary table at `span` of class `class`, when the arena placed one; refused when the class
+/// has no base frequency.
 fn rotary_table(
     span: Option<ArenaSpan>,
-    c: Option<CudaAttnClass>,
+    class: Option<(AttnClass, HeadGeometry)>,
+    facts: &LoweringFacts,
 ) -> Result<Option<RotaryTable>, CanonicalRefusal> {
-    let Some((span, c)) = span.zip(c) else {
+    let Some((span, (class, g))) = span.zip(class) else {
         return Ok(None);
     };
-    let theta = c.rope_theta.ok_or(CanonicalRefusal::NoRopeTheta)?;
+    let theta = facts.theta(class).ok_or(CanonicalRefusal::NoRopeTheta)?;
     Ok(Some(RotaryTable {
         span,
-        rot_dim: c.rot_dim,
-        freq_dim: c.freq_dim(),
-        theta_bits: theta.to_bits(),
+        rot_dim: g.rot_dim().get(),
+        freq_dim: facts.freq_dim(class, g)?,
+        theta,
     }))
 }
 
@@ -157,24 +181,6 @@ pub enum SharedExpertOwner {
     Dsl,
     /// The DSL declares none (or the model has no MoE bundle).
     Undeclared,
-}
-
-/// The token-embedding table the embedded hidden is gathered from: `vocab` rows of the hidden's
-/// width. The table is the embedded hidden source's weight index.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct CudaEmbedFacts {
-    pub vocab: u32,
-}
-
-/// The Gated-DeltaNet geometry the op does not carry: `linear_num_key_heads`,
-/// `linear_key_head_dim`, `linear_conv_kernel_dim`, and the gated norm's `rms_norm_eps`. The value
-/// heads and their dim are the op's operand widths.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct CudaGdnFacts {
-    pub num_k_heads: u32,
-    pub head_k: u32,
-    pub conv_kernel: u32,
-    pub eps: f32,
 }
 
 /// Which canonical this is, for the refusals.
@@ -198,7 +204,7 @@ pub struct CudaPlan {
     pub folds: TapeFolds<CudaFusion>,
     pub colouring: TapeColouring,
     /// The model facts the plan was made with, which opcode lowering reads.
-    pub facts: CudaModelFacts,
+    pub facts: LoweringFacts,
 }
 
 /// One decode canonical, lowered: the parts of one bucket's `CudaTape`, every one a constant.
@@ -284,6 +290,12 @@ pub enum CanonicalRefusal {
     SampleRows(SampleRowsError),
     /// The canonical builds a rotary table, and the config declares no `rope_theta` for it.
     NoRopeTheta,
+    /// The `step`-th `Compute` (`op`) reads the attention's geometry (a rope's rotated width, a
+    /// gate split's head dim), and the model's facts state no attention.
+    NoAttention {
+        step: usize,
+        op: &'static str,
+    },
     /// The graph built from the canonical is not a valid DAG.
     Graph(String),
     Fold(FoldError),
@@ -409,6 +421,11 @@ pub enum CanonicalRefusal {
     /// NeoX lanes only.
     RopePairing {
         step: usize,
+    },
+    /// The model's rope pairs its lanes as `pairing`, which no CUDA rope kernel realizes
+    /// ([`RopeLanes::of`]).
+    RopeLanes {
+        pairing: RopePairing,
     },
     /// The `step`-th `Compute` is a `RopeAppend` or attention whose window is not its attention
     /// class's (a uniform model's has none).
@@ -683,6 +700,8 @@ pub enum KvCacheRefusal {
     },
     /// Layer `layer`'s cache is `cols` wide; the pool's (its first layer's) is `want`.
     Width { layer: u64, cols: u32, want: u32 },
+    /// Layer `layer` binds a KV cache, and the model's facts state no attention.
+    NoAttention { layer: u64 },
 }
 
 /// Which rule a gate split's shape breaks: the launcher's, stated at expansion time.
@@ -922,6 +941,11 @@ impl std::fmt::Display for CanonicalRefusal {
                 "step {step} ({op}) is rows={rows} cols={cols} head_dim={head_dim} \
                  rot_dim={rot_dim}, which the bf16 rope refuses: {rule}"
             ),
+            Self::RopeLanes { pairing } => write!(
+                f,
+                "the model's rope pairs its lanes {pairing:?}; CUDA's rope kernels pair them \
+                 half-rotated or half-head only"
+            ),
             Self::RopePairing { step } => write!(
                 f,
                 "step {step} (RopeAppend) pairs its lanes interleaved; the bf16 rope pairs NeoX \
@@ -970,6 +994,11 @@ impl std::fmt::Display for CanonicalRefusal {
                 f,
                 "step {step} (AttnDecode) is rows={rows} head_dim={head_dim}, which the bf16 \
                  attention refuses: {rule}"
+            ),
+            Self::NoAttention { step, op } => write!(
+                f,
+                "step {step} ({op}) reads the attention's geometry and the model's facts state no \
+                 attention"
             ),
             Self::NoRopeTheta => write!(
                 f,
@@ -1271,6 +1300,10 @@ impl std::fmt::Display for KvCacheRefusal {
             Self::LayerTooLarge { layer } => {
                 write!(f, "layer {layer} does not fit the tape's u32 layer ids")
             }
+            Self::NoAttention { layer } => write!(
+                f,
+                "layer {layer} binds a KV cache and the model's facts state no attention"
+            ),
             Self::OffHead {
                 layer,
                 cols,
@@ -1411,7 +1444,7 @@ impl std::fmt::Display for ArenaRefusal {
 /// tape, folds, colours. `facts` ride along to opcode lowering; no shared pass reads them.
 pub fn plan_canonical(
     l: &LoweredDecode,
-    facts: CudaModelFacts,
+    facts: LoweringFacts,
     at: CanonicalAt<'_>,
 ) -> Result<CudaPlan, CanonicalRefusal> {
     plan_canonical_folding(l, facts, at, cuda_fold_facts(at.m))
@@ -1438,7 +1471,7 @@ pub const fn cuda_fold_facts(m: u64) -> ModelFoldFacts {
 #[doc(hidden)]
 pub fn plan_canonical_folding(
     l: &LoweredDecode,
-    facts: CudaModelFacts,
+    facts: LoweringFacts,
     at: CanonicalAt<'_>,
     model: ModelFoldFacts,
 ) -> Result<CudaPlan, CanonicalRefusal> {
@@ -1482,7 +1515,7 @@ pub fn plan_canonical_folding(
 /// the tape's `Compute`s, absorbed ones included.
 pub fn lower_canonical(
     l: &LoweredDecode,
-    facts: CudaModelFacts,
+    facts: LoweringFacts,
     at: CanonicalAt<'_>,
 ) -> Result<CudaCanonical, CanonicalRefusal> {
     lower_plan(plan_canonical(l, facts, at)?)
@@ -1536,8 +1569,8 @@ pub fn lower_plan(plan: CudaPlan) -> Result<CudaCanonical, CanonicalRefusal> {
     // The head, as metal's: with an embedding table, the forward's input is token ids, and its
     // first step gathers them into colour 0, the embedded hidden, from the table at the embedded
     // hidden source's index.
-    let head = match (plan.facts.embed, arena.tokens) {
-        (Some(CudaEmbedFacts { vocab }), Some(tokens)) => {
+    let head = match (plan.facts.embed_vocab(), arena.tokens) {
+        (Some(vocab), Some(tokens)) => {
             let (e, hidden) = embedded_hidden_source(&plan).map_err(CanonicalRefusal::Arena)?;
             let step = embed(
                 tokens.offset,
@@ -1667,8 +1700,12 @@ pub fn lower_plan(plan: CudaPlan) -> Result<CudaCanonical, CanonicalRefusal> {
         result,
         weight_bytes,
         steps,
-        rotary: rotary_table(arena.rotary, plan.facts.table_class(false))?,
-        rotary_local: rotary_table(arena.rotary_local, plan.facts.table_class(true))?,
+        rotary: rotary_table(arena.rotary, plan.facts.table_class(false), &plan.facts)?,
+        rotary_local: rotary_table(
+            arena.rotary_local,
+            plan.facts.table_class(true),
+            &plan.facts,
+        )?,
         // The arena placed the regions exactly when a `PrefixK` is bound, and `kv_cache` found
         // the pool exactly then.
         kv: kv.zip(arena.kv).map(|(k, r)| CanonicalKv {
@@ -2034,12 +2071,13 @@ impl KvPool {
 /// The class a two-class model's KV layers are of, by the window of their `RopeAppend`'s mask (as
 /// its lowering reads it): the base class's window is class 0, any other class 1. A layer no
 /// `RopeAppend` writes is the base class's.
-fn kv_layer_classes(plan: &CudaPlan, classes: CudaAttnClasses) -> BTreeMap<u64, u8> {
+fn kv_layer_classes(plan: &CudaPlan) -> BTreeMap<u64, u8> {
+    let base = plan.facts.window(AttnClass::Sliding);
     (tape_steps(plan))
         .filter_map(|s| match s.node.op {
             SubOp::RopeAppend { layer, attn, .. } => {
                 let window = attn.window().map(std::num::NonZeroU32::get);
-                Some((u64::from(layer), u8::from(window != classes.base.window)))
+                Some((u64::from(layer), u8::from(window != base)))
             }
             _ => None,
         })
@@ -2052,10 +2090,9 @@ fn kv_layer_classes(plan: &CudaPlan, classes: CudaAttnClasses) -> BTreeMap<u64, 
 /// layer's class's `kv_heads · head_dim` ([`kv_layer_classes`]), and the pool's geometry is the
 /// base class's.
 fn kv_cache(plan: &CudaPlan) -> Result<Option<KvPool>, KvCacheRefusal> {
-    if let Some(classes) = plan.facts.classes {
-        return kv_cache_of_classes(plan, classes);
+    if let Some(attention) = plan.facts.two_classes() {
+        return kv_cache_of_classes(plan, attention);
     }
-    let head_dim = plan.facts.head_dim;
     let mut k_layers = BTreeMap::new();
     let mut v_layers = BTreeMap::new();
     for (t, binding) in plan.lowered.bindings().iter().enumerate() {
@@ -2079,7 +2116,10 @@ fn kv_cache(plan: &CudaPlan) -> Result<Option<KvPool>, KvCacheRefusal> {
     let Some((&first, &want)) = k_layers.iter().next() else {
         return Ok(None);
     };
-    if head_dim == 0 || want == 0 || !want.is_multiple_of(head_dim) {
+    let attention =
+        (plan.facts.facts.attention()).ok_or(KvCacheRefusal::NoAttention { layer: first })?;
+    let head_dim = attention.base().head_dim().get();
+    if want == 0 || !want.is_multiple_of(head_dim) {
         return Err(KvCacheRefusal::OffHead {
             layer: first,
             cols: want,
@@ -2112,12 +2152,12 @@ fn kv_cache(plan: &CudaPlan) -> Result<Option<KvPool>, KvCacheRefusal> {
 /// of its class.
 fn kv_cache_of_classes(
     plan: &CudaPlan,
-    classes: CudaAttnClasses,
+    attention: Attention,
 ) -> Result<Option<KvPool>, KvCacheRefusal> {
-    let of_layer = kv_layer_classes(plan, classes);
+    let of_layer = kv_layer_classes(plan);
     let class = |c: u8| match c {
-        0 => classes.base,
-        _ => classes.global,
+        0 => AttnClass::Sliding,
+        _ => AttnClass::Full,
     };
     let mut k_layers = BTreeMap::new();
     let mut v_layers = BTreeMap::new();
@@ -2144,10 +2184,8 @@ fn kv_cache_of_classes(
     }
     for (&layer, &cols) in k_layers.iter().chain(&v_layers) {
         let c = of_layer.get(&layer).copied().unwrap_or(0);
-        let CudaAttnClass {
-            head_dim, kv_heads, ..
-        } = class(c);
-        if head_dim == 0 || cols == 0 || !cols.is_multiple_of(head_dim) {
+        let (head_dim, kv_heads, _) = shape(attention.class(class(c)));
+        if cols == 0 || !cols.is_multiple_of(head_dim) {
             return Err(KvCacheRefusal::OffHead {
                 layer,
                 cols,
@@ -2165,16 +2203,20 @@ fn kv_cache_of_classes(
     let layers = (k_layers.keys())
         .map(|&layer| u32::try_from(layer).map_err(|_| KvCacheRefusal::LayerTooLarge { layer }))
         .collect::<Result<Vec<_>, _>>()?;
-    let kv_class = |c: CudaAttnClass| KvClass {
-        kv_heads: c.kv_heads,
-        head_dim: c.head_dim,
-        window: c.window,
+    let kv_class = |c: AttnClass| {
+        let (head_dim, kv_heads, _) = shape(attention.class(c));
+        KvClass {
+            kv_heads,
+            head_dim,
+            window: plan.facts.window(c),
+        }
     };
+    let base = kv_class(AttnClass::Sliding);
     Ok(Some(KvPool {
         layers,
-        kv_heads: classes.base.kv_heads,
-        head_dim: classes.base.head_dim,
-        classes: vec![kv_class(classes.base), kv_class(classes.global)],
+        kv_heads: base.kv_heads,
+        head_dim: base.head_dim,
+        classes: vec![base, kv_class(AttnClass::Full)],
         layer_class,
     }))
 }
@@ -2191,7 +2233,7 @@ struct Arena {
     gdn: Option<GdnRegions>,
     moe: Option<MoeTape>,
     /// The token ids, `bucket_m` u32 after every other region: `Some` exactly when the model has
-    /// an embedding table (`CudaModelFacts::embed`).
+    /// an embedding table (`LoweringFacts::embed_vocab`).
     tokens: Option<ArenaSpan>,
     total: u64,
 }
@@ -2222,7 +2264,7 @@ pub struct GdnRegions {
     pub scratch: ArenaSpan,
     /// The geometry the scratch was sized by: the canonical's first `GatedDeltaNet`'s operand
     /// widths, which every GDN op must share. The key heads, their dim and the conv kernel are the
-    /// model's (`CudaModelFacts::gdn`), the same for every op.
+    /// model's (the facts' `Gdn`), the same for every op.
     pub geometry: GdnWidths,
 }
 
@@ -2478,8 +2520,9 @@ fn arena_layout(plan: &CudaPlan) -> Result<Arena, ArenaRefusal> {
         let bound = (plan.lowered.bindings()).contains(&SourceBinding::Cos { local });
         class
             .filter(|_| bound)
-            .map(|c| {
-                let bytes = elements_bytes(hidden.rows, c.rot_dim).ok_or(ArenaRefusal::TooLarge)?;
+            .map(|(_, g)| {
+                let bytes =
+                    elements_bytes(hidden.rows, g.rot_dim().get()).ok_or(ArenaRefusal::TooLarge)?;
                 Ok(ArenaSpan {
                     offset: ArenaOffset(place(bytes)?),
                     bytes,
@@ -2526,7 +2569,7 @@ fn arena_layout(plan: &CudaPlan) -> Result<Arena, ArenaRefusal> {
     let moe = moe_geometry(plan)
         .map(|g| moe_scratch(hidden.rows, g, &mut place))
         .transpose()?;
-    let tokens = (plan.facts.embed)
+    let tokens = (plan.facts.embed_vocab())
         .map(|_| {
             let bytes = u64::from(hidden.rows) * TOKEN_ID_BYTES;
             Ok(ArenaSpan {

@@ -10,7 +10,7 @@
 use scratchy_subtile::handoff::LoweredDecode;
 use scratchy_subtile::lower::{GemmWeight, InputRef, LoweringInput, OpDesc};
 use scratchy_subtile::subtile_ir::{EwKind, GainConvention, SourceShape, SubOp};
-use scratchy_target_cuda_compiler::canonical::CudaModelFacts;
+use scratchy_target_cuda_compiler::canonical::LoweringFacts;
 
 use super::chains::{GEMMA4_FACTS, with_hidden};
 
@@ -22,7 +22,7 @@ pub const I: u32 = 2112;
 pub const EPS: f32 = 1e-6;
 
 /// The block lowers with Gemma 4's facts.
-pub const GEMMA_MLP_FACTS: CudaModelFacts = GEMMA4_FACTS;
+pub const GEMMA_MLP_FACTS: LoweringFacts = GEMMA4_FACTS;
 
 /// The block's ops as the macro emits them (`Gelu` and `Mul` apart, the residual add as
 /// `add(delta, residual)`), at `m` rows.

@@ -51,6 +51,7 @@ use scratchy_target_cuda::tape::{
     ArenaLayout, ArenaOffset, ArenaSpan, CudaTape, KvClass, KvTape, RotaryTable, TapeInput,
     WeightIx,
 };
+use scratchy_tensors::RopeTheta;
 
 use super::chains::with_hidden;
 
@@ -341,7 +342,7 @@ const fn rotary(offset: u64, bytes: u64) -> Option<RotaryTable> {
         span: span(offset, bytes),
         rot_dim: R,
         freq_dim: R,
-        theta_bits: THETA.to_bits(),
+        theta: RopeTheta::try_new(THETA).expect("a finite positive base"),
     })
 }
 

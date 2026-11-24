@@ -141,14 +141,9 @@ fn target_model_input(
         },
         facts: *cx.facts,
         // `None` when the model states no rope: a target with no unroped attention refuses it.
-        rope_theta: roped.then(|| model.text.rope_theta.get()),
+        rope_theta: roped.then_some(model.text.rope_theta),
         // A hybrid arch's sliding class rotates by its own base frequency (the local table).
-        rope_local_theta: roped
-            .then(|| {
-                (model.scalars.get("rope_local_base_freq").copied())
-                    .or_else(|| model.bounds.get("rope_local_base_freq").map(|&v| v as f64))
-            })
-            .flatten(),
+        rope_local_theta: model.text.rope_local.filter(|_| roped),
         dsl_shared_expert_bases: program.weights.shared_expert_bases(),
     }
 }

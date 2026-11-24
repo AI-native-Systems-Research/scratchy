@@ -9,7 +9,7 @@
 use scratchy_subtile::handoff::LoweredDecode;
 use scratchy_subtile::lower::{InputRef, LoweringInput, OpDesc};
 use scratchy_subtile::subtile_ir::{SourceShape, SubOp};
-use scratchy_target_cuda_compiler::canonical::CudaModelFacts;
+use scratchy_target_cuda_compiler::canonical::LoweringFacts;
 
 use super::chains::{GEMMA4_FACTS, with_hidden};
 
@@ -21,7 +21,7 @@ pub const EPS: f32 = 1e-6;
 pub const CAP: f32 = 30.0;
 
 /// The chain lowers with Gemma 4's facts.
-pub const GEMMA_ROWS_FACTS: CudaModelFacts = GEMMA4_FACTS;
+pub const GEMMA_ROWS_FACTS: LoweringFacts = GEMMA4_FACTS;
 
 /// The embedding scale, `√H`.
 pub fn embed_scale() -> f32 {

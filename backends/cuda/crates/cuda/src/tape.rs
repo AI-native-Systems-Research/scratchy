@@ -9,6 +9,7 @@
 //! host with no CUDA toolchain.
 
 use scratchy_subtile::paged_kv_layout::PagedKvLayout;
+use scratchy_tensors::RopeTheta;
 use serde::Serialize;
 
 use crate::op_abi::CUDA_EXPERT_TILE_ROWS;
@@ -73,15 +74,8 @@ pub struct RotaryTable {
     /// `F`, the frequency exponent's denominator: `rot_dim` for a half-rotated class, the head dim
     /// for a half-head (proportional) one, Gemma 4's global layers' 512. At least `rot_dim`.
     pub freq_dim: u32,
-    /// `rope_theta` as its bits (`f64::to_bits`), so the table is `Eq`; [`Self::theta`] reads it.
-    pub theta_bits: u64,
-}
-
-impl RotaryTable {
-    /// The table's `rope_theta`.
-    pub const fn theta(&self) -> f64 {
-        f64::from_bits(self.theta_bits)
-    }
+    /// `rope_theta`.
+    pub theta: RopeTheta,
 }
 
 /// The tape's paged KV cache: which layers' K and V it writes or reads, their geometry, and the
@@ -2986,7 +2980,7 @@ mod tests {
                 span: span(offset, bytes),
                 rot_dim: 64,
                 freq_dim: 64,
-                theta_bits: 1e7f64.to_bits(),
+                theta: RopeTheta::try_new(1e7).expect("a finite positive base"),
             }),
             ..GOOD
         }
@@ -3004,7 +2998,7 @@ mod tests {
     fn a_rotary_table_inside_the_arena_validates() {
         let t = with_rotary(TABLE_AT, TABLE);
         assert_eq!(t.validate(), Ok(()));
-        assert_eq!(t.rotary.map(|r| r.theta()), Some(1e7));
+        assert_eq!(t.rotary.map(|r| r.theta.get()), Some(1e7));
     }
 
     #[test]
@@ -3185,7 +3179,7 @@ mod tests {
                 span: span(KV_ROTARY, TABLE),
                 rot_dim: 64,
                 freq_dim: 64,
-                theta_bits: 1e7f64.to_bits(),
+                theta: RopeTheta::try_new(1e7).expect("a finite positive base"),
             }),
             kv: Some(kv),
             ..GOOD
@@ -4609,7 +4603,7 @@ mod tests {
             span: span(offset, TABLE),
             rot_dim: 64,
             freq_dim: 64,
-            theta_bits: 1e4f64.to_bits(),
+            theta: RopeTheta::try_new(1e4).expect("a finite positive base"),
         };
         let at = TABLE_AT + TABLE;
         let grown = |t: CudaTape| CudaTape {

@@ -22,8 +22,8 @@ use common::attn_layer::{
 use common::chains::GEMMA4_FACTS;
 use common::chains::{
     QWEN3_5_FACTS, QWEN3_5_GDN_FACTS, THREE_GEMM_M256, TWO_GEMM_M128, TWO_GEMM_M256,
-    assert_tape_is_lowered, assert_tape_is_lowered_with, chain_input, three_gemm, two_gemm,
-    with_hidden,
+    assert_tape_is_lowered, assert_tape_is_lowered_with, chain_input, class, fixture_facts, gdn_of,
+    lowering, three_gemm, two_gemm, uniform_attention, with_attention, with_hidden,
 };
 use common::gdn_layer::{BUNDLE_BYTES, GDN_LAYER_M128, GDN_LAYER_M256, gdn_layer};
 use common::mlp::{EPS, H, I, MLP_M128, MLP_M256, mlp};
@@ -49,13 +49,14 @@ use scratchy_target_cuda::tape::{
     ArenaOffset, ArenaSpan, CUDA_ARENA_ALIGN, CudaTape, TapeInput, WeightIx,
 };
 use scratchy_target_cuda_compiler::canonical::{
-    ArenaRefusal, AttnShapeRule, CanonicalAt, CanonicalRefusal, CudaGdnFacts, CudaModelFacts,
-    GateShapeRule, GdnRegions, GdnShapeRule, GdnWidths, GemmShapeRule, KvCacheRefusal,
-    OperandRefusal, ProducerRefusal, RopeShapeRule, RowShapeRule, ViewRefusal, lower_canonical,
-    lower_plan, plan_canonical,
+    ArenaRefusal, AttnShapeRule, CanonicalAt, CanonicalRefusal, GateShapeRule, GdnRegions,
+    GdnShapeRule, GdnWidths, GemmShapeRule, KvCacheRefusal, LoweringFacts, OperandRefusal,
+    ProducerRefusal, RopeShapeRule, RowShapeRule, ViewRefusal, lower_canonical, lower_plan,
+    plan_canonical,
 };
 use scratchy_target_cuda_compiler::emit::static_tape;
 use scratchy_target_cuda_compiler::steps_from_tape::{StepCx, TapeStep, lower_step};
+use scratchy_tensors::RopeTheta;
 
 const fn span(offset: u64, bytes: u64) -> ArenaSpan {
     ArenaSpan {
@@ -66,7 +67,7 @@ const fn span(offset: u64, bytes: u64) -> ArenaSpan {
 
 fn lower_with(
     l: &LoweredDecode,
-    facts: CudaModelFacts,
+    facts: LoweringFacts,
 ) -> Result<scratchy_target_cuda_compiler::canonical::CudaCanonical, CanonicalRefusal> {
     let at = CanonicalAt {
         stem: "fixture",
@@ -82,7 +83,7 @@ fn refused(l: &LoweredDecode, names: &[&str]) -> CanonicalRefusal {
 }
 
 /// [`refused`] under `facts`.
-fn refused_with(l: &LoweredDecode, facts: CudaModelFacts, names: &[&str]) -> CanonicalRefusal {
+fn refused_with(l: &LoweredDecode, facts: LoweringFacts, names: &[&str]) -> CanonicalRefusal {
     let e = match lower_with(l, facts) {
         Err(e) => e,
         Ok(c) => panic!("lowered a canonical the kernel cannot run: {c:?}"),
@@ -664,7 +665,7 @@ fn the_attention_gate_numbers() {
             (rotary.span.offset.0, rotary.span.bytes),
             (colours_end, m * 64 * 2)
         );
-        assert_eq!((rotary.rot_dim, rotary.theta()), (64, 1e7));
+        assert_eq!((rotary.rot_dim, rotary.theta.get()), (64, 1e7));
         assert_eq!(tape.arena.total_bytes, colours_end + m * 128);
         for &o in tape.arena.colour_offsets {
             assert_eq!(o % CUDA_ARENA_ALIGN, 0);
@@ -809,10 +810,7 @@ fn rope_only(tokens: u32, cols: u32, head_dim: u32) -> LoweredDecode {
 
 #[test]
 fn a_rope_whose_rot_dim_is_off_the_vector_is_refused() {
-    let facts = CudaModelFacts {
-        rot_dim: 24,
-        ..QWEN3_5_FACTS
-    };
+    let facts = with_attention(QWEN3_5_FACTS, Some(uniform_attention(256, 24)));
     let e = refused_with(
         &rope_only(256, 2048, 256),
         facts,
@@ -833,30 +831,24 @@ fn a_rope_whose_rot_dim_is_off_the_vector_is_refused() {
 /// `cols` that is not a whole number of heads, and a zero `rot_dim`.
 #[test]
 fn every_rope_shape_rule_is_refused() {
-    let with = |rot_dim| CudaModelFacts {
-        rot_dim,
-        ..QWEN3_5_FACTS
+    let with = |head_dim, rot_dim| {
+        with_attention(QWEN3_5_FACTS, Some(uniform_attention(head_dim, rot_dim)))
     };
     let cases = [
         (
             rope_only(256, 2048, 256),
-            with(512),
+            with(512, 512),
             RopeShapeRule::RotAboveHead,
         ),
         (
             rope_only(256, 2016, 252),
-            with(64),
+            with(256, 64),
             RopeShapeRule::HeadOffVector { multiple: 8 },
         ),
         (
             rope_only(256, 1000, 256),
-            with(64),
+            with(256, 64),
             RopeShapeRule::ColsOffHead,
-        ),
-        (
-            rope_only(256, 2048, 256),
-            with(0),
-            RopeShapeRule::Empty { dim: "rot_dim" },
         ),
     ];
     for (l, facts, rule) in cases {
@@ -866,6 +858,22 @@ fn every_rope_shape_rule_is_refused() {
             "{rule:?}: {e:?}"
         );
     }
+    // No rotated width at all: the facts state no attention, so no class.
+    let e = refused_with(
+        &rope_only(256, 2048, 256),
+        with_attention(QWEN3_5_FACTS, None),
+        &["RopeRotate", "no attention"],
+    );
+    assert!(
+        matches!(
+            e,
+            CanonicalRefusal::NoAttention {
+                step: 0,
+                op: "RopeRotate"
+            }
+        ),
+        "{e:?}"
+    );
 }
 
 /// A rope over more rows than the bucket has tokens: the rotary table has one row per token. Its
@@ -914,10 +922,7 @@ fn a_rope_whose_rows_are_not_the_tokens_is_refused() {
 /// A gate split whose `half_cols` is not a whole number of the model's heads.
 #[test]
 fn a_gate_split_off_the_head_is_refused() {
-    let facts = CudaModelFacts {
-        head_dim: 384,
-        ..QWEN3_5_FACTS
-    };
+    let facts = with_attention(QWEN3_5_FACTS, Some(uniform_attention(384, 64)));
     let e = refused_with(&attn_gate(256), facts, &["GateSplit", "half_cols=2048"]);
     assert!(matches!(
         e,
@@ -929,17 +934,13 @@ fn a_gate_split_off_the_head_is_refused() {
             ..
         }
     ));
-    let facts = CudaModelFacts {
-        head_dim: 0,
-        ..QWEN3_5_FACTS
-    };
-    let e = refused_with(&attn_gate(256), facts, &["GateSplit", "head_dim = 0"]);
+    let facts = with_attention(QWEN3_5_FACTS, None);
+    let e = refused_with(&attn_gate(256), facts, &["GateSplit", "no attention"]);
     assert!(matches!(
         e,
-        CanonicalRefusal::GateShape {
+        CanonicalRefusal::NoAttention {
             step: 2,
-            rule: GateShapeRule::Empty { dim: "head_dim" },
-            ..
+            op: "GateSplit"
         }
     ));
 }
@@ -1216,10 +1217,7 @@ fn rope_append_only(tokens: u32, cols: u32) -> LoweredDecode {
 /// number of heads. The RopeAppend is alone, so no `RopeRotate` refuses first.
 #[test]
 fn a_rope_append_off_the_rope_shape_is_refused() {
-    let facts = CudaModelFacts {
-        rot_dim: 24,
-        ..QWEN3_5_FACTS
-    };
+    let facts = with_attention(QWEN3_5_FACTS, Some(uniform_attention(256, 24)));
     let e = refused_with(
         &rope_append_only(256, 512),
         facts,
@@ -1386,10 +1384,7 @@ fn a_kv_pool_of_two_widths_or_off_the_head_is_refused() {
             want: 512
         })
     ));
-    let facts = CudaModelFacts {
-        head_dim: 384,
-        ..QWEN3_5_FACTS
-    };
+    let facts = with_attention(QWEN3_5_FACTS, Some(uniform_attention(384, 64)));
     let e = refused_with(&rope_append_only(256, 512), facts, &["RopeAppend"]);
     assert!(
         matches!(
@@ -1711,13 +1706,27 @@ fn gdn_refused(l: &LoweredDecode, names: &[&str]) -> CanonicalRefusal {
     refused_with(l, QWEN3_5_GDN_FACTS, names)
 }
 
+/// The three GDN facts a test varies: key heads, their dim, and the conv's taps.
+struct GdnFixture {
+    num_k_heads: u32,
+    head_k: u32,
+    conv_kernel: u32,
+}
+
 /// [`QWEN3_5_GDN_FACTS`] with the GDN facts `f` changes.
-fn gdn_facts(f: impl FnOnce(&mut CudaGdnFacts)) -> CudaModelFacts {
-    let mut facts = QWEN3_5_GDN_FACTS;
-    if let Some(g) = facts.gdn.as_mut() {
-        f(g);
-    }
-    facts
+fn gdn_facts(f: impl FnOnce(&mut GdnFixture)) -> LoweringFacts {
+    let mut g = GdnFixture {
+        num_k_heads: 16,
+        head_k: 128,
+        conv_kernel: 4,
+    };
+    f(&mut g);
+    let gdn = gdn_of(g.num_k_heads, g.head_k, g.conv_kernel);
+    let facts = QWEN3_5_GDN_FACTS.facts;
+    lowering(
+        fixture_facts(facts.attention(), Some(gdn)),
+        QWEN3_5_GDN_FACTS.rope_theta,
+    )
 }
 
 #[test]
@@ -1960,7 +1969,7 @@ fn a_gdn_bundle_that_is_not_a_weight_is_refused() {
 #[test]
 fn every_gdn_shape_rule_is_refused() {
     let l = gdn_layer(256);
-    let case = |facts: CudaModelFacts, names: &[&str]| match refused_with(&l, facts, names) {
+    let case = |facts: LoweringFacts, names: &[&str]| match refused_with(&l, facts, names) {
         CanonicalRefusal::GdnShape { step: 5, rule } => rule,
         e => panic!("expected a GdnShape refusal at step 5, got: {e}"),
     };
@@ -2247,7 +2256,7 @@ fn a_gdn_op_is_checked_against_the_scratchs_geometry_not_its_bytes() {
 // ── The 64-column GEMM (Gemma 4) ───────────────────────────────────
 
 /// The one GEMM step `chain_input(m, k, &[n])` lowers to under `facts`.
-fn one_gemm(m: u32, k: u32, n: u32, facts: CudaModelFacts) -> CudaStep {
+fn one_gemm(m: u32, k: u32, n: u32, facts: LoweringFacts) -> CudaStep {
     let c = lower_with(&with_hidden(chain_input(m, k, &[n])), facts)
         .unwrap_or_else(|e| panic!("m={m} k={k} n={n}: {e}"));
     let [step] = c.steps.as_slice() else {
@@ -2562,33 +2571,25 @@ fn a_gemma_moe_under_qwen_facts_is_off_the_256_tile() {
 
 // ── Gemma 4's two attention classes ────────────────────────────────
 
-use scratchy_target_cuda::step::RopeLanes;
-use scratchy_target_cuda_compiler::canonical::{CudaAttnClass, CudaAttnClasses};
+use scratchy_ir::model_facts::RopePairing;
+use scratchy_ir::model_facts::{AttnScale, AttnWindow, KvRope, Rope};
 
 /// [`attn_layer`]'s layer as Gemma's base (sliding) class of a two-class model: 2 kv heads of
 /// 256, rotated in full (`rot_dim` 64 here, the fixture's), theta 1e4, a `window` of keys; the
 /// global class one kv head of 512 with no window.
-fn two_class_facts(window: Option<u32>) -> CudaModelFacts {
-    CudaModelFacts {
-        classes: Some(CudaAttnClasses {
-            base: CudaAttnClass {
-                head_dim: 256,
-                kv_heads: 2,
-                rot_dim: 64,
-                rope_theta: Some(1e4),
-                pairing: RopeLanes::HalfRotated,
-                window,
-            },
-            global: CudaAttnClass {
-                head_dim: 512,
-                kv_heads: 1,
-                rot_dim: 128,
-                rope_theta: Some(1e6),
-                pairing: RopeLanes::HalfHead,
-                window: None,
-            },
-        }),
-        ..GEMMA4_FACTS
+fn two_class_facts(window: Option<u32>) -> LoweringFacts {
+    let attention = Attention::new(
+        class(8, 2, 256, 64),
+        class(8, 1, 512, 128),
+        AttnScale::new(0.0625),
+        None,
+        window.map(AttnWindow::new),
+        Some(Rope::new(RopePairing::Proportional, KvRope::AtWrite, None)),
+    );
+    LoweringFacts {
+        rope_theta: Some(RopeTheta::try_new(1e6).expect("a finite positive base")),
+        rope_local_theta: Some(RopeTheta::try_new(1e4).expect("a finite positive base")),
+        ..with_attention(GEMMA4_FACTS, Some(attention))
     }
 }
 
@@ -2622,7 +2623,7 @@ fn a_sliding_layer_lowers_with_its_class() {
         let c = lower_with(&l, two_class_facts(Some(1024))).unwrap_or_else(|e| panic!("{e}"));
         let local = c.rotary_local.expect("the local table");
         assert!(c.rotary.is_none(), "m={m}: the global table is not bound");
-        assert_eq!((local.rot_dim, local.theta()), (64, 1e4), "m={m}");
+        assert_eq!((local.rot_dim, local.theta.get()), (64, 1e4), "m={m}");
         let kv = c.kv.as_ref().expect("a KV pool");
         assert_eq!(kv.layer_class, [0], "m={m}");
         assert_eq!(kv.classes[0].window, Some(1024), "m={m}");
@@ -2855,21 +2856,18 @@ fn an_affine_expert_bank_is_refused() {
 
 /// Gemma 4 26B-A4B's two classes as its v_norm sees them: sliding 8 kv heads of 256, global 2 of
 /// 512.
-fn gemma_vnorm_facts() -> CudaModelFacts {
-    let class = |head_dim, kv_heads| CudaAttnClass {
-        head_dim,
-        kv_heads,
-        rot_dim: 64,
-        rope_theta: Some(1e4),
-        pairing: RopeLanes::HalfRotated,
-        window: None,
-    };
-    CudaModelFacts {
-        classes: Some(CudaAttnClasses {
-            base: class(256, 8),
-            global: class(512, 2),
-        }),
-        ..GEMMA4_FACTS
+fn gemma_vnorm_facts() -> LoweringFacts {
+    let attention = Attention::new(
+        class(16, 8, 256, 64),
+        class(16, 2, 512, 64),
+        AttnScale::new(0.0625),
+        None,
+        None,
+        Some(Rope::new(RopePairing::Standard, KvRope::AtWrite, None)),
+    );
+    LoweringFacts {
+        rope_theta: Some(RopeTheta::try_new(1e4).expect("a finite positive base")),
+        ..with_attention(GEMMA4_FACTS, Some(attention))
     }
 }
 
@@ -2888,7 +2886,7 @@ fn vnorm(m: u32, cols: u32) -> LoweredDecode {
 }
 
 /// The v_norm's `(rows, cols)` as lowered.
-fn vnorm_shape(l: &LoweredDecode, facts: CudaModelFacts) -> (u32, u32) {
+fn vnorm_shape(l: &LoweredDecode, facts: LoweringFacts) -> (u32, u32) {
     let at = CanonicalAt {
         stem: "vnorm",
         m: 1,

@@ -69,6 +69,7 @@ use scratchy_target_cuda::tape::{
 };
 use scratchy_target_cuda_compiler::canonical::{CanonicalAt, lower_canonical};
 use scratchy_target_cuda_compiler::emit::static_tape;
+use scratchy_tensors::RopeTheta;
 
 /// One worker's buckets: `M = 128` and `M = 256` of the same two-GEMM graph.
 static TWO_GEMM_BUCKETS: [CudaTape; 2] = [TWO_GEMM_M128, TWO_GEMM_M256];
@@ -698,7 +699,7 @@ fn the_attention_gate_matches_the_cpu_reference_in_each_bucket() {
         let qr = read(&mut worker, colour(tape, 5));
         let rotary = tape.rotary.expect("the tape has a rotary table");
         let uploaded = read(&mut worker, rotary.span);
-        let table_matches = uploaded == rotary_rows(&positions, rotary.rot_dim, rotary.theta());
+        let table_matches = uploaded == rotary_rows(&positions, rotary.rot_dim, rotary.theta.get());
         let refs = rope_reference(&qn, &uploaded, (m, AG_Q), (AG_HD, AG_R), AG_R / 2);
         let cmp = compare_rope(&qr, &qn, &refs, AG_Q);
         let ok = cmp.rotated.pass() && cmp.pass_through_mismatched == 0 && table_matches;
@@ -854,7 +855,7 @@ static BAD_ROTARY: [CudaTape; 1] = [CudaTape {
         },
         rot_dim: 64,
         freq_dim: 64,
-        theta_bits: 0x416312D000000000,
+        theta: RopeTheta::try_new(1e7).expect("a finite positive base"),
     }),
     ..ATTN_GATE_M256
 }];
@@ -1083,7 +1084,7 @@ fn the_attention_layer_matches_the_cpu_reference_in_each_bucket() {
         pass &= check_stage("v = n·Wvᵀ", &v, &n, &w.wv, (m, AL_KV, AL_H));
         let rotary = tape.rotary.expect("the tape has a rotary table");
         let uploaded = read(&mut worker, rotary.span);
-        let table_ok = uploaded == rotary_rows(&positions, rotary.rot_dim, rotary.theta());
+        let table_ok = uploaded == rotary_rows(&positions, rotary.rot_dim, rotary.theta.get());
         let kr = read(&mut worker, colour(tape, 3));
         let refs = rope_reference(&kn, &uploaded, (m, AL_KV), (AL_HD, AL_R), AL_R / 2);
         let cmp = compare_rope(&kr, &kn, &refs, AL_KV);
@@ -4953,7 +4954,7 @@ fn a_launcher_refusal_is_a_worker_error_at_construction() {
 /// (`matvec_ends` and `matvec_norms` false: the tape before FP8 S8 W4a).
 fn w4_tapes(
     l: &scratchy_subtile::handoff::LoweredDecode,
-    facts: scratchy_target_cuda_compiler::canonical::CudaModelFacts,
+    facts: scratchy_target_cuda_compiler::canonical::LoweringFacts,
 ) -> [CudaTape; 2] {
     use scratchy_target_cuda_compiler::canonical::{
         cuda_fold_facts, lower_plan, plan_canonical_folding,
