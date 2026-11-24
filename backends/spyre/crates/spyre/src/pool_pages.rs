@@ -413,9 +413,11 @@ mod tests {
     /// the intermediate segment whole and charge no run.
     #[test]
     fn session_residency_charges_the_kv_segment_per_page() {
-        let mut layout = BundleLayout::default();
         // seg0 intermediate, seg1 weights, seg2 KV, seg3 activations.
-        layout.segment_bytes = [8192, 200, 3072, 400, 0, 0, 0];
+        let layout = BundleLayout {
+            segment_bytes: [8192, 200, 3072, 400, 0, 0, 0],
+            ..BundleLayout::default()
+        };
         let reading = session_residency(&layout, &[512, 512], Some(step(2, 1)));
         assert_eq!(
             reading.fixed().get(),
@@ -441,9 +443,11 @@ mod tests {
     /// the packed intermediates, and the packed extent while none is declared.
     #[test]
     fn session_residency_charges_the_declared_synthetics() {
-        let mut layout = BundleLayout::default();
-        layout.segment_bytes = [8192, 200, 3072, 400, 0, 0, 0];
-        layout.synth = std::cell::RefCell::new(ktir_superdsc::placement::SynthAlloc::new(8192));
+        let layout = BundleLayout {
+            segment_bytes: [8192, 200, 3072, 400, 0, 0, 0],
+            synth: std::cell::RefCell::new(ktir_superdsc::placement::SynthAlloc::new(8192)),
+            ..BundleLayout::default()
+        };
         assert_eq!(
             session_residency(&layout, &[512], None).fixed().get(),
             8192 + 200 + 400

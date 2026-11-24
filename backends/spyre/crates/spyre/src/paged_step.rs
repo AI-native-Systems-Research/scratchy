@@ -1566,7 +1566,10 @@ mod tests {
         );
         assert_eq!(
             placed(s.mask),
-            4 * 1 * 4 * 2,
+            u64::from(s.walk)
+                * u64::from(s.extent.per_request().get())
+                * u64::from(s.page_slots)
+                * 2,
             "the mask stack is the walk's 4 pages of one request's row — not the pool's 16"
         );
         assert_eq!(
