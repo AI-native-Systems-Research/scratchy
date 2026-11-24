@@ -1493,7 +1493,6 @@ impl SpyreWorker {
                 let step = wirings.decode.paged.first().ok_or_else(|| {
                     werr("this bundle states no paged step — its attention has no pools")
                 })?;
-                })?;
                 let num_blocks = step.pages as usize;
                 let pool_need_bytes = code.layout.kv_pool_bytes();
                 // ⭐ THE CONTEXT THIS RUN SERVES — the declared `--max-model-len`, which the pool must
