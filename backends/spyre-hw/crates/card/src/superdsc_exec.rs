@@ -5102,9 +5102,34 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
     /// disqualifies a forward from the emitted-row regime by the seat's
     /// own `is_quiet` gate — on this path they have no reachable input.
     /// Stated here rather than silently dropped.
-    pub fn submit_step(&mut self, n_new: NewTokens, seq_pos: SeqPos) -> Result<()> {
+    ///
+    /// ⭐ ONE SUBMIT DOOR FOR EVERY PIPELINED FORWARD — a decode step
+    /// ([`SuffixLaunch::Launched`]: its pick is the suffix's sampler) and a
+    /// MIDDLE PROMPT CHUNK ([`SuffixLaunch::Skipped`]: nobody reads its
+    /// logits, so neither the suffix nor any readback runs). A chunk submitted
+    /// here is waited out by the next forward that reads what it wrote, on this
+    /// stream in FIFO order, or by [`Self::finish_submitted`].
+    pub fn submit_step(
+        &mut self,
+        n_new: NewTokens,
+        seq_pos: SeqPos,
+        suffix: SuffixLaunch,
+    ) -> Result<()> {
         let d = Diag::get();
-        let _half = self.forward_half(n_new, seq_pos, SuffixLaunch::Launched, d)?;
+        let _half = self.forward_half(n_new, seq_pos, suffix, d)?;
+        Ok(())
+    }
+
+    /// ⭐ THE WAIT FOR WHAT [`Self::submit_step`] LEFT IN FLIGHT and nobody reads back — a prompt's
+    /// middle chunks, before another session's forward may run (its streams order nothing of this
+    /// one's) or before the prompt's step returns. The same drain [`Self::predict_finish`] takes,
+    /// without a logits row to convert, and the same epilogue every finished forward runs.
+    pub fn finish_submitted(&mut self) -> Result<()> {
+        let d = Diag::get();
+        self.stream_ref()?
+            .synchronize()
+            .map_err(|e| anyhow!("submitted forward: sync: {e}"))?;
+        self.step_epilogue(d);
         Ok(())
     }
 
@@ -6516,9 +6541,12 @@ pub struct PredictSubmitted {
     t2b: Instant,
 }
 
-/// Whether [`Executor::launch_forward`] launches the suffix — read off [`Logits`] in one place.
+/// Whether [`Executor::launch_forward`] launches the suffix — read off [`Logits`] in one place, and
+/// named by the caller of the pipelined submit door ([`Executor::submit_step`]): a decode step
+/// launches it (its pick is the suffix's sampler), a middle prompt chunk skips it (nobody reads its
+/// logits).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum SuffixLaunch {
+pub enum SuffixLaunch {
     Launched,
     Skipped,
 }

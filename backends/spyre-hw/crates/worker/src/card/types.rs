@@ -243,7 +243,7 @@ pub(crate) struct PrefixRungBuilt {
 /// write, its session and the baked row count its K/V extent is proven against all read THIS value, so
 /// they cannot come from two choices. No public constructor: only [`PrefixLadder::rung_for`] and
 /// [`PrefixLadder::packed_fill`] mint one.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct PrefixRung {
     index: usize,
     width: usize,

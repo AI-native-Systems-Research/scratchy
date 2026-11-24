@@ -785,18 +785,30 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> SuperDscSession<'a, 'c, T> {
     /// what waits this submission out; `predict`'s tail sync is the drain this
     /// door exists to not run. Call `stage_step_acts` first: this door submits
     /// whatever the shadow holds.
-    pub fn submit_step(&mut self, n_new: usize, seq_pos: usize) -> Result<()> {
+    pub fn submit_step(
+        &mut self,
+        n_new: usize,
+        seq_pos: usize,
+        suffix: crate::superdsc_exec::SuffixLaunch,
+    ) -> Result<()> {
         // ⭐ EVERY CARD'S DOORBELL BEFORE ANY WAIT — this door waits on nothing, so the ranks' steps
         // are all in flight together and their collectives meet on the cards.
         let t0 = std::time::Instant::now();
         let at = self.each_parallel("Submit", |e| {
-            e.submit_step(NewTokens(n_new as i64), SeqPos(seq_pos as i64))?;
+            e.submit_step(NewTokens(n_new as i64), SeqPos(seq_pos as i64), suffix)?;
             Ok(t0.elapsed().as_secs_f64() * 1e3)
         })?;
         if std::env::var_os("SCRATCHY_SDSC_RB_TIME").is_some() {
             eprintln!("[sdsc-submit] step {seq_pos}: rank submits done at {at:.2?} ms");
         }
         Ok(())
+    }
+
+    /// ⭐ WAIT OUT EVERY FORWARD [`Self::submit_step`] LEFT IN FLIGHT ON THIS SESSION — every rank's
+    /// stream (`Executor::finish_submitted`). Every rank was submitted before any is waited on, so
+    /// no card's wait can stall a peer's send.
+    pub fn finish_submitted(&mut self) -> Result<()> {
+        self.each(Executor::finish_submitted).map(|_| ())
     }
 
     /// ⭐ #32 (A) — ENQUEUE THE STEP'S STICK READ, no drain: the D2H rides the

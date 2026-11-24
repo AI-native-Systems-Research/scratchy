@@ -507,7 +507,12 @@ pub(crate) fn run_card_launch(
                     ))
                 })?;
             let t_submit = std::time::Instant::now();
-            pf.submit_step(mq, seq_pos).map_err(|e| {
+            pf.submit_step(
+                mq,
+                seq_pos,
+                scratchy_target_spyre_card::superdsc_exec::SuffixLaunch::Launched,
+            )
+            .map_err(|e| {
                 werr(format!(
                     "superdsc decode submit (mq={mq}, at={seq_pos}): {e}"
                 ))
@@ -575,13 +580,23 @@ pub(crate) fn run_card_launch(
                 b.result_id
             )));
         }
-        // A middle prompt chunk: no suffix runs and nothing is read back.
+        // ⭐ A MIDDLE PROMPT CHUNK, SUBMITTED: no suffix runs and nothing is read back, so nothing
+        // waits here — the pipelined decode step's own submit door, suffix skipped. The host goes
+        // on to stage the NEXT chunk while the card computes this one; the chunk loop
+        // ([`superdsc_forward_chunk`]) waits it out before another session runs or the prompt's
+        // step returns, and a later chunk on this session is FIFO behind it.
         (LogitsWanted::None, _) => {
             pf.stage_step_acts_seeded(&acts, &[], &acts_i32, &seeds)
-                .and_then(|()| pf.run_staged_step(mq, seq_pos, StepLogits::Discarded))
+                .and_then(|()| {
+                    pf.submit_step(
+                        mq,
+                        seq_pos,
+                        scratchy_target_spyre_card::superdsc_exec::SuffixLaunch::Skipped,
+                    )
+                })
                 .map_err(|e| {
                     werr(format!(
-                        "superdsc prefill run_step (mq={mq}, at={seq_pos}): {e}"
+                        "superdsc prefill submit (mq={mq}, at={seq_pos}): {e}"
                     ))
                 })?;
             None
@@ -1388,6 +1403,32 @@ fn log_seat_readback(
     );
 }
 
+/// ⭐ THE SESSION A PROMPT CHUNK RUNS ON — a rung of the first chunk's ladder (by index) or a
+/// continuation rung of the prefix ladder — compared by the chunk loop, so it knows when the next
+/// chunk leaves the session the submitted chunks are in flight on ([`superdsc_forward_chunk`]).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ChunkSession {
+    First(usize),
+    Prefix(PrefixRung),
+}
+
+/// Wait out the prompt chunks submitted on `at`'s session (every rank's streams).
+fn finish_chunks(
+    at: ChunkSession,
+    rungs: &mut [(usize, SuperDscSession)],
+    prefix: &mut PrefixLadder,
+) -> ExecutorResult<()> {
+    match at {
+        ChunkSession::First(ri) => rungs[ri].1.finish_submitted(),
+        ChunkSession::Prefix(r) => prefix.session(r).finish_submitted(),
+    }
+    .map_err(|e| {
+        werr(format!(
+            "superdsc prefill: waiting out the submitted chunks: {e}"
+        ))
+    })
+}
+
 /// ⭐ THE PREFILL LADDERS THE CHUNK LOOP CLIMBS, ONE BUNDLE: the ladder a prompt's first chunk picks
 /// from (each rung walks only its own chunk's pages), and the ladder a continuation chunk picks from
 /// (each rung's walks reach up to the whole pool) — both borrowed mutably because the picked rung's
@@ -1442,21 +1483,39 @@ pub(crate) fn superdsc_forward_chunk(
     let end = start + n;
     let mut pos = start;
     let mut pick: Option<Vec<u32>> = None;
+    // ⭐ THE SESSION WHOSE SUBMITTED CHUNKS ARE STILL IN FLIGHT — a middle chunk is submitted, not
+    // waited ([`run_card_launch`]'s `LogitsWanted::None` arm), so the card computes it while the
+    // host stages the next. A chunk on the SAME session is FIFO behind it on that session's
+    // streams; a chunk on ANOTHER session (the first chunk's rung, the tail's narrower rung) is
+    // ordered by nothing, and it reads the keys this one writes, so this session is waited out
+    // before the other runs, and before the step returns (the engine treats a step's tokens as in
+    // the pool when it returns, and another request may share them).
+    let mut in_flight: Option<ChunkSession> = None;
     while pos < end {
         let left = end - pos;
-        let (width, sess) = if pos == 0 {
-            let ri = prefill_rung_for(rungs, left.min(top_m))
-                .ok_or_else(|| werr("superdsc prefill: no prompt chunk rung baked".to_string()))?;
-            let (m, sess) = &mut rungs[ri];
-            (*m, sess)
+        let at = if pos == 0 {
+            ChunkSession::First(
+                prefill_rung_for(rungs, left.min(top_m)).ok_or_else(|| {
+                    werr("superdsc prefill: no prompt chunk rung baked".to_string())
+                })?,
+            )
         } else {
-            let r = prefix.rung_for(left).ok_or_else(|| {
+            ChunkSession::Prefix(prefix.rung_for(left).ok_or_else(|| {
                 werr(format!(
                     "superdsc prefill: a chunk at position {pos} needs a rung whose walk reaches the \
                      keys before it, and none is baked"
                 ))
-            })?;
-            (r.width(), prefix.session(r))
+            })?)
+        };
+        if let Some(prev) = in_flight.filter(|prev| *prev != at) {
+            finish_chunks(prev, rungs, prefix)?;
+        }
+        let (width, sess) = match at {
+            ChunkSession::First(ri) => {
+                let (m, sess) = &mut rungs[ri];
+                (*m, sess)
+            }
+            ChunkSession::Prefix(r) => (r.width(), prefix.session(r)),
         };
         let real = left.min(width);
         let chunk_toks: Vec<usize> = (pos..pos + real)
@@ -1512,7 +1571,13 @@ pub(crate) fn superdsc_forward_chunk(
              prefix={}",
             pos > 0
         );
+        // The chunk that finishes the prompt read its pick back, which waited out its session's
+        // stream (everything FIFO before it included); every other chunk is in flight.
+        in_flight = (!finishes).then_some(at);
         pos += real;
+    }
+    if let Some(prev) = in_flight {
+        finish_chunks(prev, rungs, prefix)?;
     }
     tokens.set_tokens_in_pool(id, end);
     Ok(match pick {
