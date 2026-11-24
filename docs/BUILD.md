@@ -22,9 +22,7 @@ image-decode stack, `bench` for `scr bench serve`. Tab completion over real
 HuggingFace model ids is on by default in `scr` (`model/hf-completions`); pass
 `--no-default-features` to build with no network access at all. The metal KV
 cache is int8, fixed at build time — see
-[int8 KV](#int8-kv--the-metal-kv-cache-fixed-at-build-time); the spyre KV cache
-is float8 by default on card (`spyre-hw`) builds — see
-[fp8 KV](#fp8-kv--the-spyre-kv-cache-float8-by-default-on-card-builds).
+[int8 KV](#int8-kv--the-metal-kv-cache-fixed-at-build-time).
 
 ## There is no default model, quant or drafter scope
 
@@ -193,29 +191,6 @@ The server logs the loaded model's codec at start (`KV cache codec: int8
 `--kv-cache-dtype` on metal takes the codec by default (`auto`) and can only
 *assert* it: `fp16` or `int8` refuses to start if the binary stores the model's
 KV cache the other way.
-
-## fp8 KV — the spyre KV cache, float8 by default on card builds
-
-On a card build (`spyre-hw`), `spyre` stores every model's KV cache as float8
-e4m3 when each of its KV head dims is whole float8 sticks of 128 elements: the
-card feature turns on `kv/fp8`. Each new K and V row is saturated at ±448 and
-cast as it is written, and the paged attention widens each page to 16 bits as it
-gathers it. Nothing chooses at runtime. An emulator (`spyre-emu`) build keeps a
-16-bit cache unless it names `kv/fp8` itself.
-
-The rest stay dense and the build names each one and why:
-
-```
-warning: scratchy-target-spyre-models@0.1.0: fp8 KV: granite-3.1-2b-instruct keeps a dense KV cache: head_dim 64 is not whole float8 sticks of 128
-```
-
-A model stays dense when it has no KV cache, when its KV cache is an MLA latent,
-when a head_dim is not a multiple of 128, or when its config states a
-`kv_cache_scheme` (per-layer scales only the checkpoint's tensors hold). The rule
-is `scratchy_layers::kv_int8::codec_for` at spyre's `Fp8Heads`.
-
-`--features spyre-hw,kv/dense` keeps every model's KV cache 16-bit on a card
-build — the build for an fp16-KV A/B, with no `--no-default-features`.
 
 ## `hf-completions` — shell tab completion over real model ids
 

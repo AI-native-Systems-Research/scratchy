@@ -25,8 +25,6 @@ tp-4 = ["spyre-hw", "scratchy-target-spyre-models/tp-4", "scratchy-target-spyre/
 tp-8 = ["spyre-hw", "scratchy-target-spyre-models/tp-8", "scratchy-target-spyre/tp-8", "scratchy-target-spyre-card/tp-8"]
 # THE FLOAT8 KV CACHE (`kv/fp8` through scratchy-kv): the models' bake selects the shared fact.
 kv-fp8 = ["scratchy-target-spyre-models/kv-fp8"]
-# THE 16-BIT KV CACHE, NAMED (`kv/dense` through scratchy-kv): wins over `kv-fp8` in the bake.
-kv-dense = ["scratchy-target-spyre-models/kv-dense"]
 # THE ON-CARD ALLOC-CENSUS WINDOW (flex-rs's zero-alloc proof instrument): frames
 # `arm()`..`disarm()` around N collected decode steps in the serving loop, so the
 # steady-state per-step allocation count is measurable on a real serve, not only in

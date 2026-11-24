@@ -16,31 +16,9 @@ use scratchy_forward_compiler_macro::target::{
 
 /// The spyre target's emitter.
 pub struct Spyre {
-    /// The float8 (e4m3) KV cache (`kv/fp8`, the spyre CLI's card default (`spyre-hw`)): every
-    /// model the build bakes whose KV heads are whole float8 sticks ([`FP8_HEADS`]) stores it as
-    /// float8, the reference's `kv_cache_dtype=fp8`; every other model keeps its 16-bit cache.
+    /// The float8 (e4m3) KV cache (`kv/fp8` from the CLI): every model the build bakes that holds
+    /// KV stores it as float8, the reference's `kv_cache_dtype=fp8`.
     pub kv_fp8: bool,
-}
-
-/// ⭐ THE HEADS SPYRE'S FLOAT8 KV STORE HOLDS — whole sticks of the card's float8 format, its
-/// [`DataFormat::ELEMS_PER_STICK`](ktir_superdsc::superdsc_opspec::DataFormat::ELEMS_PER_STICK)
-/// (the device's flit at one byte an element: the stick every float8 pool row is laid in).
-pub const FP8_HEADS: scratchy_ir::Fp8Heads = match std::num::NonZeroU32::new(
-    <ktir_superdsc::superdsc_opspec::Fp8 as ktir_superdsc::superdsc_opspec::DataFormat>::ELEMS_PER_STICK,
-) {
-    Some(stick) => scratchy_ir::Fp8Heads::new(stick),
-    None => panic!("a float8 stick holds elements"),
-};
-
-impl Spyre {
-    /// The emitter a build's KV features name: `kv/dense` (`kv-dense`) named wins over `kv/fp8`
-    /// (`kv-fp8`, the spyre CLI's card default (`spyre-hw`)), so a 16-bit-KV build needs no
-    /// `--no-default-features`.
-    pub const fn of_kv_features(kv_fp8: bool, kv_dense: bool) -> Self {
-        Self {
-            kv_fp8: kv_fp8 && !kv_dense,
-        }
-    }
 }
 
 impl TargetEmitter for Spyre {
@@ -50,7 +28,7 @@ impl TargetEmitter for Spyre {
 
     fn kv_store(&self) -> KvStore {
         if self.kv_fp8 {
-            KvStore::Fp8E4m3(FP8_HEADS)
+            KvStore::Fp8E4m3
         } else {
             KvStore::Dense
         }
@@ -258,27 +236,5 @@ impl TargetEmitter for Spyre {
             ),
         }
         out
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// `kv/dense` named wins over the default `kv/fp8`; `kv/fp8` alone selects the float8 store;
-    /// naming neither keeps the 16-bit one.
-    #[test]
-    fn kv_dense_named_wins_over_the_float8_default() {
-        let store = |fp8, dense| Spyre::of_kv_features(fp8, dense).kv_store();
-        assert_eq!(store(true, false), KvStore::Fp8E4m3(FP8_HEADS));
-        assert_eq!(store(true, true), KvStore::Dense);
-        assert_eq!(store(false, true), KvStore::Dense);
-        assert_eq!(store(false, false), KvStore::Dense);
-    }
-
-    /// Spyre's float8 heads are its float8 format's sticks: 128 elements.
-    #[test]
-    fn the_float8_heads_are_the_formats_sticks() {
-        assert_eq!(FP8_HEADS.elems_per_stick(), 128);
     }
 }
