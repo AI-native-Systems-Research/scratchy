@@ -3,9 +3,11 @@
 //!
 //! The shared analysis (`scratchy_subtile::tensor_parallel::shard`) decides WHERE the forward's
 //! collectives are. This module is how a spyre bundle EXECUTES them, entirely in the compute
-//! stream: each collective's consume is a launch group of its own, preceded by a p2p send of this
-//! rank's operand into EVERY peer's receive window and a wait on the write-done counters EVERY
-//! peer's send increments. No host step sits between a producer, its collective and its consumer.
+//! stream: each collective's consume is a launch group of its own, preceded by p2p sends of this
+//! rank's operand into its exchange's peers' receive windows and a wait on the write-done counters
+//! their sends increment ([`Exchange`]): every peer for an all-gather, one partner per round for an
+//! all-reduce (spyre-comms' `AllReduce_PairwisePow2`, `log2(W)` consume groups per all-reduce). No
+//! host step sits between a producer, its collective and its consumer.
 //!
 //! ⭐ ONE PROTOCOL FOR EVERY WORLD. Nothing here names a world size: a world of `W` ranks is the
 //! same law over `W` senders. Every receive window holds one block per SENDING rank, at the
@@ -43,7 +45,9 @@
 //!
 //! [`EmittedOp`]: crate::emit::EmittedOp
 
-pub use scratchy_tp_world::{Build, PerRank, Rank, TpWorld, World, ranks};
+pub use scratchy_tp_world::{
+    Build, PairwiseRound, PerRank, Rank, TpWorld, World, pairwise_rounds, ranks,
+};
 
 use crate::superdsc_opspec::{DataFormat, Fp16};
 
@@ -486,10 +490,38 @@ impl Sid {
 /// them exhaustively.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum CollectiveKind {
-    /// The consume sums every rank's partial, in rank order.
+    /// The consumes sum every rank's partial, one pairwise round each: a round adds its partner's
+    /// running sum to this rank's ([`Exchange::Pairwise`]).
     AllReduce,
     /// The consume places every rank's block at that rank's columns.
     AllGather,
+}
+
+/// ⭐ WHO A CONSUME'S SENDS GO TO AND WHOSE LANDINGS ITS WAITS COUNT — the consume's exchange.
+/// The CB pipeline (the bundle crate's `collective::group_steps`), the card's control blocks and
+/// the bake's emulator gate all read the peers off [`Exchange::peers`], so they cannot disagree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Exchange<T: Tp> {
+    /// Every peer, once: this rank's fragment into every peer's window, every peer's awaited (the
+    /// all-gather).
+    EveryPeer,
+    /// ⭐ ONE ROUND OF spyre-comms' `AllReduce_PairwisePow2` — this rank's running sum to its
+    /// partner at `round` ([`Rank::partner`]), and that partner's awaited. The partner differs
+    /// every round of one all-reduce, so each round's message lands in its own sender's block of
+    /// the collective's cut.
+    Pairwise(PairwiseRound<T>),
+}
+
+impl<T: Tp> Exchange<T> {
+    /// The peers rank `me` sends to and waits on in this exchange, in rank order.
+    pub fn peers(self, me: Rank<T>) -> impl Iterator<Item = Rank<T>> {
+        let pairwise = match self {
+            Self::EveryPeer => None,
+            Self::Pairwise(round) => Some(me.partner(round)),
+        };
+        me.peers()
+            .filter(move |p| pairwise.is_none_or(|partner| *p == partner))
+    }
 }
 
 /// One fragment of a collective's operand: a run of whole stick columns, which is one contiguous
@@ -631,12 +663,19 @@ pub struct TpConsume<T: Tp> {
     pub plays_at: Rank<T>,
     /// The window cut the sends land in and the consume reads.
     pub cut: WindowCut,
+    /// Who the sends go to and whose landings the waits count.
+    pub exchange: Exchange<T>,
 }
 
 impl<T: Tp> TpConsume<T> {
     /// Whether the session running as `session` launches this consume.
     pub fn launches_on(self, session: Rank<T>) -> bool {
         self.plays_at == session
+    }
+
+    /// The peers this consume's rank sends to and waits on.
+    pub fn peers(self) -> impl Iterator<Item = Rank<T>> {
+        self.exchange.peers(self.plays_at)
     }
 }
 

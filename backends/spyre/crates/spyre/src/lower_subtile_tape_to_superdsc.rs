@@ -5431,10 +5431,36 @@ fn numeric_gate_sharded<T: ktir_superdsc::collective::Tp, F: RopeForm>(
                 && covering.is_none_or(|c| c.contains(&(n.output.tensor.index() as u64)))
         })
         .collect();
-    if collective_nodes.len() + 1 != nseg {
+    // ⭐ ONE EXCHANGE PER CONSUME: an all-gather is one, an all-reduce one per pairwise round
+    // (`lower_subtile_tape_to_ktir::all_reduce_consumes`), each opening its own segment. A step
+    // names its collective node and, for an all-reduce, its round; what it sends is the node's
+    // operand, or for a later round the running sum the round before wrote
+    // (`lower_subtile_tape_to_ktir::pairwise_operand`, the emitter's own law).
+    type Step<'n, F, T> = (
+        &'n scratchy_subtile::subtile_ir::SubtileNode<F>,
+        Option<crate::bundle_code::collective::PairwiseRound<T>>,
+    );
+    let steps: Vec<Step<'_, F, T>> = collective_nodes
+        .iter()
+        .flat_map(|n| -> Vec<Step<'_, F, T>> {
+            match n.op {
+                SubOp::AllReduce => crate::bundle_code::collective::pairwise_rounds::<T>()
+                    .map(|round| (*n, Some(round)))
+                    .collect(),
+                _ => vec![(*n, None)],
+            }
+        })
+        .collect();
+    let sent = |(n, round): Step<'_, F, T>| match round {
+        Some(round) => crate::lower_subtile_tape_to_ktir::pairwise_operand(n, round),
+        None => n.inputs[0],
+    };
+    if steps.len() + 1 != nseg {
         return Err(format!(
-            "{} segment(s) for {} collective node(s) — a consume per collective",
+            "{} segment(s) for {} collective exchange(s) of {} collective node(s) — a consume per \
+             exchange",
             nseg,
+            steps.len(),
             collective_nodes.len()
         ));
     }
@@ -5449,11 +5475,15 @@ fn numeric_gate_sharded<T: ktir_superdsc::collective::Tp, F: RopeForm>(
                 std::mem::take(&mut probes[r].sources)
             } else {
                 let staged = std::mem::take(&mut windows[r]);
-                if staged.len() + 1 != ranks.len() {
+                let peers = segs[r][k]
+                    .first()
+                    .and_then(|g| g.kv.tp)
+                    .map_or(0, |c| c.peers().count());
+                if staged.len() != peers {
                     return Err(format!(
-                        "rank {r} reached segment {k} with {} of its {} peers' blocks staged",
+                        "rank {r} reached segment {k} with {} of its exchange's {peers} peers' \
+                         blocks staged",
                         staged.len(),
-                        ranks.len() - 1
                     ));
                 }
                 staged
@@ -5464,8 +5494,8 @@ fn numeric_gate_sharded<T: ktir_superdsc::collective::Tp, F: RopeForm>(
                 .filter(|t| observables[r][k].contains(t))
                 .map(|t| (*t, 0))
                 .collect();
-            if let Some(n) = collective_nodes.get(k) {
-                let t = n.inputs[0].tensor.index() as u64;
+            if let Some(&step) = steps.get(k) {
+                let t = sent(step).tensor.index() as u64;
                 if !want.iter().any(|(w, _)| *w == t) {
                     want.push((t, 0));
                 }
@@ -5486,7 +5516,9 @@ fn numeric_gate_sharded<T: ktir_superdsc::collective::Tp, F: RopeForm>(
                     k + 1
                 ));
             };
-            for peer in ranks[r].peers() {
+            // The peers the receiver's consume waits on — every peer for an all-gather, the
+            // round's partner for an all-reduce round — each landing what it sends.
+            for peer in mine.peers() {
                 let p = peer.get() as usize;
                 let Some(c) = segs[p][k + 1].first().and_then(|g| g.kv.tp) else {
                     return Err(format!(
@@ -5494,7 +5526,7 @@ fn numeric_gate_sharded<T: ktir_superdsc::collective::Tp, F: RopeForm>(
                         k + 1
                     ));
                 };
-                let x = collective_nodes[k].inputs[0];
+                let x = sent(steps[k]);
                 let tid = x.tensor.index();
                 let t = ir.tensors[tid];
                 let (rows, cols) = (t.rows as usize, t.cols as usize);
@@ -10879,9 +10911,10 @@ mod tests {
     }
 
     /// A sharded bundle's sends, as the loader reads them off the BAKED layout, at every world: each
-    /// rank's consume sends the partial at its own placement into THAT RANK'S block of the window —
-    /// the very bytes every peer's consume reads for it — and a layout that lost the window refuses
-    /// by name, the bake's gate.
+    /// (rank, pairwise round) consume sends its round's operand — the partial in round 0, the running
+    /// sum after — at its own placement into THAT RANK'S block of the window, the very bytes its
+    /// round's partner's consume reads for it, and a layout that lost the window refuses by name, the
+    /// bake's gate.
     #[test]
     fn a_baked_send_reads_the_partial_into_its_senders_block() {
         use crate::bundle_code::collective::{Rank, Tp, TpWorld, World};
@@ -10916,8 +10949,8 @@ mod tests {
             let sends = bundle::collective::sends(&baked, &groups).unwrap();
             assert_eq!(
                 sends.len(),
-                <T as World>::RANKS as usize,
-                "one all-reduce, one consume (and its sends) per rank"
+                (<T as World>::RANKS * <T as World>::PAIRWISE_ROUNDS) as usize,
+                "one all-reduce, one consume (and its send) per (rank, round)"
             );
             for s in &sends {
                 let consume = groups[s.group].kv.tp.unwrap();

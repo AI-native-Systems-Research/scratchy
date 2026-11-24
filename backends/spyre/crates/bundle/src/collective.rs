@@ -45,37 +45,36 @@ pub fn plays_on<T: Tp>(tp: Option<TpConsume<T>>, session: Rank<T>) -> bool {
     tp.is_none_or(|c| c.launches_on(session))
 }
 
-/// One group's control blocks, in order: a consume group is `send to every peer, wait for every
-/// peer, launch`, every other group one launch. A collective's sends are never a group of their
-/// own: the consume names everything they move, so every consume has its sends in front of it and
-/// a wait never queues ahead of its own rank's sends (the symmetric deadlock: every rank waiting,
-/// none sending).
+/// One group's control blocks, in order: a consume group is `send to each of its exchange's peers,
+/// wait for each of them, launch` ([`TpConsume::peers`]: every peer for an all-gather, the round's
+/// one partner for an all-reduce round), every other group one launch. A collective's sends are
+/// never a group of their own: the consume names everything they move, so every consume has its
+/// sends in front of it and a wait never queues ahead of its own rank's sends (the symmetric
+/// deadlock: every rank waiting, none sending).
 pub fn group_steps<T: Tp>(
     group: usize,
     tp: Option<TpConsume<T>>,
 ) -> impl Iterator<Item = CbStep<T>> {
     let steps: Vec<CbStep<T>> = match tp {
-        Some(consume) => {
-            let me = consume.plays_at;
-            me.peers()
-                .map(|to| CbStep::Send { group, consume, to })
-                .chain(me.peers().map(|from| CbStep::Wait {
-                    group,
-                    consume,
-                    from,
-                }))
-                .chain(std::iter::once(CbStep::Launch { group }))
-                .collect()
-        }
+        Some(consume) => consume
+            .peers()
+            .map(|to| CbStep::Send { group, consume, to })
+            .chain(consume.peers().map(|from| CbStep::Wait {
+                group,
+                consume,
+                from,
+            }))
+            .chain(std::iter::once(CbStep::Launch { group }))
+            .collect(),
         None => vec![CbStep::Launch { group }],
     };
     steps.into_iter()
 }
 
 /// THE CB PIPELINE OF A BUNDLE — the groups `session` plays ([`plays_on`]), each as its
-/// [`group_steps`], in launch order. Each rank sends once to and waits once on every peer per
-/// collective, and the write-done counter returns to where it started after every replay of the
-/// bundle.
+/// [`group_steps`], in launch order. Each consume sends once to and waits once on each of its
+/// exchange's peers, and the write-done counter returns to where it started after every replay of
+/// the bundle.
 pub fn cb_pipeline<'g, T: Tp>(
     groups: &'g [crate::LaunchGroup<'_, T>],
     session: Rank<T>,
@@ -339,7 +338,50 @@ mod tests {
             fragment: frag(),
             plays_at: me,
             cut: WindowCut::of_collective(cut),
+            exchange: Exchange::EveryPeer,
         }
+    }
+
+    /// An all-reduce round's consume group, at every power-of-two world: a rank sends to and waits
+    /// on its round's partner alone, then launches; over the rounds the partners are distinct, and
+    /// the write-done ledger closes.
+    #[test]
+    fn a_pairwise_round_sends_to_and_waits_on_its_partner_alone() {
+        fn check<T: Tp>() {
+            for me in ranks::<T>() {
+                let mut groups = Vec::new();
+                for round in pairwise_rounds::<T>() {
+                    groups.push(consume_group(TpConsume {
+                        exchange: Exchange::Pairwise(round),
+                        ..consume_at(CollectiveKind::AllReduce, me, 0)
+                    }));
+                }
+                let mut want = Vec::new();
+                for (group, round) in pairwise_rounds::<T>().enumerate() {
+                    let consume = groups[group].kv.tp.unwrap();
+                    let partner = me.partner(round);
+                    want.push(CbStep::Send {
+                        group,
+                        consume,
+                        to: partner,
+                    });
+                    want.push(CbStep::Wait {
+                        group,
+                        consume,
+                        from: partner,
+                    });
+                    want.push(CbStep::Launch { group });
+                }
+                let steps: Vec<CbStep<T>> = cb_pipeline(&groups, me).collect();
+                assert_eq!(steps, want, "rank {} of {}", me.get(), T::RANKS);
+                assert_eq!(wdone_balance(cb_pipeline(&groups, me)), 0);
+            }
+        }
+        check::<TpWorld<1>>();
+        check::<TpWorld<2>>();
+        check::<TpWorld<4>>();
+        check::<TpWorld<8>>();
+        check::<TpWorld<MAX_WORLD>>();
     }
 
     /// The pipeline law, at every world width: a rank plays its own consume group — a send to

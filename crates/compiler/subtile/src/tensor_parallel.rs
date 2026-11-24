@@ -55,8 +55,9 @@
 //!
 //! - At `W = 1` [`shard`] is the identity: same ops, same sources, no collective.
 //! - The forward is SPMD: every rank runs `ShardedForward::local` verbatim.
-//! - Every [`Placement::Whole`] value is bit-identical on every rank: an all-reduce sums in
-//!   ABSOLUTE RANK ORDER ([`eval_ranks`] is the reference every target's lowering answers to).
+//! - Every [`Placement::Whole`] value is bit-identical on every rank: an all-reduce sums as ONE
+//!   pairwise tree on every rank ([`eval_collective`]; [`eval_ranks`] is the reference every
+//!   target's lowering answers to).
 //! - What the analysis cannot shard is replicated, never refused. The two refusals
 //!   ([`ShardRefusal`]) are inputs no forward should contain.
 
@@ -1333,12 +1334,16 @@ pub fn slice_source_all_ranks<E: SliceElement, T: World>(
 }
 
 /// ⭐ WHAT A COLLECTIVE MEANS — its value on every rank, given every rank's buffers in ABSOLUTE
-/// RANK ORDER (`ranks[r]` is rank `r`'s). An [`SubOp::AllReduce`] sums its operand over the ranks
-/// in that order; an [`SubOp::AllGather`] concatenates their column blocks in that order. The one
-/// law [`eval_ranks`] and any lockstep reference over a rank's own buffers read.
+/// RANK ORDER (`ranks[r]` is rank `r`'s). An [`SubOp::AllReduce`] is the PAIRWISE TREE sum of its
+/// operand (spyre-comms' `AllReduce_PairwisePow2`): in round `i` every rank adds its partner's
+/// running sum ([`scratchy_tp_world::pairwise_partner`]) to its own, so after `log2(W)` rounds every
+/// rank holds the same tree, `((x0 + x1) + (x2 + x3)) + …`; an [`SubOp::AllGather`] concatenates
+/// their column blocks in rank order. The one law [`eval_ranks`] and any lockstep reference over a
+/// rank's own buffers read.
 ///
 /// # Panics
-/// On a node that is not a collective.
+/// On a node that is not a collective, or an all-reduce over a world that is not a power of two
+/// (no typed world is one: [`World::PAIRWISE_ROUNDS`]).
 pub fn eval_collective<F: RopeForm>(
     node: &crate::subtile_ir::SubtileNode<F>,
     graph: &SubtileIR<F>,
@@ -1347,17 +1352,28 @@ pub fn eval_collective<F: RopeForm>(
     use crate::subtile_ir::gather;
     match node.op {
         SubOp::AllReduce => {
-            let parts: Vec<Vec<f32>> = ranks
+            let mut sums: Vec<Vec<f32>> = ranks
                 .iter()
                 .map(|b| gather(&node.inputs[0], graph, b).0)
                 .collect();
-            let mut sum = parts[0].clone();
-            for p in &parts[1..] {
-                for (a, x) in sum.iter_mut().zip(p) {
-                    *a += *x;
-                }
+            let w = sums.len() as u32;
+            assert!(
+                w.is_power_of_two(),
+                "a pairwise all-reduce over {w} ranks: a power-of-two world"
+            );
+            for round in 0..w.trailing_zeros() {
+                sums = (0..w)
+                    .map(|r| {
+                        let partner = scratchy_tp_world::pairwise_partner(r, round);
+                        sums[r as usize]
+                            .iter()
+                            .zip(&sums[partner as usize])
+                            .map(|(mine, theirs)| *mine + *theirs)
+                            .collect()
+                    })
+                    .collect();
             }
-            sum
+            sums.swap_remove(0)
         }
         SubOp::AllGather { cols } => {
             let parts: Vec<(Vec<f32>, u32, u32)> = ranks
@@ -1389,9 +1405,9 @@ pub fn eval_collective<F: RopeForm>(
 /// Evaluate a sharded forward's local graph on every rank IN LOCKSTEP — the host reference for
 /// what the collectives mean. `sources(r)` is rank `r`'s source buffers (already sliced). Every
 /// non-collective node runs per rank through [`crate::subtile_ir::eval_node`]; an
-/// [`SubOp::AllReduce`] sums its operand over ranks in ABSOLUTE RANK ORDER and an
-/// [`SubOp::AllGather`] concatenates column blocks in rank order, and both write the same bytes
-/// to every rank. Returns every rank's buffers, `[rank]`.
+/// [`SubOp::AllReduce`] sums its operand over ranks as the pairwise tree and an
+/// [`SubOp::AllGather`] concatenates column blocks in rank order ([`eval_collective`]), and both
+/// write the same bytes to every rank. Returns every rank's buffers, `[rank]`.
 pub fn eval_ranks<F: RopeForm, T: World>(
     graph: &SubtileIR<F>,
     scale_site: crate::subtile_ir::AttnScaleSite,
@@ -1518,7 +1534,7 @@ mod tests {
 
     /// A tensor-parallel forward computes the same function: every rank's result equals the
     /// unsharded forward's, to f32 reassociation — and every rank's result is BIT-IDENTICAL to
-    /// every other's, because the all-reduce sums in absolute rank order everywhere.
+    /// every other's, because the all-reduce sums the same pairwise tree everywhere.
     fn sharded_equals_unsharded<T: World>() {
         let input = one_layer_input();
         let full = sources_of(&input);

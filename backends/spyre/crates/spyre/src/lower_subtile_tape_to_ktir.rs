@@ -684,22 +684,47 @@ fn whole_block(
     }
 }
 
-/// The all-reduce's consumes: per rank `me` of the world, the sum of every rank's share in
-/// ABSOLUTE RANK ORDER (`((x_0 + x_1) + x_2) + …`), each share read from `me`'s own operand when it
-/// is `me`'s and from the sender's block of the window otherwise. A chain of `W - 1` ordinary `Add`
-/// splices into the output's fragment columns — the running sum lives in the output, so the chain
-/// is one program per add and no temporary. Every rank adds the same values in the same order, so
-/// the replicated result is bit-identical on every card (the analysis's own law,
-/// `tensor_parallel::eval_collective`). All of one rank's adds carry ONE [`TpConsume`] that plays
-/// at that rank, so they fuse into its consume group behind its sends and waits.
+/// ⭐ WHAT A PAIRWISE ROUND SENDS AND ADDS TO — the all-reduce's running sum entering `round`: the
+/// node's own operand in round 0, and after it the node's output, which the round before wrote. The
+/// emitter's consumes and the bake's emulator gate both read it here.
+pub(crate) fn pairwise_operand<T: ktir_superdsc::collective::Tp, F: RopeForm>(
+    node: &SubtileNode<F>,
+    round: ktir_superdsc::collective::PairwiseRound<T>,
+) -> scratchy_subtile::subtile_ir::TensorRegion {
+    if round.get() == 0 {
+        node.inputs[0]
+    } else {
+        node.output
+    }
+}
+
+/// ⭐ THE ALL-REDUCE'S CONSUMES — spyre-comms' `AllReduce_PairwisePow2` (`src/coll/allreduce.cpp`),
+/// compiled in. Per rank `me`, `log2(W)` rounds ([`pairwise_rounds`]): round `r` sends `me`'s running
+/// sum to its partner `me ^ 2^r` ([`Rank::partner`]), waits for the partner's, and adds it, one
+/// `Add` splice into the output's fragment columns. Round 0's running sum is `me`'s own operand;
+/// every later round's is the output the round before it wrote, so the sum lives in the output and
+/// no temporary exists. Each round is its own consume group ([`Exchange::Pairwise`]), its send
+/// barriered behind the round before it.
 ///
-/// [`TpConsume`]: ktir_superdsc::collective::TpConsume
+/// ⭐ EVERY RANK HOLDS THE SAME BITS. In each round both ranks of a pair add the same two values
+/// (`mine + partner's` on one, `partner's + mine` on the other) and addition commutes, so the pair
+/// leaves the round holding the same sum; by induction, after the last round every rank holds the
+/// pairwise tree sum (`tensor_parallel::eval_collective`, which states the same tree). At `W = 2`
+/// the one round is the one exchange and the one add.
+///
+/// A rank's partners are distinct across rounds, so round `r`'s message lands in its sender's own
+/// block of the collective's cut ([`WindowCut::block_tid`]), which no other round reads.
+///
+/// [`pairwise_rounds`]: ktir_superdsc::collective::pairwise_rounds
+/// [`Rank::partner`]: ktir_superdsc::collective::Rank::partner
+/// [`Exchange::Pairwise`]: ktir_superdsc::collective::Exchange::Pairwise
+/// [`WindowCut::block_tid`]: ktir_superdsc::collective::WindowCut::block_tid
 fn all_reduce_consumes<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     node: &SubtileNode<F>,
     ir: &SubtileIR<F>,
     rows_are_requests: bool,
 ) -> NodeLowering<T> {
-    use ktir_superdsc::collective::{CollectiveKind, Rank, TpConsume, ranks};
+    use ktir_superdsc::collective::{CollectiveKind, Exchange, TpConsume, pairwise_rounds, ranks};
     use scratchy_subtile::subtile_ir::{EwKind, Range, Region, TensorRegion};
     let x = node.inputs[0];
     let rows = x.region.rows.len;
@@ -708,64 +733,59 @@ fn all_reduce_consumes<T: ktir_superdsc::collective::Tp, F: RopeForm>(
         Err(refusal) => return refusal,
     };
     let cut = window_cut(node, ir);
-    let cols_at = |start: u32| Range::new(start + f.first_col(), f.cols());
-    let own = TensorRegion {
-        tensor: x.tensor,
+    // A region's fragment columns: the fragment's run of stick columns, at the region's own start.
+    let fragment_of = |r: TensorRegion| TensorRegion {
+        tensor: r.tensor,
         region: Region {
-            rows: x.region.rows,
-            cols: cols_at(x.region.cols.start),
+            rows: r.region.rows,
+            cols: Range::new(r.region.cols.start + f.first_col(), f.cols()),
         },
     };
-    let out = TensorRegion {
-        tensor: node.output.tensor,
-        region: Region {
-            rows: node.output.region.rows,
-            cols: cols_at(node.output.region.cols.start),
-        },
-    };
+    let out = fragment_of(node.output);
     let mut ops = Vec::new();
     for me in ranks::<T>() {
-        let consume = TpConsume {
-            kind: CollectiveKind::AllReduce,
-            operand: ktir_superdsc::place::PlaceId::Act(x.tensor.index() as u32),
-            fragment: f,
-            plays_at: me,
-            cut,
-        };
-        let share = |s: Rank<T>| {
-            if s == me {
-                own
-            } else {
-                whole_block(
-                    TensorId::from_index(cut.block_tid(s) as usize),
-                    rows,
-                    f.cols(),
-                )
-            }
-        };
-        // Rank 0's share then each later rank's, each add accumulating into the output.
-        let mut acc = share(Rank::of::<0>());
-        for (k, s) in ranks::<T>().enumerate().skip(1) {
+        for round in pairwise_rounds::<T>() {
+            let acc = fragment_of(pairwise_operand(node, round));
+            let partner = me.partner(round);
+            let consume = TpConsume {
+                kind: CollectiveKind::AllReduce,
+                operand: ktir_superdsc::place::PlaceId::Act(acc.tensor.index() as u32),
+                fragment: f,
+                plays_at: me,
+                cut,
+                exchange: Exchange::Pairwise(round),
+            };
             let add = SubtileNode {
                 id: node.id,
                 op: SubOp::Elementwise(EwKind::Add),
-                inputs: vec![acc, share(s)],
+                inputs: vec![
+                    acc,
+                    whole_block(
+                        TensorId::from_index(cut.block_tid(partner) as usize),
+                        rows,
+                        f.cols(),
+                    ),
+                ],
                 output: out,
             };
             let mut e = match scratchy_triton_splice::lower(&add, ir, rows_are_requests) {
                 Ok(e) => e,
                 Err(reason) => return NodeLowering::Unhandled(reason),
             };
-            // One name per (rank, add): they share the node's id, and a launch's name is its
+            // One name per (rank, round): they share the node's id, and a launch's name is its
             // program's identity.
-            let name = format!("tpreduce_s{}_r{}_a{k}", node.id.index(), me.get());
+            let name = format!(
+                "tpreduce_s{}_r{}_p{}",
+                node.id.index(),
+                me.get(),
+                round.get()
+            );
             if let Some(kt) = e.ktir.as_mut() {
                 kt.func.name = ktir_core::arena::Arena::global().str(name.clone());
             }
             e.op_name = name;
             e.tp_consume = Some(consume);
             ops.push(e);
-            acc = out;
         }
     }
     NodeLowering::Ops(ops)
@@ -786,7 +806,9 @@ fn all_gather_consumes<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     ir: &SubtileIR<F>,
     cols: u32,
 ) -> NodeLowering<T> {
-    use ktir_superdsc::collective::{CollectiveKind, STICK_ELEMS, TpConsume, World, ranks};
+    use ktir_superdsc::collective::{
+        CollectiveKind, Exchange, STICK_ELEMS, TpConsume, World, ranks,
+    };
     use scratchy_subtile::subtile_ir::{Range, Region, TensorRegion};
     let x = node.inputs[0];
     let (rows, lc) = (x.region.rows.len, x.region.cols.len);
@@ -831,6 +853,7 @@ fn all_gather_consumes<T: ktir_superdsc::collective::Tp, F: RopeForm>(
             fragment,
             plays_at: me,
             cut,
+            exchange: Exchange::EveryPeer,
         };
         for s in ranks::<T>() {
             let src = if s == me {
@@ -939,11 +962,11 @@ pub(crate) fn lower_one_node<T: ktir_superdsc::collective::Tp, F: RopeForm>(
         | SubOp::Mamba2 { .. }
         | SubOp::ExpertAct { .. }
         | SubOp::Mean => Unhandled(format!("{:?} has no SuperDSC kernel", node.op)),
-        // ⭐ THE ALL-REDUCE'S CONSUME. The exchange itself is not a program — the bundle's CB
-        // pipeline sends this rank's operand fragment into every peer's window and waits for every
-        // peer's before the consume launches (`bundle::collective::cb_pipeline`). What IS a program
-        // is the sum: a chain of ordinary `Add` splices over every rank's share in absolute rank
-        // order, so every rank computes bit-identical sums at any world width.
+        // ⭐ THE ALL-REDUCE'S CONSUMES. The exchange itself is not a program — the bundle's CB
+        // pipeline sends this rank's running sum into its round's partner's window and waits for
+        // the partner's before the round's consume launches (`bundle::collective::cb_pipeline`).
+        // What IS a program is each round's sum: one ordinary `Add` splice, so every rank holds
+        // bit-identical sums at any world width (spyre-comms' `AllReduce_PairwisePow2`).
         SubOp::AllReduce => all_reduce_consumes(node, ir, rows_are_requests),
         // ⭐ THE ALL-GATHER'S CONSUME: every rank's block lands at that rank's columns, read from
         // this rank's operand or the sender's window block; the bake carries one consume per rank

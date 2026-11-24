@@ -34,6 +34,7 @@ fn consume(stick: u32) -> TpConsume<W1> {
         fragment: ktir_superdsc::collective::Fragment::baked(stick, 1, 64),
         plays_at: ranks::<W1>().next().unwrap(),
         cut: WindowCut::of_collective(0),
+        exchange: ktir_superdsc::collective::Exchange::EveryPeer,
     }
 }
 
