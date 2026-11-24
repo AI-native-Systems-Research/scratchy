@@ -730,10 +730,12 @@ impl LLM {
             volatile,
             #[cfg(feature = "rag")]
             &aug_options,
-            &tokenizer,
-            template,
-            &cfg,
-            block_size,
+            crate::spans::SpanTokenizing {
+                tokenizer: &tokenizer,
+                template,
+                cfg: &cfg,
+                block_size,
+            },
             |prompts, sp, s, v| self.generate_impl(prompts, sp, false, s, v),
         )
     }

@@ -161,7 +161,6 @@ impl Default for VllmConfig {
 }
 
 /// Fully initialized stack ready to serve requests.
-#[allow(dead_code)]
 pub struct InitializedStack {
     /// The async engine (wraps engine core + tokenizer).
     pub engine: Arc<AsyncEngine>,
@@ -467,8 +466,17 @@ fn create_worker(
     linked_factory()?.create(worker_config, progress_cb)
 }
 
+/// A worker whose KV cache [`init_cache`] built, with the sizes it was built at.
+struct InitializedCache {
+    worker: Box<dyn Worker>,
+    available_memory: usize,
+    num_gpu_blocks: usize,
+    swa_hybrid_kv: Option<HybridKvConfig>,
+    effective_utilization: f64,
+    max_model_len: usize,
+}
+
 /// Initialize cache on the worker and compute block counts.
-#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn init_cache(
     mut worker: Box<dyn Worker>,
     block_size: KvBlockTokens,
@@ -477,14 +485,7 @@ fn init_cache(
     gpu_memory_utilization: f64,
     declared_max_model_len: Option<usize>,
     max_model_len: usize,
-) -> Result<(
-    Box<dyn Worker>,
-    usize,
-    usize,
-    Option<HybridKvConfig>,
-    f64,
-    usize,
-)> {
+) -> Result<InitializedCache> {
     let available_memory = worker
         .determine_available_memory()
         .context("failed to determine available memory")?;
@@ -502,9 +503,11 @@ fn init_cache(
         hf_config,
         dtype_elem_bytes,
         utilization,
-        worker.kv_block_bytes(block_size),
         worker.supports_hybrid_swa_kv(),
-        worker.kv_layer_geometry(),
+        WorkerKv {
+            block_bytes: worker.kv_block_bytes(block_size),
+            kv_layers: worker.kv_layer_geometry(),
+        },
     );
     // Fixed-size resident KV pool cap (a baked PAGED pool): the on-device pool is
     // exactly `nblk` blocks, so the scheduler's block allocator must not exceed it
@@ -575,17 +578,16 @@ fn init_cache(
             served
         }
     };
-    Ok((
+    Ok(InitializedCache {
         worker,
         available_memory,
         num_gpu_blocks,
         swa_hybrid_kv,
-        utilization,
-        effective_max_model_len,
-    ))
+        effective_utilization: utilization,
+        max_model_len: effective_max_model_len,
+    })
 }
 
-#[allow(dead_code)]
 struct InitializedCore {
     client: InprocClient,
     tokenizer: Option<Arc<Tokenizer>>,
@@ -1415,14 +1417,14 @@ fn initialize_core(
     if let Some(pb) = progress {
         pb.set_stage("Initializing KV cache");
     }
-    let (
+    let InitializedCache {
         mut worker,
         available_memory,
         num_gpu_blocks,
         swa_hybrid_kv,
         effective_utilization,
         max_model_len,
-    ) = init_cache(
+    } = init_cache(
         worker,
         block_size,
         &hf_config,
@@ -2080,6 +2082,14 @@ fn compute_num_blocks(
     )
 }
 
+/// What a worker states about the KV pool it lays out: its own cost of one
+/// block ([`Worker::kv_block_bytes`]) and its compiled per-layer geometry
+/// ([`Worker::kv_layer_geometry`]).
+struct WorkerKv {
+    block_bytes: Option<usize>,
+    kv_layers: Option<Vec<scratchy_core_config::LayerKvGeometry>>,
+}
+
 /// Compute the KV-cache block count AND the hybrid SWA layout, if any.
 ///
 /// Both layouts spend the WHOLE KV budget, as vLLM does: the scheduler admits
@@ -2096,17 +2106,19 @@ fn compute_num_blocks(
 /// but holding `group_size`× more blocks since each physical tensor is shared across groups)
 /// and the per-group `(is_sliding, window, block_size)` the scheduler's hybrid allocator
 /// consumes. Returns `(num_blocks, hybrid_kv)`.
-#[allow(clippy::too_many_arguments)]
 fn compute_kv_blocks(
     available_bytes: usize,
     block_size: KvBlockTokens,
     hf_config: &HfModelConfig,
     dtype_elem_bytes: usize,
     utilization: f64,
-    block_bytes: Option<usize>,
     allow_hybrid: bool,
-    kv_layers: Option<Vec<scratchy_core_config::LayerKvGeometry>>,
+    worker_kv: WorkerKv,
 ) -> (usize, Option<HybridKvConfig>) {
+    let WorkerKv {
+        block_bytes,
+        kv_layers,
+    } = worker_kv;
     let uniform = match block_bytes {
         Some(bytes) => scratchy_core_config::blocks_within(available_bytes, bytes),
         None => compute_num_blocks(
@@ -2450,17 +2462,29 @@ mod tests {
                 &config,
                 2,
                 0.9,
-                Some(block_bytes),
                 true,
-                kv_layers(),
+                WorkerKv {
+                    block_bytes: Some(block_bytes),
+                    kv_layers: kv_layers(),
+                },
             );
             let (pool, groups) = hybrid.expect("gemma4 takes the hybrid layout");
             assert_eq!(num_blocks, budget / block_bytes, "budget {budget}");
             assert_eq!(pool, num_blocks, "scheduler and worker size one pool");
             assert_eq!(groups.len(), 6, "1 full + 5 sliding groups");
             // No worker cost: the dense shared pages alone.
-            let (dense, _) =
-                compute_kv_blocks(budget, bs, &config, 2, 0.9, None, true, kv_layers());
+            let (dense, _) = compute_kv_blocks(
+                budget,
+                bs,
+                &config,
+                2,
+                0.9,
+                true,
+                WorkerKv {
+                    block_bytes: None,
+                    kv_layers: kv_layers(),
+                },
+            );
             assert_eq!(dense, budget / (page * group_size), "budget {budget}");
         }
     }
