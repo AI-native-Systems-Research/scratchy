@@ -194,8 +194,8 @@ pub const fn extra_rows(pool: PoolPages, context: ContextPages) -> u32 {
 /// every segment's extent but the KV segment's ([`BundleLayout::segment_extents`]: the
 /// intermediate segment covers every synthetic the door declared; the pools are the pages,
 /// charged per page), minus
-/// the row pool's bytes when the session's step reads it (those bytes ride inside the
-/// intermediate segment's total, and they are per-page too — the step's own
+/// the row pool's bytes when the session's step reads it (those bytes ride inside its colour
+/// segment's extent, which the fixed bytes sum, and they are per-page too — the step's own
 /// [`card_kv_row_pool_bytes`](crate::wiring::PagedStep::card_kv_row_pool_bytes), never a
 /// layout lookup); the per-page bytes are every pool's page
 /// ([`crate::wiring::pool_page_bytes`] at each pool's columns) plus the row pool's page
@@ -221,8 +221,8 @@ pub fn session_residency(
     if let Some(step) = step
         && step.reads_kv_row_pool()
     {
-        // The row pool's bytes sit inside the intermediate segment's total — take them out of
-        // the fixed bytes and charge the run per page instead, both figures the step itself
+        // The row pool's bytes sit inside its colour segment's extent, which the fixed bytes
+        // sum — take them out and charge the run per page instead, both figures the step itself
         // states (`card_kv_row_pool_bytes` is its pages at the one page law).
         fixed -= step.card_kv_row_pool_bytes();
         page += crate::wiring::KV_ROW_POOL_PAGE_BYTES;
@@ -388,7 +388,7 @@ mod tests {
     /// The session's residency charges the KV segment per page, never as fixed bytes, and
     /// the row pool's bytes leave the fixed total to ride per page when the session's step
     /// reads it — a step whose kernel does not, and a layout with no paged step at all, keep
-    /// the intermediate segment whole and charge no run.
+    /// every segment's extent whole and charge no run.
     #[test]
     fn session_residency_charges_the_kv_segment_per_page() {
         // seg0 intermediate, seg1 weights, seg2 KV, seg3 activations.

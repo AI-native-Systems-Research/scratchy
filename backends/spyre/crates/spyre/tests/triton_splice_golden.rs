@@ -2501,6 +2501,65 @@ fn attn_ir(s: AttnShape, scale: f32) -> SubtileIR {
     }
 }
 
+/// [`attn_ir`]'s rope-appended decode with its cache stored float8 (`KvCodec::Fp8E4m3`), as the
+/// shared expansion states one (`scratchy_subtile::kv_codec::expand_kv_quantize`): the new K and V
+/// each quantized, and a `KvAppend` of the two writing the caches the attention reads — the writer
+/// whose operands state the pools' format (`scratchy_triton_splice::kv_pool_format`).
+fn attn_ir_fp8(s: AttnShape, scale: f32) -> SubtileIR {
+    use scratchy_subtile::lower::{
+        InputRef::{Ext, Op},
+        OpDesc,
+    };
+    use scratchy_subtile::subtile_ir::{AttnMask, KvOperand};
+    let (nqh, nkvh, hd) = s.geom;
+    let (q_width, kv_width, mq) = (nqh * hd, nkvh * hd, s.mq);
+    let new_len = if mq > 1 { mq } else { 1 };
+    let shape = |rows, cols| scratchy_subtile::subtile_ir::SourceShape { rows, cols };
+    let attention = scratchy_subtile::fixtures::attention_at(nqh, nkvh, hd, scale);
+    let quantize = |operand, x| OpDesc {
+        op: SubOp::KvQuantize {
+            operand,
+            scales: scratchy_ir::KvCacheScales::Unscaled,
+        },
+        m: new_len,
+        inputs: vec![x],
+    };
+    let input = scratchy_subtile::lower::LoweringInput {
+        sources: vec![
+            shape(mq, q_width),
+            shape(s.cap, kv_width),
+            shape(s.cap, kv_width),
+            shape(new_len, kv_width),
+            shape(new_len, kv_width),
+        ],
+        ops: vec![
+            quantize(KvOperand::K, Ext(3)),
+            quantize(KvOperand::V, Ext(4)),
+            OpDesc {
+                op: SubOp::kv_append(
+                    attention,
+                    scratchy_ir::model_facts::HeadDim::new(hd),
+                    0,
+                    AttnMask::Causal,
+                ),
+                m: new_len,
+                inputs: vec![Op(0), Op(1), Ext(1), Ext(2)],
+            },
+            OpDesc {
+                op: SubOp::attn_decode(attention, s.cap, AttnMask::Causal),
+                m: mq,
+                inputs: vec![Ext(0), Ext(1), Ext(2), Op(2), Ext(4)],
+            },
+        ],
+        result: 3,
+        exported: None,
+    };
+    scratchy_subtile::subtile_ir::lower_region(
+        &input,
+        std::num::NonZeroU32::new(8192).expect("8192 != 0"),
+    )
+}
+
 /// spyre-inference's paged kernels attend causally, so a sliding-window attention (gemma's local
 /// layers) is refused by name rather than run as causal.
 #[test]
@@ -2579,6 +2638,94 @@ fn a_pool_no_bigger_than_a_chunk_is_refused() {
         PagedRows::Batch,
     )
     .expect("a pool wider than one chunk splices");
+}
+
+/// ⭐ THE POOL'S PAGE COUNT MOVES NO SYNTHETIC. One decode step's bundle at two pool sizes over one
+/// context: the step's statics — the int32 zero, then `kv_row_pool`, the pool's pages long — sit in
+/// a segment the synthetic allocator never grows, the row pool last, so the allocator starts at the
+/// same byte at both sizes, a synthetic the door declares lands at the same offset, and so does the
+/// int32 zero.
+#[test]
+fn the_pools_page_count_moves_no_synthetic() {
+    for (format, s, mint) in [
+        (
+            "fp16",
+            ATTN_SHAPES[0],
+            attn_ir as fn(AttnShape, f32) -> SubtileIR,
+        ),
+        (
+            "fp8",
+            AttnShape {
+                geom: (32, 8, 128),
+                mq: 1,
+                cap: 256,
+                rung: 0,
+                rope_appended: true,
+            },
+            attn_ir_fp8,
+        ),
+    ] {
+        let slots = ktir_superdsc::sdsc_abstract::SchedulerBlockTokens::REFERENCE.get();
+        let layout_at = |pages: u32| {
+            let mut ir = mint(s, 0.015625);
+            let attn = ir.nodes.last().expect("the attention");
+            let caches = [attn.inputs[1].tensor.index(), attn.inputs[2].tensor.index()];
+            // The pool's rows; the context (`valid_len`) stays the cache's own.
+            for cache in caches {
+                ir.tensors[cache].rows = pages * slots;
+            }
+            compute_bundle_layout::<ktir_superdsc::collective::TpWorld<1>, _>(
+                &ir,
+                &HashSet::new(),
+                PagedRows::Sequence,
+                &[],
+                pair_of_one_request(s.mq),
+            )
+            .unwrap_or_else(|e| panic!("{format}: the layout at {pages} pages: {e}"))
+        };
+        let (narrow, wide) = (layout_at(s.cap / slots), layout_at(16 * s.cap / slots));
+        let tids = scratchy_triton_splice::PagedStepTids::RESERVED;
+        assert!(
+            narrow.placements[&tids.kv_row_pool].size < wide.placements[&tids.kv_row_pool].size,
+            "{format}: the row pool is the pool's pages long"
+        );
+        let inter = ktir_superdsc::placement::SegRole::Intermediate.segment();
+        for tid in [tids.kv_row_pool, tids.int32_zero] {
+            assert_ne!(
+                wide.placements[&tid].segment, inter,
+                "{format}: t{tid} sits outside the synthetic allocator's segment"
+            );
+        }
+        let at = |l: &ktir_superdsc::placement::BundleLayout, tid: u32| {
+            let p = l.placements[&tid];
+            (p.segment, p.offset)
+        };
+        assert_eq!(
+            at(&narrow, tids.int32_zero),
+            at(&wide, tids.int32_zero),
+            "{format}: the int32 zero sits where no page count reaches"
+        );
+        assert_eq!(
+            at(&narrow, tids.kv_row_pool),
+            at(&wide, tids.kv_row_pool),
+            "{format}: the row pool starts at one byte and grows at the end"
+        );
+        assert_eq!(
+            narrow.synth.borrow().high_water(),
+            wide.synth.borrow().high_water(),
+            "{format}: the synthetic allocator starts at one byte"
+        );
+        let id = ktir_superdsc::place::SynthId::Act(900_000);
+        for l in [&narrow, &wide] {
+            l.synth(id, &[4, 64]);
+        }
+        let name = id.to_string();
+        assert_eq!(
+            narrow.synth.borrow().offset(&name),
+            wide.synth.borrow().offset(&name),
+            "{format}: a declared synthetic lands at one offset"
+        );
+    }
 }
 
 #[test]

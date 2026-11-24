@@ -854,17 +854,20 @@ impl PagedStep {
                 }
             }
         }
+        // The int32 zero first: its bytes are the pool's page count's for no pool, so it is placed
+        // where no page count reaches, and `kv_row_pool` — the pool's pages long — is the last
+        // placement of its segment, growing in place at the end.
         if self.reads_kv_row_pool() {
             v.extend([
-                (
-                    self.kv_row_pool,
-                    CardSeat::Static,
-                    self.card_kv_row_pool_bytes(),
-                ),
                 (
                     self.int32_zero,
                     CardSeat::Static,
                     self.card_int32_zero_bytes(),
+                ),
+                (
+                    self.kv_row_pool,
+                    CardSeat::Static,
+                    self.card_kv_row_pool_bytes(),
                 ),
             ]);
         }

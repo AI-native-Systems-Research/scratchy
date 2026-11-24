@@ -1561,9 +1561,13 @@ pub fn compute_bundle_layout<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     //    (`crate::paged_step`): the page index table, the mask stack, the KV write index and the
     //    query row index, at their reserved tids in the ACTIVATION segment like every per-step
     //    binding (the reserved-tid law above), and the decode kernel's `kv_row_pool` and int32 zero
-    //    in the intermediate segment, which neither a layer's launch nor a walk's relaunch shifts
-    //    (the KV segment moves with every layer). `PagedStep::card_placements` is
-    //    the one statement of what they are and how big — the card stagers stage within it.
+    //    in the second intermediate colour: a segment neither a layer's launch nor a walk's
+    //    relaunch shifts (the KV segment moves with every layer), and one the synthetic allocator
+    //    never grows. `kv_row_pool` is the pool's pages long, so in the Intermediate segment it sat
+    //    under every synthetic the door declares and moved each one with the pool's page count;
+    //    last in the colour, after its intermediates and the int32 zero, it moves nothing.
+    //    `PagedStep::card_placements` is the one statement of what they are and how big — the card
+    //    stagers stage within it.
     if let Some(step) = crate::lower_subtile_tape_to_ktir::paged_step_of_ir(
         ir,
         ActiveCap::FULL,
@@ -1571,11 +1575,12 @@ pub fn compute_bundle_layout<T: ktir_superdsc::collective::Tp, F: RopeForm>(
         query_rows,
     )? {
         for (tid, seat, size) in step.card_placements() {
-            let role = match seat {
-                crate::wiring::CardSeat::Step => SegRole::Activation,
-                crate::wiring::CardSeat::Static => SegRole::Intermediate,
+            let (role, seg) = match seat {
+                crate::wiring::CardSeat::Step => {
+                    (SegRole::Activation, SegRole::Activation.segment())
+                }
+                crate::wiring::CardSeat::Static => (SegRole::Intermediate, inter_segs[1]),
             };
-            let seg = role.segment();
             let off = seg_bytes[seg];
             placements.insert(
                 tid,
