@@ -20,7 +20,7 @@
 //! exactly why the gap survived until `rmsnorm.py` made the f32 island a deliberate line in a
 //! kernel rather than an accident. These are the tests for the gap.
 
-mod common;
+use crate::common;
 
 use triton_frontend::codegen;
 use triton_frontend::target::Target;

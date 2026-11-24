@@ -17,9 +17,7 @@
 //! make_ir` and there is no `0_ttir.mlir` to feed us. The test below asserts exactly
 //! that, so the absence is a recorded measurement rather than a gap.
 
-mod common;
-
-use common::*;
+use crate::common::*;
 use triton_ktir::text::parse;
 
 /// The C++ verifier's message, verbatim, as the golden records it.

@@ -18,7 +18,7 @@
 //! extension that accepted a shape its lowering cannot state would be a
 //! silent-wrong-answer risk, not a feature.
 
-mod common;
+use crate::common;
 
 use triton_frontend::codegen::{self, KernelSpec};
 use triton_frontend::semantic::Val;

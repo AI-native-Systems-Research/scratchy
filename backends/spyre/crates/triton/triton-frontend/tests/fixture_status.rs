@@ -15,7 +15,7 @@
 //!
 //! `cargo test --test fixture_status -- --nocapture` prints the mismatches.
 
-mod common;
+use crate::common;
 
 use triton_frontend::codegen;
 use triton_frontend::diff;

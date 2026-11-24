@@ -17,7 +17,7 @@
 //! test that a deliberately-broken module is caught AND NAMED, a passing diff proves
 //! nothing.
 
-mod common;
+use crate::common;
 
 use triton_frontend::codegen;
 use triton_frontend::diff;

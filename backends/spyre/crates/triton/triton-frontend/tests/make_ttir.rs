@@ -32,7 +32,7 @@
 //! assert the gate CATCHES them -- including one planted difference that is ONLY a
 //! location difference, to prove the exemption is narrow and not the whole comparison.
 
-mod common;
+use crate::common;
 
 use triton_frontend::target::Target;
 use triton_frontend::ttir::{Attr, Type};

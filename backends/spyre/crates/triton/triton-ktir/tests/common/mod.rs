@@ -6,11 +6,6 @@
 //! prints `ok` and proves nothing -- that is the silent green, and this tree has
 //! been bitten by it before (commit e35e626b9, "the golden diff fails closed when
 //! the golden is missing"). So [`golden`] PANICS with the regeneration command.
-//!
-//! Each test binary uses a different subset of these helpers, so an unused here is
-//! per-target, not per-crate; the module-level allow states that scope.
-
-#![allow(dead_code)] // each test binary uses a different subset of these helpers.
 
 use std::path::PathBuf;
 

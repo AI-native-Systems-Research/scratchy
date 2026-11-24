@@ -6,7 +6,7 @@
 //! verifier's value rule -- the stored value is exactly `[len(x_offsets), block[1]]` of the
 //! descriptor's element type, with NO implicit cast (unlike `descriptor_store`).
 
-mod common;
+use crate::common;
 
 use triton_frontend::codegen;
 use triton_frontend::target::Target;
