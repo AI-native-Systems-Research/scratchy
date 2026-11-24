@@ -4,3 +4,8 @@ rustflags = ["-C", "linker=dylint-link"]
 # For Rust versions 1.74.0 and onward, the following alternative can be used
 # (see https://github.com/rust-lang/cargo/pull/12535):
 # linker = "dylint-link"
+
+# The ui harness builds under the temp dir and rewrites that path in the output it compares. On
+# Linux that is /tmp, which the P11 temp-path cases quote, so the tests build in target/ instead.
+[env]
+TMPDIR = { value = "target", relative = true, force = true }
