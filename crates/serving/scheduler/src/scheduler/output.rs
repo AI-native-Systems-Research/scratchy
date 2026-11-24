@@ -61,7 +61,6 @@ pub struct NewRequestData {
 
 impl NewRequestData {
     /// Construct `NewRequestData` from the core fields of a request.
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         req_id: String,
         prompt_token_ids: Option<Vec<u32>>,
