@@ -83,6 +83,65 @@ impl CodedHeads {
     }
 }
 
+/// ⭐ THE HEAD DIMS A TARGET'S FLOAT8 STORE HOLDS — every head whole sticks of its float8 format,
+/// `elems_per_stick` elements a stick (spyre-inference's `head_size % 128`: "a float8 stick holds
+/// 128 elements"). The target states its stick ([`HeadTable`]); the law is this type's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Fp8Heads {
+    elems_per_stick: std::num::NonZeroU32,
+}
+
+impl Fp8Heads {
+    /// A target's float8 stick, in elements.
+    pub const fn new(elems_per_stick: std::num::NonZeroU32) -> Self {
+        Self { elems_per_stick }
+    }
+
+    pub const fn elems_per_stick(self) -> u32 {
+        self.elems_per_stick.get()
+    }
+
+    /// Whether a head of `head_dim` is stored: whole sticks, the one law.
+    pub const fn admits(self, head_dim: u32) -> bool {
+        head_dim.is_multiple_of(self.elems_per_stick.get())
+    }
+}
+
+/// ⭐ A TARGET'S TABLE OF THE HEADS ONE CODEC STORES — what [`codec_for`] reads, one table a codec:
+/// int8 codes ([`CodedHeads`]), float8 bytes ([`Fp8Heads`]).
+pub trait HeadTable: Copy {
+    /// Whether a head of `head_dim` is stored: the table's one law.
+    fn admits(self, head_dim: u32) -> bool;
+    /// Why a model with a head of `head_dim` the table does not store keeps a dense cache.
+    fn refuses(self, head_dim: u32) -> DenseReason;
+}
+
+impl HeadTable for CodedHeads {
+    fn admits(self, head_dim: u32) -> bool {
+        CodedHeads::admits(self, head_dim)
+    }
+
+    fn refuses(self, head_dim: u32) -> DenseReason {
+        DenseReason::HeadDim {
+            head_dim,
+            coded: self,
+        }
+    }
+}
+
+impl HeadTable for Fp8Heads {
+    fn admits(self, head_dim: u32) -> bool {
+        Fp8Heads::admits(self, head_dim)
+    }
+
+    fn refuses(self, head_dim: u32) -> DenseReason {
+        DenseReason::Fp8HeadDim {
+            head_dim,
+            heads: self,
+        }
+    }
+}
+
 /// Element `e`'s sign before the transform: a fixed ±1 the sign hash of `e` decides.
 pub const fn sign(e: u32) -> f32 {
     let mut z = (e as u64).wrapping_add(SIGN_SEED);
@@ -122,6 +181,14 @@ pub enum DenseReason {
         head_dim: u32,
         coded: CodedHeads,
     },
+    /// A head not whole sticks of the target's float8 format ([`Fp8Heads`]).
+    Fp8HeadDim {
+        head_dim: u32,
+        heads: Fp8Heads,
+    },
+    /// The config states a `kv_cache_scheme`: per-layer KV scales whose values live only in the
+    /// checkpoint's tensors, which no build-time path reads.
+    StatedKvScales,
 }
 
 impl std::fmt::Display for DenseReason {
@@ -135,14 +202,23 @@ impl std::fmt::Display for DenseReason {
                 coded.min(),
                 coded.max()
             ),
+            Self::Fp8HeadDim { head_dim, heads } => write!(
+                f,
+                "head_dim {head_dim} is not whole float8 sticks of {}",
+                heads.elems_per_stick()
+            ),
+            Self::StatedKvScales => f.write_str(
+                "its config states a kv_cache_scheme, whose per-layer scales only the \
+                 checkpoint's tensors hold",
+            ),
         }
     }
 }
 
-/// Int8 for a model whose KV cache holds `rows`, on a target whose kernels code the heads `coded`,
-/// or why it stays dense. The one rule: the lowering injects the codec, the factory provisions it
-/// and the worker sizes its pool from the `KV_CODEC` this decides.
-pub fn codec_for(rows: KvRows, coded: CodedHeads) -> Result<(), DenseReason> {
+/// The codec whose heads `table` states, for a model whose KV cache holds `rows`, or why it stays
+/// dense. The one rule: the lowering injects the codec, the factory provisions it and the worker
+/// sizes its pool from the `KV_CODEC` this decides.
+pub fn codec_for(rows: KvRows, table: impl HeadTable) -> Result<(), DenseReason> {
     let (head_dim, global_head_dim) = match rows {
         KvRows::None => return Err(DenseReason::NoKvCache),
         KvRows::Latent => return Err(DenseReason::LatentKv),
@@ -153,9 +229,9 @@ pub fn codec_for(rows: KvRows, coded: CodedHeads) -> Result<(), DenseReason> {
     };
     match [head_dim, global_head_dim]
         .into_iter()
-        .find(|&hd| !coded.admits(hd))
+        .find(|&hd| !table.admits(hd))
     {
-        Some(head_dim) => Err(DenseReason::HeadDim { head_dim, coded }),
+        Some(head_dim) => Err(table.refuses(head_dim)),
         None => Ok(()),
     }
 }
@@ -276,5 +352,32 @@ mod tests {
         assert_eq!(codec_for(g(1024), coded), dense(1024));
         assert_eq!(codec_for(KvRows::Latent, coded), Err(DenseReason::LatentKv));
         assert_eq!(codec_for(KvRows::None, coded), Err(DenseReason::NoKvCache));
+    }
+
+    /// A float8 store takes a head whole sticks of its format, and per-head K and V.
+    #[test]
+    fn the_float8_store_takes_whole_stick_heads() {
+        let heads = Fp8Heads::new(std::num::NonZeroU32::new(128).expect("a stick holds elements"));
+        let g = |head_dim| KvRows::Heads {
+            head_dim,
+            global_head_dim: head_dim,
+        };
+        let dense = |head_dim| Err(DenseReason::Fp8HeadDim { head_dim, heads });
+        assert_eq!(codec_for(g(128), heads), Ok(()));
+        assert_eq!(codec_for(g(256), heads), Ok(()));
+        assert_eq!(codec_for(g(64), heads), dense(64));
+        assert_eq!(codec_for(g(96), heads), dense(96));
+        assert_eq!(
+            codec_for(
+                KvRows::Heads {
+                    head_dim: 256,
+                    global_head_dim: 64
+                },
+                heads
+            ),
+            dense(64)
+        );
+        assert_eq!(codec_for(KvRows::Latent, heads), Err(DenseReason::LatentKv));
+        assert_eq!(codec_for(KvRows::None, heads), Err(DenseReason::NoKvCache));
     }
 }

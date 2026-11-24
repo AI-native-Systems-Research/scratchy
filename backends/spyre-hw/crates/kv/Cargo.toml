@@ -7,10 +7,14 @@ description = "KV cache build scope: the element format the KV pools hold (`kv/<
 
 [features]
 # A crate of its own for the reason scratchy-tp is one: Cargo forbids aliasing one crate under two
-# names in one Cargo.toml, so `--features kv/fp8` needs a package named `kv`. Naming it selects the
-# float8 e4m3 KV cache (the shared `KvCodec::Fp8E4m3`) for every model the build bakes; naming none
-# keeps the model's 16-bit pool.
+# names in one Cargo.toml, so `--features kv/fp8` needs a package named `kv`. `fp8` (the spyre CLI's
+# card default (`spyre-hw`)) selects the float8 e4m3 KV cache (the shared `KvCodec::Fp8E4m3`) for
+# every model the build bakes whose KV heads are whole float8 sticks; the rest keep their 16-bit
+# pool.
 fp8 = ["scratchy-target-spyre-worker/kv-fp8"]
+# `dense` keeps every model's 16-bit pool, and wins over `fp8` when named: an fp16-KV build is
+# `--features kv/dense`, with no `--no-default-features`.
+dense = ["scratchy-target-spyre-worker/kv-dense"]
 
 [dependencies]
 scratchy-target-spyre-worker = { workspace = true }
