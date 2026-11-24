@@ -1617,7 +1617,7 @@ mod pool_rows_tests {
     /// allocation's own format — and a width that does not divide them is no frame of the pool.
     #[test]
     fn a_pools_rows_are_its_elements_over_the_frames_width() {
-        let mut layout = pool_at(7, 8 * 128);
+        let layout = pool_at(7, 8 * 128);
         layout
             .allocate_row_outermost::<Fp16>(7)
             .expect("1024 B is whole 64-element fp16 sticks");
