@@ -234,6 +234,16 @@ echo "exit ${PIPESTATUS[0]}"
 run under the pins: scratchy alone, no frozen rung, one rep, and step 4
 reports its scope as `quick`.
 
+**A full run of scratchy alone** keeps everything else a full run does (the
+frozen rung, three reps, the longer grid answers, the larger MuSiQue sets) and
+times no comparison engine. It needs only scratchy's pin. With no engine to
+compare, the mlx-lm parity gate is skipped; `--parity` runs it anyway:
+
+```bash
+./scripts/bench_metal_matrix.sh --full --engines scratchy --fail-fast [--models full] \
+  --pin scratchy=<sha> [--parity] 2>&1 | tee ~/metal-matrix-run.log
+```
+
 With `--engines all`, pin the others too: `--pin mlx-lm=<v> --pin ollama=<v>
 --pin llama.cpp=b<build> --pin vllm-metal=<v> --pin mistral.rs=<v> --pin
 Splash=<v>`. oMLX
