@@ -286,8 +286,13 @@ jobs:
         run: cargo install cargo-dylint dylint-link --version 6.4.0 --locked
 
       # The lints' own ui and unit tests, then main's code under them. Every lint is Deny.
+      # The ui harness builds its driver and its tests under the temp dir, and rewrites that path
+      # in the output it compares. /tmp would rewrite the P11 temp-path cases, and a dir inside
+      # a workspace breaks the driver's build, so the runner's own temp dir it is.
       - name: Lint tests
         working-directory: lints/scratchy-purity
+        env:
+          TMPDIR: ${{ runner.temp }}
         run: cargo test
       - name: Purity lints (root workspace)
         run: scripts/purity.sh --scope root
