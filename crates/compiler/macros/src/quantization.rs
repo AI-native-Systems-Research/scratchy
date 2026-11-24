@@ -18,8 +18,6 @@
 //! its parser + per-format FieldLoad arm + at least one solver-
 //! accepting Impl that emits the matching kernel call.
 
-#![allow(dead_code)]
-
 use crate::classified::{OpKind, Program, UnrollIndex, WeightId};
 use crate::config::ModelParams;
 use crate::fuf::{Fuf, FufInput};
