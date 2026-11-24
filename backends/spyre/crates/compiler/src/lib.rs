@@ -64,7 +64,7 @@ impl TargetEmitter for Spyre {
     }
 
     fn weights_struct(&self, cx: &StructCx<'_>) -> Option<WeightsStruct> {
-        Some(weights::weights_struct(cx))
+        Some(weights::weights_struct(self, cx))
     }
 
     fn load_fn(&self, cx: &LoadCx<'_>) -> TokenStream {

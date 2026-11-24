@@ -2118,6 +2118,11 @@ impl OpFunc {
                 ("clipMax", 448.0),
                 ("mulConst", 1.0 / 448.0),
             ],
+            // ⭐ THE W8A8 ACTIVATION QUANTIZE'S SATURATION CLAMP — the fold's `min(max(x, -448), 448)`
+            // the min/max pair encoded, in the same order-independent clamp form. The bounds are the
+            // E4M3 finite range, so they are quant-format constants, not model constants: they belong
+            // to the op, which is why they live in this table.
+            OpFunc::Clip => &[("clipMin", -448.0), ("clipMax", 448.0)],
             // ⭐ THE TOP-K PAIR NEEDS NONE — the running `(max, idx)` state, the `-inf`/`-1`/`1`
             // SFP constants and the ring are ALL `ddl.internal_tensor`s or template-internal
             // constant units (`topk.ddl:87-115`), reached by no `ddl.get_external_constant` in

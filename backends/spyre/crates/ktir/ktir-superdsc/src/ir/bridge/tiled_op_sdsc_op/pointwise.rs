@@ -846,7 +846,8 @@ fn landing_arg<DF: DataFormat>(
         .with_device_order(["x", "out", "y", "mb"])
         .map_err(|e| e.0)?
         .with_frame(frame)
-        .with_df(DF::DF),
+        .with_df(DF::DF)
+        .map_err(|e| e.0)?,
     ))
 }
 
@@ -981,7 +982,8 @@ pub fn index_select_opspec<L: LandingOp>(
         .with_device_order(["out", "x", "y", "mb"])
         .map_err(|e| e.0)?
         .with_frame(crate::superdsc_opspec::ViewFrame::Own)
-        .with_df(<L::In as DataFormat>::DF),
+        .with_df(<L::In as DataFormat>::DF)
+        .map_err(|e| e.0)?,
     );
     let output = landing_arg::<L::Out>(
         false,
