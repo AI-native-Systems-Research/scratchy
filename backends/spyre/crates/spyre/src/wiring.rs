@@ -21,7 +21,9 @@
 //! role breaks every match that must learn it, at build time, in one place.
 
 use crate::bundle_code as bundle;
-use crate::lower_subtile_tape_to_superdsc::{FP16_ELEMS_PER_STICK, row_footprint_bytes};
+use crate::lower_subtile_tape_to_superdsc::{
+    FP16_ELEMS_PER_STICK, row_footprint_bytes, row_stick_bytes,
+};
 pub use ktir_superdsc::element_arrangement::{
     DL16TOFP32_PERMUTATION, ElementArrangement, dl16tofp32_stagger,
 };
@@ -716,13 +718,14 @@ pub struct KvPool {
 
 impl KvPool {
     /// ⭐ THE POOL'S PAGE — the bytes one page of this pool holds on the card: the scheduler's own
-    /// block ([`SchedulerBlockTokens::REFERENCE`] slots) of rows, each at its format's row footprint
-    /// ([`row_footprint_bytes`] at [`scratchy_triton_splice::KvPoolFormat::df`]) the layout's pool
-    /// placement is sized at. The ONE statement both the bake's re-placement at its pool and the
-    /// session's per-page residency ([`crate::pool_pages`]) read.
+    /// block ([`SchedulerBlockTokens::REFERENCE`] slots) of rows, each its format's whole sticks
+    /// ([`row_stick_bytes`] at [`scratchy_triton_splice::KvPoolFormat::df`]). The pool is allocated
+    /// row-outermost, a flat buffer whose rows sit one after another and are never core-split, so a
+    /// row is never the occupancy pad. The ONE statement both the bake's re-placement at its pool and
+    /// the session's per-page residency ([`crate::pool_pages`]) read.
     pub fn page_bytes(self) -> u64 {
         u64::from(SchedulerBlockTokens::REFERENCE.get())
-            * row_footprint_bytes(self.cols, self.format.df())
+            * row_stick_bytes(self.cols, self.format.df())
     }
 }
 

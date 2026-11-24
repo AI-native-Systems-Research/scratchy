@@ -92,7 +92,8 @@ pub use ktir_superdsc::superdsc_opspec::{Df, Fp8, Fp16, Fp32, SenInt8};
 pub use ktir_superdsc::work::{
     CORELETS_PER_CORE, CoreSplit, DeviceWidth, FP16_ELEMS_PER_STICK, MAX_SPAN_BYTES, MatmulSplit,
     STICK_BYTES, bump_sticks_to_splittable, core_split, core_to_wk_slice, distribute_cores,
-    fp8_k_pad, matmul_cost_split, matmul_split_plan, row_footprint_bytes, stick_count,
+    fp8_k_pad, matmul_cost_split, matmul_split_plan, row_footprint_bytes, row_stick_bytes,
+    stick_count,
 };
 
 // ⭐ THE DXP-GROUP DESCRIPTOR CEILING LIVES IN THE LEAF CRATE — in `sdsc_abstract`, beside the

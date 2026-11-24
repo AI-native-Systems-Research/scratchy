@@ -291,12 +291,24 @@ pub fn bump_sticks_to_splittable(sticks: Fp16Sticks) -> u32 {
 ///     widths, and a sub-stick column is never core-split (Kani: `(d)`). The exact
 ///     reservation makes `size / rows` the row stride the staging writes at.
 pub fn row_footprint_bytes(cols: u32, df: Df) -> u64 {
-    let width = cols.next_multiple_of(df.elems_per_stick());
-    let body = match Fp16Sticks::exact(width) {
-        Some(sticks) => bump_sticks_to_splittable(sticks) as u64,
-        None => width as u64,
-    };
-    body * df.word_length() as u64
+    let width = stick_whole_width(cols, df);
+    match Fp16Sticks::exact(width) {
+        Some(sticks) => bump_sticks_to_splittable(sticks) as u64 * df.word_length() as u64,
+        None => row_stick_bytes(cols, df),
+    }
+}
+
+/// `cols` at its own `Df`'s stick basis: whole sticks, never a partial one.
+fn stick_whole_width(cols: u32, df: Df) -> u32 {
+    cols.next_multiple_of(df.elems_per_stick())
+}
+
+/// ⭐ A ROW'S WHOLE-STICK BYTES — `cols` at its own `Df`'s stick basis, whole sticks, UNPADDED: what one
+/// row takes in a FLAT (row-outermost) buffer, whose rows sit one after another and are never
+/// core-split, so [`row_footprint_bytes`]' occupancy pad has no job there. The paged KV pool's page is
+/// its rows at this (`KvPool::page_bytes`).
+pub fn row_stick_bytes(cols: u32, df: Df) -> u64 {
+    stick_whole_width(cols, df) as u64 * df.word_length() as u64
 }
 
 /// The contraction-K width of an fp8 W8A8 matmul's ACTIVATION and WEIGHT, rounded to a whole
