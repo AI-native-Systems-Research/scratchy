@@ -560,7 +560,7 @@ mod tests {
     /// borrow it (a literal in place is a dropped temporary).
     const KIND: crate::wiring::RotaryKind = crate::wiring::RotaryKind::Default {
         head_dim: 64,
-        theta_bits: 1_232_348_160, // f32::to_bits(1e6), spelled as bits: const-evaluable.
+        theta: crate::wiring::RopeTheta::new(1e6),
     };
 
     /// A granite-shaped step: 4 pages of 4 slots, 2 kv heads, a 3-row bundle walking every block.
