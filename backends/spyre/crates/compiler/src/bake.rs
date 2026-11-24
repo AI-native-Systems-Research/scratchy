@@ -2752,6 +2752,7 @@ pub(crate) fn dump_wavefront_mega(
                 scratchy_forward_compiler_macro::to_wavefront::PrefixCapacity::new(cap),
             ),
             SOLO_DECODE_ROWS,
+            scratchy_forward_compiler_macro::to_wavefront::DenseExperts::Refuse,
         )
     };
     let first = lower_at(prefix_len);
@@ -4773,6 +4774,7 @@ pub(crate) fn dump_wavefront_mega(
                         ),
                     ),
                     seqs,
+                    scratchy_forward_compiler_macro::to_wavefront::DenseExperts::Refuse,
                 ) {
                     Ok(lwd_b) => {
                         let lwd_b = bake_tape(stem, lwd_b, facts.kv_codec());
@@ -4924,6 +4926,7 @@ pub(crate) fn dump_wavefront_mega(
                     scratchy_forward_compiler_macro::to_wavefront::PrefixCapacity::new(prefix_len),
                 ),
                 pl,
+                to_wavefront::DenseExperts::Refuse,
             );
             match lowered {
                 Ok(lwd_p) => {
@@ -5039,6 +5042,7 @@ pub(crate) fn dump_wavefront_mega(
                         ),
                     ),
                     m,
+                    scratchy_forward_compiler_macro::to_wavefront::DenseExperts::Refuse,
                 ) {
                     Ok(lwd_p) => {
                         let lwd_p = bake_tape(stem, lwd_p, facts.kv_codec());
@@ -5110,6 +5114,7 @@ pub(crate) fn dump_wavefront_mega(
                         ),
                     ),
                     w * s,
+                    scratchy_forward_compiler_macro::to_wavefront::DenseExperts::Refuse,
                 ) {
                     Ok(lwd_p) => {
                         let lwd_p = bake_tape(stem, lwd_p, facts.kv_codec());

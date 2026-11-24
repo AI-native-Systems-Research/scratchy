@@ -40,6 +40,8 @@ pub mod subtile_ir;
 pub mod handoff;
 /// A target's KV codec steps, inserted around its coded KV writers and attentions.
 pub mod kv_codec;
+/// The paged KV cache's layout, `[num_blocks, num_kv_heads, block_size, head_dim]`, and its strides.
+pub mod paged_kv_layout;
 /// A target's sampled rows, inserted around the result matmul of a multi-row canonical.
 pub mod sample_rows;
 
