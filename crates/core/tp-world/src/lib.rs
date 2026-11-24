@@ -174,7 +174,10 @@ impl<T: World> PairwiseRound<T> {
     /// const R: PairwiseRound<TpWorld<4>> = PairwiseRound::baked(2);
     /// ```
     pub const fn baked(r: u32) -> Self {
-        assert!(r < T::PAIRWISE_ROUNDS, "a baked pairwise round is below its world's");
+        assert!(
+            r < T::PAIRWISE_ROUNDS,
+            "a baked pairwise round is below its world's"
+        );
         Self(r, PhantomData)
     }
 

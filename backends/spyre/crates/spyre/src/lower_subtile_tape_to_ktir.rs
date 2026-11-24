@@ -724,9 +724,7 @@ fn all_reduce_consumes<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     ir: &SubtileIR<F>,
     rows_are_requests: bool,
 ) -> NodeLowering<T> {
-    use ktir_superdsc::collective::{
-        CollectiveKind, Exchange, TpConsume, pairwise_rounds, ranks,
-    };
+    use ktir_superdsc::collective::{CollectiveKind, Exchange, TpConsume, pairwise_rounds, ranks};
     use scratchy_subtile::subtile_ir::{EwKind, Range, Region, TensorRegion};
     let x = node.inputs[0];
     let rows = x.region.rows.len;
