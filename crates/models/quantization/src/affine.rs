@@ -18,31 +18,44 @@ use anyhow::Result;
 use rayon::prelude::*;
 use scratchy_tensors::DType;
 
-/// CPU-dequantize one MLX-affine int4 weight to dense `[N, K]` bytes.
-///
-/// * `weight_bytes` — packed nibbles, `n * k / 2` bytes (low nibble first).
-/// * `scales_bytes` / `biases_bytes` — `n_groups` elements of `scale_dtype`
-///   (`F16` or `BF16`), 2 bytes each, where `n_groups = n * k / group_size`.
-/// * `n` / `k` — dequantized output dims (`k` already in elements, i.e.
-///   `packed_cols * 8`).
-/// * `group_size` — affine group width along `k`.
-/// * `bits` — 2, 3, 4 or 8.
-/// * `scale_dtype` — dtype of the scales/biases (`F16` or `BF16`).
-/// * `dtype_out` — output dtype (`F16` or `BF16`).
+/// One MLX-affine quantized weight as a checkpoint stores it: packed codes,
+/// per-group scales and biases, and the geometry they decode at.
+#[derive(Clone, Copy)]
+pub struct AffineWeight<'a> {
+    /// Packed codes, `n * k * bits / 8` bytes (low bits first).
+    pub weight_bytes: &'a [u8],
+    /// `n_groups` elements of `scale_dtype` (`F16` or `BF16`), 2 bytes each,
+    /// where `n_groups = n * k / group_size`.
+    pub scales_bytes: &'a [u8],
+    /// Same layout as `scales_bytes`.
+    pub biases_bytes: &'a [u8],
+    /// Dequantized output rows.
+    pub n: usize,
+    /// Dequantized output columns, in elements (i.e. `packed_cols * 8`).
+    pub k: usize,
+    /// Affine group width along `k`.
+    pub group_size: u32,
+    /// 2, 3, 4 or 8.
+    pub bits: u32,
+    /// Dtype of the scales/biases (`F16` or `BF16`).
+    pub scale_dtype: DType,
+}
+
+/// CPU-dequantize one MLX-affine weight to dense `[N, K]` bytes of
+/// `dtype_out` (`F16` or `BF16`).
 ///
 /// Returns the dequantized `[N, K]` weight as `n * k * 2` little-endian bytes.
-#[allow(clippy::too_many_arguments)]
-pub fn affine_dequant_b4_to_dtype(
-    weight_bytes: &[u8],
-    scales_bytes: &[u8],
-    biases_bytes: &[u8],
-    n: usize,
-    k: usize,
-    group_size: u32,
-    bits: u32,
-    scale_dtype: DType,
-    dtype_out: DType,
-) -> Result<Vec<u8>> {
+pub fn affine_dequant_b4_to_dtype(weight: AffineWeight<'_>, dtype_out: DType) -> Result<Vec<u8>> {
+    let AffineWeight {
+        weight_bytes,
+        scales_bytes,
+        biases_bytes,
+        n,
+        k,
+        group_size,
+        bits,
+        scale_dtype,
+    } = weight;
     anyhow::ensure!(
         bits == 2 || bits == 3 || bits == 4 || bits == 8,
         "affine_dequant_b4_to_dtype: only bits=2, bits=3, bits=4 or bits=8 is supported, got bits={bits}"
@@ -241,9 +254,20 @@ mod tests {
         let bias_f = -1.25f32;
         let scale = half::f16::from_f32(scale_f).to_bits().to_le_bytes();
         let bias = half::f16::from_f32(bias_f).to_bits().to_le_bytes();
-        let out =
-            affine_dequant_b4_to_dtype(&packed, &scale, &bias, n, k, gs, 3, DType::F16, DType::F16)
-                .unwrap();
+        let out = affine_dequant_b4_to_dtype(
+            AffineWeight {
+                weight_bytes: &packed,
+                scales_bytes: &scale,
+                biases_bytes: &bias,
+                n,
+                k,
+                group_size: gs,
+                bits: 3,
+                scale_dtype: DType::F16,
+            },
+            DType::F16,
+        )
+        .unwrap();
         let out_halves = unsafe { std::slice::from_raw_parts(out.as_ptr() as *const u16, n * k) };
         for (i, &c) in codes.iter().enumerate() {
             let want = half::f16::from_f32(scale_f * (c as f32) + bias_f).to_bits();
@@ -275,14 +299,16 @@ mod tests {
             })
             .collect();
         let out = affine_dequant_b4_to_dtype(
-            &packed,
-            &scales,
-            &biases,
-            n,
-            k,
-            gs as u32,
-            3,
-            DType::F16,
+            AffineWeight {
+                weight_bytes: &packed,
+                scales_bytes: &scales,
+                biases_bytes: &biases,
+                n,
+                k,
+                group_size: gs as u32,
+                bits: 3,
+                scale_dtype: DType::F16,
+            },
             DType::F16,
         )
         .unwrap();
@@ -336,14 +362,16 @@ mod tests {
             })
             .collect();
         let out = affine_dequant_b4_to_dtype(
-            &packed,
-            &scales,
-            &biases,
-            n,
-            k,
-            gs as u32,
-            2,
-            DType::F16,
+            AffineWeight {
+                weight_bytes: &packed,
+                scales_bytes: &scales,
+                biases_bytes: &biases,
+                n,
+                k,
+                group_size: gs as u32,
+                bits: 2,
+                scale_dtype: DType::F16,
+            },
             DType::F16,
         )
         .unwrap();
@@ -370,40 +398,46 @@ mod tests {
         let scales: Vec<u8> = vec![0x00; n_groups * 2];
         let biases: Vec<u8> = vec![0x00; n_groups * 2];
         let out4 = affine_dequant_b4_to_dtype(
-            &w4,
-            &scales,
-            &biases,
-            n,
-            k,
-            gs as u32,
-            4,
-            DType::F16,
+            AffineWeight {
+                weight_bytes: &w4,
+                scales_bytes: &scales,
+                biases_bytes: &biases,
+                n,
+                k,
+                group_size: gs as u32,
+                bits: 4,
+                scale_dtype: DType::F16,
+            },
             DType::F16,
         )
         .unwrap();
         assert_eq!(out4.len(), n * k * 2);
         let out8 = affine_dequant_b4_to_dtype(
-            &w8,
-            &scales,
-            &biases,
-            n,
-            k,
-            gs as u32,
-            8,
-            DType::F16,
+            AffineWeight {
+                weight_bytes: &w8,
+                scales_bytes: &scales,
+                biases_bytes: &biases,
+                n,
+                k,
+                group_size: gs as u32,
+                bits: 8,
+                scale_dtype: DType::F16,
+            },
             DType::F16,
         )
         .unwrap();
         assert_eq!(out8.len(), n * k * 2);
         let out2 = affine_dequant_b4_to_dtype(
-            &w2,
-            &scales,
-            &biases,
-            n,
-            k,
-            gs as u32,
-            2,
-            DType::F16,
+            AffineWeight {
+                weight_bytes: &w2,
+                scales_bytes: &scales,
+                biases_bytes: &biases,
+                n,
+                k,
+                group_size: gs as u32,
+                bits: 2,
+                scale_dtype: DType::F16,
+            },
             DType::F16,
         )
         .unwrap();
