@@ -2051,6 +2051,14 @@ fn whole<F: scratchy_subtile::subtile_ir::RopeForm>(
     Ok(())
 }
 
+/// ⭐ A DECODE BATCH'S CHUNK FITS ITS POOL — it gathers fewer pages than the pool holds: a gather of
+/// the whole pool faults the card (torch-spyre#4033), and this port has no per-sequence loop to
+/// serve that step. The ONE statement the splice checks at the pool it lowers over and the bake's
+/// placement checks again at the pool the card is given.
+pub fn chunk_fits_pool(chunking: &BatchChunking, pool_pages: u32) -> bool {
+    chunking.entries() < pool_pages
+}
+
 /// ⭐ THE WALK — how many blocks of the page table a rung's attention reads (`NUM_BLOCKS`): the rung's
 /// swept extent in pages. Every page of the context at `ActiveCap::FULL` (a decode step's keys can sit
 /// anywhere below it); the pool may hold more pages than the context, and the walk never reaches past
@@ -2238,7 +2246,7 @@ pub fn lower_attn<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile
         // (tinyllama-1.1b, 2048) bakes no spyre decode at all (its head is untied). PORTING their
         // loop is what admits such a pool.
         let chunking = BatchChunking::of(mq, blocks, nkvh, g.q_width(), g.head_dim().get());
-        if chunking.entries() >= pages.get() {
+        if !chunk_fits_pool(&chunking, pages.get()) {
             return Err(format!(
                 "triton splice: AttnDecode t{}: a {mq}-sequence decode walking {blocks} block(s) \
                  gathers {} page(s) a chunk, and the pool holds {pages} — a gather of the whole \
@@ -5932,6 +5940,25 @@ mod walk_on_the_card {
             8,
             "under the floor"
         );
+    }
+
+    /// ⭐ A BATCH CHUNK FITS ONLY A POOL LARGER THAN IT — a chunk gathers fewer pages than the pool
+    /// holds or its gather of the whole pool faults the card (torch-spyre#4033): [`chunk_fits_pool`]
+    /// is false at the pool's own count, true one page past it.
+    #[test]
+    fn a_batch_chunk_fits_only_a_pool_larger_than_it() {
+        // The `batched_walk_heads` shapes: granite's geometry and its rank shares, over the
+        // walk lengths the batch rungs bake.
+        for (seqs, walk, hd, kv_heads, group) in [
+            (4u32, 64u32, 64u32, 8u32, 4u32),
+            (1, 128, 64, 8, 4),
+            (32, 1, 64, 8, 4),
+            (4, 64, 128, 4, 8),
+        ] {
+            let c = BatchChunking::of(seqs, walk, kv_heads, kv_heads * group * hd, hd);
+            assert!(!chunk_fits_pool(&c, c.entries()), "{c:?}");
+            assert!(chunk_fits_pool(&c, c.entries() + 1), "{c:?}");
+        }
     }
 
     /// ⛔ A DECODE BATCH GATHERS EACH OF ITS PAGES WHOLE, ONE OP FOR ALL OF THEM — the whole-page

@@ -9,11 +9,10 @@
 //!     ([`scratchy_core_config::DEFAULT_GPU_MEMORY_UTILIZATION`]);
 //!   * the SESSION's residency ([`Residency`]): the bytes that sit whatever the pool's page
 //!     count ([`Residency::fixed`]) and the bytes one more page costs ([`Residency::page`]) —
-//!     read off the bake's own layout by [`session_residency`], never re-derived;
-//!   * the MODEL's reach ([`ContextPages`]): the context's own pages, the floor.
+//!     read off the bake's own layout by [`session_residency`], never re-derived.
 //!
 //! [`within`] is the whole law: the pages the budget's remainder holds at the
-//! per-page bytes, never fewer than the context's own pages. Everything else here reads a
+//! per-page bytes — the pool is what the card holds. Everything else here reads a
 //! pool already sized — [`Residency::at`] its bytes, [`extra_rows`] the rows past
 //! the context.
 
@@ -172,34 +171,25 @@ impl std::iter::Sum for Residency {
     }
 }
 
-/// ⭐ THE LAW — the pages the budget's remainder holds at the page's bytes, never fewer
-/// than the context's own pages. [`blocks_within`] is the serving step's own division
-/// (its sixteen-page floor and its zero-page fallback included — the page's own zero law
-/// lives there, at its one home), so a card that cannot hold the context still yields
-/// the context's pages — the pool is sized for the model's reach first and the card's
-/// remainder second. A zero count falls to the context's own pages: total, with no arm
-/// to reach.
+/// ⭐ THE LAW — the pages the budget's remainder holds at the per-page bytes
+/// ([`blocks_within`], the serving step's own division, its sixteen-page floor included) —
+/// the pool is what the card holds, never forced to the model's whole context; a context
+/// longer than the pool is refused at serve time by the engine's own context law, and the
+/// bake's placement checks the batch rule against it (`place_kv_pools_at`).
 ///
 /// [`blocks_within`]: scratchy_core_config::blocks_within
-pub fn within(
-    budget: CardBudget,
-    fixed: FixedBytes,
-    page: PageBytes,
-    context: ContextPages,
-) -> PoolPages {
+pub fn within(budget: CardBudget, fixed: FixedBytes, page: PageBytes) -> PoolPages {
     let pages = scratchy_core_config::blocks_within(
         budget.get().saturating_sub(fixed.get()) as usize,
         page.get().get() as usize,
     ) as u32;
-    PoolPages::of_nonzero(
-        NonZeroU32::new(pages).map_or(context.nonzero(), |p| p.max(context.nonzero())),
-    )
+    PoolPages::of_nonzero(NonZeroU32::MIN.saturating_add(pages.saturating_sub(1)))
 }
 
 /// The pool's rows past the context's pages — the positions a request may still fill
-/// before the pool is the context, at the scheduler's own page. SATURATES below the
-/// context (a state [`Self::of`]'s floor excludes), the same spelling the saturating row
-/// laws of the prefix capacity take.
+/// before the pool is the context, at the scheduler's own page. SATURATES at zero when
+/// the pool holds no more than the context, the same spelling the saturating row laws of
+/// the prefix capacity take.
 pub const fn extra_rows(pool: PoolPages, context: ContextPages) -> u32 {
     pool.get().saturating_sub(context.get()) * SchedulerBlockTokens::REFERENCE.get()
 }
@@ -215,7 +205,6 @@ pub fn of_bake(residency: Residency, context: ContextPages) -> PoolPages {
             CardBudget::of::<ktir_core::ddl_binds::Baked>(),
             residency.fixed(),
             page,
-            context,
         ),
         _ => PoolPages::of_nonzero(context.nonzero()),
     }
@@ -385,28 +374,34 @@ mod tests {
         }
     }
 
-    /// A budget that cannot hold the context still yields the context's pages — and a budget
-    /// below the fixed bytes saturates at zero remainder rather than refusing, so the floor
-    /// is the context's own pages either way.
+    /// A budget smaller than the context gives a smaller pool — the pool is what the card's
+    /// budget holds, never forced to the context; and a budget below the fixed bytes saturates
+    /// at zero remainder, where `blocks_within`'s own sixteen-page floor is the only one left.
     #[test]
-    fn the_pool_floors_at_the_contexts_pages() {
+    fn a_budget_smaller_than_the_context_gives_a_smaller_pool() {
         let context = ContextPages::new(nz32(100));
         // Sixteen pages fit — `blocks_within`'s own floor — and the context needs a hundred.
         let pool = within(
             CardBudget::new(16 * 1024),
             FixedBytes::new(0),
             PageBytes::new(nz64(1024)),
-            context,
         );
-        assert_eq!(pool.get(), 100);
-        // The budget below the fixed bytes: a zero remainder, the same floor.
+        assert_eq!(
+            pool.get(),
+            scratchy_core_config::blocks_within(16 * 1024, 1024) as u32
+        );
+        assert_eq!(pool.get(), 16);
+        assert!(pool.get() < context.get());
+        // The budget below the fixed bytes: a zero remainder, the same sixteen-page floor.
         let pool = within(
             CardBudget::new(100),
             FixedBytes::new(4096),
             PageBytes::new(nz64(1024)),
-            context,
         );
-        assert_eq!(pool.get(), 100);
+        assert_eq!(
+            pool.get(),
+            scratchy_core_config::blocks_within(0, 1024) as u32
+        );
     }
 
     /// Above the floor, the pool is the budget's remainder divided by the page: floor
@@ -418,20 +413,14 @@ mod tests {
             PageBytes::of(PerPageBytes::new(1024)).expect("the fixture's page cost is nonzero");
         assert_eq!(PageBytes::of(PerPageBytes::new(0)), None);
         let fixed = FixedBytes::new(4096);
-        let context = ContextPages::new(nz32(10));
-        let pool = within(
-            CardBudget::new(4096 + 100 * 1024 + 512),
-            fixed,
-            page,
-            context,
-        );
+        let pool = within(CardBudget::new(4096 + 100 * 1024 + 512), fixed, page);
         assert_eq!(pool.get(), 100, "the 512-byte remainder is dropped");
         let residency = Residency {
             fixed,
             page: PerPageBytes::new(1024),
         };
         assert_eq!(residency.at(pool), 4096 + 100 * 1024);
-        let pool = within(CardBudget::new(4096 + 250 * 1024), fixed, page, context);
+        let pool = within(CardBudget::new(4096 + 250 * 1024), fixed, page);
         assert_eq!(pool.get(), 250);
     }
 
@@ -445,8 +434,8 @@ mod tests {
         assert_eq!(ContextPages::of_slots(nz32(16 * b)).get(), 16);
     }
 
-    /// The extra rows are the pages past the context, at the scheduler's own page; below the
-    /// context the extra rows saturate at zero — a state [`PoolPages::of`]'s floor excludes.
+    /// The extra rows are the pages past the context, at the scheduler's own page; a pool that
+    /// holds no more than the context saturates them at zero.
     #[test]
     fn extra_rows_are_the_pages_past_the_context() {
         let pool = PoolPages::of_nonzero(nz32(100));
@@ -665,7 +654,6 @@ mod tests {
                     CardBudget::of::<ktir_core::ddl_binds::Baked>(),
                     residency.fixed(),
                     page,
-                    context
                 )
             );
             assert!(pool.get() > context.get());

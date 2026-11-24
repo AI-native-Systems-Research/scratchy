@@ -740,9 +740,10 @@ impl PagedStep {
 
     /// ⭐ THE STEP OVER THE BAKE'S POOL — this step at the pool's pages
     /// ([`crate::pool_pages::of_bake`]), every other field its own. A graph's step states its
-    /// context's pages ([`crate::lower_subtile_tape_to_ktir::paged_step_of_ir`]); the pool holds
-    /// the context by [`crate::pool_pages::within`]'s floor, so every walk the step names lies
-    /// inside it.
+    /// context's pages ([`crate::lower_subtile_tape_to_ktir::paged_step_of_ir`]); the step's pages
+    /// are the bake's pool, which may hold fewer pages than the context: no request is scheduled
+    /// past the pool (the engine's context law), and the batch rule is checked against it at
+    /// placement ([`crate::lower_subtile_tape_to_superdsc::place_kv_pools_at`]).
     pub const fn over_pool(self, pool: crate::pool_pages::PoolPages) -> Self {
         PagedStep {
             pages: pool.get(),

@@ -2114,6 +2114,21 @@ pub fn place_kv_pools_at<T: ktir_superdsc::collective::Tp>(
     step: Option<crate::wiring::PagedStep>,
     pages: crate::pool_pages::PoolPages,
 ) -> Result<(), SuperDscError> {
+    // ⭐ THE BATCH RULE AT THE POOL THE CARD IS GIVEN ([`scratchy_triton_splice::chunk_fits_pool`]): the
+    // splice checked it at the context's pool; the bake's pool may hold fewer pages, so it is checked
+    // again here, a build error naming both counts.
+    if let Some(step) = step
+        && let Some(chunking) = step.batch()
+        && !scratchy_triton_splice::chunk_fits_pool(&chunking, pages.get())
+    {
+        return Err(SuperDscError(format!(
+            "a {}-sequence decode batch gathers {} page(s) a chunk, and the bake's KV pool holds {} \
+             — a gather of the whole pool faults the card (torch-spyre#4033)",
+            step.rows,
+            chunking.entries(),
+            pages.get()
+        )));
+    }
     let RolledSuperDsc {
         layout,
         per_layer_ext,
