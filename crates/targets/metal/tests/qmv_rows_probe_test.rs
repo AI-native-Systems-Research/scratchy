@@ -12,13 +12,13 @@
 //! Run: cargo test -p scratchy-target-metal --release --test qmv_rows_probe_test -- \
 //!     --ignored --nocapture
 
-mod common;
-
 use half::bf16;
 use objc2_metal::MTLSize;
 use scratchy_target_metal::aot::baked_build;
 use scratchy_target_metal::detect_device;
-use scratchy_target_metal::mtl4_dispatch::{Mtl4DispatchBatch, shared_slice, shared_zeroed};
+use scratchy_target_metal::mtl4_dispatch::{
+    Mtl4DispatchBatch, ThreadgroupGrid, shared_slice, shared_zeroed,
+};
 use scratchy_target_metal::specialized_pipeline_cache::{
     ConstantValue, PipelineKey, SpecializedPipelineCache,
 };
@@ -161,7 +161,17 @@ fn qmv_rows_plain_and_normalizing_on_load() {
                             (&y, 4),
                             (&gain, 15),
                         ];
-                        batch.encode(&pso, &binds, &[], &[], &[], size(grid), size(threads));
+                        batch.encode(
+                            &pso,
+                            &binds,
+                            &[],
+                            &[],
+                            &[],
+                            ThreadgroupGrid {
+                                threadgroups: size(grid),
+                                threads_per_threadgroup: size(threads),
+                            },
+                        );
                         batch.barrier();
                     }
                     let t0 = std::time::Instant::now();
@@ -294,7 +304,17 @@ fn qmv_wide_against_small_m_twin_by_bucket() {
             for i in 0..ITERS {
                 let (w, scales, biases) = &weights[i % copies];
                 let binds = [(w, 0), (scales, 1), (biases, 2), (&x, 3), (&y, 4)];
-                batch.encode(pso, &binds, &[], &[], &[], size(grid), size(threads));
+                batch.encode(
+                    pso,
+                    &binds,
+                    &[],
+                    &[],
+                    &[],
+                    ThreadgroupGrid {
+                        threadgroups: size(grid),
+                        threads_per_threadgroup: size(threads),
+                    },
+                );
                 batch.barrier();
             }
             let t0 = std::time::Instant::now();
@@ -453,8 +473,10 @@ fn norm_folded_into_its_readers_on_a_chip_emulated_by_width() {
                             &[],
                             &[],
                             &[],
-                            size((rows, 1, 1)),
-                            size((1024, 1, 1)),
+                            ThreadgroupGrid {
+                                threadgroups: size((rows, 1, 1)),
+                                threads_per_threadgroup: size((1024, 1, 1)),
+                            },
                         );
                         batch.barrier();
                     }
@@ -471,7 +493,17 @@ fn norm_folded_into_its_readers_on_a_chip_emulated_by_width() {
                             (y, 4),
                             (&gain, 15),
                         ];
-                        batch.encode(pso, &binds, &[], &[], &[], size(*grid), size(*threads));
+                        batch.encode(
+                            pso,
+                            &binds,
+                            &[],
+                            &[],
+                            &[],
+                            ThreadgroupGrid {
+                                threadgroups: size(*grid),
+                                threads_per_threadgroup: size(*threads),
+                            },
+                        );
                     }
                     batch.barrier();
                 }
@@ -643,7 +675,17 @@ fn narrow_projection_at_verify_buckets() {
                     for c in 0..width {
                         let (w, scales, biases) = &weights[(i * width + c) % copies];
                         let binds = [(w, 0), (scales, 1), (biases, 2), (&x, 3), (&ys[c], 4)];
-                        batch.encode(pso, &binds, &[], &[], &[], size(grid), size(threads));
+                        batch.encode(
+                            pso,
+                            &binds,
+                            &[],
+                            &[],
+                            &[],
+                            ThreadgroupGrid {
+                                threadgroups: size(grid),
+                                threads_per_threadgroup: size(threads),
+                            },
+                        );
                     }
                     batch.barrier();
                 }

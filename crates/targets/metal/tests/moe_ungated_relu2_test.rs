@@ -14,6 +14,7 @@ use objc2_metal::MTLSize;
 use scratchy_subtile::subtile_ir::{ExpertBody, UngatedAct};
 use scratchy_target_metal::aot::{BakedPipeline, baked_pipeline};
 use scratchy_target_metal::device::detect_device;
+use scratchy_target_metal::mtl4_dispatch::ThreadgroupGrid;
 use scratchy_target_metal::tape::constants::ConstantValue;
 use scratchy_target_metal::tape::ids::{ElementCount, KDimI32, NDimI32, NumExperts, TopK};
 use scratchy_target_metal::tape::kernel_constants::{
@@ -144,7 +145,17 @@ type Dispatch<'a> = (
 fn run(d: &common::Device, dispatches: &[Dispatch<'_>]) {
     let mut batch = common::Mtl4DispatchBatch::begin(d).expect("an MTL4 queue");
     for (pso, buffers, groups, threads) in dispatches {
-        batch.encode(pso, buffers, &[], &[], &[], *groups, *threads);
+        batch.encode(
+            pso,
+            buffers,
+            &[],
+            &[],
+            &[],
+            ThreadgroupGrid {
+                threadgroups: *groups,
+                threads_per_threadgroup: *threads,
+            },
+        );
         batch.barrier();
     }
     batch.commit(true);

@@ -13,7 +13,9 @@
 use objc2_metal::{MTLBuffer as _, MTLSize};
 use scratchy_target_metal::aot::baked_build;
 use scratchy_target_metal::detect_device;
-use scratchy_target_metal::mtl4_dispatch::{Mtl4DispatchBatch, shared_slice, shared_zeroed};
+use scratchy_target_metal::mtl4_dispatch::{
+    Mtl4DispatchBatch, ThreadgroupGrid, shared_slice, shared_zeroed,
+};
 use scratchy_target_metal::off_tape::VocabSuffix;
 use scratchy_target_metal::specialized_pipeline_cache::{
     ConstantValue, PipelineKey, SpecializedPipelineCache,
@@ -139,8 +141,10 @@ fn a_wide_pass_whole_vocabulary_vs_prefix_and_suffix() {
                     &[],
                     &[],
                     &[],
-                    size(grid),
-                    size(threads),
+                    ThreadgroupGrid {
+                        threadgroups: size(grid),
+                        threads_per_threadgroup: size(threads),
+                    },
                 );
                 batch.barrier();
                 batch.encode(
@@ -149,8 +153,10 @@ fn a_wide_pass_whole_vocabulary_vs_prefix_and_suffix() {
                     &[(m, 2)],
                     &[],
                     &[],
-                    one(m as usize),
-                    one(1024),
+                    ThreadgroupGrid {
+                        threadgroups: one(m as usize),
+                        threads_per_threadgroup: one(1024),
+                    },
                 );
                 batch.barrier();
             }
@@ -200,8 +206,10 @@ fn a_wide_pass_whole_vocabulary_vs_prefix_and_suffix() {
                     &[],
                     &[],
                     &[],
-                    size(grid),
-                    size(threads),
+                    ThreadgroupGrid {
+                        threadgroups: size(grid),
+                        threads_per_threadgroup: size(threads),
+                    },
                 );
                 let pick = PassPick {
                     hidden: x.gpuAddress(),

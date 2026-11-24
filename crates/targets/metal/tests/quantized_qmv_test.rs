@@ -23,6 +23,7 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions, MTLSize};
 use scratchy_target_metal::aot::baked_pipeline;
+use scratchy_target_metal::cpu_reference::AffineMatmul;
 use scratchy_target_metal::cpu_reference::affine_qmv_b4_bf16 as cpu_qmv_bf16;
 use scratchy_target_metal::device::detect_device;
 use scratchy_target_metal::quantized::{
@@ -35,6 +36,16 @@ use scratchy_target_metal::tape::kernel_constants::AffineCodes;
 type Buffer = Retained<ProtocolObject<dyn MTLBuffer>>;
 type Device = Retained<ProtocolObject<dyn MTLDevice>>;
 
+/// The buffers a qmv dispatch binds: the packed weight, its scales and biases, the input and the
+/// output.
+struct QmvBuffers<'a> {
+    packed_buf: &'a Buffer,
+    scales_buf: &'a Buffer,
+    biases_buf: &'a Buffer,
+    x_buf: &'a Buffer,
+    y_buf: &'a Buffer,
+}
+
 /// Build the qmv pipeline for `(m, n, k, group_size, scale_dtype)` and
 /// dispatch it on the production MTL4 path. Replicates the bindings of
 /// `MetalAffineQmv::execute_with_kernel` (buffer 0=packed_w, 1=scales,
@@ -45,22 +56,22 @@ type Device = Retained<ProtocolObject<dyn MTLDevice>>;
 /// M ≥ 2 picks the small-M band (`qmv_wide`) when `wide_ok` passes, as an
 /// M5 target does; without it the buckets take the fast kernel's fold twin.
 /// M is baked at slot 7 (`AffineQmvWideConstants`) for the wide pick.
-#[allow(clippy::too_many_arguments)]
 fn dispatch_qmv(
     device: &Device,
-    packed_buf: &Buffer,
-    scales_buf: &Buffer,
-    biases_buf: &Buffer,
-    x_buf: &Buffer,
-    y_buf: &Buffer,
-    m: usize,
-    n: usize,
-    k: usize,
+    bufs: QmvBuffers<'_>,
+    (m, n, k): (usize, usize, usize),
     group_size: u32,
     scale_dtype: ScaleDtype,
     codes: AffineCodes,
     wide_ok: bool,
 ) -> bool {
+    let QmvBuffers {
+        packed_buf,
+        scales_buf,
+        biases_buf,
+        x_buf,
+        y_buf,
+    } = bufs;
     let kernel = pick_qmv_kernel_wide(n as u32, k as u32, 4, m as u32, wide_ok);
     let kernel_name = qmv_kernel_name(
         kernel,
@@ -177,40 +188,26 @@ fn make_inputs_bf16(
     (packed, scales, biases, x)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn run_qmv_bf16(
-    packed: &[u8],
-    scales: &[half::f16],
-    biases: &[half::f16],
-    x: &[half::bf16],
-    m: usize,
-    n: usize,
-    k: usize,
-    group_size: u32,
+fn run_qmv_bf16(mm: AffineMatmul<'_, half::bf16, half::f16>) -> Option<Vec<half::bf16>> {
+    run_qmv_bf16_codes(mm, AffineCodes::AsWritten, /*wide_ok=*/ true)
+}
+
+fn run_qmv_bf16_codes(
+    mm: AffineMatmul<'_, half::bf16, half::f16>,
+    codes: AffineCodes,
+    wide_ok: bool,
 ) -> Option<Vec<half::bf16>> {
-    run_qmv_bf16_codes(
+    let AffineMatmul {
         packed,
         scales,
         biases,
         x,
-        (m, n, k),
+        m,
+        n,
+        k,
         group_size,
-        AffineCodes::AsWritten,
-        /*wide_ok=*/ true,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn run_qmv_bf16_codes(
-    packed: &[u8],
-    scales: &[half::f16],
-    biases: &[half::f16],
-    x: &[half::bf16],
-    (m, n, k): (usize, usize, usize),
-    group_size: u32,
-    codes: AffineCodes,
-    wide_ok: bool,
-) -> Option<Vec<half::bf16>> {
+    } = mm;
+    let group_size = group_size as u32;
     let device = detect_device()?.device;
 
     let packed_buf = buffer_from_bytes(&device, packed);
@@ -232,14 +229,14 @@ fn run_qmv_bf16_codes(
 
     if !dispatch_qmv(
         &device,
-        &packed_buf,
-        &scales_buf,
-        &biases_buf,
-        &x_buf,
-        &y_buf,
-        m,
-        n,
-        k,
+        QmvBuffers {
+            packed_buf: &packed_buf,
+            scales_buf: &scales_buf,
+            biases_buf: &biases_buf,
+            x_buf: &x_buf,
+            y_buf: &y_buf,
+        },
+        (m, n, k),
         group_size,
         ScaleDtype::F16,
         codes,
@@ -325,9 +322,26 @@ fn affine_qmv_quad_b4_bf16_matches_cpu_reference() {
     for &group_size in &[32usize, 64, 128] {
         let (packed, scales, biases, x) =
             make_inputs_bf16(0xCAFE_u64 ^ group_size as u64, n, k, m, group_size);
-        let expected = cpu_qmv_bf16(&packed, &scales, &biases, &x, m, n, k, group_size);
-        let Some(metal) = run_qmv_bf16(&packed, &scales, &biases, &x, m, n, k, group_size as u32)
-        else {
+        let expected = cpu_qmv_bf16(AffineMatmul {
+            packed: &packed,
+            scales: &scales,
+            biases: &biases,
+            x: &x,
+            m,
+            n,
+            k,
+            group_size,
+        });
+        let Some(metal) = run_qmv_bf16(AffineMatmul {
+            packed: &packed,
+            scales: &scales,
+            biases: &biases,
+            x: &x,
+            m,
+            n,
+            k,
+            group_size,
+        }) else {
             eprintln!("skipping: no Metal 4 GPU");
             return;
         };
@@ -355,9 +369,26 @@ fn affine_qmv_fast_b4_bf16_matches_cpu_reference() {
     for &group_size in &[32usize, 64, 128] {
         let (packed, scales, biases, x) =
             make_inputs_bf16(0xBEEF_u64 ^ group_size as u64, n, k, m, group_size);
-        let expected = cpu_qmv_bf16(&packed, &scales, &biases, &x, m, n, k, group_size);
-        let Some(metal) = run_qmv_bf16(&packed, &scales, &biases, &x, m, n, k, group_size as u32)
-        else {
+        let expected = cpu_qmv_bf16(AffineMatmul {
+            packed: &packed,
+            scales: &scales,
+            biases: &biases,
+            x: &x,
+            m,
+            n,
+            k,
+            group_size,
+        });
+        let Some(metal) = run_qmv_bf16(AffineMatmul {
+            packed: &packed,
+            scales: &scales,
+            biases: &biases,
+            x: &x,
+            m,
+            n,
+            k,
+            group_size,
+        }) else {
             eprintln!("skipping: no Metal 4 GPU");
             return;
         };
@@ -451,18 +482,21 @@ fn buffer_from_bytes_offset_into_parent(
     (parent, child)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn run_qmv_bf16_with_packed_prefix(
-    packed: &[u8],
-    scales: &[half::f16],
-    biases: &[half::f16],
-    x: &[half::bf16],
-    m: usize,
-    n: usize,
-    k: usize,
-    group_size: u32,
+    mm: AffineMatmul<'_, half::bf16, half::f16>,
     prefix_bytes: usize,
 ) -> Option<Vec<half::bf16>> {
+    let AffineMatmul {
+        packed,
+        scales,
+        biases,
+        x,
+        m,
+        n,
+        k,
+        group_size,
+    } = mm;
+    let group_size = group_size as u32;
     let device = detect_device()?.device;
 
     // Parent must stay live through dispatch; the child is the
@@ -490,14 +524,14 @@ fn run_qmv_bf16_with_packed_prefix(
 
     if !dispatch_qmv(
         &device,
-        &packed_buf,
-        &scales_buf,
-        &biases_buf,
-        &x_buf,
-        &y_buf,
-        m,
-        n,
-        k,
+        QmvBuffers {
+            packed_buf: &packed_buf,
+            scales_buf: &scales_buf,
+            biases_buf: &biases_buf,
+            x_buf: &x_buf,
+            y_buf: &y_buf,
+        },
+        (m, n, k),
         group_size,
         ScaleDtype::F16,
         AffineCodes::AsWritten,
@@ -527,16 +561,27 @@ fn affine_qmv_fast_b4_bf16_unaligned_packed_offset_1_byte_prefix() {
     let k = 2048;
     let group_size = 64usize;
     let (packed, scales, biases, x) = make_inputs_bf16(0xA11A_u64, n, k, m, group_size);
-    let expected = cpu_qmv_bf16(&packed, &scales, &biases, &x, m, n, k, group_size);
-    let Some(metal) = run_qmv_bf16_with_packed_prefix(
-        &packed,
-        &scales,
-        &biases,
-        &x,
+    let expected = cpu_qmv_bf16(AffineMatmul {
+        packed: &packed,
+        scales: &scales,
+        biases: &biases,
+        x: &x,
         m,
         n,
         k,
-        group_size as u32,
+        group_size,
+    });
+    let Some(metal) = run_qmv_bf16_with_packed_prefix(
+        AffineMatmul {
+            packed: &packed,
+            scales: &scales,
+            biases: &biases,
+            x: &x,
+            m,
+            n,
+            k,
+            group_size,
+        },
         /*prefix_bytes=*/ 1,
     ) else {
         // No Metal 4 GPU (e.g. CI's paravirtual device): this #[should_panic]
@@ -571,9 +616,26 @@ fn affine_qmv_fast_b4_bf16_llama_3_2_1b_q_proj_shape() {
     let k = 2048;
     let group_size = 64usize;
     let (packed, scales, biases, x) = make_inputs_bf16(0x11B_u64, n, k, m, group_size);
-    let expected = cpu_qmv_bf16(&packed, &scales, &biases, &x, m, n, k, group_size);
-    let Some(metal) = run_qmv_bf16(&packed, &scales, &biases, &x, m, n, k, group_size as u32)
-    else {
+    let expected = cpu_qmv_bf16(AffineMatmul {
+        packed: &packed,
+        scales: &scales,
+        biases: &biases,
+        x: &x,
+        m,
+        n,
+        k,
+        group_size,
+    });
+    let Some(metal) = run_qmv_bf16(AffineMatmul {
+        packed: &packed,
+        scales: &scales,
+        biases: &biases,
+        x: &x,
+        m,
+        n,
+        k,
+        group_size,
+    }) else {
         eprintln!("skipping: no Metal 4 GPU");
         return;
     };
@@ -595,9 +657,26 @@ fn affine_qmv_fast_b4_bf16_llama_3_2_1b_kv_proj_shape() {
     let k = 2048;
     let group_size = 64usize;
     let (packed, scales, biases, x) = make_inputs_bf16(0x11C_u64, n, k, m, group_size);
-    let expected = cpu_qmv_bf16(&packed, &scales, &biases, &x, m, n, k, group_size);
-    let Some(metal) = run_qmv_bf16(&packed, &scales, &biases, &x, m, n, k, group_size as u32)
-    else {
+    let expected = cpu_qmv_bf16(AffineMatmul {
+        packed: &packed,
+        scales: &scales,
+        biases: &biases,
+        x: &x,
+        m,
+        n,
+        k,
+        group_size,
+    });
+    let Some(metal) = run_qmv_bf16(AffineMatmul {
+        packed: &packed,
+        scales: &scales,
+        biases: &biases,
+        x: &x,
+        m,
+        n,
+        k,
+        group_size,
+    }) else {
         eprintln!("skipping: no Metal 4 GPU");
         return;
     };
@@ -619,9 +698,26 @@ fn affine_qmv_fast_b4_bf16_llama_3_2_1b_gate_up_shape() {
     let k = 2048;
     let group_size = 64usize;
     let (packed, scales, biases, x) = make_inputs_bf16(0x11D_u64, n, k, m, group_size);
-    let expected = cpu_qmv_bf16(&packed, &scales, &biases, &x, m, n, k, group_size);
-    let Some(metal) = run_qmv_bf16(&packed, &scales, &biases, &x, m, n, k, group_size as u32)
-    else {
+    let expected = cpu_qmv_bf16(AffineMatmul {
+        packed: &packed,
+        scales: &scales,
+        biases: &biases,
+        x: &x,
+        m,
+        n,
+        k,
+        group_size,
+    });
+    let Some(metal) = run_qmv_bf16(AffineMatmul {
+        packed: &packed,
+        scales: &scales,
+        biases: &biases,
+        x: &x,
+        m,
+        n,
+        k,
+        group_size,
+    }) else {
         eprintln!("skipping: no Metal 4 GPU");
         return;
     };
@@ -644,9 +740,26 @@ fn affine_qmv_fast_b4_bf16_llama_3_2_1b_down_proj_shape() {
     let k = 8192;
     let group_size = 64usize;
     let (packed, scales, biases, x) = make_inputs_bf16(0x11E_u64, n, k, m, group_size);
-    let expected = cpu_qmv_bf16(&packed, &scales, &biases, &x, m, n, k, group_size);
-    let Some(metal) = run_qmv_bf16(&packed, &scales, &biases, &x, m, n, k, group_size as u32)
-    else {
+    let expected = cpu_qmv_bf16(AffineMatmul {
+        packed: &packed,
+        scales: &scales,
+        biases: &biases,
+        x: &x,
+        m,
+        n,
+        k,
+        group_size,
+    });
+    let Some(metal) = run_qmv_bf16(AffineMatmul {
+        packed: &packed,
+        scales: &scales,
+        biases: &biases,
+        x: &x,
+        m,
+        n,
+        k,
+        group_size,
+    }) else {
         eprintln!("skipping: no Metal 4 GPU");
         return;
     };
@@ -673,10 +786,26 @@ fn affine_qmv_fast_b4_bf16_finishes_a_partial_block() {
             }
             let seed = 0xF457_u64 ^ (k as u64) << 8 ^ group_size as u64;
             let (packed, scales, biases, x) = make_inputs_bf16(seed, n, k, m, group_size);
-            let expected = cpu_qmv_bf16(&packed, &scales, &biases, &x, m, n, k, group_size);
-            let Some(metal) =
-                run_qmv_bf16(&packed, &scales, &biases, &x, m, n, k, group_size as u32)
-            else {
+            let expected = cpu_qmv_bf16(AffineMatmul {
+                packed: &packed,
+                scales: &scales,
+                biases: &biases,
+                x: &x,
+                m,
+                n,
+                k,
+                group_size,
+            });
+            let Some(metal) = run_qmv_bf16(AffineMatmul {
+                packed: &packed,
+                scales: &scales,
+                biases: &biases,
+                x: &x,
+                m,
+                n,
+                k,
+                group_size,
+            }) else {
                 eprintln!("skipping: no Metal 4 GPU");
                 return;
             };
@@ -706,9 +835,26 @@ fn affine_qmv_generic_b4_bf16_matches_cpu_reference() {
     for &group_size in &[32usize, 64, 128] {
         let (packed, scales, biases, x) =
             make_inputs_bf16(0xFACE_u64 ^ group_size as u64, n, k, m, group_size);
-        let expected = cpu_qmv_bf16(&packed, &scales, &biases, &x, m, n, k, group_size);
-        let Some(metal) = run_qmv_bf16(&packed, &scales, &biases, &x, m, n, k, group_size as u32)
-        else {
+        let expected = cpu_qmv_bf16(AffineMatmul {
+            packed: &packed,
+            scales: &scales,
+            biases: &biases,
+            x: &x,
+            m,
+            n,
+            k,
+            group_size,
+        });
+        let Some(metal) = run_qmv_bf16(AffineMatmul {
+            packed: &packed,
+            scales: &scales,
+            biases: &biases,
+            x: &x,
+            m,
+            n,
+            k,
+            group_size,
+        }) else {
             eprintln!("skipping: no Metal 4 GPU");
             return;
         };
@@ -744,10 +890,26 @@ fn affine_qmv_tiny_b4_bf16_matches_cpu_reference() {
             }
             let seed = 0x71DE_u64 ^ (n as u64) << 12 ^ (k as u64) << 4 ^ group_size as u64;
             let (packed, scales, biases, x) = make_inputs_bf16(seed, n, k, m, group_size);
-            let expected = cpu_qmv_bf16(&packed, &scales, &biases, &x, m, n, k, group_size);
-            let Some(metal) =
-                run_qmv_bf16(&packed, &scales, &biases, &x, m, n, k, group_size as u32)
-            else {
+            let expected = cpu_qmv_bf16(AffineMatmul {
+                packed: &packed,
+                scales: &scales,
+                biases: &biases,
+                x: &x,
+                m,
+                n,
+                k,
+                group_size,
+            });
+            let Some(metal) = run_qmv_bf16(AffineMatmul {
+                packed: &packed,
+                scales: &scales,
+                biases: &biases,
+                x: &x,
+                m,
+                n,
+                k,
+                group_size,
+            }) else {
                 eprintln!("skipping: no Metal 4 GPU");
                 return;
             };
@@ -797,17 +959,18 @@ fn make_inputs_bf16_s_bf16(
     (packed, scales, biases, x)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn run_qmv_bf16_s_bf16(
-    packed: &[u8],
-    scales: &[half::bf16],
-    biases: &[half::bf16],
-    x: &[half::bf16],
-    m: usize,
-    n: usize,
-    k: usize,
-    group_size: u32,
-) -> Option<Vec<half::bf16>> {
+fn run_qmv_bf16_s_bf16(mm: AffineMatmul<'_, half::bf16, half::bf16>) -> Option<Vec<half::bf16>> {
+    let AffineMatmul {
+        packed,
+        scales,
+        biases,
+        x,
+        m,
+        n,
+        k,
+        group_size,
+    } = mm;
+    let group_size = group_size as u32;
     let device = detect_device()?.device;
     let packed_buf = buffer_from_bytes(&device, packed);
     let scales_bytes: &[u8] = unsafe {
@@ -825,14 +988,14 @@ fn run_qmv_bf16_s_bf16(
     let y_buf = zeroed_buffer(&device, n_out * std::mem::size_of::<half::bf16>());
     if !dispatch_qmv(
         &device,
-        &packed_buf,
-        &scales_buf,
-        &biases_buf,
-        &x_buf,
-        &y_buf,
-        m,
-        n,
-        k,
+        QmvBuffers {
+            packed_buf: &packed_buf,
+            scales_buf: &scales_buf,
+            biases_buf: &biases_buf,
+            x_buf: &x_buf,
+            y_buf: &y_buf,
+        },
+        (m, n, k),
         group_size,
         ScaleDtype::Bf16,
         AffineCodes::AsWritten,
@@ -852,12 +1015,27 @@ fn affine_qmv_quad_b4_bf16_s_bf16_matches_cpu_reference() {
     for &group_size in &[32usize, 64, 128] {
         let (packed, scales, biases, x) =
             make_inputs_bf16_s_bf16(0xC0DE_u64 ^ group_size as u64, n, k, m, group_size);
-        let expected = scratchy_target_metal::cpu_reference::affine_qmv_b4_bf16_s_bf16(
-            &packed, &scales, &biases, &x, m, n, k, group_size,
-        );
-        let Some(metal) =
-            run_qmv_bf16_s_bf16(&packed, &scales, &biases, &x, m, n, k, group_size as u32)
-        else {
+        let expected =
+            scratchy_target_metal::cpu_reference::affine_qmv_b4_bf16_s_bf16(AffineMatmul {
+                packed: &packed,
+                scales: &scales,
+                biases: &biases,
+                x: &x,
+                m,
+                n,
+                k,
+                group_size,
+            });
+        let Some(metal) = run_qmv_bf16_s_bf16(AffineMatmul {
+            packed: &packed,
+            scales: &scales,
+            biases: &biases,
+            x: &x,
+            m,
+            n,
+            k,
+            group_size,
+        }) else {
             eprintln!("skipping: no Metal 4 GPU");
             return;
         };
@@ -879,12 +1057,27 @@ fn affine_qmv_fast_b4_bf16_s_bf16_matches_cpu_reference() {
     for &group_size in &[32usize, 64, 128] {
         let (packed, scales, biases, x) =
             make_inputs_bf16_s_bf16(0xBEEF_u64 ^ group_size as u64, n, k, m, group_size);
-        let expected = scratchy_target_metal::cpu_reference::affine_qmv_b4_bf16_s_bf16(
-            &packed, &scales, &biases, &x, m, n, k, group_size,
-        );
-        let Some(metal) =
-            run_qmv_bf16_s_bf16(&packed, &scales, &biases, &x, m, n, k, group_size as u32)
-        else {
+        let expected =
+            scratchy_target_metal::cpu_reference::affine_qmv_b4_bf16_s_bf16(AffineMatmul {
+                packed: &packed,
+                scales: &scales,
+                biases: &biases,
+                x: &x,
+                m,
+                n,
+                k,
+                group_size,
+            });
+        let Some(metal) = run_qmv_bf16_s_bf16(AffineMatmul {
+            packed: &packed,
+            scales: &scales,
+            biases: &biases,
+            x: &x,
+            m,
+            n,
+            k,
+            group_size,
+        }) else {
             eprintln!("skipping: no Metal 4 GPU");
             return;
         };
@@ -906,12 +1099,27 @@ fn affine_qmv_generic_b4_bf16_s_bf16_matches_cpu_reference() {
     for &group_size in &[32usize, 64, 128] {
         let (packed, scales, biases, x) =
             make_inputs_bf16_s_bf16(0xFACE_u64 ^ group_size as u64, n, k, m, group_size);
-        let expected = scratchy_target_metal::cpu_reference::affine_qmv_b4_bf16_s_bf16(
-            &packed, &scales, &biases, &x, m, n, k, group_size,
-        );
-        let Some(metal) =
-            run_qmv_bf16_s_bf16(&packed, &scales, &biases, &x, m, n, k, group_size as u32)
-        else {
+        let expected =
+            scratchy_target_metal::cpu_reference::affine_qmv_b4_bf16_s_bf16(AffineMatmul {
+                packed: &packed,
+                scales: &scales,
+                biases: &biases,
+                x: &x,
+                m,
+                n,
+                k,
+                group_size,
+            });
+        let Some(metal) = run_qmv_bf16_s_bf16(AffineMatmul {
+            packed: &packed,
+            scales: &scales,
+            biases: &biases,
+            x: &x,
+            m,
+            n,
+            k,
+            group_size,
+        }) else {
             eprintln!("skipping: no Metal 4 GPU");
             return;
         };
@@ -946,15 +1154,28 @@ fn affine_qmv_wide_b4_bf16_matches_cpu_reference_at_every_group_size() {
             );
             let (packed, scales, biases, x) =
                 make_inputs_bf16(0x51DE ^ (group_size * 16 + m) as u64, n, k, m, group_size);
-            let expected = cpu_qmv_bf16(&packed, &scales, &biases, &x, m, n, k, group_size);
+            let expected = cpu_qmv_bf16(AffineMatmul {
+                packed: &packed,
+                scales: &scales,
+                biases: &biases,
+                x: &x,
+                m,
+                n,
+                k,
+                group_size,
+            });
             let run = |packed: &[u8], codes| {
                 run_qmv_bf16_codes(
-                    packed,
-                    &scales,
-                    &biases,
-                    &x,
-                    (m, n, k),
-                    group_size as u32,
+                    AffineMatmul {
+                        packed,
+                        scales: &scales,
+                        biases: &biases,
+                        x: &x,
+                        m,
+                        n,
+                        k,
+                        group_size,
+                    },
                     codes,
                     /*wide_ok=*/ true,
                 )
@@ -998,15 +1219,28 @@ fn affine_qmv_fast_fold_b4_bf16_matches_cpu_reference() {
             );
             let (packed, scales, biases, x) =
                 make_inputs_bf16(0xF01D ^ (group_size * 16 + m) as u64, n, k, m, group_size);
-            let expected = cpu_qmv_bf16(&packed, &scales, &biases, &x, m, n, k, group_size);
+            let expected = cpu_qmv_bf16(AffineMatmul {
+                packed: &packed,
+                scales: &scales,
+                biases: &biases,
+                x: &x,
+                m,
+                n,
+                k,
+                group_size,
+            });
             let run = |packed: &[u8], codes| {
                 run_qmv_bf16_codes(
-                    packed,
-                    &scales,
-                    &biases,
-                    &x,
-                    (m, n, k),
-                    group_size as u32,
+                    AffineMatmul {
+                        packed,
+                        scales: &scales,
+                        biases: &biases,
+                        x: &x,
+                        m,
+                        n,
+                        k,
+                        group_size,
+                    },
                     codes,
                     /*wide_ok=*/ false,
                 )
@@ -1043,12 +1277,16 @@ fn affine_qmv_b4_offset8_codes_match_as_written() {
         let (packed, scales, biases, x) = make_inputs_bf16(0x0FF5E7 ^ k as u64, n, k, m, 64);
         let run = |packed: &[u8], codes| {
             run_qmv_bf16_codes(
-                packed,
-                &scales,
-                &biases,
-                &x,
-                (m, n, k),
-                64,
+                AffineMatmul {
+                    packed,
+                    scales: &scales,
+                    biases: &biases,
+                    x: &x,
+                    m,
+                    n,
+                    k,
+                    group_size: 64,
+                },
                 codes,
                 /*wide_ok=*/ true,
             )
@@ -1151,7 +1389,16 @@ fn a_narrow_projection_fast_matvec_row_is_the_one_row_bits() {
             .collect()
     };
     let alone: Vec<u16> = (0..m_max).flat_map(|r| run_fast(r, 1)).collect();
-    let expected = cpu_qmv_bf16(&packed, &scales, &biases, &x, m_max, n, k, gs);
+    let expected = cpu_qmv_bf16(AffineMatmul {
+        packed: &packed,
+        scales: &scales,
+        biases: &biases,
+        x: &x,
+        m: m_max,
+        n,
+        k,
+        group_size: gs,
+    });
     for m in [2usize, 4, 8, 13, 16, 27, 32, 45, 64] {
         assert!(
             narrow_matvec(n as u32, k as u32, 4, m as u32),

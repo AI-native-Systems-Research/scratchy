@@ -14,7 +14,7 @@ use half::{bf16, f16};
 use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions, MTLSize};
 use scratchy_target_metal::aot::baked_build;
 use scratchy_target_metal::detect_device;
-use scratchy_target_metal::mtl4_dispatch::Mtl4DispatchBatch;
+use scratchy_target_metal::mtl4_dispatch::{Mtl4DispatchBatch, ThreadgroupGrid};
 use scratchy_target_metal::specialized_pipeline_cache::{
     ComputePipelineState, ConstantValue, PipelineKey, SpecializedPipelineCache,
 };
@@ -226,20 +226,60 @@ fn run(r: &Rig, c: &Case, i: &Inputs, how: How) -> Vec<u16> {
     match how {
         How::Normed => {
             let binds = [(&y, 0), (&x, 1), (&w, 2), (&g, 3)];
-            batch.encode(&r.normed, &binds, &[], &[], &[], groups, threads);
+            batch.encode(
+                &r.normed,
+                &binds,
+                &[],
+                &[],
+                &[],
+                ThreadgroupGrid {
+                    threadgroups: groups,
+                    threads_per_threadgroup: threads,
+                },
+            );
         }
         How::Plain => {
             let binds = [(&y, 0), (&x, 1), (&w, 2)];
-            batch.encode(&r.plain, &binds, &[], &[], &[], groups, threads);
+            batch.encode(
+                &r.plain,
+                &binds,
+                &[],
+                &[],
+                &[],
+                ThreadgroupGrid {
+                    threadgroups: groups,
+                    threads_per_threadgroup: threads,
+                },
+            );
         }
         How::NormThenPlain => {
             let binds = [(&normed_row, 0), (&x, 1), (&g, 2)];
             let one = size((1, 1, 1));
             let norm_threads = size((NORM_THREADS as usize, 1, 1));
-            batch.encode(&r.norm, &binds, &[], &[], &[], one, norm_threads);
+            batch.encode(
+                &r.norm,
+                &binds,
+                &[],
+                &[],
+                &[],
+                ThreadgroupGrid {
+                    threadgroups: one,
+                    threads_per_threadgroup: norm_threads,
+                },
+            );
             batch.barrier();
             let binds = [(&y, 0), (&normed_row, 1), (&w, 2)];
-            batch.encode(&r.plain, &binds, &[], &[], &[], groups, threads);
+            batch.encode(
+                &r.plain,
+                &binds,
+                &[],
+                &[],
+                &[],
+                ThreadgroupGrid {
+                    threadgroups: groups,
+                    threads_per_threadgroup: threads,
+                },
+            );
         }
     }
     batch.commit(true);

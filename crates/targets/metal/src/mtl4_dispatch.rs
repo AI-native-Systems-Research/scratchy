@@ -347,6 +347,13 @@ pub fn build_arg_table(
     table
 }
 
+/// A dispatch's grid: its threadgroups, and the threads in each.
+#[derive(Clone, Copy, Debug)]
+pub struct ThreadgroupGrid {
+    pub threadgroups: MTLSize,
+    pub threads_per_threadgroup: MTLSize,
+}
+
 /// A single MTL4 command buffer + residency set carrying N argument-table
 /// dispatches — the production-path replacement for a classic
 /// `queue.commandBuffer()` + `MTLComputeCommandEncoder`.
@@ -442,7 +449,6 @@ impl Mtl4DispatchBatch {
     /// * `extra_resident`: buffers the kernel dereferences via a stored
     ///   `gpuAddress` (e.g. the paged chunk-data buffers) — made resident but
     ///   NOT bound in the argument table.
-    #[allow(clippy::too_many_arguments)]
     pub fn encode(
         &mut self,
         pso: &Pipeline,
@@ -450,9 +456,12 @@ impl Mtl4DispatchBatch {
         u32_scalars: &[(u32, usize)],
         f32_scalars: &[(f32, usize)],
         extra_resident: &[&Buffer],
-        threadgroups: MTLSize,
-        threads_per_threadgroup: MTLSize,
+        grid: ThreadgroupGrid,
     ) {
+        let ThreadgroupGrid {
+            threadgroups,
+            threads_per_threadgroup,
+        } = grid;
         let mut binds: Vec<(u64, usize)> =
             Vec::with_capacity(buffer_bindings.len() + u32_scalars.len() + f32_scalars.len());
         for &(b, i) in buffer_bindings {

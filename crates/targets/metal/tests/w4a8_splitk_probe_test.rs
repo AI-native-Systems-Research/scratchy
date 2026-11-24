@@ -12,13 +12,13 @@
 //! Run: cargo test -p scratchy-target-metal --release --test w4a8_splitk_probe_test -- \
 //!     --ignored --nocapture
 
-mod common;
-
 use half::bf16;
 use objc2_metal::MTLSize;
 use scratchy_target_metal::aot::baked_build;
 use scratchy_target_metal::detect_device;
-use scratchy_target_metal::mtl4_dispatch::{Mtl4DispatchBatch, shared_slice, shared_zeroed};
+use scratchy_target_metal::mtl4_dispatch::{
+    Mtl4DispatchBatch, ThreadgroupGrid, shared_slice, shared_zeroed,
+};
 use scratchy_target_metal::specialized_pipeline_cache::{
     ConstantValue, PipelineKey, SpecializedPipelineCache,
 };
@@ -159,8 +159,10 @@ fn w4a8_against_split_k_at_qwen38_27b_shapes() {
                         &[],
                         &[],
                         &[],
-                        size(n / tn, m.div_ceil(W4A8_TILE_ROWS)),
-                        size(32 * sgs, 1),
+                        ThreadgroupGrid {
+                            threadgroups: size(n / tn, m.div_ceil(W4A8_TILE_ROWS)),
+                            threads_per_threadgroup: size(32 * sgs, 1),
+                        },
                     );
                     batch.barrier();
                 }

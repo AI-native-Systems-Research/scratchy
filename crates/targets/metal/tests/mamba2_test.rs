@@ -25,7 +25,7 @@ use scratchy_state_decoder_gdn::pool::{GdnSave, GdnSeqSlots, GdnSlot};
 use scratchy_target_metal::aot::baked_build;
 use scratchy_target_metal::detect_device;
 use scratchy_target_metal::gdn_state::GDN_SSM_STATE_DTYPE;
-use scratchy_target_metal::mtl4_dispatch::Mtl4DispatchBatch;
+use scratchy_target_metal::mtl4_dispatch::{Mtl4DispatchBatch, ThreadgroupGrid};
 use scratchy_target_metal::specialized_pipeline_cache::{
     ConstantValue, PipelineKey, SpecializedPipelineCache,
 };
@@ -395,8 +395,10 @@ impl Gpu {
             &[],
             &[],
             &[],
-            size(num_seqs, conv_dim.div_ceil(tg_y), tokens.div_ceil(3)),
-            size(1, tg_y, 1),
+            ThreadgroupGrid {
+                threadgroups: size(num_seqs, conv_dim.div_ceil(tg_y), tokens.div_ceil(3)),
+                threads_per_threadgroup: size(1, tg_y, 1),
+            },
         );
         batch.barrier();
         let scan_constants = || {
@@ -427,8 +429,10 @@ impl Gpu {
                 &[],
                 &[],
                 &[],
-                size(geo.heads * geo.head_dim / 32, 1, num_seqs),
-                size(128, 1, 1),
+                ThreadgroupGrid {
+                    threadgroups: size(geo.heads * geo.head_dim / 32, 1, num_seqs),
+                    threads_per_threadgroup: size(128, 1, 1),
+                },
             );
         } else if geo.simd() {
             let mut c = scan_constants();
@@ -444,8 +448,10 @@ impl Gpu {
                 &[],
                 &[],
                 &[],
-                size(1, geo.heads * geo.head_dim / 4, num_seqs),
-                size(32, 4, 1),
+                ThreadgroupGrid {
+                    threadgroups: size(1, geo.heads * geo.head_dim / 4, num_seqs),
+                    threads_per_threadgroup: size(32, 4, 1),
+                },
             );
         } else {
             let mut c = vec![
@@ -468,8 +474,10 @@ impl Gpu {
                 &[],
                 &[],
                 &[],
-                size((tokens * geo.heads).div_ceil(THREADS), 1, 1),
-                size(THREADS, 1, 1),
+                ThreadgroupGrid {
+                    threadgroups: size((tokens * geo.heads).div_ceil(THREADS), 1, 1),
+                    threads_per_threadgroup: size(THREADS, 1, 1),
+                },
             );
             batch.barrier();
             let scan = self.key("gdn_scan_varlen", "gdn_scan_varlen_f32", scan_constants());
@@ -483,8 +491,10 @@ impl Gpu {
                 &[],
                 &[],
                 &[],
-                size(geo.head_dim.div_ceil(tgx), geo.heads, num_seqs),
-                size(tgx, 1, 1),
+                ThreadgroupGrid {
+                    threadgroups: size(geo.head_dim.div_ceil(tgx), geo.heads, num_seqs),
+                    threads_per_threadgroup: size(tgx, 1, 1),
+                },
             );
         }
         batch.barrier();
@@ -507,8 +517,10 @@ impl Gpu {
             &[],
             &[],
             &[],
-            size(tokens * geo.groups, 1, 1),
-            size(width.next_power_of_two().min(THREADS), 1, 1),
+            ThreadgroupGrid {
+                threadgroups: size(tokens * geo.groups, 1, 1),
+                threads_per_threadgroup: size(width.next_power_of_two().min(THREADS), 1, 1),
+            },
         );
         batch.commit(true);
         Some(dtype.decode(&out, tokens * inner))
@@ -875,8 +887,10 @@ fn mamba2_gate_before_norm_matches_reference() {
                 &[],
                 &[],
                 &[],
-                size(tokens * groups, 1, 1),
-                size(width.next_power_of_two().min(THREADS), 1, 1),
+                ThreadgroupGrid {
+                    threadgroups: size(tokens * groups, 1, 1),
+                    threads_per_threadgroup: size(width.next_power_of_two().min(THREADS), 1, 1),
+                },
             );
             batch.commit(true);
             let got = dtype.decode(&out, tokens * inner);

@@ -10,7 +10,7 @@ use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions, MTLSize};
 use scratchy_subtile::subtile_ir::ExpertBody;
 use scratchy_target_metal::aot::baked_build;
 use scratchy_target_metal::detect_device;
-use scratchy_target_metal::mtl4_dispatch::Mtl4DispatchBatch;
+use scratchy_target_metal::mtl4_dispatch::{Mtl4DispatchBatch, ThreadgroupGrid};
 use scratchy_target_metal::specialized_pipeline_cache::{
     ConstantValue, PipelineKey, SpecializedPipelineCache,
 };
@@ -214,7 +214,17 @@ fn run(c: Case) -> Option<(Vec<u16>, Vec<u16>)> {
             tg(1, groups as usize),
             tg(lanes as usize, simdgroups as usize),
         );
-        batch.encode(&matvec, &binds, &[], &[], &[], grid, threads);
+        batch.encode(
+            &matvec,
+            &binds,
+            &[],
+            &[],
+            &[],
+            ThreadgroupGrid {
+                threadgroups: grid,
+                threads_per_threadgroup: threads,
+            },
+        );
     }
     batch.barrier();
     let binds = [(&unfused, 0), (&gate_y, 1), (&up_y, 2)];
@@ -224,8 +234,10 @@ fn run(c: Case) -> Option<(Vec<u16>, Vec<u16>)> {
         &[],
         &[],
         &[],
-        tg(c.n.div_ceil(256), 1),
-        tg(256, 1),
+        ThreadgroupGrid {
+            threadgroups: tg(c.n.div_ceil(256), 1),
+            threads_per_threadgroup: tg(256, 1),
+        },
     );
     let binds = [
         (&gate.w, 0),
@@ -238,7 +250,17 @@ fn run(c: Case) -> Option<(Vec<u16>, Vec<u16>)> {
         (&up.biases, 7),
     ];
     let rows = gated_tile_rows(c.fast()) as usize;
-    batch.encode(&fused, &binds, &[], &[], &[], tg(1, c.n / rows), tg(32, 4));
+    batch.encode(
+        &fused,
+        &binds,
+        &[],
+        &[],
+        &[],
+        ThreadgroupGrid {
+            threadgroups: tg(1, c.n / rows),
+            threads_per_threadgroup: tg(32, 4),
+        },
+    );
     batch.commit(true);
     Some((read_u16(&out, c.n), read_u16(&unfused, c.n)))
 }

@@ -18,9 +18,10 @@ use half::{bf16, f16};
 use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions, MTLSize};
 use scratchy_subtile::subtile_ir::ExpertBody;
 use scratchy_target_metal::aot::baked_build;
+use scratchy_target_metal::cpu_reference::AffineMatmul;
 use scratchy_target_metal::cpu_reference::affine_qmv_b3_bf16_s_bf16;
 use scratchy_target_metal::detect_device;
-use scratchy_target_metal::mtl4_dispatch::Mtl4DispatchBatch;
+use scratchy_target_metal::mtl4_dispatch::{Mtl4DispatchBatch, ThreadgroupGrid};
 use scratchy_target_metal::specialized_pipeline_cache::{
     ConstantValue, PipelineKey, SpecializedPipelineCache,
 };
@@ -321,7 +322,17 @@ fn matvec(r: &Rig, c: &Case, w: &Weights, rows: &Rows<'_>, y0: &[u16], how: How)
             (gain, 15),
             (bias, 16),
         ];
-        batch.encode(pso, &binds, &[], &[], &[], size(grid), size(threads));
+        batch.encode(
+            pso,
+            &binds,
+            &[],
+            &[],
+            &[],
+            ThreadgroupGrid {
+                threadgroups: size(grid),
+                threads_per_threadgroup: size(threads),
+            },
+        );
     };
     match how {
         How::Plain => qmv(&mut batch, &r.plain, x),
@@ -337,8 +348,10 @@ fn matvec(r: &Rig, c: &Case, w: &Weights, rows: &Rows<'_>, y0: &[u16], how: How)
                 &[],
                 &[],
                 &[],
-                size(one),
-                size((norm_threads(QSize(c.k as u32)), 1, 1)),
+                ThreadgroupGrid {
+                    threadgroups: size(one),
+                    threads_per_threadgroup: size((norm_threads(QSize(c.k as u32)), 1, 1)),
+                },
             );
             batch.barrier();
             qmv(&mut batch, &r.plain, &normed_row);
@@ -504,7 +517,17 @@ fn a_normalizing_wide_matvec_is_as_close_to_the_exact_normed_product_on_every_ro
                     (&gb, 15),
                     (&gb, 16),
                 ];
-                batch.encode(pso, &binds, &[], &[], &[], size(grid), size(threads));
+                batch.encode(
+                    pso,
+                    &binds,
+                    &[],
+                    &[],
+                    &[],
+                    ThreadgroupGrid {
+                        threadgroups: size(grid),
+                        threads_per_threadgroup: size(threads),
+                    },
+                );
                 batch.commit(true);
                 read_u16(&y, m * c.n)
             };
@@ -636,8 +659,10 @@ fn a_normalizing_gated_matvec_is_as_close_as_the_norm_then_gated_matvec() {
                 &[],
                 &[],
                 &[],
-                size((1, 1, 1)),
-                size((norm_threads(QSize(c.k as u32)), 1, 1)),
+                ThreadgroupGrid {
+                    threadgroups: size((1, 1, 1)),
+                    threads_per_threadgroup: size((norm_threads(QSize(c.k as u32)), 1, 1)),
+                },
             );
             batch.barrier();
         }
@@ -658,8 +683,10 @@ fn a_normalizing_gated_matvec_is_as_close_as_the_norm_then_gated_matvec() {
             &[],
             &[],
             &[],
-            size((1, c.n as u32 / gated_tile_rows(true), 1)),
-            size((32, 4, 1)),
+            ThreadgroupGrid {
+                threadgroups: size((1, c.n as u32 / gated_tile_rows(true), 1)),
+                threads_per_threadgroup: size((32, 4, 1)),
+            },
         );
         batch.commit(true);
         read_u16(&y, c.n)
@@ -750,7 +777,16 @@ fn a_b3_normed_biased_matvec_matches_the_reference_at_glm_decode_shapes() {
             .map(|i| bf16::from_f32(xf[i] * inv * gainf[i]))
             .collect();
 
-        let want = affine_qmv_b3_bf16_s_bf16(&packed, &scales, &biases, &xn, 1, n, k, group_size);
+        let want = affine_qmv_b3_bf16_s_bf16(AffineMatmul {
+            packed: &packed,
+            scales: &scales,
+            biases: &biases,
+            x: &xn,
+            m: 1,
+            n,
+            k,
+            group_size,
+        });
 
         // Dispatch with the M1 binding layout: w/scales/biases at 0/1/2,
         // x at 3, y at 4, gain at 15, linear bias at 16.
@@ -776,7 +812,17 @@ fn a_b3_normed_biased_matvec_matches_the_reference_at_glm_decode_shapes() {
             (&gb, 15),
             (&lb, 16),
         ];
-        batch.encode(&pso, &binds, &[], &[], &[], size(grid), size(threads));
+        batch.encode(
+            &pso,
+            &binds,
+            &[],
+            &[],
+            &[],
+            ThreadgroupGrid {
+                threadgroups: size(grid),
+                threads_per_threadgroup: size(threads),
+            },
+        );
         batch.commit(true);
 
         // Compare: the reference IS the biased output (the CPU fn has no
@@ -887,7 +933,16 @@ fn a_b3_normed_residual_matvec_matches_the_reference_at_glm_o_proj_shape() {
     let xn: Vec<bf16> = (0..k)
         .map(|i| bf16::from_f32(xf[i] * inv * gainf[i]))
         .collect();
-    let want = affine_qmv_b3_bf16_s_bf16(&packed, &scales, &biases, &xn, 1, n, k, group_size);
+    let want = affine_qmv_b3_bf16_s_bf16(AffineMatmul {
+        packed: &packed,
+        scales: &scales,
+        biases: &biases,
+        x: &xn,
+        m: 1,
+        n,
+        k,
+        group_size,
+    });
 
     let (wb, sb, bb) = (
         shared(&r.device, &packed),
@@ -912,7 +967,17 @@ fn a_b3_normed_residual_matvec_matches_the_reference_at_glm_o_proj_shape() {
         (&gb, 15),
         (&lb, 16),
     ];
-    batch.encode(&pso, &binds, &[], &[], &[], size(grid), size(threads));
+    batch.encode(
+        &pso,
+        &binds,
+        &[],
+        &[],
+        &[],
+        ThreadgroupGrid {
+            threadgroups: size(grid),
+            threads_per_threadgroup: size(threads),
+        },
+    );
     batch.commit(true);
 
     let got = read_u16(&y, n);
@@ -1007,10 +1072,26 @@ fn a_b3_gated_matvec_matches_the_reference_at_glm_shared_expert_shapes() {
         let xn: Vec<bf16> = (0..k)
             .map(|i| bf16::from_f32(xf[i] * inv * gainf[i]))
             .collect();
-        let g =
-            affine_qmv_b3_bf16_s_bf16(&g_packed, &g_scales, &g_biases, &xn, 1, n, k, group_size);
-        let u =
-            affine_qmv_b3_bf16_s_bf16(&u_packed, &u_scales, &u_biases, &xn, 1, n, k, group_size);
+        let g = affine_qmv_b3_bf16_s_bf16(AffineMatmul {
+            packed: &g_packed,
+            scales: &g_scales,
+            biases: &g_biases,
+            x: &xn,
+            m: 1,
+            n,
+            k,
+            group_size,
+        });
+        let u = affine_qmv_b3_bf16_s_bf16(AffineMatmul {
+            packed: &u_packed,
+            scales: &u_scales,
+            biases: &u_biases,
+            x: &xn,
+            m: 1,
+            n,
+            k,
+            group_size,
+        });
 
         let (gw, gs, gb) = (
             shared(&r.device, &g_packed),
@@ -1044,8 +1125,10 @@ fn a_b3_gated_matvec_matches_the_reference_at_glm_shared_expert_shapes() {
             &[],
             &[],
             &[],
-            size((1, n as u32 / gated_tile_rows(true), 1)),
-            size((32, 4, 1)),
+            ThreadgroupGrid {
+                threadgroups: size((1, n as u32 / gated_tile_rows(true), 1)),
+                threads_per_threadgroup: size((32, 4, 1)),
+            },
         );
         batch.commit(true);
 

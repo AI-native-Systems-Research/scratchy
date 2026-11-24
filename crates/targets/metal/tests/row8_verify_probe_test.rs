@@ -14,13 +14,13 @@
 //! Run: cargo test -p scratchy-target-metal --release --test row8_verify_probe_test -- \
 //!     --ignored --nocapture
 
-mod common;
-
 use half::bf16;
 use objc2_metal::MTLSize;
 use scratchy_target_metal::aot::baked_build;
 use scratchy_target_metal::detect_device;
-use scratchy_target_metal::mtl4_dispatch::{Mtl4DispatchBatch, shared_slice, shared_zeroed};
+use scratchy_target_metal::mtl4_dispatch::{
+    Mtl4DispatchBatch, ThreadgroupGrid, shared_slice, shared_zeroed,
+};
 use scratchy_target_metal::specialized_pipeline_cache::{
     ConstantValue, PipelineKey, SpecializedPipelineCache,
 };
@@ -228,8 +228,10 @@ fn small_m_steps_in_the_eight_row_bucket_at_qwen38_27b_shapes() {
                             &[],
                             &[],
                             &[],
-                            size(grid.0, grid.1),
-                            size(threads.0, threads.1),
+                            ThreadgroupGrid {
+                                threadgroups: size(grid.0, grid.1),
+                                threads_per_threadgroup: size(threads.0, threads.1),
+                            },
                         ),
                         Run::Pair {
                             quant,
@@ -243,8 +245,10 @@ fn small_m_steps_in_the_eight_row_bucket_at_qwen38_27b_shapes() {
                                 &[],
                                 &[],
                                 &[],
-                                size((k / 64).div_ceil(16), live),
-                                size(128, 1),
+                                ThreadgroupGrid {
+                                    threadgroups: size((k / 64).div_ceil(16), live),
+                                    threads_per_threadgroup: size(128, 1),
+                                },
                             );
                             batch.barrier();
                             batch.encode(
@@ -253,8 +257,10 @@ fn small_m_steps_in_the_eight_row_bucket_at_qwen38_27b_shapes() {
                                 &[],
                                 &[],
                                 &[],
-                                size(grid.0, grid.1),
-                                size(*threads, 1),
+                                ThreadgroupGrid {
+                                    threadgroups: size(grid.0, grid.1),
+                                    threads_per_threadgroup: size(*threads, 1),
+                                },
                             );
                         }
                     }

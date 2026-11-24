@@ -1339,20 +1339,28 @@ mod tests {
         let mut kv_k_cpu = vec![0.0_f32; num_blocks * num_kv * block_size * head_dim];
         let mut kv_v_cpu = vec![0.0_f32; num_blocks * num_kv * block_size * head_dim];
         cpu_golden::rope_append(
-            &q_data,
-            &k_data,
-            &v_data,
+            cpu_golden::QkvRows {
+                q: &q_data,
+                k: &k_data,
+                v: &v_data,
+            },
             &positions,
             &slot_mapping,
-            &cos_table,
-            &sin_table,
+            cpu_golden::RopeTables {
+                cos: &cos_table,
+                sin: &sin_table,
+            },
             &mut q_out_cpu,
-            &mut kv_k_cpu,
-            &mut kv_v_cpu,
-            num_q,
-            num_kv,
-            head_dim,
-            block_size,
+            cpu_golden::PagedKvMut {
+                k: &mut kv_k_cpu,
+                v: &mut kv_v_cpu,
+                block_size,
+            },
+            cpu_golden::Heads {
+                num_q_heads: num_q,
+                num_kv_heads: num_kv,
+                head_dim,
+            },
         );
 
         // Read back f16 buffers and convert to f32 for comparison.
@@ -1575,20 +1583,28 @@ mod tests {
         let mut kv_k_cpu = vec![0.0_f32; num_blocks * num_kv * block_size * head_dim];
         let mut kv_v_cpu = vec![0.0_f32; num_blocks * num_kv * block_size * head_dim];
         cpu_golden::rope_append(
-            &q_b,
-            &k_b,
-            &v_b,
+            cpu_golden::QkvRows {
+                q: &q_b,
+                k: &k_b,
+                v: &v_b,
+            },
             &positions,
             &slot_mapping,
-            &cos_b,
-            &sin_b,
+            cpu_golden::RopeTables {
+                cos: &cos_b,
+                sin: &sin_b,
+            },
             &mut q_out_cpu,
-            &mut kv_k_cpu,
-            &mut kv_v_cpu,
-            num_q,
-            num_kv,
-            head_dim,
-            block_size,
+            cpu_golden::PagedKvMut {
+                k: &mut kv_k_cpu,
+                v: &mut kv_v_cpu,
+                block_size,
+            },
+            cpu_golden::Heads {
+                num_q_heads: num_q,
+                num_kv_heads: num_kv,
+                head_dim,
+            },
         );
 
         fn read_bf16(buf: &Buffer, n: usize) -> Vec<f32> {
@@ -1797,16 +1813,20 @@ mod tests {
         let mut output_cpu = vec![0.0_f32; q_elems];
         cpu_golden::attention_via_cache(
             &q_b,
-            &kv_k_b,
-            &kv_v_b,
-            &block_table,
+            cpu_golden::PagedKv {
+                k: &kv_k_b,
+                v: &kv_v_b,
+                block_table: &block_table,
+                block_size,
+                max_blocks_per_seq,
+            },
             &seq_used_k,
             &mut output_cpu,
-            num_q,
-            num_kv,
-            head_dim,
-            block_size,
-            max_blocks_per_seq,
+            cpu_golden::Heads {
+                num_q_heads: num_q,
+                num_kv_heads: num_kv,
+                head_dim,
+            },
             Llama32_1BProbe::ATTN_SCALE,
         );
 
@@ -2010,20 +2030,28 @@ mod tests {
         let mut kv_k_cpu = vec![0.0_f32; num_blocks * num_kv * block_size * head_dim];
         let mut kv_v_cpu = vec![0.0_f32; num_blocks * num_kv * block_size * head_dim];
         cpu_golden::rope_append(
-            &q_b,
-            &k_b,
-            &v_b,
+            cpu_golden::QkvRows {
+                q: &q_b,
+                k: &k_b,
+                v: &v_b,
+            },
             &positions,
             &slot_mapping,
-            &cos_b,
-            &sin_b,
+            cpu_golden::RopeTables {
+                cos: &cos_b,
+                sin: &sin_b,
+            },
             &mut q_out_cpu,
-            &mut kv_k_cpu,
-            &mut kv_v_cpu,
-            num_q,
-            num_kv,
-            head_dim,
-            block_size,
+            cpu_golden::PagedKvMut {
+                k: &mut kv_k_cpu,
+                v: &mut kv_v_cpu,
+                block_size,
+            },
+            cpu_golden::Heads {
+                num_q_heads: num_q,
+                num_kv_heads: num_kv,
+                head_dim,
+            },
         );
 
         fn read_bf16(buf: &Buffer, n: usize) -> Vec<f32> {
@@ -2257,16 +2285,20 @@ mod tests {
         let mut output_cpu = vec![0.0_f32; batch * num_q * head_dim];
         cpu_golden::attention_via_cache(
             &q_f16,
-            &kv_k_f16,
-            &kv_v_f16,
-            &block_table,
+            cpu_golden::PagedKv {
+                k: &kv_k_f16,
+                v: &kv_v_f16,
+                block_table: &block_table,
+                block_size,
+                max_blocks_per_seq,
+            },
             &seq_used_k,
             &mut output_cpu,
-            num_q,
-            num_kv,
-            head_dim,
-            block_size,
-            max_blocks_per_seq,
+            cpu_golden::Heads {
+                num_q_heads: num_q,
+                num_kv_heads: num_kv,
+                head_dim,
+            },
             TinyLlamaProbe::ATTN_SCALE,
         );
 
@@ -2455,16 +2487,20 @@ mod tests {
         let mut output_cpu = vec![0.0_f32; batch * num_q * head_dim];
         cpu_golden::attention_via_cache(
             &q_b,
-            &kv_k_b,
-            &kv_v_b,
-            &block_table,
+            cpu_golden::PagedKv {
+                k: &kv_k_b,
+                v: &kv_v_b,
+                block_table: &block_table,
+                block_size,
+                max_blocks_per_seq,
+            },
             &seq_used_k,
             &mut output_cpu,
-            num_q,
-            num_kv,
-            head_dim,
-            block_size,
-            max_blocks_per_seq,
+            cpu_golden::Heads {
+                num_q_heads: num_q,
+                num_kv_heads: num_kv,
+                head_dim,
+            },
             Llama32Probe::ATTN_SCALE,
         );
 
@@ -2665,16 +2701,20 @@ mod tests {
         let mut output_cpu = vec![0.0_f32; batch * num_q * head_dim];
         cpu_golden::attention_via_cache(
             &q_b,
-            &kv_k_b,
-            &kv_v_b,
-            &block_table,
+            cpu_golden::PagedKv {
+                k: &kv_k_b,
+                v: &kv_v_b,
+                block_table: &block_table,
+                block_size,
+                max_blocks_per_seq,
+            },
             &seq_used_k,
             &mut output_cpu,
-            num_q,
-            num_kv,
-            head_dim,
-            block_size,
-            max_blocks_per_seq,
+            cpu_golden::Heads {
+                num_q_heads: num_q,
+                num_kv_heads: num_kv,
+                head_dim,
+            },
             Llama32_1BProbe::ATTN_SCALE,
         );
 
@@ -2872,17 +2912,21 @@ mod tests {
         let mut output_cpu = vec![0.0_f32; bucket_m * num_q * head_dim];
         cpu_golden::attention_prefill_paged(
             &q_bf,
-            &k_cache_bf,
-            &v_cache_bf,
+            cpu_golden::PagedKv {
+                k: &k_cache_bf,
+                v: &v_cache_bf,
+                block_table: &block_table,
+                block_size,
+                max_blocks_per_seq,
+            },
             &mut output_cpu,
             &cu_seqlens_q,
             &seq_used_k,
-            &block_table,
-            num_q,
-            num_kv,
-            head_dim,
-            block_size,
-            max_blocks_per_seq,
+            cpu_golden::Heads {
+                num_q_heads: num_q,
+                num_kv_heads: num_kv,
+                head_dim,
+            },
             Llama32Probe::ATTN_SCALE,
         );
 
@@ -3112,9 +3156,11 @@ mod tests {
             &v_contig,
             &mut output_cpu_real,
             &seq_starts,
-            num_q,
-            num_kv,
-            head_dim,
+            cpu_golden::Heads {
+                num_q_heads: num_q,
+                num_kv_heads: num_kv,
+                head_dim,
+            },
             Llama32Probe::ATTN_SCALE,
         );
 

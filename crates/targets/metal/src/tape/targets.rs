@@ -174,10 +174,9 @@ mod tests {
     use super::*;
 
     #[test]
-    #[allow(clippy::assertions_on_constants)] // deliberate const sanity checks on the profile tables
     fn test_profile_constants() {
         assert_eq!(M1_8CORE.generation, AppleSiliconGen::M1);
-        assert!(M3_10CORE.peak_tflops_fp16 > M2_10CORE.peak_tflops_fp16);
+        const { assert!(M3_10CORE.peak_tflops_fp16 > M2_10CORE.peak_tflops_fp16) };
     }
 
     /// The wide band's boundary is MLX's `arch_gen >= 15`: every generation from

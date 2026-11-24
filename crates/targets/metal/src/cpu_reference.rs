@@ -54,6 +54,24 @@ impl HalfF for half::bf16 {
     }
 }
 
+/// One affine-quantized matmul a reference below computes: the packed weight with its per-group
+/// scales and biases, the activations `x` (`[M, K]`), the `M, N, K` extents and the group width.
+#[derive(Clone, Copy)]
+pub struct AffineMatmul<'a, TAct, TScale> {
+    /// Packed codes.
+    pub packed: &'a [u8],
+    /// One scale per group.
+    pub scales: &'a [TScale],
+    /// One bias per group.
+    pub biases: &'a [TScale],
+    /// Activations, `m * k` elements.
+    pub x: &'a [TAct],
+    pub m: usize,
+    pub n: usize,
+    pub k: usize,
+    pub group_size: usize,
+}
+
 /// Dequantize a packed 4-bit affine tensor where every two nibbles in
 /// `packed` correspond to two consecutive output elements (contiguous-K
 /// row order). `output.len()` must equal `packed.len() * 2` and be a
@@ -104,16 +122,17 @@ fn affine_dequantize_b4<TAct: HalfF, TScale: HalfF>(
 ///
 /// Also serves as the reference for `affine_qmv` — the small-M and
 /// large-M kernels differ in dispatch, not math.
-fn affine_qmm_t_b4<TAct: HalfF, TScale: HalfF>(
-    packed: &[u8],
-    scales: &[TScale],
-    biases: &[TScale],
-    x: &[TAct],
-    m: usize,
-    n: usize,
-    k: usize,
-    group_size: usize,
-) -> Vec<TAct> {
+fn affine_qmm_t_b4<TAct: HalfF, TScale: HalfF>(p: AffineMatmul<'_, TAct, TScale>) -> Vec<TAct> {
+    let AffineMatmul {
+        packed,
+        scales,
+        biases,
+        x,
+        m,
+        n,
+        k,
+        group_size,
+    } = p;
     assert_eq!(k % group_size, 0, "K must be a multiple of group_size");
     assert_eq!(packed.len(), n * k / 2);
     assert_eq!(scales.len(), n * k / group_size);
@@ -142,16 +161,17 @@ fn affine_qmm_t_b4<TAct: HalfF, TScale: HalfF>(
 /// `y[i,j] = Σ_k x[i,k] * w[k,j]` (i.e. `y = x @ w`).
 ///
 /// Also serves as the reference for `affine_qvm`.
-fn affine_qmm_n_b4<TAct: HalfF, TScale: HalfF>(
-    packed: &[u8],
-    scales: &[TScale],
-    biases: &[TScale],
-    x: &[TAct],
-    m: usize,
-    n: usize,
-    k: usize,
-    group_size: usize,
-) -> Vec<TAct> {
+fn affine_qmm_n_b4<TAct: HalfF, TScale: HalfF>(p: AffineMatmul<'_, TAct, TScale>) -> Vec<TAct> {
+    let AffineMatmul {
+        packed,
+        scales,
+        biases,
+        x,
+        m,
+        n,
+        k,
+        group_size,
+    } = p;
     assert_eq!(n % group_size, 0, "N must be a multiple of group_size");
     assert_eq!(packed.len(), k * n / 2);
     assert_eq!(scales.len(), k * n / group_size);
@@ -195,16 +215,17 @@ fn affine_qmm_n_b4<TAct: HalfF, TScale: HalfF>(
 /// Also serves as the reference for the 8-bit qmv kernels (the small-M
 /// and large-M kernels differ in dispatch, not math). Gemma4-12B ships
 /// its MLP projections in this layout (8-bit g64).
-fn affine_qmm_t_b8<TAct: HalfF, TScale: HalfF>(
-    packed: &[u8],
-    scales: &[TScale],
-    biases: &[TScale],
-    x: &[TAct],
-    m: usize,
-    n: usize,
-    k: usize,
-    group_size: usize,
-) -> Vec<TAct> {
+fn affine_qmm_t_b8<TAct: HalfF, TScale: HalfF>(p: AffineMatmul<'_, TAct, TScale>) -> Vec<TAct> {
+    let AffineMatmul {
+        packed,
+        scales,
+        biases,
+        x,
+        m,
+        n,
+        k,
+        group_size,
+    } = p;
     assert_eq!(k % group_size, 0, "K must be a multiple of group_size");
     assert_eq!(packed.len(), n * k);
     assert_eq!(scales.len(), n * k / group_size);
@@ -252,16 +273,17 @@ fn affine_qmm_t_b8<TAct: HalfF, TScale: HalfF>(
 /// are MLX's own `qdot` bits==3 branch (quantized.h:47-76). Also
 /// serves as the reference for the 3-bit qmv kernels. GLM-4.5-Air-3bit
 /// ships every linear in this layout (3-bit g64).
-fn affine_qmm_t_b3<TAct: HalfF, TScale: HalfF>(
-    packed: &[u8],
-    scales: &[TScale],
-    biases: &[TScale],
-    x: &[TAct],
-    m: usize,
-    n: usize,
-    k: usize,
-    group_size: usize,
-) -> Vec<TAct> {
+fn affine_qmm_t_b3<TAct: HalfF, TScale: HalfF>(p: AffineMatmul<'_, TAct, TScale>) -> Vec<TAct> {
+    let AffineMatmul {
+        packed,
+        scales,
+        biases,
+        x,
+        m,
+        n,
+        k,
+        group_size,
+    } = p;
     assert_eq!(k % group_size, 0, "K must be a multiple of group_size");
     assert_eq!(k % 8, 0, "K must be a multiple of 8 for the 3-bit packs");
     assert_eq!(packed.len(), n * k * 3 / 8);
@@ -310,30 +332,12 @@ fn affine_qmm_t_b3<TAct: HalfF, TScale: HalfF>(
     y
 }
 
-pub fn affine_qmm_t_b3_f16(
-    packed: &[u8],
-    scales: &[half::f16],
-    biases: &[half::f16],
-    x: &[half::f16],
-    m: usize,
-    n: usize,
-    k: usize,
-    group_size: usize,
-) -> Vec<half::f16> {
-    affine_qmm_t_b3::<half::f16, half::f16>(packed, scales, biases, x, m, n, k, group_size)
+pub fn affine_qmm_t_b3_f16(p: AffineMatmul<'_, half::f16, half::f16>) -> Vec<half::f16> {
+    affine_qmm_t_b3::<half::f16, half::f16>(p)
 }
 
-pub fn affine_qmm_t_b3_bf16_s_bf16(
-    packed: &[u8],
-    scales: &[half::bf16],
-    biases: &[half::bf16],
-    x: &[half::bf16],
-    m: usize,
-    n: usize,
-    k: usize,
-    group_size: usize,
-) -> Vec<half::bf16> {
-    affine_qmm_t_b3::<half::bf16, half::bf16>(packed, scales, biases, x, m, n, k, group_size)
+pub fn affine_qmm_t_b3_bf16_s_bf16(p: AffineMatmul<'_, half::bf16, half::bf16>) -> Vec<half::bf16> {
+    affine_qmm_t_b3::<half::bf16, half::bf16>(p)
 }
 
 pub use affine_qmm_t_b3_bf16_s_bf16 as affine_qmv_b3_bf16_s_bf16;
@@ -345,16 +349,17 @@ pub use affine_qmm_t_b3_f16 as affine_qmv_b3_f16;
 /// run is byte-anchored (group_size is a multiple of 4). Also serves
 /// as the reference for the 2-bit qmv kernels. gpt-oss-mlx-2Bit ships
 /// every linear in this layout (2-bit g64).
-fn affine_qmm_t_b2<TAct: HalfF, TScale: HalfF>(
-    packed: &[u8],
-    scales: &[TScale],
-    biases: &[TScale],
-    x: &[TAct],
-    m: usize,
-    n: usize,
-    k: usize,
-    group_size: usize,
-) -> Vec<TAct> {
+fn affine_qmm_t_b2<TAct: HalfF, TScale: HalfF>(p: AffineMatmul<'_, TAct, TScale>) -> Vec<TAct> {
+    let AffineMatmul {
+        packed,
+        scales,
+        biases,
+        x,
+        m,
+        n,
+        k,
+        group_size,
+    } = p;
     assert_eq!(k % group_size, 0, "K must be a multiple of group_size");
     assert_eq!(k % 4, 0, "K must be a multiple of 4 for the 2-bit packs");
     assert_eq!(packed.len(), n * k / 4);
@@ -397,30 +402,12 @@ fn affine_qmm_t_b2<TAct: HalfF, TScale: HalfF>(
     y
 }
 
-pub fn affine_qmm_t_b2_f16(
-    packed: &[u8],
-    scales: &[half::f16],
-    biases: &[half::f16],
-    x: &[half::f16],
-    m: usize,
-    n: usize,
-    k: usize,
-    group_size: usize,
-) -> Vec<half::f16> {
-    affine_qmm_t_b2::<half::f16, half::f16>(packed, scales, biases, x, m, n, k, group_size)
+pub fn affine_qmm_t_b2_f16(p: AffineMatmul<'_, half::f16, half::f16>) -> Vec<half::f16> {
+    affine_qmm_t_b2::<half::f16, half::f16>(p)
 }
 
-pub fn affine_qmm_t_b2_bf16_s_bf16(
-    packed: &[u8],
-    scales: &[half::bf16],
-    biases: &[half::bf16],
-    x: &[half::bf16],
-    m: usize,
-    n: usize,
-    k: usize,
-    group_size: usize,
-) -> Vec<half::bf16> {
-    affine_qmm_t_b2::<half::bf16, half::bf16>(packed, scales, biases, x, m, n, k, group_size)
+pub fn affine_qmm_t_b2_bf16_s_bf16(p: AffineMatmul<'_, half::bf16, half::bf16>) -> Vec<half::bf16> {
+    affine_qmm_t_b2::<half::bf16, half::bf16>(p)
 }
 
 pub use affine_qmm_t_b2_bf16_s_bf16 as affine_qmv_b2_bf16_s_bf16;
@@ -446,72 +433,27 @@ pub fn affine_dequantize_b4_bf16(
     affine_dequantize_b4::<half::bf16, half::f16>(packed, scales, biases, output, group_size);
 }
 
-pub fn affine_qmm_t_b4_f16(
-    packed: &[u8],
-    scales: &[half::f16],
-    biases: &[half::f16],
-    x: &[half::f16],
-    m: usize,
-    n: usize,
-    k: usize,
-    group_size: usize,
-) -> Vec<half::f16> {
-    affine_qmm_t_b4::<half::f16, half::f16>(packed, scales, biases, x, m, n, k, group_size)
+pub fn affine_qmm_t_b4_f16(p: AffineMatmul<'_, half::f16, half::f16>) -> Vec<half::f16> {
+    affine_qmm_t_b4::<half::f16, half::f16>(p)
 }
 
-pub fn affine_qmm_t_b4_bf16(
-    packed: &[u8],
-    scales: &[half::f16],
-    biases: &[half::f16],
-    x: &[half::bf16],
-    m: usize,
-    n: usize,
-    k: usize,
-    group_size: usize,
-) -> Vec<half::bf16> {
-    affine_qmm_t_b4::<half::bf16, half::f16>(packed, scales, biases, x, m, n, k, group_size)
+pub fn affine_qmm_t_b4_bf16(p: AffineMatmul<'_, half::bf16, half::f16>) -> Vec<half::bf16> {
+    affine_qmm_t_b4::<half::bf16, half::f16>(p)
 }
 
 /// `TAct = bfloat, TScale = bfloat` reference — Qwen3 mlx-community
 /// 4bit convention (see `INST_QMV_ALL(bf16, bfloat, bf16, bfloat, …)`
 /// instantiations in `shaders/quantized_qmv.metal`).
-pub fn affine_qmm_t_b4_bf16_s_bf16(
-    packed: &[u8],
-    scales: &[half::bf16],
-    biases: &[half::bf16],
-    x: &[half::bf16],
-    m: usize,
-    n: usize,
-    k: usize,
-    group_size: usize,
-) -> Vec<half::bf16> {
-    affine_qmm_t_b4::<half::bf16, half::bf16>(packed, scales, biases, x, m, n, k, group_size)
+pub fn affine_qmm_t_b4_bf16_s_bf16(p: AffineMatmul<'_, half::bf16, half::bf16>) -> Vec<half::bf16> {
+    affine_qmm_t_b4::<half::bf16, half::bf16>(p)
 }
 
-pub fn affine_qmm_n_b4_f16(
-    packed: &[u8],
-    scales: &[half::f16],
-    biases: &[half::f16],
-    x: &[half::f16],
-    m: usize,
-    n: usize,
-    k: usize,
-    group_size: usize,
-) -> Vec<half::f16> {
-    affine_qmm_n_b4::<half::f16, half::f16>(packed, scales, biases, x, m, n, k, group_size)
+pub fn affine_qmm_n_b4_f16(p: AffineMatmul<'_, half::f16, half::f16>) -> Vec<half::f16> {
+    affine_qmm_n_b4::<half::f16, half::f16>(p)
 }
 
-pub fn affine_qmm_n_b4_bf16(
-    packed: &[u8],
-    scales: &[half::f16],
-    biases: &[half::f16],
-    x: &[half::bf16],
-    m: usize,
-    n: usize,
-    k: usize,
-    group_size: usize,
-) -> Vec<half::bf16> {
-    affine_qmm_n_b4::<half::bf16, half::f16>(packed, scales, biases, x, m, n, k, group_size)
+pub fn affine_qmm_n_b4_bf16(p: AffineMatmul<'_, half::bf16, half::f16>) -> Vec<half::bf16> {
+    affine_qmm_n_b4::<half::bf16, half::f16>(p)
 }
 
 // Kernel-name aliases. `qmv` and `qmm_t` share math (transpose=true);
@@ -523,30 +465,12 @@ pub use affine_qmm_n_b4_f16 as affine_qvm_b4_f16;
 pub use affine_qmm_t_b4_bf16 as affine_qmv_b4_bf16;
 pub use affine_qmm_t_b4_bf16_s_bf16 as affine_qmv_b4_bf16_s_bf16;
 
-pub fn affine_qmm_t_b8_f16(
-    packed: &[u8],
-    scales: &[half::f16],
-    biases: &[half::f16],
-    x: &[half::f16],
-    m: usize,
-    n: usize,
-    k: usize,
-    group_size: usize,
-) -> Vec<half::f16> {
-    affine_qmm_t_b8::<half::f16, half::f16>(packed, scales, biases, x, m, n, k, group_size)
+pub fn affine_qmm_t_b8_f16(p: AffineMatmul<'_, half::f16, half::f16>) -> Vec<half::f16> {
+    affine_qmm_t_b8::<half::f16, half::f16>(p)
 }
 
-pub fn affine_qmm_t_b8_bf16_s_bf16(
-    packed: &[u8],
-    scales: &[half::bf16],
-    biases: &[half::bf16],
-    x: &[half::bf16],
-    m: usize,
-    n: usize,
-    k: usize,
-    group_size: usize,
-) -> Vec<half::bf16> {
-    affine_qmm_t_b8::<half::bf16, half::bf16>(packed, scales, biases, x, m, n, k, group_size)
+pub fn affine_qmm_t_b8_bf16_s_bf16(p: AffineMatmul<'_, half::bf16, half::bf16>) -> Vec<half::bf16> {
+    affine_qmm_t_b8::<half::bf16, half::bf16>(p)
 }
 
 pub use affine_qmm_t_b4_f16 as affine_qmv_b4_f16;

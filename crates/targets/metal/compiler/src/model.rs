@@ -1799,19 +1799,23 @@ pub(crate) fn emit(cx: &ModelCx<'_>) -> ModelEmission {
                 weights,
                 allocator,
                 &METAL_RUNGS,
-                runtime_factory,
-                max_workers,
-                // Standalone factory: no device-budget context here, so keep
-                // all buckets. The lazy-init path below passes the real cap.
-                None,
-                block_cap,
-                addressing,
-                // Nor the serving engine's batch: every bucket row's decode partials.
-                None,
-                // Its arena is its own.
-                ::scratchy_target_metal::interpreter::metal::ArenaShare::Own,
-                // Its callers read the logits on the host.
-                ::scratchy_target_metal::interpreter::metal::TerminalReads::Host,
+                ::scratchy_target_metal::interpreter::metal::PoolWorkers {
+                    runtime_factory,
+                    max_workers,
+                },
+                ::scratchy_target_metal::interpreter::metal::PoolSizing {
+                    // Standalone factory: no device-budget context here, so keep
+                    // all buckets. The lazy-init path below passes the real cap.
+                    max_bucket_m: None,
+                    block_cap,
+                    addressing,
+                    // Nor the serving engine's batch: every bucket row's decode partials.
+                    decode_rows: None,
+                    // Its arena is its own.
+                    share: ::scratchy_target_metal::interpreter::metal::ArenaShare::Own,
+                    // Its callers read the logits on the host.
+                    terminal: ::scratchy_target_metal::interpreter::metal::TerminalReads::Host,
+                },
             )
         }
 
@@ -2167,28 +2171,33 @@ pub(crate) fn emit(cx: &ModelCx<'_>) -> ModelEmission {
                     wm,
                     device.allocator.clone(),
                     &METAL_RUNGS,
-                    factory,
-                    1,
-                    // Target-reactive cap stashed on the device by the worker
-                    // after `determine_available_memory`. Prunes the compiled
-                    // ladder so the colored arena fits the KV budget.
-                    device.metal_bucket_max_m,
-                    // Runtime per-sequence block-table capacity, read off the KV
-                    // pool: it picks the KV cap rung — none for a model reading no KV.
-                    #pool_block_cap,
-                    device.kv_addressing,
-                    // The serving engine's batch, stashed by the worker: the decode split's
-                    // partials are reserved for that many rows.
-                    device.max_decode_rows,
-                    // How its arena is shared with that of a model whose forwards never overlap
-                    // its own: an MTP target holds its head's (a fact of the target, set before
-                    // its first forward), a head runs in its target's (its device's).
-                    ::scratchy_target_metal::interpreter::metal::ArenaShare::of(
-                        wm.metal_guest.get(),
-                        device.host.as_deref(),
-                    ),
-                    // Whether its owner reads the logits on the host (a draft model's seed).
-                    device.terminal_reads,
+                    ::scratchy_target_metal::interpreter::metal::PoolWorkers {
+                        runtime_factory: factory,
+                        max_workers: 1,
+                    },
+                    ::scratchy_target_metal::interpreter::metal::PoolSizing {
+                        // Target-reactive cap stashed on the device by the worker
+                        // after `determine_available_memory`. Prunes the compiled
+                        // ladder so the colored arena fits the KV budget.
+                        max_bucket_m: device.metal_bucket_max_m,
+                        // Runtime per-sequence block-table capacity, read off the KV
+                        // pool: it picks the KV cap rung — none for a model reading no KV.
+                        block_cap: #pool_block_cap,
+                        addressing: device.kv_addressing,
+                        // The serving engine's batch, stashed by the worker: the decode split's
+                        // partials are reserved for that many rows.
+                        decode_rows: device.max_decode_rows,
+                        // How its arena is shared with that of a model whose forwards never
+                        // overlap its own: an MTP target holds its head's (a fact of the target,
+                        // set before its first forward), a head runs in its target's (its
+                        // device's).
+                        share: ::scratchy_target_metal::interpreter::metal::ArenaShare::of(
+                            wm.metal_guest.get(),
+                            device.host.as_deref(),
+                        ),
+                        // Whether its owner reads the logits on the host (a draft model's seed).
+                        terminal: device.terminal_reads,
+                    },
                 )
                 .expect("MetalWorkerPool::for_buckets: pool init failed")
             })

@@ -14,7 +14,7 @@ use half::{bf16, f16};
 use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions, MTLSize};
 use scratchy_target_metal::aot::baked_build;
 use scratchy_target_metal::detect_device;
-use scratchy_target_metal::mtl4_dispatch::Mtl4DispatchBatch;
+use scratchy_target_metal::mtl4_dispatch::{Mtl4DispatchBatch, ThreadgroupGrid};
 use scratchy_target_metal::quantized::{
     DequantDtype, SMALL_M_TILE_COLS, ScaleDtype, SmallMTile, W4A8_GROUPED_TILE, W4A8_TILE_ROWS,
     W4a8Act, W4a8Gemm, W4a8Rows, W4a8SplitK, W4a8Tile, qmm_w4a8_static_name,
@@ -228,14 +228,16 @@ fn run(device: &Device, cache: &SpecializedPipelineCache, g: &Gemm) -> Vec<f32> 
                 &[],
                 &[],
                 &[],
-                size(
-                    n / SMALL_M_TILE_COLS as usize,
-                    m.div_ceil(tile.rows() as usize),
-                ),
-                size(
-                    32 * scratchy_target_metal::quantized::SMALL_M_SIMDGROUPS as usize,
-                    1,
-                ),
+                ThreadgroupGrid {
+                    threadgroups: size(
+                        n / SMALL_M_TILE_COLS as usize,
+                        m.div_ceil(tile.rows() as usize),
+                    ),
+                    threads_per_threadgroup: size(
+                        32 * scratchy_target_metal::quantized::SMALL_M_SIMDGROUPS as usize,
+                        1,
+                    ),
+                },
             );
             name
         }
@@ -268,8 +270,10 @@ fn run(device: &Device, cache: &SpecializedPipelineCache, g: &Gemm) -> Vec<f32> 
                 &[],
                 &[],
                 &[],
-                size((k / 64).div_ceil(16), m),
-                size(128, 1),
+                ThreadgroupGrid {
+                    threadgroups: size((k / 64).div_ceil(16), m),
+                    threads_per_threadgroup: size(128, 1),
+                },
             );
             batch.barrier();
             let name = kernel.static_name(g.act.act(), g.scale.scale(), gs as u32);
@@ -285,11 +289,13 @@ fn run(device: &Device, cache: &SpecializedPipelineCache, g: &Gemm) -> Vec<f32> 
                 &[],
                 &[],
                 &[],
-                size(
-                    n / kernel.cols() as usize,
-                    m.div_ceil(kernel.rows() as usize),
-                ),
-                size(32 * kernel.simdgroups() as usize, 1),
+                ThreadgroupGrid {
+                    threadgroups: size(
+                        n / kernel.cols() as usize,
+                        m.div_ceil(kernel.rows() as usize),
+                    ),
+                    threads_per_threadgroup: size(32 * kernel.simdgroups() as usize, 1),
+                },
             );
             name
         }
@@ -688,8 +694,10 @@ fn w4a8_act_quant_matches_the_separated_pair() {
                     &[],
                     &[],
                     &[],
-                    size(n.div_ceil(256), 1),
-                    size(256, 1),
+                    ThreadgroupGrid {
+                        threadgroups: size(n.div_ceil(256), 1),
+                        threads_per_threadgroup: size(256, 1),
+                    },
                 );
                 batch.barrier();
                 let pair = shared(device, &vec![0xffu8; scratch_bytes]);
@@ -705,8 +713,10 @@ fn w4a8_act_quant_matches_the_separated_pair() {
                     &[],
                     &[],
                     &[],
-                    size((k / 64).div_ceil(16), m),
-                    size(128, 1),
+                    ThreadgroupGrid {
+                        threadgroups: size((k / 64).div_ceil(16), m),
+                        threads_per_threadgroup: size(128, 1),
+                    },
                 );
                 batch.commit(true);
                 let want = read(&pair, scratch_bytes);
@@ -738,8 +748,10 @@ fn w4a8_act_quant_matches_the_separated_pair() {
                     &[],
                     &[],
                     &[],
-                    size((k / 64).div_ceil(16), m),
-                    size(128, 1),
+                    ThreadgroupGrid {
+                        threadgroups: size((k / 64).div_ceil(16), m),
+                        threads_per_threadgroup: size(128, 1),
+                    },
                 );
                 batch.commit(true);
                 let got = read(&fused_buf, scratch_bytes);
@@ -822,8 +834,10 @@ fn run_grouped(
         &[],
         &[],
         &[],
-        size((k / 64).div_ceil(16), m),
-        size(128, 1),
+        ThreadgroupGrid {
+            threadgroups: size((k / 64).div_ceil(16), m),
+            threads_per_threadgroup: size(128, 1),
+        },
     );
     batch.barrier();
     batch.encode(
@@ -839,8 +853,10 @@ fn run_grouped(
         &[],
         &[],
         &[],
-        size(n / tile.cols() as usize, m / W4A8_TILE_ROWS as usize),
-        size(32 * tile.simdgroups() as usize, 1),
+        ThreadgroupGrid {
+            threadgroups: size(n / tile.cols() as usize, m / W4A8_TILE_ROWS as usize),
+            threads_per_threadgroup: size(32 * tile.simdgroups() as usize, 1),
+        },
     );
     batch.commit(true);
     let got: Vec<u16> =
