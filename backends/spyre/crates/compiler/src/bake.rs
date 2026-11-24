@@ -3312,11 +3312,7 @@ pub(crate) fn dump_wavefront_mega(
                     lower_dag_to_tape, reroll_layer_classes, reroll_subtile_tape,
                 };
                 let valid = ValidatedGraph::new(&krg).unwrap_or_else(|e| {
-                    panic!(
-                        "[spyre-superdsc] {base}: SubtileIR invalid for reroll — {e:?} (previously \
-                         swallowed by an eprintln, leaving superdsc_fp unset and shipping a ZERO-group \
-                         bundle that only crashed at pod load.)"
-                    )
+                    panic!("[spyre-superdsc] {base}: SubtileIR invalid for reroll — {e:?}")
                 });
                 let tape_unrolled = lower_dag_to_tape(&valid);
                 // ⭐ THE CLASS-SPLIT ROLL FIRST. A hybrid-attention model (gemma-4:
@@ -5207,7 +5203,8 @@ pub(crate) fn dump_wavefront_mega(
             real_one_session(&lwd_b, declared);
             real_sharded_session(tp);
         }
-        // SuperDSC replaces the sengraph ENTIRELY: `emit_bundle` above baked the work-divided dxp bundle
+        // SuperDSC replaces the sengraph ENTIRELY: every session's real pass above (`world_bake!`'s
+        // second closure) baked the work-divided dxp bundle
         // and set `superdsc_fp`, but the SENGRAPH decode lowering is REFUSED for granite (the lm_head
         // vocab-slice `t65` non-whole-region) so `default_decode_groups` is EMPTY. The SengraphBundle still
         // needs ONE [prefill,decode] group to carry the `SUPERDSC_BUNDLE:{fp}` sentinel (both slots are
