@@ -2522,7 +2522,7 @@ type Walked<T> = Result<
     scratchy_target_spyre::lower_subtile_tape_to_superdsc::SuperDscError,
 >;
 
-/// ⭐ ONE SESSION BETWEEN ITS DECLARE PASS AND ITS REAL PASS — what `world_bake!`'s walk leaves its real pass: the call the session is baked for, its minted graph and wiring, and its walk (the ceiling and every sweep rung, each layout declared at the context's pool). Phase 2 reads its residency, phase 3 places it at the bake's one pool ([`PooledSession`]), and its real pass consumes it.
+/// ⭐ ONE SESSION BETWEEN ITS DECLARE PASS AND ITS REAL PASS — what `world_bake!`'s walk leaves its real pass: the call the session is baked for, its minted graph and wiring, and its walk (the ceiling and every sweep rung, each layout declared at the context's pool). Phase 2 reads its residency, phase 3 places it at its world's pool ([`PooledSession`]), and its real pass consumes it.
 struct Declared<T: ktir_superdsc::collective::Tp> {
     base: String,
     cap: u32,
@@ -2545,7 +2545,7 @@ struct Declared<T: ktir_superdsc::collective::Tp> {
     walked: Walked<T>,
 }
 
-/// ⭐ A SESSION THE BAKE'S POOL IS COMPUTED OVER AND PLACED AT ([`pool_every_session`]).
+/// ⭐ A SESSION ITS WORLD'S POOL IS COMPUTED OVER AND PLACED AT ([`pool_world`]).
 trait PooledSession {
     /// What the session costs the card at `role` — `None` when its walk did not lower (its real pass fails the build).
     fn residency(&self, role: SessionRole) -> Option<Residency>;
@@ -2617,30 +2617,21 @@ fn pooled<'s, T: ktir_superdsc::collective::Tp + 's>(
         .filter_map(move |d| d.as_mut().map(|d| (role, d as &mut dyn PooledSession)))
 }
 
-/// ⭐ THE BAKE'S POOL, ONCE — one pool per world, the narrower of the two, every session of both placed at it (phases 2 and 3).
+/// ⭐ ONE WORLD'S POOL, ONCE — [`PoolPages::of_bake`] over the world's own sessions at their roles, its decode the owner, against one card; every session of the world placed at it exactly once (phases 2 and 3).
 ///
-/// A run serves ONE world: the one-rank world on one card, or the tp world spread across its ranks' cards — never both on one card's budget. So each world's pool is [`PoolPages::of_bake`] over that world's own sessions at their roles, its decode the owner, against one card. The tp world shards the one-rank decode's pool (`shard_lowered`) and inherits its rows, so one pool serves both worlds: the narrower one. With no tp world baked (`sharded` is empty), it is the one-rank pool.
-fn pool_every_session<'a>(
-    one_rank: &mut [(SessionRole, &'a mut dyn PooledSession)],
-    sharded: &mut [(SessionRole, &'a mut dyn PooledSession)],
+/// A run serves ONE world: the one-rank world on one card, or the tp world spread across its ranks' cards — never both on one card's budget. So each world is pooled apart, by its own sessions (a tp world's are one rank's), and its wiring is stamped with its own pool. A world with no sessions places none, and its pool stamps no wiring.
+fn pool_world(
+    world: &mut [(SessionRole, &mut dyn PooledSession)],
     context: ContextPages,
 ) -> PoolPages {
-    let of_world = |world: &[(SessionRole, &mut dyn PooledSession)]| {
-        of_bake(
-            world
-                .iter()
-                .filter_map(|(role, s)| s.residency(*role))
-                .sum(),
-            context,
-        )
-    };
-    let one = of_world(one_rank);
-    let pool = if sharded.is_empty() {
-        one
-    } else {
-        one.min(of_world(sharded))
-    };
-    for (_, s) in one_rank.iter_mut().chain(sharded.iter_mut()) {
+    let pool = of_bake(
+        world
+            .iter()
+            .filter_map(|(role, s)| s.residency(*role))
+            .sum(),
+        context,
+    );
+    for (_, s) in world.iter_mut() {
         s.place(pool);
     }
     pool
@@ -5155,8 +5146,8 @@ pub(crate) fn dump_wavefront_mega(
         } else {
             (Vec::new(), Vec::new())
         };
-        // ⭐ THE POOL, ONCE — each world's sessions apart, each world's decode its owner (`pool_every_session`).
-        let pool = {
+        // ⭐ EACH WORLD'S POOL, ONCE — each world's sessions apart, each world's decode its owner (`pool_world`).
+        let (one_rank_pages, tp_pages) = {
             let mut one_rank_sessions: Vec<(SessionRole, &mut dyn PooledSession)> =
                 pooled(SessionRole::Owner, [&mut decode_declared]).collect();
             let mut sharded_sessions: Vec<(SessionRole, &mut dyn PooledSession)> =
@@ -5171,18 +5162,20 @@ pub(crate) fn dump_wavefront_mega(
                 sharded_sessions
                     .extend(pooled(SessionRole::Borrower, tp.iter_mut().map(|(_, d)| d)));
             }
-            pool_every_session(
-                &mut one_rank_sessions,
-                &mut sharded_sessions,
-                ContextPages::of_slots(prefix_len),
+            let context = ContextPages::of_slots(prefix_len);
+            (
+                pool_world(&mut one_rank_sessions, context),
+                pool_world(&mut sharded_sessions, context),
             )
         };
         // Each world's stamped pool — `None` only for a world whose decode never declared, which commits no decode wiring to stamp.
-        let one_rank_pool = decode_declared.as_ref().map(|d| d.baked_pool(pool));
+        let one_rank_pool = decode_declared
+            .as_ref()
+            .map(|d| d.baked_pool(one_rank_pages));
         let tp_pool = tp_decode
             .as_ref()
             .and_then(|(_, d)| d.as_ref())
-            .map(|d| d.baked_pool(pool));
+            .map(|d| d.baked_pool(tp_pages));
         // ── EVERY SESSION'S REAL PASS, committed in the bake's order ──
         let real_one_session = |lwd: &BakeTape, declared: Option<Declared<One>>| -> GroupGraphs {
             declared.map_or_else(Vec::new, |d| {
@@ -5853,10 +5846,10 @@ mod tests {
         }
     }
 
-    /// ⭐ THE BAKE'S POOL IS COMPUTED ONCE PER WORLD AND EVERY SESSION RUNS AT ONE POOL. Each world's residency is read once per session, at its own role, against one card. The bake's pool is the one-rank world's when no tp world is baked, and the narrower of the two when one is. Every session of every world is placed at it exactly once: past the context on a card build, the context's own pages off it.
+    /// ⭐ THE POOL IS COMPUTED ONCE PER WORLD, BY ITS OWN SESSIONS, AND EVERY SESSION RUNS AT ITS WORLD'S POOL. Each world's residency is read once per session, at its own role, against one card. A tp world's pool is its own: the one-rank world never bounds it. Every session is placed at its world's pool exactly once: past the context on a card build, the context's own pages off it.
     #[test]
-    fn the_pool_is_computed_once_per_world_and_every_session_runs_at_it() {
-        use super::{PooledSession, pool_every_session};
+    fn the_pool_is_computed_once_per_world_by_its_own_sessions() {
+        use super::{PooledSession, pool_world};
         use ktir_superdsc::placement::BundleLayout;
         use scratchy_target_spyre::pool_pages::{
             ContextPages, PoolPages, Residency, SessionRole, session_residency,
@@ -5951,16 +5944,12 @@ mod tests {
                 context,
             )
         };
-        let pool_of = |one: &mut [Fake; 3], tp: &mut [Fake]| {
-            let mut one_rank: Vec<(SessionRole, &mut dyn PooledSession)> = roles
+        let pool_of = |w: &mut [Fake]| {
+            let mut sessions: Vec<(SessionRole, &mut dyn PooledSession)> = roles
                 .into_iter()
-                .zip(one.iter_mut().map(|s| s as &mut dyn PooledSession))
+                .zip(w.iter_mut().map(|s| s as &mut dyn PooledSession))
                 .collect();
-            let mut sharded: Vec<(SessionRole, &mut dyn PooledSession)> = roles
-                .into_iter()
-                .zip(tp.iter_mut().map(|s| s as &mut dyn PooledSession))
-                .collect();
-            pool_every_session(&mut one_rank, &mut sharded, context)
+            pool_world(&mut sessions, context)
         };
         let check = |sessions: &[Fake], pool: PoolPages| {
             for (s, role) in sessions.iter().zip(roles) {
@@ -5973,30 +5962,32 @@ mod tests {
                 assert_eq!(
                     s.step.pages,
                     pool.get(),
-                    "every session runs at the one pool"
+                    "every session runs at its world's pool"
                 );
             }
         };
-        // No tp world: the one-rank world's pool.
+        // One world: its own pool.
         let mut one = world(8192);
-        let pool = pool_of(&mut one, &mut []);
+        let pool = pool_of(&mut one);
         assert_eq!(pool, of_world(&one));
         check(&one, pool);
-        // A tp world whose own sessions hold a GiB more: each world is its own; the bake takes the narrower.
+        // A tp world whose own sessions hold a GiB more: each world is pooled by its own sessions, and neither bounds the other.
         let (mut one, mut tp) = (world(8192), world(1 << 30));
-        let pool = pool_of(&mut one, &mut tp);
-        assert_eq!(
-            pool,
-            of_world(&one).min(of_world(&tp)),
-            "one pool, the narrower world's"
-        );
-        check(&one, pool);
-        check(&tp, pool);
+        let (one_pool, tp_pool) = (pool_of(&mut one), pool_of(&mut tp));
+        assert_eq!(one_pool, of_world(&one), "the one-rank world's own pool");
+        assert_eq!(tp_pool, of_world(&tp), "the tp world's own pool");
+        check(&one, one_pool);
+        check(&tp, tp_pool);
         if cfg!(feature = "spyre-lower") {
-            assert_eq!(pool, of_world(&tp), "the heavier world bounds the pool");
-            assert!(of_world(&tp) < of_world(&one) && pool.get() > context.get());
+            assert!(
+                tp_pool < one_pool && tp_pool.get() > context.get(),
+                "the heavier world's pool is its own and past the context, and the lighter world keeps its larger one"
+            );
         } else {
-            assert_eq!(pool.get(), context.get());
+            assert_eq!(
+                (one_pool.get(), tp_pool.get()),
+                (context.get(), context.get())
+            );
         }
     }
 }
