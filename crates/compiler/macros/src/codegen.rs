@@ -7433,26 +7433,26 @@ impl KvCacheLayers {
 /// [`crate::quantization::KvCacheScheme`]) — the reference's `_k_scale_float` / `_v_scale_float`
 /// (spyre-inference `spyre_attn.py:1993-2002`, set by vLLM's `BaseKVCacheMethod` from the
 /// checkpoint). A config that states no scheme stores K and V unscaled. A config that states one
-/// holds its per-layer values only in the checkpoint's tensors, which no build-time path reads: a
-/// build error naming the model, never an assumed scale.
-fn kv_cache_scales(model: &ModelParams) -> scratchy_forward_compiler::KvCacheScales {
-    match model.quantization.as_ref().map(|q| q.kv_cache_scheme) {
+/// holds its per-layer values only in the checkpoint's tensors, which no build-time path reads, so
+/// its cache stays dense ([`scratchy_ir::DenseReason::StatedKvScales`]), never at an assumed scale.
+fn kv_cache_scales(
+    scheme: Option<crate::quantization::KvCacheScheme>,
+) -> Result<scratchy_forward_compiler::KvCacheScales, scratchy_ir::DenseReason> {
+    match scheme {
         None | Some(crate::quantization::KvCacheScheme::Absent) => {
-            scratchy_forward_compiler::KvCacheScales::Unscaled
+            Ok(scratchy_forward_compiler::KvCacheScales::Unscaled)
         }
-        Some(crate::quantization::KvCacheScheme::Stated) => panic!(
-            "config `{}`: its quantization_config states a kv_cache_scheme — per-layer KV scales \
-             whose values live only in the checkpoint's tensors, which this build does not read; \
-             a float8 KV cache for it needs those values as build constants",
-            model.source_stem
-        ),
+        Some(crate::quantization::KvCacheScheme::Stated) => {
+            Err(scratchy_ir::DenseReason::StatedKvScales)
+        }
     }
 }
 
-/// The model's KV codec, at the target's store (`store`, [`crate::target::KvStore`]): float8 for
-/// every body that holds KV on a target storing it; int8 on a target whose kernels code its heads
-/// (`coded`), wherever `codec_for` takes its geometry; dense everywhere else. A model it would
-/// compress but can't is named in the build output.
+/// The model's KV codec, at the target's store (`store`, [`crate::target::KvStore`]): the coded
+/// store's codec wherever its head table takes the model's rows (`codec_for`) — int8 at the heads a
+/// target's kernels code, float8 at whole sticks of its float8 format and the scales its config
+/// states — and dense everywhere else. A model a target would code but can't is named in the build
+/// output.
 fn kv_codec_for(
     model: &ModelParams,
     head_dim: u32,
@@ -7461,16 +7461,6 @@ fn kv_codec_for(
     store: crate::target::KvStore,
 ) -> scratchy_forward_compiler::KvCodec {
     use scratchy_ir::{DenseReason, KvRows, codec_for};
-    let coded = match store {
-        crate::target::KvStore::Dense => return scratchy_forward_compiler::KvCodec::Dense,
-        // A float8 cache holds any head: no geometry admission, the reference's own. A body that
-        // holds no KV stores none.
-        crate::target::KvStore::Fp8E4m3 if kv_layers.any() => {
-            return scratchy_forward_compiler::KvCodec::Fp8E4m3(kv_cache_scales(model));
-        }
-        crate::target::KvStore::Fp8E4m3 => return scratchy_forward_compiler::KvCodec::Dense,
-        crate::target::KvStore::Int8(coded) => coded,
-    };
     let latent = model.bounds.get("kv_lora_rank").is_some_and(|&r| r > 0);
     let rows = match (kv_layers.any(), latent) {
         (false, _) => KvRows::None,
@@ -7480,18 +7470,30 @@ fn kv_codec_for(
             global_head_dim,
         },
     };
-    match codec_for(rows, coded) {
-        Ok(()) => scratchy_forward_compiler::KvCodec::Int8,
-        Err(reason) => {
-            if reason != DenseReason::NoKvCache {
-                println!(
-                    "cargo:warning=int8 KV: {} keeps a dense KV cache: {reason}",
-                    model.source_stem
-                );
-            }
-            scratchy_forward_compiler::KvCodec::Dense
+    let (name, coded) = match store {
+        crate::target::KvStore::Dense => return scratchy_forward_compiler::KvCodec::Dense,
+        crate::target::KvStore::Int8(coded) => (
+            "int8",
+            codec_for(rows, coded).map(|()| scratchy_forward_compiler::KvCodec::Int8),
+        ),
+        crate::target::KvStore::Fp8E4m3(heads) => (
+            "fp8",
+            codec_for(rows, heads)
+                .and_then(|()| {
+                    kv_cache_scales(model.quantization.as_ref().map(|q| q.kv_cache_scheme))
+                })
+                .map(scratchy_forward_compiler::KvCodec::Fp8E4m3),
+        ),
+    };
+    coded.unwrap_or_else(|reason| {
+        if reason != DenseReason::NoKvCache {
+            println!(
+                "cargo:warning={name} KV: {} keeps a dense KV cache: {reason}",
+                model.source_stem
+            );
         }
-    }
+        scratchy_forward_compiler::KvCodec::Dense
+    })
 }
 
 /// A canonical's facts as the expression its generated `CanonicalParams::FACTS` states: every
@@ -9560,6 +9562,63 @@ mod tests {
         assert!(
             ts.contains("4 as usize"),
             "expected `4 as usize` for baked tp_world_size literal (got: {ts})",
+        );
+    }
+
+    /// ⭐ THE FLOAT8 STORE'S RULE, ON THE CHECKED-IN CONFIGS — a float8 store of 128-element sticks
+    /// (spyre's) gives granite-3.1-8b-instruct (head_dim 128) a float8 cache and
+    /// granite-3.1-2b-instruct (head_dim 64) a dense one; a dense store gives both dense; metal's
+    /// int8 store gives the 8b int8 as before.
+    #[test]
+    fn a_float8_store_takes_whole_stick_heads_and_leaves_the_rest_dense() {
+        let configs = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../models/arch/configs/granite");
+        let codec = |stem: &str, store: crate::target::KvStore| {
+            let path = configs.join(format!("{stem}.json"));
+            let model = crate::config::load_file_declared(&path)
+                .unwrap_or_else(|e| panic!("{stem} loads: {e:?}"));
+            fill_canonical_params(&model, 1, false, &every_layer(&model), None, store)
+                .0
+                .kv_codec()
+        };
+        let fp8 = crate::target::KvStore::Fp8E4m3(scratchy_ir::Fp8Heads::new(
+            std::num::NonZeroU32::new(128).expect("a stick holds elements"),
+        ));
+        let int8 = crate::target::KvStore::Int8(scratchy_ir::CodedHeads::new(64, 512));
+        assert_eq!(
+            codec("granite-3.1-8b-instruct", fp8),
+            scratchy_ir::KvCodec::Fp8E4m3(scratchy_ir::KvCacheScales::Unscaled)
+        );
+        assert_eq!(
+            codec("granite-3.1-2b-instruct", fp8),
+            scratchy_ir::KvCodec::Dense
+        );
+        assert_eq!(
+            codec("granite-3.1-8b-instruct", crate::target::KvStore::Dense),
+            scratchy_ir::KvCodec::Dense
+        );
+        assert_eq!(
+            codec("granite-3.1-8b-instruct", int8),
+            scratchy_ir::KvCodec::Int8
+        );
+    }
+
+    /// A config that states a `kv_cache_scheme` keeps a dense cache: its scales live only in the
+    /// checkpoint's tensors. One that states none stores K and V unscaled.
+    #[test]
+    fn a_stated_kv_cache_scheme_keeps_the_cache_dense() {
+        use crate::quantization::KvCacheScheme;
+        assert_eq!(
+            kv_cache_scales(Some(KvCacheScheme::Stated)),
+            Err(scratchy_ir::DenseReason::StatedKvScales)
+        );
+        assert_eq!(
+            kv_cache_scales(Some(KvCacheScheme::Absent)),
+            Ok(scratchy_forward_compiler::KvCacheScales::Unscaled)
+        );
+        assert_eq!(
+            kv_cache_scales(None),
+            Ok(scratchy_forward_compiler::KvCacheScales::Unscaled)
         );
     }
 }

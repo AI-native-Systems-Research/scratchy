@@ -138,13 +138,13 @@ pub struct ModelEmission {
 
 /// ⭐ HOW A TARGET STORES A MODEL'S KV CACHE — its choice of the shared KV codec fact
 /// ([`scratchy_ir::KvCodec`]), made once per build: dense, int8 codes wherever the codec takes the
-/// geometry at the heads the target's kernels code (`scratchy_ir::codec_for`), or float8 e4m3 for
-/// every body that holds KV.
+/// geometry at the heads the target's kernels code (`scratchy_ir::codec_for`), or float8 e4m3 at
+/// the heads whole sticks of the target's float8 format.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KvStore {
     Dense,
     Int8(scratchy_ir::CodedHeads),
-    Fp8E4m3,
+    Fp8E4m3(scratchy_ir::Fp8Heads),
 }
 
 /// A target's emission, called by the shared pipeline.

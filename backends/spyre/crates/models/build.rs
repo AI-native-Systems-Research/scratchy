@@ -20,9 +20,10 @@ fn main() {
     scratchy_models_build::build(&ModelsBuild {
         metadata: &metadata,
         out_dir: &out_dir,
-        emitter: &scratchy_target_spyre_compiler::Spyre {
-            kv_fp8: cfg!(feature = "kv-fp8"),
-        },
+        emitter: &scratchy_target_spyre_compiler::Spyre::of_kv_features(
+            cfg!(feature = "kv-fp8"),
+            cfg!(feature = "kv-dense"),
+        ),
         dump_dir,
         inspect: &|_| Vec::new(),
     });

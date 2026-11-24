@@ -21,7 +21,7 @@ use scratchy_tensors::tensor::MAX_DIMS;
 // `scratchy-tensors` core so this cfg-free crate can name them without a
 // backend feature.
 pub use scratchy_layers::kv_int8::{
-    CodedHeads, DenseReason, KvCacheScales, KvCodec, KvRows, codec_for,
+    CodedHeads, DenseReason, Fp8Heads, KvCacheScales, KvCodec, KvRows, codec_for,
 };
 use scratchy_tensors::{ActDtype, ScaleDtype};
 
