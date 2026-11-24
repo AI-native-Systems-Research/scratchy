@@ -454,7 +454,7 @@ mod tests {
     ///   `PagedStep::card_placements` (sixteen pages at `INDEX_RUN_WORDS × 4` each); pinning
     ///   the const here closes the chain through `card_kv_row_pool_bytes`'s page spelling.
     /// * a whole-page pool's bytes are the same counted by page or by row — `pages ×
-    ///   pool_page_bytes(cols)` is the row-count spelling (`rows × row_footprint_bytes`)
+    ///   pool_page_bytes(cols)` is the row-count spelling (`rows × row_stick_bytes`)
     ///   the layout's pool placement was sized by, so the re-route through the page law
     ///   moves no byte.
     #[test]
@@ -479,10 +479,7 @@ mod tests {
                         }
                         .page_bytes(),
                     u64::from(rows)
-                        * crate::lower_subtile_tape_to_superdsc::row_footprint_bytes(
-                            cols,
-                            format.df(),
-                        ),
+                        * crate::lower_subtile_tape_to_superdsc::row_stick_bytes(cols, format.df()),
                     "cols {cols}: a whole-page pool's bytes are the same by page or by row"
                 );
             }
@@ -675,7 +672,7 @@ mod tests {
         );
     }
 
-    /// ⭐ A FLOAT8 POOL PAYS ITS OWN FORMAT'S PAGE — the tape's format, at its row footprint.
+    /// ⭐ A FLOAT8 POOL PAYS ITS OWN FORMAT'S PAGE — the tape's format, at its whole-stick row.
     #[test]
     fn a_float8_pool_pays_its_own_page() {
         use ktir_superdsc::superdsc_opspec::Df;
@@ -683,7 +680,7 @@ mod tests {
             assert_eq!(
                 fp8(cols).page_bytes(),
                 u64::from(SchedulerBlockTokens::REFERENCE.get())
-                    * crate::lower_subtile_tape_to_superdsc::row_footprint_bytes(cols, Df::Fp8)
+                    * crate::lower_subtile_tape_to_superdsc::row_stick_bytes(cols, Df::Fp8)
             );
             assert!(fp8(cols).page_bytes() < fp16(cols).page_bytes());
         }
@@ -699,5 +696,24 @@ mod tests {
             None,
         );
         assert_eq!(r.page().get(), 2 * fp8(1024).page_bytes());
+    }
+
+    /// ⭐ A POOL ROW IS ITS WHOLE STICKS, NEVER THE OCCUPANCY PAD — a rank's 256-column share of a
+    /// tensor-parallel world pays its own bytes a row, where a streamed width of the same columns
+    /// reserves the pad's; a width the pad leaves alone is the same either way.
+    #[test]
+    fn a_pool_row_pays_its_whole_sticks_not_the_occupancy_pad() {
+        use ktir_superdsc::superdsc_opspec::Df;
+        let slots = u64::from(SchedulerBlockTokens::REFERENCE.get());
+        assert_eq!(fp16(256).page_bytes(), slots * 512);
+        assert_eq!(fp8(256).page_bytes(), slots * 256);
+        assert!(
+            fp16(256).page_bytes()
+                < slots * crate::lower_subtile_tape_to_superdsc::row_footprint_bytes(256, Df::Fp16)
+        );
+        assert_eq!(
+            fp16(1024).page_bytes(),
+            slots * crate::lower_subtile_tape_to_superdsc::row_footprint_bytes(1024, Df::Fp16)
+        );
     }
 }
