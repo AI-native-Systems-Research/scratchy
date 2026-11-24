@@ -1,6 +1,4 @@
 // SPDX-License-Identifier: Apache-2.0
-// The MoE loader `*Ops` mirror the GPU target's multi-arg `load` signatures.
-#![allow(clippy::too_many_arguments)]
 //! Spyre (KTIR) MoE (Mixture of Experts) load surface.
 //!
 //! Spyre is a host fp16 backend with no MoE GEMM / topk kernels yet, so every
@@ -48,7 +46,6 @@ pub trait FusedMoEOps {
 
 impl FusedMoEOps for FusedMoELayer {
     /// Macro-emitted load entry for Dense BF16 MoE checkpoints (spyre).
-    #[allow(clippy::too_many_arguments)]
     fn load(
         _gw: &mut crate::weights::GpuWeights,
         _prefix: &str,
@@ -59,7 +56,6 @@ impl FusedMoEOps for FusedMoELayer {
     }
 
     /// Macro-emitted load entry for MLX-affine int4 MoE checkpoints (spyre).
-    #[allow(clippy::too_many_arguments)]
     fn load_affine(
         _gw: &mut crate::weights::GpuWeights,
         _prefix: &str,
@@ -98,7 +94,6 @@ pub trait SharedFusedMoEOps {
 
 impl SharedFusedMoEOps for SharedFusedMoELayer {
     /// Macro-emitted load entry for Dense BF16 Qwen-MoE checkpoints (spyre).
-    #[allow(clippy::too_many_arguments)]
     fn load(
         _gw: &mut crate::weights::GpuWeights,
         _prefix: &str,
@@ -110,7 +105,6 @@ impl SharedFusedMoEOps for SharedFusedMoELayer {
     }
 
     /// Macro-emitted load entry for MLX-affine int4 Qwen-MoE checkpoints (spyre).
-    #[allow(clippy::too_many_arguments)]
     fn load_affine(
         _gw: &mut crate::weights::GpuWeights,
         _prefix: &str,
@@ -262,7 +256,6 @@ fn gemma_router_gate_check(
 // ---------------------------------------------------------------------------
 
 pub trait SwitchGluExpertsOps {
-    #[allow(clippy::too_many_arguments)]
     fn load(
         gw: &mut crate::weights::GpuWeights,
         prefix: &str,
@@ -292,7 +285,6 @@ impl SwitchGluExpertsOps for SwitchGluExpertsLayer {
     /// Any other layout (MLX-affine pre-stacked, HF fused bf16,
     /// compressed-tensors INT4) bails for now — the fp8 checkpoint is this
     /// track's target and a partial dequant path here would be untestable.
-    #[allow(clippy::too_many_arguments)]
     fn load(
         gw: &mut crate::weights::GpuWeights,
         prefix: &str,
@@ -412,7 +404,6 @@ pub trait DeepSeekV2MoEOps {
 
 impl DeepSeekV2MoEOps for DeepSeekV2MoELayer {
     /// Macro-emitted load entry for DeepSeek-V2/V3-family BF16 MoE (spyre).
-    #[allow(clippy::too_many_arguments)]
     fn load(
         _gw: &mut crate::weights::GpuWeights,
         _prefix: &str,
@@ -433,16 +424,9 @@ pub trait DeepSeekV2Fp8BlockMoEOps {
     fn load(
         gw: &mut crate::weights::GpuWeights,
         prefix: &str,
-        n_routed_experts: usize,
+        bank: ExpertBank,
         n_shared_experts: usize,
-        top_k: usize,
-        moe_intermediate_size: usize,
-        hidden_size: usize,
-        norm_topk_prob: bool,
-        routed_scaling_factor: f32,
-        use_sigmoid: bool,
-        n_expert_group: usize,
-        topk_group: usize,
+        routing: GroupedRouting,
         output_dtype: crate::dtype::DType,
         stream: crate::LoadStream,
     ) -> anyhow::Result<Self>
@@ -452,20 +436,12 @@ pub trait DeepSeekV2Fp8BlockMoEOps {
 
 impl DeepSeekV2Fp8BlockMoEOps for DeepSeekV2Fp8BlockMoELayer {
     /// Macro-emitted load entry for DeepSeek-V3/Kimi-K2 FP8-block MoE (spyre).
-    #[allow(clippy::too_many_arguments)]
     fn load(
         _gw: &mut crate::weights::GpuWeights,
         _prefix: &str,
-        _n_routed_experts: usize,
+        _bank: ExpertBank,
         _n_shared_experts: usize,
-        _top_k: usize,
-        _moe_intermediate_size: usize,
-        _hidden_size: usize,
-        _norm_topk_prob: bool,
-        _routed_scaling_factor: f32,
-        _use_sigmoid: bool,
-        _n_expert_group: usize,
-        _topk_group: usize,
+        _routing: GroupedRouting,
         _output_dtype: crate::dtype::DType,
         _stream: crate::LoadStream,
     ) -> anyhow::Result<Self> {
@@ -481,16 +457,9 @@ pub trait DeepSeekV2GgmlMoEOps {
     fn load_gguf(
         gw: &mut crate::weights::GpuWeights,
         prefix: &str,
-        n_routed_experts: usize,
+        bank: ExpertBank,
         n_shared_experts: usize,
-        top_k: usize,
-        moe_intermediate_size: usize,
-        hidden_size: usize,
-        norm_topk_prob: bool,
-        routed_scaling_factor: f32,
-        use_sigmoid: bool,
-        n_expert_group: usize,
-        topk_group: usize,
+        routing: GroupedRouting,
         stream: crate::LoadStream,
     ) -> anyhow::Result<Self>
     where
@@ -499,20 +468,12 @@ pub trait DeepSeekV2GgmlMoEOps {
 
 impl DeepSeekV2GgmlMoEOps for DeepSeekV2GgmlMoELayer {
     /// Macro-emitted load entry for DeepSeek-family GGUF/GGML MoE (spyre).
-    #[allow(clippy::too_many_arguments)]
     fn load_gguf(
         _gw: &mut crate::weights::GpuWeights,
         _prefix: &str,
-        _n_routed_experts: usize,
+        _bank: ExpertBank,
         _n_shared_experts: usize,
-        _top_k: usize,
-        _moe_intermediate_size: usize,
-        _hidden_size: usize,
-        _norm_topk_prob: bool,
-        _routed_scaling_factor: f32,
-        _use_sigmoid: bool,
-        _n_expert_group: usize,
-        _topk_group: usize,
+        _routing: GroupedRouting,
         _stream: crate::LoadStream,
     ) -> anyhow::Result<Self> {
         anyhow::bail!("scratchy-target-spyre: DeepSeekV2GgmlMoELayer load not yet implemented")

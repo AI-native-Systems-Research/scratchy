@@ -84,51 +84,40 @@ impl TargetEmitter for Spyre {
             rope_context_init,
             ..
         } = cx;
+        let body = quote! {
+            #packed_splits_prelude
+            // ⛔ THE QUANT PRELUDES, because the `#lets` below are the shared per-accessor
+            // load plans and they REFERENCE these bindings (`__fp8_dtype`, `__marlin_ws`,
+            // `__bnb_code`). Omitting them does not disable quant — it emits a load body
+            // that names an undefined local. Each prelude elides itself when the model has
+            // no accessor of that kind, so a dense model is unaffected.
+            #marlin_prelude
+            #bnb4_prelude
+            #fp8_prelude
+            #(#lets)*
+            #rope_rows
+            #rotary_load
+            #rotary_local_load
+            Ok(#weights_ctor {
+                #(#field_shorthand,)*
+                #rotary_init
+                #rotary_local_init
+                #rope_context_init
+            })
+        };
+        // A body that loads a weight calls a loader `*Ops` method, so it opens their glob; a body
+        // of no weights opens nothing.
+        let load_ops = (!(lets.is_empty() && packed_splits_prelude.is_empty()))
+            .then(|| quote! { use crate::__gpu::load_ops::*; });
+        let params = scratchy_forward_compiler_macro::target::load_params(&body);
         quote! {
             /// It builds the real `Weights` through `crate::__gpu`'s loader `*Ops`, which
             /// `scratchy-target-spyre` provides (backed by the neutral allocator-generic
             /// loaders + `SpyreAllocator`). `stream` is `()` (`LoadStream`); rotary loads from
             /// `GpuWeights` (no stream).
-            #[allow(clippy::too_many_lines, unused_variables)]
-            pub fn load(
-                gw: &mut crate::__gpu::weights::GpuWeights,
-                stream: crate::__gpu::LoadStream,
-                max_model_len: usize,
-                tp_rank: u8,
-            ) -> ::anyhow::Result<Weights> {
-                use crate::__gpu::layers::{
-                    LinearLayerOps as _, EmbeddingOps as _, RmsNormOps as _, LayerNormOps as _,
-                    GatedDeltaNetOps as _,
-                };
-                use crate::__gpu::layers_quant::{
-                    MarlinLoadOps as _, Fp8LoadOps as _, Fp8BlockLoadOps as _, Bnb4bitLoadOps as _,
-                    AffineQuantEmbeddingOps as _,
-                };
-                use crate::__gpu::layers_moe::{
-                    DeepSeekV2MoEOps as _, DeepSeekV2Fp8BlockMoEOps as _,
-                    DeepSeekV2GgmlMoEOps as _, FusedMoEOps as _, SharedFusedMoEOps as _,
-                    Gemma4RouterOps as _, SwitchGluExpertsOps as _,
-                };
-                use crate::__gpu::rotary::CudaRotaryExt as _;
-                #packed_splits_prelude
-                // ⛔ THE QUANT PRELUDES, because the `#lets` below are the shared per-accessor
-                // load plans and they REFERENCE these bindings (`__fp8_dtype`, `__marlin_ws`,
-                // `__bnb_code`). Omitting them does not disable quant — it emits a load body
-                // that names an undefined local. Each prelude elides itself when the model has
-                // no accessor of that kind, so a dense model is unaffected.
-                #marlin_prelude
-                #bnb4_prelude
-                #fp8_prelude
-                #(#lets)*
-                #rope_rows
-                #rotary_load
-                #rotary_local_load
-                Ok(#weights_ctor {
-                    #(#field_shorthand,)*
-                    #rotary_init
-                    #rotary_local_init
-                    #rope_context_init
-                })
+            pub fn load(#params) -> ::anyhow::Result<Weights> {
+                #load_ops
+                #body
             }
         }
     }
@@ -242,16 +231,7 @@ impl TargetEmitter for Spyre {
     fn bake_model(&self, cx: &BakeCx<'_>) -> TokenStream {
         let mut out = TokenStream::new();
         match cx.decode_bounds {
-            Some(decode_bounds) => bake::dump_wavefront_mega(
-                cx.program,
-                cx.model,
-                cx.facts,
-                cx.fuf,
-                cx.inferred,
-                decode_bounds,
-                &mut out,
-                cx.dump_dir,
-            ),
+            Some(decode_bounds) => bake::dump_wavefront_mega(cx, decode_bounds, &mut out),
             None => eprintln!(
                 "[wavefront] {}: no decode (num_tokens=1) workload point",
                 cx.model.source_stem

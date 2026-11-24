@@ -125,10 +125,6 @@ impl TargetEmitter for Metal {
                 metal_guest: ::std::sync::OnceLock::new(),
             })
         };
-        // A parameter the body reads keeps its name; one it doesn't (the stream, a rank no weight
-        // shards by) is `_`.
-        let [reads_stream, reads_len, reads_rank] =
-            crate::const_tokens::named(&body, ["stream", "max_model_len", "tp_rank"]);
         // Bring the `load*` extension traits into scope so the path-syntax
         // `LinearLayer::load_dense_or_ggml(...)`, `RmsNorm::load(...)`, `Embedding::load(...)`,
         // `AffineQuantEmbedding::load(...)`, … calls the body emits resolve: a body that loads a
@@ -136,33 +132,14 @@ impl TargetEmitter for Metal {
         let load_ops = (!(lets.is_empty() && packed_splits_prelude.is_empty())).then(|| {
             quote! { use crate::__gpu::load_ops::*; }
         });
-        let stream = if reads_stream {
-            quote!(stream)
-        } else {
-            quote!(_)
-        };
-        let max_model_len = if reads_len {
-            quote!(max_model_len)
-        } else {
-            quote!(_)
-        };
-        let tp_rank = if reads_rank {
-            quote!(tp_rank)
-        } else {
-            quote!(_)
-        };
+        let params = scratchy_forward_compiler_macro::target::load_params(&body);
         quote! {
             /// The `stream` is `()` and unused; the body shares the canonical's `lets`
             /// and `field_shorthand` — `LinearConcat` arms route
             /// through `LinearLayer::load_dense_concat_packed`. The
             /// RoPE tables are not built here but with the pool
             /// (`build_rope_tables`), once the KV cache is sized.
-            pub fn load(
-                gw: &mut crate::__gpu::weights::GpuWeights,
-                #stream: crate::__gpu::LoadStream,
-                #max_model_len: usize,
-                #tp_rank: u8,
-            ) -> ::anyhow::Result<Weights> {
+            pub fn load(#params) -> ::anyhow::Result<Weights> {
                 #load_ops
                 // Pin the RMSNorm gain dtype to the kernel's `T_scale` (the
                 // `_s_<scale>_` arm fixes it from `SCALE_DTYPE`, not the on-disk

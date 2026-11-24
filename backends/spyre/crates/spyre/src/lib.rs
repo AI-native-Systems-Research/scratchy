@@ -122,6 +122,22 @@ pub mod layers_moe;
 pub mod layers_quant;
 pub mod loaders;
 pub mod rotary;
+/// The loader `*Ops` extension traits, one glob for the emitted `Weights::load` to open, so its
+/// path-syntax `Embedding::load(...)`, `LinearLayer::load_dense(...)`, … calls resolve.
+pub mod load_ops {
+    pub use crate::layers::{
+        EmbeddingOps as _, GatedDeltaNetOps as _, LayerNormOps as _, LinearLayerOps as _,
+        RmsNormOps as _,
+    };
+    pub use crate::layers_moe::{
+        DeepSeekV2Fp8BlockMoEOps as _, DeepSeekV2GgmlMoEOps as _, DeepSeekV2MoEOps as _,
+        FusedMoEOps as _, Gemma4RouterOps as _, SharedFusedMoEOps as _, SwitchGluExpertsOps as _,
+    };
+    pub use crate::layers_quant::{
+        AffineQuantEmbeddingOps as _, Bnb4bitLoadOps as _, Fp8BlockLoadOps as _, Fp8LoadOps as _,
+        MarlinLoadOps as _,
+    };
+}
 // Re-export the `load_layered_*` free fns at the crate root so the macro's
 // `crate::__gpu::load_layered_*` calls resolve (mirrors every other target's lib.rs).
 pub use loaders::{

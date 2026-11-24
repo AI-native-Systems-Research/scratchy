@@ -294,11 +294,11 @@ fn emit_weight_bindings(
         };
         let i = proc_macro2::Literal::u32_unsuffixed(i as u32);
         arms.push(quote! {
-            out.push(::scratchy_target_spyre::BoundWeight {
+            ::scratchy_target_spyre::BoundWeight {
                 id: #i,
                 tensor: #tensor,
                 is_gemm: #is_gemm,
-            });
+            }
         });
     }
 
@@ -340,13 +340,10 @@ fn emit_weight_bindings(
         /// Generated: each entry NAMES a field, so a source the struct cannot
         /// satisfy fails to compile here rather than failing to resolve a
         /// string at model load.
-        #[allow(clippy::vec_init_then_push)]
         pub fn superdsc_weights(
             w: &Weights,
         ) -> ::anyhow::Result<::std::vec::Vec<::scratchy_target_spyre::BoundWeight>> {
-            let mut out = ::std::vec::Vec::new();
-            #(#arms)*
-            Ok(out)
+            Ok(::std::vec![#(#arms),*])
         }
     })
 }

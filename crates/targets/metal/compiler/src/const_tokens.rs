@@ -58,37 +58,7 @@ pub(crate) fn alias_preamble(body: &TokenStream) -> TokenStream {
     )
 }
 
-/// Which of `names` `body` mentions, at any depth: an emitted item names what it reads and
-/// nothing else.
-pub(crate) fn named<const N: usize>(body: &TokenStream, names: [&str; N]) -> [bool; N] {
-    fn mark<const N: usize>(tokens: &TokenStream, names: &[&str; N], seen: &mut [bool; N]) {
-        for tree in tokens.clone() {
-            match tree {
-                proc_macro2::TokenTree::Ident(ident) => {
-                    for (name, seen) in names.iter().zip(seen.iter_mut()) {
-                        *seen |= ident == name;
-                    }
-                }
-                proc_macro2::TokenTree::Group(group) => mark(&group.stream(), names, seen),
-                proc_macro2::TokenTree::Punct(_) | proc_macro2::TokenTree::Literal(_) => {}
-            }
-        }
-    }
-    let mut seen = [false; N];
-    mark(body, &names, &mut seen);
-    seen
-}
-
-/// The `use` items of `uses` (each beside the name it brings into scope) whose names `body`
-/// mentions, in `uses`' order: an emitted block imports what it names and nothing else.
-pub(crate) fn uses_named<const N: usize>(
-    body: &TokenStream,
-    uses: [(&str, TokenStream); N],
-) -> TokenStream {
-    let seen = named(body, uses.each_ref().map(|(name, _)| *name));
-    let items = (uses.into_iter().zip(seen)).filter_map(|((_, item), seen)| seen.then_some(item));
-    quote!(#(#items)*)
-}
+pub(crate) use scratchy_forward_compiler_macro::target::uses_named;
 
 /// The module each tape type lives in — the single per-type fact the
 /// emitter needs. A type missing here is a macro-time error naming it.

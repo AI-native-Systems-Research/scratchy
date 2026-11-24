@@ -6,7 +6,7 @@
 use std::collections::BTreeMap;
 
 use quote::quote;
-use scratchy_forward_compiler_frontend::classified::{OpKind, Program, WeightId};
+use scratchy_forward_compiler_frontend::classified::{OpKind, WeightId};
 use scratchy_forward_compiler_macro::config::ModelParams;
 use scratchy_forward_compiler_macro::fuf::{Fuf, FufInput, TileId};
 use scratchy_target_spyre::pool_pages::{
@@ -1197,7 +1197,6 @@ fn emit_superdsc_wiring(
 /// 156 MB of distinct device code packs to single-digit MB. A launch group's token names its frame's
 /// ROW in the one `BakedImages` static; the card crate decompresses at the door that uploads it, so
 /// the card receives byte-identical bytes and nothing between here and there parses anything.
-#[cfg_attr(not(feature = "spyre-lower"), allow(unused_variables))]
 fn superdsc_bundle_tokens(model: &ModelParams) -> proc_macro2::TokenStream {
     // ⭐⭐⭐ WHAT IS INVENTORIED DEPENDS ON THE DEVICE, AND ONLY ON THE DEVICE.
     //
@@ -1285,38 +1284,16 @@ fn superdsc_bundle_tokens(model: &ModelParams) -> proc_macro2::TokenStream {
         &mut out,
         (&mut n_groups, &mut n_bytes),
     );
-    // ── THE BAKE BUDGET, PER MODEL (see `scratchy_target_spyre::superdsc_bake::BakeBudget`) ──
-    //    Launch-group COUNT is the dxp floor's multiplication lever: the floor is total compile
-    //    cost ÷ the queue's width, so a ladder that doubles its rungs doubles the floor no
-    //    parallelism recovers. Checked at the drain — one `#[forward]` expansion, i.e. one
-    //    model's whole ladder — and scaled per LAYER, because the models in scope span the
-    //    measured 25 groups/layer (granite-2b, 40 layers) to 73 (gemma-4-12b, 48): a flat
-    //    ceiling tight enough to hold the 2b refuses the 12b. Card-only: on the emulator the
-    //    drained groups are one-per-op KTIR programs, a different unit this budget never sees.
-    #[cfg(feature = "spyre-lower")]
-    {
-        let layers = model.text.layers.get();
-        let per_layer = scratchy_target_spyre::superdsc_bake::BakeBudget::MAX_GROUPS_PER_LAYER;
-        let ceiling = layers * per_layer;
-        if n_groups > ceiling {
-            panic!(
-                "[spyre-superdsc] {}: {n_groups} launch group(s) across {layers} layer(s) is \
-                 PAST THE BAKE BUDGET of {per_layer} groups per layer ({ceiling} total). Group \
-                 count is the dxp floor's multiplication lever — a ladder this wide is a bake \
-                 that grew, not one a wider queue absorbs. Moving the budget is a measured \
-                 decision that names the bake; this refusal is the measurement.",
-                model.source_stem
-            );
-        }
-    }
+    bake_budget(model, n_groups);
     // The programs are `const` items and the placement tables `static`s; both precede the
     // `inventory::submit!`s that name them. The packed images are one more `static` of the same
     // kind: `__SDSC_IMAGES`, the one table every launch group's `BakedImage::Baked` names.
     let programs = interner.items();
     let tables = places_interner.items();
     let (images_static, packed) = image_interner.pack(&images);
-    let preamble = crate::ktir_tokens::preamble();
-    out = quote! { #preamble #(#programs)* #(#tables)* #images_static #out };
+    let body = quote! { #(#programs)* #(#tables)* #images_static #out };
+    let preamble = crate::ktir_tokens::preamble(&body);
+    out = quote! { #preamble #body };
     let packed_note = if packed.frames > 0 {
         format!(
             " packed to {:.1} MB in {} zstd frame(s) against a {:.0} KB dictionary",
@@ -1336,6 +1313,35 @@ fn superdsc_bundle_tokens(model: &ModelParams) -> proc_macro2::TokenStream {
     );
     out
 }
+
+/// THE BAKE BUDGET, PER MODEL (see `scratchy_target_spyre::superdsc_bake::BakeBudget`).
+/// Launch-group COUNT is the dxp floor's multiplication lever: the floor is total compile
+/// cost ÷ the queue's width, so a ladder that doubles its rungs doubles the floor no
+/// parallelism recovers. Checked at the drain — one `#[forward]` expansion, i.e. one
+/// model's whole ladder — and scaled per LAYER, because the models in scope span the
+/// measured 25 groups/layer (granite-2b, 40 layers) to 73 (gemma-4-12b, 48): a flat
+/// ceiling tight enough to hold the 2b refuses the 12b. Card-only: on the emulator the
+/// drained groups are one-per-op KTIR programs, a different unit this budget never sees.
+#[cfg(feature = "spyre-lower")]
+fn bake_budget(model: &ModelParams, n_groups: usize) {
+    let layers = model.text.layers.get();
+    let per_layer = scratchy_target_spyre::superdsc_bake::BakeBudget::MAX_GROUPS_PER_LAYER;
+    let ceiling = layers * per_layer;
+    if n_groups > ceiling {
+        panic!(
+            "[spyre-superdsc] {}: {n_groups} launch group(s) across {layers} layer(s) is \
+             PAST THE BAKE BUDGET of {per_layer} groups per layer ({ceiling} total). Group \
+             count is the dxp floor's multiplication lever — a ladder this wide is a bake \
+             that grew, not one a wider queue absorbs. Moving the budget is a measured \
+             decision that names the bake; this refusal is the measurement.",
+            model.source_stem
+        );
+    }
+}
+
+/// A build that lowers no card rung holds no bake budget.
+#[cfg(not(feature = "spyre-lower"))]
+fn bake_budget(_: &ModelParams, _: usize) {}
 
 /// Render one world's drained bundles as `inventory` registrations — each `BundleCode::<'static, W>`
 /// (`world` is `W`'s path), registered type-erased so a lookup of world `W` finds it by downcast.
@@ -2668,27 +2674,26 @@ fn baked_pool_tokens(pool: BakedPool) -> proc_macro2::TokenStream {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-// `program` and `ktir_bundle_out` are only
-// read inside the spyre cfg block below; without that feature the
-// function still lowers + reports stats but consumes none of them.
+/// The model's bake at its decode point's `decode_bounds`: `cx.facts` is the one source of the
+/// attention geometry and scale it lowers by, resolved once below, never re-read from a config or
+/// a bound. `ktir_bundle_out` receives the embedded `pub const KTIR_BUNDLE` token stream
+/// (spliced into the per-model module). `cx.dump_dir` is where the bake writes each bundle's dxp
+/// input, when the build asked (`superdsc-dump`).
 pub(crate) fn dump_wavefront_mega(
-    program: &Program,
-    model: &ModelParams,
-    // The model's facts (#1083): the one source of the attention geometry and scale this
-    // bake lowers by — resolved once below, never re-read from a config or a bound.
-    facts: &scratchy_ir::model_facts::ModelFacts,
-    fuf: &Fuf,
-    inferred: &scratchy_forward_compiler_macro::shape::Inferred,
+    cx: &scratchy_forward_compiler_macro::target::BakeCx<'_>,
     decode_bounds: &BTreeMap<String, u64>,
-    // Out: under `-Fspyre` the embedded `pub const KTIR_BUNDLE` token stream
-    // (spliced into the per-model module); empty under every other target.
     ktir_bundle_out: &mut proc_macro2::TokenStream,
-    // Where the bake writes each bundle's dxp input, when the build asked (`superdsc-dump`): the
-    // build script's own output directory, passed down from `compile_carrier`'s caller.
-    dump_dir: Option<&std::path::Path>,
 ) {
     use scratchy_forward_compiler_macro::to_wavefront;
+    let scratchy_forward_compiler_macro::target::BakeCx {
+        program,
+        model,
+        facts,
+        fuf,
+        inferred,
+        dump_dir,
+        ..
+    } = *cx;
     let stem = model.source_stem.as_str();
     let dump = match dump_dir {
         Some(d) => scratchy_target_spyre::lower_subtile_tape_to_superdsc::DumpRoot::under(d),
@@ -2837,7 +2842,6 @@ pub(crate) fn dump_wavefront_mega(
         // `Fn` and runs twice (decode, prefill), and only the decode walk's
         // wiring is kept (both agree on every field below — the prefill bundle
         // differs only in row count, which is not a term here).
-        #[allow(clippy::type_complexity)]
         let wiring_tokens: std::cell::RefCell<WiringCells> = std::cell::RefCell::new(WiringCells {
             decode: None,
             prefill: None,
