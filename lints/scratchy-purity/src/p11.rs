@@ -1,6 +1,6 @@
 //! P11, lock and comment hygiene.
 
-use crate::comments;
+use crate::{allows, comments};
 use clippy_utils::diagnostics::span_lint_and_help;
 use rustc_lint::{EarlyContext, EarlyLintPass, LintContext};
 use rustc_session::{declare_lint, declare_lint_pass};
@@ -38,13 +38,24 @@ declare_lint! {
     "a [lints] table that sets a purity lint's level"
 }
 
-declare_lint_pass!(P11 => [P11_ESCAPE_HATCH_CONSTRUCTOR, P11_TOMBSTONE_COMMENT, P11_TMP_PATH_COMMENT, P11_LINT_OPT_OUT]);
+declare_lint! {
+    /// P11: no `#[allow]` anywhere. An `allow` or `expect` attribute, for any lint, opts the
+    /// code under it out of a check; the fix is the design the lint doesn't flag. It is reported
+    /// in a macro's expansion too, so an allow a workspace macro emits is caught.
+    pub P11_LINT_ALLOW,
+    Forbid,
+    "an allow or expect attribute, which opts code out of a lint",
+    report_in_external_macro
+}
+
+declare_lint_pass!(P11 => [P11_ESCAPE_HATCH_CONSTRUCTOR, P11_TOMBSTONE_COMMENT, P11_TMP_PATH_COMMENT, P11_LINT_OPT_OUT, P11_LINT_ALLOW]);
 
 pub static LINTS: &[&rustc_lint::Lint] = &[
     P11_ESCAPE_HATCH_CONSTRUCTOR,
     P11_TOMBSTONE_COMMENT,
     P11_TMP_PATH_COMMENT,
     P11_LINT_OPT_OUT,
+    P11_LINT_ALLOW,
 ];
 
 /// The package's manifest, then the nearest manifest above it with a `[workspace]` table.
@@ -63,6 +74,10 @@ fn manifests(manifest_dir: &Path) -> Vec<std::path::PathBuf> {
     found.extend(workspace);
     found
 }
+
+const ALLOW_MSG: &str =
+    "P11: a lint allow opts this code out of a check; find the design the lint doesn't flag";
+const ALLOW_HELP: &str = "fix what the lint reports, then delete the attribute";
 
 const TOMBSTONE_HELP: &str = "say what the code does now, or delete the comment";
 const TMP_HELP: &str =
@@ -109,19 +124,27 @@ pub fn check_comment(cx: &EarlyContext<'_>, span: rustc_span::Span, body: &str, 
     }
 }
 
-/// What one file's tokens hold for P11: its comments, and the names of the `fn`s it defines.
+/// What one file's tokens hold for P11: its comments, the names of the `fn`s it defines, and
+/// its lint allows.
 #[derive(Default)]
 struct Found {
     comments: Vec<(rustc_span::Span, String)>,
     fns: Vec<(rustc_span::Span, String)>,
+    allows: Vec<rustc_span::Span>,
 }
 
-/// Every comment in one source file, and every name a `fn` keyword defines, each with its span.
-/// Read from tokens, so code no build compiles (tests, a disabled feature) is read too.
+/// Every comment in one source file, every name a `fn` keyword defines, and every lint allow
+/// attribute, each with its span. Read from tokens, so code no build compiles (tests, a disabled
+/// feature) is read too.
 fn file_tokens(file: &rustc_span::SourceFile, found: &mut Found) {
     let Some(src) = file.src.as_deref() else {
         return;
     };
+    for at in allows::lint_allows(src) {
+        let lo = file.start_pos + rustc_span::BytePos(at.start as u32);
+        let hi = file.start_pos + rustc_span::BytePos(at.end as u32);
+        found.allows.push(rustc_span::Span::with_root_ctxt(lo, hi));
+    }
     let mut offset = 0u32;
     let mut after_fn = false;
     for token in rustc_lexer::tokenize(src, rustc_lexer::FrontmatterAllowed::No) {
@@ -230,11 +253,91 @@ fn checked_tokens(cx: &EarlyContext<'_>, manifest_dir: &Path) -> Found {
     found
 }
 
+/// A source file's path on this host, absolute.
+fn file_path(file: &rustc_span::SourceFile) -> Option<std::path::PathBuf> {
+    let rustc_span::FileName::Real(real) = &file.name else {
+        return None;
+    };
+    let (dir, _) = real.embeddable_name(rustc_span::RemapPathScopeComponents::DIAGNOSTICS);
+    Some(dir.join(real.local_path()?))
+}
+
+/// Whether a file is generated: under this crate's `OUT_DIR`, or under a `target` directory.
+fn generated(path: &Path) -> bool {
+    std::env::var_os("OUT_DIR").is_some_and(|out| path.starts_with(out))
+        || path
+            .components()
+            .any(|c| c == std::path::Component::Normal("target".as_ref()))
+}
+
+/// Whether the package token walk reads this attribute and flags it itself: it sits, as an allow,
+/// in a source file outside every `target` and `OUT_DIR`.
+fn read_by_token_walk(cx: &EarlyContext<'_>, span: rustc_span::Span) -> bool {
+    let file = cx.sess().source_map().lookup_source_file(span.lo());
+    let (Some(path), Some(src)) = (file_path(&file), file.src.as_deref()) else {
+        return false;
+    };
+    let (lo, hi) = (
+        (span.lo() - file.start_pos).0 as usize,
+        (span.hi() - file.start_pos).0 as usize,
+    );
+    !generated(&path)
+        && allows::lint_allows(src)
+            .iter()
+            .any(|at| at.start <= lo && hi <= at.end)
+}
+
+/// The repository this package is in: the nearest directory at or above it holding `.git`.
+fn repository(manifest_dir: &Path) -> Option<&Path> {
+    manifest_dir.ancestors().find(|d| d.join(".git").exists())
+}
+
+/// Whether an attribute the token walk doesn't flag is this repository's to fix: written in
+/// generated code (`OUT_DIR`, the source of an `include!`), or emitted by a macro defined in the
+/// repository. An allow a dependency's or the compiler's macro emits (a derive's, `thread_local!`'s)
+/// is not, even where the macro gives it the span of the item it derives for, as clap's derive
+/// does: such a span has no expansion to name the macro, and the source under it has no allow.
+fn emitted_here(cx: &EarlyContext<'_>, span: rustc_span::Span, manifest_dir: &Path) -> bool {
+    let file = cx.sess().source_map().lookup_source_file(span.lo());
+    if file_path(&file).is_some_and(|path| generated(&path)) {
+        return true;
+    }
+    if !span.from_expansion() {
+        return false;
+    }
+    let def_site = span.ctxt().outer_expn_data().def_site;
+    if def_site.is_dummy() {
+        return false;
+    }
+    let file = cx.sess().source_map().lookup_source_file(def_site.lo());
+    file_path(&file)
+        .zip(repository(manifest_dir))
+        .is_some_and(|(path, repo)| path.starts_with(repo))
+}
+
 fn escape_hatch(name: &str) -> bool {
     name == "from_untyped" || name.starts_with("conflated_with_")
 }
 
 impl EarlyLintPass for P11 {
+    /// The allows the token walk can't see: those in generated code and those a macro emits.
+    fn check_attribute(&mut self, cx: &EarlyContext<'_>, attr: &rustc_ast::Attribute) {
+        if !allows::OPT_OUTS
+            .iter()
+            .any(|name| attr.name().is_some_and(|n| n.as_str() == *name))
+        {
+            return;
+        }
+        let Some(manifest_dir) = std::env::var_os("CARGO_MANIFEST_DIR") else {
+            return;
+        };
+        if !read_by_token_walk(cx, attr.span)
+            && emitted_here(cx, attr.span, Path::new(&manifest_dir))
+        {
+            span_lint_and_help(cx, P11_LINT_ALLOW, attr.span, ALLOW_MSG, None, ALLOW_HELP);
+        }
+    }
+
     fn check_crate(&mut self, cx: &EarlyContext<'_>, krate: &rustc_ast::Crate) {
         let Some(manifest_dir) = std::env::var_os("CARGO_MANIFEST_DIR") else {
             return;
@@ -243,6 +346,9 @@ impl EarlyLintPass for P11 {
         let found = checked_tokens(cx, manifest_dir);
         for (span, body) in &found.comments {
             check_comment(cx, *span, body, "");
+        }
+        for span in &found.allows {
+            span_lint_and_help(cx, P11_LINT_ALLOW, *span, ALLOW_MSG, None, ALLOW_HELP);
         }
         for (span, name) in found.fns.iter().filter(|(_, name)| escape_hatch(name)) {
             span_lint_and_help(
