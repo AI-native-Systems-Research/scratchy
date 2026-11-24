@@ -2,3 +2,10 @@
 # registry lookup, the one loader door, operational failures) and P2's user-approved staging LUT.
 # Each entry names the item's path, its rule, and who approved it. A new kind of exception is a
 # change to the skill first.
+
+# P4 exception 1, the runtime config.json to registry lookup: the one place a checkpoint's
+# architecture string is matched against the compiled models' rows, so P7 leaves it untouched.
+[[exception]]
+rule = "P7"
+item = "scratchy_forward_compiler::arch_registry::ArchRegistration::claims"
+approved = "the purity skill, P4 exception 1"

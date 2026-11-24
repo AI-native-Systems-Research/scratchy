@@ -1,0 +1,163 @@
+error: P7: `qwen3` is a model name deciding behavior; derive the fact from the config in one shared place, and name the math, not the model
+  --> $DIR/p7_model_names.rs:6:9
+   |
+LL |         "qwen3" => 8,
+   |         ^^^^^^^
+   |
+   = help: state the fact the model name stands for (a shape, a flag the config carries) and decide on that
+   = note: `#[forbid(p7_model_name_in_logic)]` on by default
+
+error: P7: `llama` is a model name deciding behavior; derive the fact from the config in one shared place, and name the math, not the model
+  --> $DIR/p7_model_names.rs:7:9
+   |
+LL |         "llama" | "mistral" => 4,
+   |         ^^^^^^^
+   |
+   = help: state the fact the model name stands for (a shape, a flag the config carries) and decide on that
+
+error: P7: `mistral` is a model name deciding behavior; derive the fact from the config in one shared place, and name the math, not the model
+  --> $DIR/p7_model_names.rs:7:19
+   |
+LL |         "llama" | "mistral" => 4,
+   |                   ^^^^^^^^^
+   |
+   = help: state the fact the model name stands for (a shape, a flag the config carries) and decide on that
+
+error: P7: `gemma` is a model name deciding behavior; derive the fact from the config in one shared place, and name the math, not the model
+  --> $DIR/p7_model_names.rs:14:13
+   |
+LL |     arch == "gemma" || "gemma2" == arch
+   |             ^^^^^^^
+   |
+   = help: state the fact the model name stands for (a shape, a flag the config carries) and decide on that
+
+error: P7: `gemma2` is a model name deciding behavior; derive the fact from the config in one shared place, and name the math, not the model
+  --> $DIR/p7_model_names.rs:14:24
+   |
+LL |     arch == "gemma" || "gemma2" == arch
+   |                        ^^^^^^^^
+   |
+   = help: state the fact the model name stands for (a shape, a flag the config carries) and decide on that
+
+error: P7: `granite` is a model name deciding behavior; derive the fact from the config in one shared place, and name the math, not the model
+  --> $DIR/p7_model_names.rs:18:13
+   |
+LL |     arch != "granite"
+   |             ^^^^^^^^^
+   |
+   = help: state the fact the model name stands for (a shape, a flag the config carries) and decide on that
+
+error: P7: `llama` is a model name deciding behavior; derive the fact from the config in one shared place, and name the math, not the model
+  --> $DIR/p7_model_names.rs:22:26
+   |
+LL | const ALLOW: &[&str] = &["llama", "qwen2", "not-a-model"];
+   |                          ^^^^^^^
+   |
+   = help: state the fact the model name stands for (a shape, a flag the config carries) and decide on that
+
+error: P7: `qwen2` is a model name deciding behavior; derive the fact from the config in one shared place, and name the math, not the model
+  --> $DIR/p7_model_names.rs:22:35
+   |
+LL | const ALLOW: &[&str] = &["llama", "qwen2", "not-a-model"];
+   |                                   ^^^^^^^
+   |
+   = help: state the fact the model name stands for (a shape, a flag the config carries) and decide on that
+
+error: P7: `phi3` is a model name deciding behavior; derive the fact from the config in one shared place, and name the math, not the model
+  --> $DIR/p7_model_names.rs:28:31
+   |
+LL | static FAMILIES: [&str; 2] = ["phi3", "commandr"];
+   |                               ^^^^^^
+   |
+   = help: state the fact the model name stands for (a shape, a flag the config carries) and decide on that
+
+error: P7: `commandr` is a model name deciding behavior; derive the fact from the config in one shared place, and name the math, not the model
+  --> $DIR/p7_model_names.rs:28:39
+   |
+LL | static FAMILIES: [&str; 2] = ["phi3", "commandr"];
+   |                                       ^^^^^^^^^^
+   |
+   = help: state the fact the model name stands for (a shape, a flag the config carries) and decide on that
+
+error: P7: `mixtral` is a model name deciding behavior; derive the fact from the config in one shared place, and name the math, not the model
+  --> $DIR/p7_model_names.rs:36:6
+   |
+LL |     ["mixtral", "qwen3-moe"].contains(&arch)
+   |      ^^^^^^^^^
+   |
+   = help: state the fact the model name stands for (a shape, a flag the config carries) and decide on that
+
+error: P7: `qwen3-moe` is a model name deciding behavior; derive the fact from the config in one shared place, and name the math, not the model
+  --> $DIR/p7_model_names.rs:36:17
+   |
+LL |     ["mixtral", "qwen3-moe"].contains(&arch)
+   |                 ^^^^^^^^^^^
+   |
+   = help: state the fact the model name stands for (a shape, a flag the config carries) and decide on that
+
+error: P7: `smollm2-360m` is a model name deciding behavior; derive the fact from the config in one shared place, and name the math, not the model
+  --> $DIR/p7_model_names.rs:40:22
+   |
+LL |     stem.starts_with("smollm2-360m") || stem.contains("LlamaForCausalLM")
+   |                      ^^^^^^^^^^^^^^
+   |
+   = help: state the fact the model name stands for (a shape, a flag the config carries) and decide on that
+
+error: P7: `LlamaForCausalLM` is a model name deciding behavior; derive the fact from the config in one shared place, and name the math, not the model
+  --> $DIR/p7_model_names.rs:40:55
+   |
+LL |     stem.starts_with("smollm2-360m") || stem.contains("LlamaForCausalLM")
+   |                                                       ^^^^^^^^^^^^^^^^^^
+   |
+   = help: state the fact the model name stands for (a shape, a flag the config carries) and decide on that
+
+error: P7: `glm4-moe` is a model name deciding behavior; derive the fact from the config in one shared place, and name the math, not the model
+  --> $DIR/p7_model_names.rs:45:20
+   |
+LL |     matches!(arch, "glm4-moe" | "gpt-oss")
+   |                    ^^^^^^^^^^
+   |
+   = help: state the fact the model name stands for (a shape, a flag the config carries) and decide on that
+
+error: P7: `gpt-oss` is a model name deciding behavior; derive the fact from the config in one shared place, and name the math, not the model
+  --> $DIR/p7_model_names.rs:45:33
+   |
+LL |     matches!(arch, "glm4-moe" | "gpt-oss")
+   |                                 ^^^^^^^^^
+   |
+   = help: state the fact the model name stands for (a shape, a flag the config carries) and decide on that
+
+error: P7: `arch-qwen3` is a model name deciding behavior; derive the fact from the config in one shared place, and name the math, not the model
+  --> $DIR/p7_model_names.rs:49:17
+   |
+LL |     if let Some("arch-qwen3") = arch { true } else { false }
+   |                 ^^^^^^^^^^^^
+   |
+   = help: state the fact the model name stands for (a shape, a flag the config carries) and decide on that
+
+error: P7: `nemotron-h` is a model name deciding behavior; derive the fact from the config in one shared place, and name the math, not the model
+  --> $DIR/p7_model_names.rs:59:16
+   |
+LL |     a.contains("nemotron-h")
+   |                ^^^^^^^^^^^^
+   |
+   = help: state the fact the model name stands for (a shape, a flag the config carries) and decide on that
+
+error: P7: `qwen2-moe` is a model name deciding behavior; derive the fact from the config in one shared place, and name the math, not the model
+  --> $DIR/p7_model_names.rs:64:13
+   |
+LL |     base == "qwen2-moe"
+   |             ^^^^^^^^^^^
+   |
+   = help: state the fact the model name stands for (a shape, a flag the config carries) and decide on that
+
+error: P7: `modernbert` is a model name deciding behavior; derive the fact from the config in one shared place, and name the math, not the model
+  --> $DIR/p7_model_names.rs:68:36
+   |
+LL |     hf_arches.iter().any(|a| *a == "modernbert")
+   |                                    ^^^^^^^^^^^^
+   |
+   = help: state the fact the model name stands for (a shape, a flag the config carries) and decide on that
+
+error: aborting due to 20 previous errors
+

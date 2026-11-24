@@ -176,7 +176,7 @@ impl EarlyLintPass for P11Track {
 }
 
 /// Whether this crate is its package's owner target, the one that checks the whole package.
-fn owns_package(
+pub(crate) fn owns_package(
     sess: &rustc_session::Session,
     owner: &Option<std::path::PathBuf>,
     root: &Path,
@@ -185,7 +185,10 @@ fn owns_package(
 }
 
 /// The crate root, relative to its package's manifest directory where it is under it.
-fn crate_root(sess: &rustc_session::Session, manifest_dir: &Path) -> Option<std::path::PathBuf> {
+pub(crate) fn crate_root(
+    sess: &rustc_session::Session,
+    manifest_dir: &Path,
+) -> Option<std::path::PathBuf> {
     let cwd = std::env::current_dir().unwrap_or_default();
     let root = cwd.join(sess.local_crate_source_file()?.local_path()?);
     Some(

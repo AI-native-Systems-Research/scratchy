@@ -732,6 +732,7 @@ dependencies = [
  "clippy_utils",
  "dylint_linting",
  "dylint_testing",
+ "serde_json",
  "toml 0.9.12+spec-1.1.0",
 ]
 
