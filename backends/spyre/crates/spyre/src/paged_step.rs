@@ -1803,9 +1803,11 @@ mod tests {
         // 4 pages, whatever the pool holds.
         assert_eq!(
             walk_pages(
-                4 * SchedulerBlockTokens::REFERENCE.get(),
+                4,
                 1,
-                ktir_superdsc::ktir_node::ActiveCap::FULL
+                1,
+                ktir_superdsc::ktir_node::ActiveCap::FULL,
+                None
             ),
             4
         );

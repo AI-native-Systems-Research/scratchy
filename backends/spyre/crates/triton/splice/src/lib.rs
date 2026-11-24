@@ -2280,6 +2280,7 @@ pub fn walk_pages(
     }
     blocks.min(context_pages)
 }
+
 /// ⭐ THE WALK RUNGS — spyre-inference's `SpyreAttnBucketer` (`spyre_attn_bucketer.py`, 297fc48): its
 /// kv buckets are the powers of two from one block up to `max_model_len`, plus `max_model_len`
 /// itself, and the kernel is specialized on `num_blocks = ceil(kv / block)` of each. Over a pool of
@@ -2446,7 +2447,7 @@ pub fn lower_attn<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile
     }
     let kv_width = nkvh * hd.get();
     // The pools meet their law HERE, once: both planes one pool, the verified count threaded
-    // to every front below (the walk, the chunk bound, the kernel's NUM_PAGES).
+    // to every front below (the chunk bound's eligibility, the placement's pool).
     let pools = KvPools::of(
         ir,
         &node.inputs[1],
