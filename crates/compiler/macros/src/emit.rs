@@ -32,7 +32,7 @@ pub fn weight_field_stem(
     id: WeightId,
     index: Option<UnrollIndex>,
 ) -> String {
-    let stem = weights.path(id).join("_");
+    let stem = weights.path(id).join("_").to_ascii_lowercase();
     match index {
         Some(i) => format!("{stem}_{}", i.0),
         None => stem,

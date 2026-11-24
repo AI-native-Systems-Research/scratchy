@@ -114,33 +114,56 @@ impl TargetEmitter for Metal {
             rope_context_init,
             ..
         } = cx;
+        let body = quote! {
+            #packed_splits_prelude
+            #(#lets)*
+            Ok(#weights_ctor {
+                #(#field_shorthand,)*
+                #rotary_deferred_init
+                #rope_context_init
+                metal_pool: ::std::sync::OnceLock::new(),
+                metal_guest: ::std::sync::OnceLock::new(),
+            })
+        };
+        // A parameter the body reads keeps its name; one it doesn't (the stream, a rank no weight
+        // shards by) is `_`.
+        let [reads_stream, reads_len, reads_rank] =
+            crate::const_tokens::named(&body, ["stream", "max_model_len", "tp_rank"]);
+        // Bring the `load*` extension traits into scope so the path-syntax
+        // `LinearLayer::load_dense_or_ggml(...)`, `RmsNorm::load(...)`, `Embedding::load(...)`,
+        // `AffineQuantEmbedding::load(...)`, … calls the body emits resolve: a body that loads a
+        // weight calls one, and a body of no weights none.
+        let load_ops = (!(lets.is_empty() && packed_splits_prelude.is_empty())).then(|| {
+            quote! { use crate::__gpu::load_ops::*; }
+        });
+        let stream = if reads_stream {
+            quote!(stream)
+        } else {
+            quote!(_)
+        };
+        let max_model_len = if reads_len {
+            quote!(max_model_len)
+        } else {
+            quote!(_)
+        };
+        let tp_rank = if reads_rank {
+            quote!(tp_rank)
+        } else {
+            quote!(_)
+        };
         quote! {
             /// The `stream` is `()` and unused; the body shares the canonical's `lets`
             /// and `field_shorthand` — `LinearConcat` arms route
             /// through `LinearLayer::load_dense_concat_packed`. The
             /// RoPE tables are not built here but with the pool
             /// (`build_rope_tables`), once the KV cache is sized.
-            #[allow(clippy::too_many_lines, unused_variables)]
             pub fn load(
                 gw: &mut crate::__gpu::weights::GpuWeights,
-                stream: crate::__gpu::LoadStream,
-                max_model_len: usize,
-                tp_rank: u8,
+                #stream: crate::__gpu::LoadStream,
+                #max_model_len: usize,
+                #tp_rank: u8,
             ) -> ::anyhow::Result<Weights> {
-                // Bring the relocated `load*` extension traits into scope so
-                // the path-syntax `LinearLayer::load_dense_or_ggml(...)`,
-                // `RmsNorm::load(...)`, `Embedding::load(...)`,
-                // `AffineQuantEmbedding::load(...)`, … calls the body
-                // emits below resolve.
-                use crate::__gpu::layers::{
-                    LinearLayerOps as _, EmbeddingOps as _, RmsNormOps as _, LayerNormOps as _,
-                    GatedDeltaNetOps as _, MetalAffineEmbedOps as _, MetalLinearLayerOps as _,
-                };
-                use crate::__gpu::layers_moe::{
-                    FusedMoEOps as _, SharedFusedMoEOps as _, DeepSeekV2MoEOps as _,
-                    Gemma4RouterOps as _, SwitchGluExpertsOps as _,
-                    GptOssMoEOps as _,
-                };
+                #load_ops
                 // Pin the RMSNorm gain dtype to the kernel's `T_scale` (the
                 // `_s_<scale>_` arm fixes it from `SCALE_DTYPE`, not the on-disk
                 // dtype). `RmsNorm::load`'s `take_as_dtype` then converts the
@@ -150,15 +173,7 @@ impl TargetEmitter for Metal {
                 gw.set_rmsnorm_scale_dtype(
                     <Weights as ::scratchy_forward_compiler::CanonicalParams>::FACTS.scale_dtype(),
                 );
-                #packed_splits_prelude
-                #(#lets)*
-                Ok(#weights_ctor {
-                    #(#field_shorthand,)*
-                    #rotary_deferred_init
-                    #rope_context_init
-                    metal_pool: ::std::sync::OnceLock::new(),
-                    metal_guest: ::std::sync::OnceLock::new(),
-                })
+                #body
             }
         }
     }

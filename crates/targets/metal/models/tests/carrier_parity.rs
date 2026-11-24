@@ -107,7 +107,6 @@ mod imp {
         /// `harness.json`'s `vision_grid` object, present only for vision
         /// goldens (`@vision_forward` carriers): grid t/h/w, patch/merge
         /// sizes, n_merged. Its presence routes the case to the vision arm.
-        #[cfg_attr(not(feature = "vision"), allow(dead_code))]
         vision_grid: Option<serde_json::Value>,
         /// `harness.json`'s `dense_moe`: whether the oracle EXECUTED a
         /// dense MoE (a hybrid schedule may declare experts no layer runs).
