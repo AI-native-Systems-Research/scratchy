@@ -5724,7 +5724,7 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
             None => (ListSel::Body(0), 0),
         };
         let t0 = std::time::Instant::now();
-        self.launch_ops(sel, zero, bank)?;
+        self.launch_ops(sel, zero, bank, KvBank::BASE)?;
         self.stream_ref()?
             .synchronize()
             .map_err(|e| anyhow!("launch_timed sync: {e}"))?;
