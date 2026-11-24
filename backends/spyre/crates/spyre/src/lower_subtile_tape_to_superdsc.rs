@@ -1437,15 +1437,11 @@ pub fn compute_bundle_layout<T: ktir_superdsc::collective::Tp, F: RopeForm>(
         .iter()
         .map(|(id, _, _)| ir.nodes[id.index()].output.tensor.index() as u32)
         .collect();
+    let is_intermediate = |t: u32| t >= ir.num_sources && t != result;
     let mut inter: Vec<u32> = first_def
         .keys()
         .copied()
-        .filter(|&t| {
-            t >= ir.num_sources
-                && t != result
-                && !folded_out.contains(&t)
-                && !twins.contains_key(&t)
-        })
+        .filter(|&t| is_intermediate(t) && !folded_out.contains(&t) && !twins.contains_key(&t))
         .collect();
     inter.sort_by_key(|t| (first_def[t], *t));
     // ── SEGMENT COLORING (the multi-op stitching fix): dxp's ModuleStitcher connects
@@ -1516,8 +1512,10 @@ pub fn compute_bundle_layout<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     //    placements, which no launch shifts — so a twin's placement is its representative's, at its
     //    own size, which is the representative's (the same op in every layer). A twin a fold places
     //    (its node a folded ScalarMul, as its representative's is) keeps the fold's placement.
+    //    A twin that is a source (a per-layer weight or cache) or the result keeps its own
+    //    placement: only intermediates are the body's to share.
     for (&twin, &rep) in twins {
-        if folded_out.contains(&twin) {
+        if !is_intermediate(twin) || folded_out.contains(&twin) {
             continue;
         }
         let p = placements.get(&rep).copied().ok_or_else(|| {
@@ -10969,8 +10967,10 @@ mod tests {
     }
 
     /// ⭐ A ROLLED BODY'S TWINS ARE ITS REPRESENTATIVE'S BYTES: a four-layer stack re-rolled into one
-    /// body places every per-layer twin at its representative's segment and offset, and its
-    /// intermediate segments hold less than the same layout with every twin given bytes of its own.
+    /// body places every per-layer INTERMEDIATE twin at its representative's segment and offset,
+    /// and its intermediate segments hold less than the same layout with every twin given bytes of
+    /// its own. A twin that is a source (a per-layer weight or cache) or the forward's result keeps
+    /// its own placement: only intermediates are the body's to share.
     #[test]
     fn a_rolled_bodys_twins_share_their_representatives_bytes() {
         use scratchy_subtile::subtile_ir::{ValidatedGraph, lower_region};
@@ -10997,13 +10997,23 @@ mod tests {
             .expect("the stack lays out")
         };
         let (shared, apart) = (at(&twins), at(&Default::default()));
+        let result = ir.result.index() as u32;
         for (twin, rep) in &twins {
             let (t, r) = (shared.placements[twin], shared.placements[rep]);
-            assert_eq!(
-                (t.segment, t.offset),
-                (r.segment, r.offset),
-                "t{twin} sits on t{rep}"
-            );
+            if *twin >= ir.num_sources && *twin != result {
+                assert_eq!(
+                    (t.segment, t.offset),
+                    (r.segment, r.offset),
+                    "t{twin} sits on t{rep}"
+                );
+            } else {
+                let own = apart.placements[twin];
+                assert_eq!(
+                    (t.segment, t.offset),
+                    (own.segment, own.offset),
+                    "t{twin} keeps its own placement"
+                );
+            }
         }
         let inter = |l: &BundleLayout| {
             [SegRole::Intermediate.segment(), 5, 6]
