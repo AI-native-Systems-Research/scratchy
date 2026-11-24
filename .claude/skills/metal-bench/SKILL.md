@@ -56,6 +56,9 @@ on a 64 GB Mac; `full` runs both where each fits); glm-4.5-air and the gemma
 and qwen3.6-27b models run by name. The run file records the class table
 (`config.classes`), and the page's overview reads its columns from it.
 
+**On a 36 GB M3 Pro, runs finish, but #780 is open:** at scratchy's default budget a long
+prefill can still panic and restart the Mac. Save work and close other sessions first.
+
 ## Quick run
 
 Run it straight through. Don't ask about the commit, a dirty tree, the
