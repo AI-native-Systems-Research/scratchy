@@ -5921,9 +5921,11 @@ mod tests {
             }
         };
         let fake = |intermediate: u64, rows: u32| {
-            let mut layout = BundleLayout::default();
-            layout.segment_bytes = [intermediate, 1_000_000, 3072, 400, 0, 0, 0];
-            layout.weight_bank_bytes = vec![500_000];
+            let layout = BundleLayout {
+                segment_bytes: [intermediate, 1_000_000, 3072, 400, 0, 0, 0],
+                weight_bank_bytes: vec![500_000],
+                ..BundleLayout::default()
+            };
             Fake {
                 layout,
                 at_context: step(rows),
