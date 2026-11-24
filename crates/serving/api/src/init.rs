@@ -2074,30 +2074,10 @@ fn compute_num_blocks(
     // way (a float8 or int8 codec) is its worker's own statement from the model's built codec
     // ([`Worker::kv_block_bytes`]), never a CLI string here.
     let bytes_per_token_per_layer = 2 * num_kv_heads * head_dim * dtype_elem_bytes;
-    blocks_within(
+    scratchy_core_config::blocks_within(
         available_bytes,
         block_size.get() * num_layers * bytes_per_token_per_layer,
     )
-}
-
-/// How many blocks of `bytes_per_block` a uniform KV pool fits in
-/// `available_bytes` — at least 16.
-fn blocks_within(available_bytes: usize, bytes_per_block: usize) -> usize {
-    if bytes_per_block == 0 {
-        return 1024; // Fallback.
-    }
-
-    let num_blocks = available_bytes / bytes_per_block;
-
-    // NOTE: bumping num_blocks for SWA here was REVERTED — the uniform
-    // `KvCachePool` sizes EVERY layer's buffer to num_blocks, and that VA is
-    // residency-attached to the command queue (so it counts against the GPU
-    // working set, not just committed pages). Doubling it OOMs the command
-    // buffer. Fitting 32k needs the sliding LAYERS' buffers to be window-sized
-    // (per-layer block counts), not a larger uniform pool.
-
-    // At least 16 blocks.
-    num_blocks.max(16)
 }
 
 /// Compute the KV-cache block count AND the hybrid SWA layout, if any.
@@ -2128,7 +2108,7 @@ fn compute_kv_blocks(
     kv_layers: Option<Vec<scratchy_core_config::LayerKvGeometry>>,
 ) -> (usize, Option<HybridKvConfig>) {
     let uniform = match block_bytes {
-        Some(bytes) => blocks_within(available_bytes, bytes),
+        Some(bytes) => scratchy_core_config::blocks_within(available_bytes, bytes),
         None => compute_num_blocks(
             available_bytes,
             block_size,
@@ -2165,7 +2145,7 @@ fn compute_kv_blocks(
             // keeps that inside the budget the activation arena was carved from.
             let num_blocks = block_bytes
                 .map_or(layout.config.num_blocks, |bytes| {
-                    blocks_within(available_bytes, bytes)
+                    scratchy_core_config::blocks_within(available_bytes, bytes)
                 })
                 .max(16);
             tracing::info!(

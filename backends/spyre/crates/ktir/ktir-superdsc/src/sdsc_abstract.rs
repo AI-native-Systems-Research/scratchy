@@ -3215,7 +3215,50 @@ impl PoolPages {
         u32::try_from(pages).ok().filter(|&n| n > 0).map(PoolPages)
     }
 
-    pub fn get(self) -> u32 {
+    /// A pool of `pages` pages, nonzero by its argument — the bake's pool, sized by the pool-pages law
+    /// (`scratchy_target_spyre::pool_pages::within`) and stamped into the wiring as a const.
+    pub const fn of_nonzero(pages: std::num::NonZeroU32) -> PoolPages {
+        PoolPages(pages.get())
+    }
+
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+}
+
+/// ⭐ THE CONTEXT'S PAGES — a context of `slots` positions (an attention's `valid_len`, the bridge's
+/// one mint) in whole scheduler blocks ([`SchedulerBlockTokens::REFERENCE`]), a partial block
+/// counted whole. NONZERO BY TYPE. The ONE statement of how many pages a context reaches: the most
+/// a request's walk reads (the splice's `walk_pages`), the pages a paged kernel's view of the K and V
+/// pools covers (its `NUM_PAGES`, the KV write's `NUM_ROWS`), and the floor the bake's pool is sized
+/// at (`scratchy_target_spyre::pool_pages`). A pool's own extent is its placement's fact
+/// ([`crate::placement::BundleLayout::pool_rows`]), never a kernel's, so one compile serves a context
+/// at every pool the bake sizes.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub struct ContextPages(std::num::NonZeroU32);
+
+impl ContextPages {
+    /// The pages of a context of `slots` positions.
+    pub const fn of_slots(slots: std::num::NonZeroU32) -> Self {
+        Self(
+            std::num::NonZeroU32::MIN
+                .saturating_add(slots.get().div_ceil(SchedulerBlockTokens::REFERENCE.get()) - 1),
+        )
+    }
+
+    /// A view of `pages` pages stated directly — a kernel compiled outside a model's bake (a test,
+    /// the card's round-trip leg) views the pages it allocates.
+    pub const fn new(pages: std::num::NonZeroU32) -> Self {
+        Self(pages)
+    }
+
+    /// The pages.
+    pub const fn get(self) -> u32 {
+        self.0.get()
+    }
+
+    /// The pages as their nonzero — handed over, never re-minted.
+    pub const fn nonzero(self) -> std::num::NonZeroU32 {
         self.0
     }
 }

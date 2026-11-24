@@ -704,6 +704,7 @@ mod tests {
                 weight_ids,
                 scratchy_triton_splice::PagedRows::Sequence,
                 &[],
+                &Default::default(),
                 one_row_one_request(),
             )
             .expect("the sublayer lays out")

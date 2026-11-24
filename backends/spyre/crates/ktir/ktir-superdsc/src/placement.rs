@@ -1459,6 +1459,18 @@ impl BundleLayout {
         self.synth.borrow_mut().take(name, bytes);
     }
 
+    /// ⭐ THE SEGMENT EXTENTS THIS LAYOUT ADDRESSES — [`Self::segment_bytes`], the Intermediate
+    /// segment grown to the synthetic allocator's high-water mark ([`SynthAlloc::high_water`]).
+    /// Every synthetic sits above the packed intermediates, so the packed extent alone ends below
+    /// the last one the door declared. The one statement the bake's segment table and the
+    /// session's residency read.
+    pub fn segment_extents(&self) -> [u64; 7] {
+        let mut extents = self.segment_bytes;
+        let seg = SegRole::Intermediate.segment();
+        extents[seg] = extents[seg].max(self.synth.borrow().high_water());
+        extents
+    }
+
     /// THE arrangement authority. Record that tensor `name` is addressed through `want`; a later op that
     /// addresses it NON-equivalently ([`StickLayout::addr_eq`]) is a build `Err` naming the tensor.
     /// `addr_eq` is true for the same layout, and for a byte-identical RESHAPE (same total elements, both
@@ -1488,6 +1500,31 @@ impl BundleLayout {
         }
     }
 
+    /// The row-outermost arrangement of `tid` at its placement's present size, at format `df` —
+    /// row-major, whole `df` sticks, as many as the placement holds. Refuses an unplaced buffer or a
+    /// size that is not whole sticks. The ONE statement of what a row-outermost allocation is.
+    fn row_outermost_layout(&self, tid: u32, df: Df) -> Result<StickLayout, SuperDscError> {
+        let Some(p) = self.placements.get(&tid) else {
+            return Err(SuperDscError(format!(
+                "t{tid} is allocated row-outermost but this bundle never placed it"
+            )));
+        };
+        let stick = u64::from(df.elems_per_stick());
+        let elems = p.size / u64::from(df.word_length());
+        if !elems.is_multiple_of(stick) {
+            return Err(SuperDscError(format!(
+                "t{tid}: a row-outermost allocation of {elems} {} elements is not whole \
+                 {stick}-element sticks",
+                df.dataformat()
+            )));
+        }
+        Ok(StickLayout::flat_df(
+            (elems / stick) as usize,
+            stick as usize,
+            df,
+        ))
+    }
+
     /// ⭐ A BUFFER ALLOCATED ROW-OUTERMOST — its `DF` elements in order, `[rows][sticks][stick]`:
     /// torch-spyre's row-outermost `SpyreTensorLayout`, the one spyre-inference allocates its paged
     /// KV cache in (`head_major_kv_layout`, device `[pages·kv, block, sticks, eps]` at the cache's own
@@ -1497,32 +1534,182 @@ impl BundleLayout {
     /// arrangement authority and before any op addresses it, so an op that then addresses it
     /// stick-major is the authority's build `Err`.
     pub fn allocate_row_outermost<DF: DataFormat>(&self, tid: u32) -> Result<(), SuperDscError> {
-        let Some(p) = self.placements.get(&tid) else {
+        let want = self.row_outermost_layout(tid, DF::DF)?;
+        self.declare_arrangement(&crate::place::act_name(tid), want)
+            .map(drop)
+    }
+
+    /// ⭐ A ROW-OUTERMOST BUFFER RE-PLACED — `tid`'s arrangement re-stated at its placement's present
+    /// size, its kind and its format kept.
+    ///
+    /// A row-outermost arrangement is its allocation's ([`Self::row_outermost_layout`]), so a buffer its allocator re-places at a new size (the KV pools at the bake's pages) states the new size here. This is the one re-statement the arrangement authority admits, and only for a buffer whose arrangement is row-major ([`Self::is_row_outermost`]). Any other arrangement, a buffer never arranged, or a size that is not whole sticks is refused, so a stick-major buffer can never be re-stated row-major.
+    pub fn resize_row_outermost(&self, tid: u32) -> Result<(), SuperDscError> {
+        let Some(held) = self.row_outermost(tid) else {
             return Err(SuperDscError(format!(
-                "t{tid} is allocated row-outermost but this bundle never placed it"
+                "t{tid} is re-sized row-outermost, but its arrangement is not row-outermost"
             )));
         };
-        let stick = u64::from(DF::ELEMS_PER_STICK);
-        let elems = p.size / u64::from(DF::WORD_LENGTH);
-        if !elems.is_multiple_of(stick) {
-            return Err(SuperDscError(format!(
-                "t{tid}: a row-outermost allocation of {elems} {} elements is not whole \
-                 {stick}-element sticks",
-                DF::NAME
-            )));
-        }
-        self.declare_arrangement(
-            &crate::place::act_name(tid),
-            StickLayout::flat_df((elems / stick) as usize, stick as usize, DF::DF),
-        )
-        .map(drop)
+        let want = self.row_outermost_layout(tid, held.df)?;
+        self.arrangements
+            .borrow_mut()
+            .insert(crate::place::act_name(tid), want);
+        Ok(())
+    }
+
+    /// `tid`'s arrangement where it is row-major — allocated so ([`Self::allocate_row_outermost`]).
+    fn row_outermost(&self, tid: u32) -> Option<StickLayout> {
+        self.arrangements
+            .borrow()
+            .get(&crate::place::act_name(tid))
+            .copied()
+            .filter(|a| a.kind == StickKind::Flat)
     }
 
     /// Whether `tid`'s arrangement is row-major — allocated so ([`Self::allocate_row_outermost`]).
     pub fn is_row_outermost(&self, tid: u32) -> bool {
-        self.arrangements
+        self.row_outermost(tid).is_some()
+    }
+
+    /// ⭐ A POOL'S ROWS IN A `cols`-WIDE FRAME — the rows of a buffer allocated row-outermost (the
+    /// paged KV cache's allocation, at the format its allocator stated: [`StickLayout::df`]), read off
+    /// its arrangement: its elements in order, whatever their format, so its rows in any frame are
+    /// its elements over the frame's width. `None` for a buffer this layout does not hold
+    /// row-outermost, or a width that does not divide it. A paged kernel's view of a pool is not this
+    /// — it states the context's pages ([`crate::sdsc_abstract::ContextPages`]) and its gathers and
+    /// scatters reach any page of the pool — so the pool's extent is the placement's fact, and this is
+    /// where the door reads it.
+    pub fn pool_rows(&self, tid: u32, cols: u32) -> Option<u32> {
+        let a = self.row_outermost(tid)?;
+        let elems = u64::try_from(a.rows)
+            .ok()?
+            .checked_mul(u64::try_from(a.cols).ok()?)?;
+        let cols = u64::from(cols);
+        let rows = elems
+            .checked_div(cols)
+            .filter(|&rows| rows * cols == elems)?;
+        u32::try_from(rows).ok()
+    }
+}
+
+#[cfg(test)]
+mod pool_rows_tests {
+    use super::*;
+    use crate::superdsc_opspec::{Fp8, Fp16};
+
+    /// A layout holding one pool — `bytes` bytes at `tid` in the KV segment.
+    fn pool_at(tid: u32, bytes: u64) -> BundleLayout {
+        let mut layout = BundleLayout::default();
+        layout.placements.insert(
+            tid,
+            TensorPlacement {
+                tid,
+                role: SegRole::Kv,
+                segment: SegRole::Kv.segment(),
+                bank: 0,
+                offset: 0,
+                size: bytes,
+            },
+        );
+        layout
+    }
+
+    /// A pool's rows are its elements over the frame's width — the placement's own bytes at the
+    /// allocation's own format — and a width that does not divide them is no frame of the pool.
+    #[test]
+    fn a_pools_rows_are_its_elements_over_the_frames_width() {
+        let layout = pool_at(7, 8 * 128);
+        layout
+            .allocate_row_outermost::<Fp16>(7)
+            .expect("1024 B is whole 64-element fp16 sticks");
+        assert_eq!(layout.pool_rows(7, 64), Some(8));
+        assert_eq!(layout.pool_rows(7, 128), Some(4));
+        assert_eq!(layout.pool_rows(7, 96), None);
+        // The same bytes held float8: twice the elements, twice the rows at a width.
+        let mut layout = pool_at(7, 8 * 128);
+        layout
+            .allocate_row_outermost::<Fp8>(7)
+            .expect("1024 B is whole 128-element fp8 sticks");
+        assert_eq!(layout.pool_rows(7, 128), Some(8));
+        assert_eq!(layout.pool_rows(7, 64), Some(16));
+        // A tid the layout placed but never allocated row-outermost holds no pool, and a tid it
+        // never placed at all holds none either.
+        layout.placements.insert(
+            9,
+            TensorPlacement {
+                tid: 9,
+                role: SegRole::Kv,
+                segment: SegRole::Kv.segment(),
+                bank: 0,
+                offset: 8 * 128,
+                size: 8 * 128,
+            },
+        );
+        assert_eq!(layout.pool_rows(9, 64), None);
+        assert_eq!(layout.pool_rows(8, 64), None);
+    }
+}
+
+#[cfg(test)]
+mod row_outermost_tests {
+    use super::*;
+    use crate::superdsc_opspec::{Fp8, Fp16};
+
+    fn pool(size: u64) -> TensorPlacement {
+        TensorPlacement {
+            tid: 7,
+            role: SegRole::Kv,
+            segment: SegRole::Kv.segment(),
+            bank: 0,
+            offset: 0,
+            size,
+        }
+    }
+
+    /// ⭐ A ROW-OUTERMOST BUFFER RE-SIZES WITH ITS PLACEMENT, AND ONLY IT DOES. The authority refuses a second, different allocation; the re-size re-states the allocation's own law at the new size, keeping the row-major kind. A buffer not allocated row-outermost, or a size that is not whole sticks, is refused.
+    #[test]
+    fn a_row_outermost_buffer_resizes_with_its_placement_and_nothing_else_does() {
+        let mut l = BundleLayout::default();
+        l.placements.insert(7, pool(4 * 128));
+        l.allocate_row_outermost::<Fp16>(7).expect("4 whole sticks");
+        l.placements.insert(7, pool(8 * 128));
+        assert!(
+            l.allocate_row_outermost::<Fp16>(7).is_err(),
+            "a second, different allocation is refused"
+        );
+        l.resize_row_outermost(7)
+            .expect("re-sized at its placement");
+        let a = *l
+            .arrangements
             .borrow()
-            .get(&crate::place::act_name(tid))
-            .is_some_and(|a| a.kind == StickKind::Flat)
+            .get(&crate::place::act_name(7))
+            .expect("arranged");
+        assert_eq!((a.rows, a.cols), (8, 64));
+        assert!(l.is_row_outermost(7));
+        l.placements.insert(8, pool(8 * 128));
+        assert!(
+            l.resize_row_outermost(8).is_err(),
+            "a buffer never allocated row-outermost is refused"
+        );
+        l.placements.insert(7, pool(8 * 128 + 2));
+        assert!(
+            l.resize_row_outermost(7).is_err(),
+            "a size that is not whole sticks is refused"
+        );
+        // The same re-size keeps a float8 pool's format: its sticks stay 128 wide.
+        let mut m = BundleLayout::default();
+        m.placements.insert(7, pool(4 * 128));
+        m.allocate_row_outermost::<Fp8>(7).expect("4 fp8 sticks");
+        m.placements.insert(7, pool(8 * 128));
+        m.resize_row_outermost(7).expect("re-sized");
+        let a = *m
+            .arrangements
+            .borrow()
+            .get(&crate::place::act_name(7))
+            .expect("arranged");
+        assert_eq!(
+            (a.rows, a.cols, a.df),
+            (8, 128, Df::Fp8),
+            "a float8 pool keeps its format"
+        );
     }
 }

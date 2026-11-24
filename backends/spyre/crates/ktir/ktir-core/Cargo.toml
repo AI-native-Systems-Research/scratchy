@@ -28,3 +28,14 @@ repository = "https://github.com/torch-spyre/ktir-cpu"
 [lib]
 name = "ktir_core"
 path = "src/lib.rs"
+
+[features]
+# The chip this build bakes for: `snt1p0` is Spyre generation 1, the card whose
+# geometry `DeviceGen`'s `Gen1` impl states. THE ONE SELECTION — a build that names
+# no chip does not compile (the `compile_error!` beside `Chip` in ddl_binds.rs),
+# the same law senlib-rs holds for flex-rs; `backends/spyre-hw`'s workspace row
+# already names this same feature for flex-rs, and the card crate ties the two
+# where they meet. Forwarded up the chain the way `tp-N` is:
+# scratchy-target-spyre → its compiler → its models → the spyre-hw worker and CLI.
+# Deliberately not a default: naming no chip must fail, never silently pick one.
+snt1p0 = []

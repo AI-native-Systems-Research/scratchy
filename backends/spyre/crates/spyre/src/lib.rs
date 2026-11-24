@@ -68,6 +68,10 @@ pub mod subtile_tape_to_tile_ir {
 pub mod forward_tape;
 pub mod manifest;
 pub mod paged_step;
+/// ⭐ THE POOL-PAGES LAW — how many pages of KV pool a card's budget holds: the budget over
+/// the session's residency (fixed bytes plus bytes per page), floored at the model's own
+/// context pages. The ONE formula a pool is sized by.
+pub mod pool_pages;
 /// Bundle execution on the `ktir_emulator` emulator — behind the `runner` feature
 /// (it links the emulator). Emit/weight-load paths use [`manifest`] alone.
 #[cfg(feature = "spyre-emu")]

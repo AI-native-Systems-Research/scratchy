@@ -92,17 +92,19 @@ jobs:
       # one-model scope stays for bake time and RAM (every selected config's full
       # expansion), per the CLAUDE.md rule: never build `model/all` to test one thing.
       # Every arch's forward is linted by the macOS job; granite is the one the card builds
-      # use.
+      # use. Every spyre command names the chip (`snt1p0`, Spyre generation 1) the same way:
+      # ktir-core's `compile_error!` refuses a build that names none, and the ktir/triton-side
+      # legs below reach it as a dependency, named `ktir-core/snt1p0`.
       - name: Clippy (spyre workspace)
         working-directory: backends/spyre
-        run: cargo clippy --workspace --features scratchy-models/granite-3.1-8b-instruct -- -D warnings
+        run: cargo clippy --workspace --features scratchy-models/granite-3.1-8b-instruct,scratchy-target-spyre-models/snt1p0 -- -D warnings
 
       # The same model under its fp8 preset (`fp8-dynamic-per-channel`): the weights
       # struct's typed handles must cover an fp8 linear too, or every fp8 build panics
       # at expansion. One model, the expansion only.
       - name: Check the fp8 preset expands
         working-directory: backends/spyre
-        run: cargo check -p scratchy-target-spyre-models --features scratchy-models/granite-3.1-8b-instruct,scratchy-quantizations/fp8-dynamic-per-channel
+        run: cargo check -p scratchy-target-spyre-models --features scratchy-models/granite-3.1-8b-instruct,scratchy-quantizations/fp8-dynamic-per-channel,snt1p0
 
       # e_otel.rs, which needs `otel` and runs on any backend, type-checked
       # and linted: the macOS e2e step builds without `otel`. Here rather than
@@ -124,7 +126,7 @@ jobs:
       # so nothing here compiles flex-rs.
       - name: Lint the spyre binary's targets
         working-directory: backends/spyre-hw
-        run: cargo clippy -p scratchy-target-spyre-cli --features claude,model/granite-3.1-8b-instruct
+        run: cargo clippy -p scratchy-target-spyre-cli --features claude,model/granite-3.1-8b-instruct,snt1p0
           --all-targets -- -D warnings
 
       # The separation-of-concerns guard: outside the target homes (crates/targets/ and
@@ -404,11 +406,11 @@ jobs:
       # them from `cargo test` here does not skip any test coverage.
       - name: KTIR emulator tests
         working-directory: backends/spyre
-        run: cargo test -p ktir-emulator --features metal --lib --tests
+        run: cargo test -p ktir-emulator --features metal,ktir-core/snt1p0 --lib --tests
 
       - name: KTIR optimizer tests
         working-directory: backends/spyre
-        run: cargo test -p ktir-optimizer
+        run: cargo test -p ktir-optimizer --features ktir-core/snt1p0
 
       # The Metal matrix's energy sampler on macOS 26; power-sampler-macos-27 runs it on 27.
       - name: Power sampler
@@ -547,9 +549,9 @@ jobs:
           workspaces: backends/spyre -> target
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Clippy (openblas-system)
-        run: cargo clippy -p ktir-emulator --no-default-features --features optimizer,openblas-system -- -D warnings
+        run: cargo clippy -p ktir-emulator --no-default-features --features optimizer,openblas-system,ktir-core/snt1p0 -- -D warnings
       - name: Test (openblas-system)
-        run: cargo test -p ktir-emulator --no-default-features --features optimizer,openblas-system --lib --tests
+        run: cargo test -p ktir-emulator --no-default-features --features optimizer,openblas-system,ktir-core/snt1p0 --lib --tests
 
   # ⭐ THE TRITON SPLICE'S OWN GATE. The splice is now the ONLY producer for the
   # spliced op kinds (unconditional in `lower_one_node`), so every job that builds
@@ -612,9 +614,9 @@ jobs:
             backends/spyre-hw -> target
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Clippy (spyre triton)
-        run: cargo clippy -p scratchy-target-spyre --features spyre-emu --all-targets -- -D warnings
+        run: cargo clippy -p scratchy-target-spyre --features spyre-emu,snt1p0 --all-targets -- -D warnings
       - name: Test (spyre triton golden + emu execution)
-        run: cargo test -p scratchy-target-spyre --features spyre-emu --lib --tests
+        run: cargo test -p scratchy-target-spyre --features spyre-emu,snt1p0 --lib --tests
       # The spyre worker's modules compile under no other CI job:
       # linux-workspace builds plain `spyre`, which carries no spyre worker
       # runtime (that needs an executor: `spyre-emu` or `spyre-hw`). So they
@@ -628,18 +630,18 @@ jobs:
       - name: Clippy (spyre worker, all targets)
         working-directory: backends/spyre-hw
         run: cargo clippy -p scratchy-target-spyre-worker -p scratchy-target-spyre-cli --all-targets
-          --features spyre-emu,model/granite-3.1-8b-instruct -- -D warnings
+          --features spyre-emu,model/granite-3.1-8b-instruct,snt1p0 -- -D warnings
       - name: Test (spyre worker unit tests)
         working-directory: backends/spyre-hw
         run: cargo test -p scratchy-target-spyre-worker -p scratchy-target-spyre-cli
-          --features spyre-emu,model/granite-3.1-8b-instruct --lib
+          --features spyre-emu,model/granite-3.1-8b-instruct,snt1p0 --lib
       # The same modules at -D warnings, all targets: no other step lints them, so lint debt
       # piled up unseen (#616's 9 errors). llama-3.2-1b is the smallest model whose bundles bake
       # clean here.
       - name: Clippy (spyre worker, emulator)
         working-directory: backends/spyre-hw
         run: cargo clippy -p scratchy-target-spyre-worker -p scratchy-target-spyre-cli
-          --features spyre-emu,model/llama-3.2-1b --all-targets -- -D warnings
+          --features spyre-emu,model/llama-3.2-1b,snt1p0 --all-targets -- -D warnings
       # The spyre-side ktir-superdsc and spyre-bundle crates' TEST targets compile
       # under no other CI step: this job's clippy above is -p scratchy-target-spyre,
       # the triton clippy below is the five re-host crates, and the linux-workspace job's
@@ -654,9 +656,9 @@ jobs:
       # unseen — main was red in this leg nobody ran (chain_stage_program's
       # nine positional args, an identity op in the broadcast-prefix-row test).
       - name: Clippy (spyre ktir-superdsc, all targets)
-        run: cargo clippy -p ktir-superdsc --all-targets -- -D warnings
+        run: cargo clippy -p ktir-superdsc --features ktir-core/snt1p0 --all-targets -- -D warnings
       - name: Test (spyre ktir-superdsc + bundle)
-        run: cargo test -p ktir-superdsc -p scratchy-spyre-bundle
+        run: cargo test -p ktir-superdsc -p scratchy-spyre-bundle --features ktir-core/snt1p0
       # scratchy-subtile's lib and integration tests ran in no step, so they rotted unseen (#542:
       # a missing initializer field kept the lib tests from compiling). Pure Rust, no device.
       - name: Test (scratchy-subtile)
@@ -665,7 +667,7 @@ jobs:
       # The test targets of spyre-bundle and subtile at -D warnings: `cargo test` compiles
       # them but never lints them, so lint debt piles up in them unseen.
       - name: Clippy (spyre-bundle, tests)
-        run: cargo clippy -p scratchy-spyre-bundle --tests -- -D warnings
+        run: cargo clippy -p scratchy-spyre-bundle --features ktir-core/snt1p0 --tests -- -D warnings
       - name: Clippy (scratchy-subtile, tests)
         working-directory: .
         run: cargo clippy -p scratchy-subtile --tests -- -D warnings
@@ -685,12 +687,12 @@ jobs:
       # pinned derivations on the checked-in configs.
       - name: Spyre compiler tests
         run: |
-          cargo test -p scratchy-target-spyre-compiler --features spyre-emu --lib
-          cargo clippy -p scratchy-target-spyre-compiler --features spyre-emu --tests -- -D warnings
+          cargo test -p scratchy-target-spyre-compiler --features spyre-emu,snt1p0 --lib
+          cargo clippy -p scratchy-target-spyre-compiler --features spyre-emu,snt1p0 --tests -- -D warnings
       - name: Clippy (triton re-host crates, all targets)
-        run: cargo clippy -p triton-frontend -p triton-ktir -p triton-ktir-superdsc -p triton-numeric -p scratchy-triton-splice --all-targets -- -D warnings
+        run: cargo clippy -p triton-frontend -p triton-ktir -p triton-ktir-superdsc -p triton-numeric -p scratchy-triton-splice --features ktir-core/snt1p0 --all-targets -- -D warnings
       - name: Test (triton re-host crates)
-        run: cargo test -p triton-frontend -p triton-ktir -p triton-ktir-superdsc -p triton-numeric -p scratchy-triton-splice
+        run: cargo test -p triton-frontend -p triton-ktir -p triton-ktir-superdsc -p triton-numeric -p scratchy-triton-splice --features ktir-core/snt1p0
 
   # ---------------------------------------------------------------------------
   # ⭐ THE CARD'S LOWERING, WITHOUT A CARD. `spyre-lower` lowers every rung a card build bakes — the
@@ -728,7 +730,7 @@ jobs:
           workspaces: backends/spyre -> target
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Lower every card rung (no device compile)
-        run: cargo check -p scratchy-target-spyre-models --features spyre-lower,${{ matrix.model.features }}
+        run: cargo check -p scratchy-target-spyre-models --features spyre-lower,snt1p0,${{ matrix.model.features }}
 
   # ---------------------------------------------------------------------------
   # compile_fail doctest ERROR CODES, checked on nightly rustdoc.
@@ -772,7 +774,7 @@ jobs:
         run: cargo +nightly test --doc -p scratchy-tensors -p scratchy-target-metal
       - name: Doctests (compile_fail error codes, spyre workspace)
         working-directory: backends/spyre
-        run: cargo +nightly test --doc -p ktir-core
+        run: cargo +nightly test --doc -p ktir-core --features snt1p0
       # The card crate's compile_fail doctests compile flex-rs (IBM-internal, beside
       # the tree on a card host only), so no runner can run them. They are
       # scripts/spyre-hw-card-gate.sh's last leg, on a card host.

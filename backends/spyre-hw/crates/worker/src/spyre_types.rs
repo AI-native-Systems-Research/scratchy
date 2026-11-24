@@ -175,18 +175,8 @@ pub(crate) struct Loaded {
     /// tensor ids); but `run_card_launch` binds this meta to the DISTINCT prefill SESSION (where the ids
     /// match), so it is kept here. Some only for SuperDsc with a baked prefill bundle; None otherwise.
     pub(crate) batched_prefill: Option<BundleMeta>,
-    /// THE KV POOL'S BYTES — on the card, the KV segment the bake placed (every layer's pools and the
-    /// pool's statics): the number the ENGINE sizes the scheduler's block allocator from
-    /// ([`Worker::determine_available_memory`]), beside [`Self::pool_stride_bytes`].
-    ///
-    /// `None` on the emulator, which sizes no device pool.
-    pub(crate) kv_budget_bytes: Option<u64>,
-    /// ONE PAGE OF THE POOL, in bytes — the KV segment over its pages, so the engine's
-    /// `budget / kv_block_bytes` arithmetic lands on the pool's own page count, which
-    /// `kv_cache_num_blocks_override` then holds it to.
-    ///
-    /// `None` on the emulator.
-    pub(crate) pool_stride_bytes: Option<u64>,
+    /// ⭐ THE KV POOL THE BAKE PLACED — its pages and one page ([`scratchy_target_spyre::wiring::Wirings::pool`]): the ENGINE's final KV budget ([`Worker::determine_available_memory`]) and block ([`Worker::kv_block_bytes`]) read it, so the scheduler's block count is the pool's page count.
+    pub(crate) pool: scratchy_target_spyre::pool_pages::BakedPool,
     /// ⭐ THE CONTEXT THIS RUN SERVES, in tokens — the `--max-model-len` declared (else the model's
     /// own limit), which the pool the bake placed must hold: a declaration past the pool is refused at
     /// load, never clamped. `usize::MAX` on the emulator (no cap).

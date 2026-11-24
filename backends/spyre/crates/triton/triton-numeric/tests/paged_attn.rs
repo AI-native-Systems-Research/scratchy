@@ -20,10 +20,10 @@ use ktir_core::ir::IRFunction;
 use ktir_core::opkind::OpKind;
 use ktir_superdsc::superdsc_opspec::Fp16;
 use scratchy_triton_splice::{
-    AttnScale, BatchChunking, BatchedDecodeGeometry, BlockSize, HeadDim, HeadGeometry, HeadWidth,
-    KvHeads, KvWriteGeometry, PagedAttnGeometry, PagedKernel, PagedSequence, PoolPages, QueryHeads,
-    RotDim, SchedulerBlockTokens, TokenRows, WalkBlocks, batched_decode_kernel, kv_write_kernel,
-    paged_attn_kernel,
+    AttnScale, BatchChunking, BatchedDecodeGeometry, BlockSize, ContextPages, HeadDim,
+    HeadGeometry, HeadWidth, KvHeads, KvWriteGeometry, PagedAttnGeometry, PagedKernel,
+    PagedSequence, QueryHeads, RotDim, SchedulerBlockTokens, TokenRows, WalkBlocks,
+    batched_decode_kernel, kv_write_kernel, paged_attn_kernel,
 };
 use triton_frontend::codegen::{self, KernelSpec};
 use triton_frontend::opt;
@@ -74,7 +74,7 @@ fn kv_write(t: i128, nkvh: i128, hd: i128, block_size: i128, pages: i128) -> Pag
         nkvh: KvHeads::new(nkvh as u32),
         hd: HeadWidth::of_whole_sticks(hd as u32),
         block: scheduler_block(block_size),
-        pages: PoolPages::new(nz(pages as u32)),
+        pages: ContextPages::new(nz(pages as u32)),
     })
     .expect("the KV write's spec")
 }
@@ -105,7 +105,7 @@ fn attn_kernel(s: &AttnShape) -> PagedKernel {
         rows,
         heads: heads(s.num_heads, s.num_kv_heads, s.head_size),
         block: scheduler_block(s.block_size),
-        pages: PoolPages::new(nz(s.num_pages as u32)),
+        pages: ContextPages::new(nz(s.num_pages as u32)),
         blocks: WalkBlocks::new(nz(s.num_blocks as u32)),
         scale: AttnScale::new(1.0 / (s.head_size as f32).sqrt()),
     })
@@ -580,7 +580,7 @@ impl Batch {
             rows: TokenRows::new(nz(self.seqs as u32)),
             heads: heads(nqh, nkvh, hd),
             block: scheduler_block(block),
-            pages: PoolPages::new(nz(pages as u32)),
+            pages: ContextPages::new(nz(pages as u32)),
             chunking: BatchChunking {
                 seqs: self.seqs as u32,
                 blocks_per_chunk: self.blocks_per_chunk as u32,

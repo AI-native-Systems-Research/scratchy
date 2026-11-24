@@ -140,6 +140,70 @@ pub const NUM_SEGMENTS: usize =
 pub const MAX_SEGMENT_BYTES: u64 =
     <ktir_core::ddl_binds::Baked as ktir_core::ddl_binds::DeviceGen>::MAX_SEGMENT_BYTES;
 
+/// ⭐ THE HOST PAGE — the smallest page a host maps, and so the grain the card allocates every segment
+/// region and weight bank at ([`page_cover`]); a region's host shadow is mapped at the same cover. The
+/// ONE statement of the page; the card's `PageExtent` covers by it.
+pub const HOST_PAGE_BYTES: u64 = 4096;
+
+/// `bytes` rounded up to whole [`HOST_PAGE_BYTES`] — the host page law.
+pub const fn page_cover(bytes: u64) -> u64 {
+    bytes.div_ceil(HOST_PAGE_BYTES) * HOST_PAGE_BYTES
+}
+
+/// ⭐ THE RESIDENT SEGMENTS — the weights and the KV pool, placed identically in every bundle: the owner session allocates them, and every other session aliases the owner's.
+pub const RESIDENT_SEGMENTS: [ktir_superdsc::placement::SegRole; 2] = [
+    ktir_superdsc::placement::SegRole::Weight,
+    ktir_superdsc::placement::SegRole::Kv,
+];
+
+/// ⭐ HOW A SESSION HOLDS ONE SEGMENT ON THE CARD — its own allocation, or the owner's, aliased.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SegmentHold {
+    Allocated,
+    Borrowed,
+}
+
+impl SegmentHold {
+    /// The smallest region a segment is allocated as — an empty segment's, and a borrowed one's: `tensor_allocs` is positional, so every segment has an address, and a borrowed one's is replaced by the owner's region at alias.
+    pub const PLACEHOLDER_BYTES: u64 = 128;
+
+    /// ⭐ THE BYTES A SESSION ALLOCATES FOR A SEGMENT (or an extra weight bank) of `extent` bytes held
+    /// this way — its region at the host page cover ([`page_cover`]) of the extent, or of the
+    /// placeholder for a borrowed or empty one — the ONE statement the card's `prepare` allocates by
+    /// and the bake's residency charges by.
+    pub const fn alloc_bytes(self, extent: u64) -> u64 {
+        page_cover(match self {
+            Self::Borrowed => Self::PLACEHOLDER_BYTES,
+            Self::Allocated => {
+                if extent > Self::PLACEHOLDER_BYTES {
+                    extent
+                } else {
+                    Self::PLACEHOLDER_BYTES
+                }
+            }
+        })
+    }
+}
+
+/// ⭐ A SESSION'S ROLE ON THE CARD — the owner allocates the resident segments ([`RESIDENT_SEGMENTS`]: the weights with every extra bank, and the KV pool); every other session borrows them.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SessionRole {
+    Owner,
+    Borrower,
+}
+
+impl SessionRole {
+    /// How a session of this role holds segment `seg`: a borrower borrows the resident ones and allocates every other.
+    pub fn holds(self, seg: usize) -> SegmentHold {
+        match self {
+            Self::Borrower if RESIDENT_SEGMENTS.iter().any(|r| r.segment() == seg) => {
+                SegmentHold::Borrowed
+            }
+            Self::Borrower | Self::Owner => SegmentHold::Allocated,
+        }
+    }
+}
+
 /// WHAT A LAUNCH'S PROGRAM COMPUTES, and the pointwise kinds it names — re-exported for the same
 /// reason as [`PlaceId`]: [`LaunchProgram::program`] carries the kind, so the token emitter
 /// (`ktir_tokens`) renders it through THIS crate's path into the generated source, and the macro
@@ -959,6 +1023,39 @@ pub fn registered_fps<T: collective::Tp>() -> Vec<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_borrower_holds_the_resident_segments_as_placeholders() {
+        use ktir_superdsc::placement::SegRole;
+        for r in RESIDENT_SEGMENTS {
+            assert_eq!(
+                SessionRole::Borrower.holds(r.segment()),
+                SegmentHold::Borrowed
+            );
+            assert_eq!(
+                SessionRole::Owner.holds(r.segment()),
+                SegmentHold::Allocated
+            );
+        }
+        assert_eq!(
+            SessionRole::Borrower.holds(SegRole::Intermediate.segment()),
+            SegmentHold::Allocated
+        );
+        assert_eq!(
+            (page_cover(0), page_cover(1), page_cover(4096)),
+            (0, 4096, 4096)
+        );
+        assert_eq!(
+            SegmentHold::Borrowed.alloc_bytes(1 << 30),
+            page_cover(SegmentHold::PLACEHOLDER_BYTES)
+        );
+        assert_eq!(SegmentHold::Allocated.alloc_bytes(0), HOST_PAGE_BYTES);
+        assert_eq!(SegmentHold::Allocated.alloc_bytes(4096), 4096);
+        assert_eq!(
+            SegmentHold::Allocated.alloc_bytes(4097),
+            2 * HOST_PAGE_BYTES
+        );
+    }
 
     /// ⭐ RUNG SELECTION ASKS THE SWEEP EXTENT ITS OWN QUESTION, and the batch width cannot answer it.
     ///

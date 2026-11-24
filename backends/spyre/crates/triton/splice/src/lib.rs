@@ -1721,7 +1721,9 @@ pub fn lower_block_copy<
 /// that one value. The pool's page ([`PagedKvPool::POOL_PAGE_SLOTS`], a
 /// [`PoolPageSlots`]) is a DIFFERENT quantity: before they were types, a plain integer
 /// accepted either. Integer boundaries call `.get()`.
-pub use ktir_superdsc::sdsc_abstract::{HeadWidth, PoolPageSlots, SchedulerBlockTokens};
+pub use ktir_superdsc::sdsc_abstract::{
+    ContextPages, HeadWidth, PoolPageSlots, SchedulerBlockTokens,
+};
 /// The shared head facts every paged kernel's geometry states — re-exported so the leg and the tests
 /// mint them from the same crate the splice reads them from.
 pub use scratchy_ir::model_facts::{
@@ -2049,9 +2051,18 @@ fn whole<F: scratchy_subtile::subtile_ir::RopeForm>(
     Ok(())
 }
 
+/// ⭐ A DECODE BATCH'S CHUNK FITS ITS POOL — it gathers fewer pages than the pool holds: a gather of
+/// the whole pool faults the card (torch-spyre#4033), and this port has no per-sequence loop to
+/// serve that step. The ONE statement the splice checks at the pool it lowers over and the bake's
+/// placement checks again at the pool the card is given.
+pub fn chunk_fits_pool(chunking: &BatchChunking, pool_pages: u32) -> bool {
+    chunking.entries() < pool_pages
+}
+
 /// ⭐ THE WALK — how many blocks of the page table a rung's attention reads (`NUM_BLOCKS`): the rung's
-/// swept extent in pages. Every page of the pool at `ActiveCap::FULL` (a decode step's keys can sit
-/// anywhere below the capacity), and at `ActiveCap::NONE` (a prompt chunk baked with no resident
+/// swept extent in pages. Every page of the context at `ActiveCap::FULL` (a decode step's keys can sit
+/// anywhere below it); the pool may hold more pages than the context, and the walk never reaches past
+/// the context. At `ActiveCap::NONE` (a prompt chunk baked with no resident
 /// prefix) the pages its own `mq` rows fill.
 ///
 /// Blocks past a sequence's length carry a fully-masked tile, so a walk wider than the context costs
@@ -2059,15 +2070,12 @@ fn whole<F: scratchy_subtile::subtile_ir::RopeForm>(
 /// of the rung: a step whose positions end at or below `walk · SchedulerBlockTokens::REFERENCE` can run on it, whatever its
 /// start — the mask stack, not the rung, says which of the walked keys each row attends. The splice
 /// bakes it and the wiring states it (`PagedStep::walk`) from this one function.
-pub fn walk_pages(pages: u32, mq: u32, active_cap: ktir_superdsc::ktir_node::ActiveCap) -> u32 {
-    let swept = active_cap.resolve(
-        pages * SchedulerBlockTokens::REFERENCE.get(),
-        ktir_superdsc::sdsc_abstract::POOL_STICK,
-    );
+pub fn walk_pages(context: u32, mq: u32, active_cap: ktir_superdsc::ktir_node::ActiveCap) -> u32 {
+    let swept = active_cap.resolve(context, ktir_superdsc::sdsc_abstract::POOL_STICK);
     let walked = if swept == 0 { mq } else { swept };
     walked
         .div_ceil(SchedulerBlockTokens::REFERENCE.get())
-        .min(pages)
+        .min(std::num::NonZeroU32::new(context).map_or(0, |c| ContextPages::of_slots(c).get()))
 }
 
 /// ⭐ THE WALK RUNGS — spyre-inference's `SpyreAttnBucketer` (`spyre_attn_bucketer.py`, 297fc48): its
@@ -2131,7 +2139,7 @@ pub fn lower_attn<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile
     // state and dots are f16). The op states neither, so neither reaches here today; a field added
     // for one is a compile error at this line rather than an attention run without it.
     let SubOp::AttnDecode {
-        valid_len: _,
+        valid_len,
         layout: _,
         producer,
         softmax_state: _,
@@ -2206,6 +2214,9 @@ pub fn lower_attn<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile
             node.output.tensor.index()
         ));
     }
+    // The kernel's view of the pools is the context's pages ([`ContextPages::of_slots`]); `pages`
+    // stays the pool's own, which the batch's eligibility below compares a chunk's gather against.
+    let view = ContextPages::of_slots(positive(*valid_len, "the attention's context")?);
     whole(ir, &node.inputs[0], mq, nqh * hd.get(), "query")?;
     whole(ir, &node.output, mq, nqh * hd.get(), "attention output")?;
     // ⭐ THE WALK'S EXTENT IS PER-REQUEST FOR A PREFILL CHUNK, THE GRAPH'S ROWS FOR THE BATCHED
@@ -2215,9 +2226,9 @@ pub fn lower_attn<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile
     // decode kernel (one query row) and the batched kernel (the request axis carried inside one
     // launch) keep the graph's row count, exactly as before.
     let blocks = if batch || decode {
-        walk_pages(pages.get(), mq, active_cap)
+        walk_pages(*valid_len, mq, active_cap)
     } else {
-        walk_pages(pages.get(), query_rows.per_request().get(), active_cap)
+        walk_pages(*valid_len, query_rows.per_request().get(), active_cap)
     };
     let tids = PagedStepTids::RESERVED;
     // ⭐ THE POOLS' FORMAT IS THE TAPE'S — the writer this attention's cache names
@@ -2235,7 +2246,7 @@ pub fn lower_attn<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile
         // (tinyllama-1.1b, 2048) bakes no spyre decode at all (its head is untied). PORTING their
         // loop is what admits such a pool.
         let chunking = BatchChunking::of(mq, blocks, nkvh, g.q_width(), g.head_dim().get());
-        if chunking.entries() >= pages.get() {
+        if !chunk_fits_pool(&chunking, pages.get()) {
             return Err(format!(
                 "triton splice: AttnDecode t{}: a {mq}-sequence decode walking {blocks} block(s) \
                  gathers {} page(s) a chunk, and the pool holds {pages} — a gather of the whole \
@@ -2251,7 +2262,7 @@ pub fn lower_attn<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile
                 rows: TokenRows::new(query_rows.graph_rows().rows()),
                 heads: g,
                 block: SchedulerBlockTokens::REFERENCE,
-                pages: PoolPages::new(pages),
+                pages: view,
                 chunking,
                 scale: AttnScale::new(scale),
             },
@@ -2287,7 +2298,7 @@ pub fn lower_attn<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile
             rows: TokenRows::new(query_rows.graph_rows().rows()),
             heads: g,
             block: SchedulerBlockTokens::REFERENCE,
-            pages: PoolPages::new(pages),
+            pages: view,
             blocks: WalkBlocks::new(positive(blocks, "the attention's walked pages")?),
             scale: AttnScale::new(scale),
         },
@@ -2646,6 +2657,9 @@ pub fn lower_kv_write<
             node.output.tensor.index()
         ));
     }
+    // The write's view of the pools covers its reader's context ([`ContextPages::of_slots`]), as
+    // the attention's does; its scatter lands a row wherever the index names it in the placed pool.
+    let view = ContextPages::of_slots(written_context(node, ir)?);
     let positional = kv_write_at(
         kv_pool_format(ir, node)?,
         KvWriteGeometry {
@@ -2653,7 +2667,7 @@ pub fn lower_kv_write<
             nkvh: g.kv_heads(),
             hd,
             block: SchedulerBlockTokens::REFERENCE,
-            pages: PoolPages::new(pages),
+            pages: view,
         },
     )?;
     let t =
@@ -2670,6 +2684,39 @@ pub fn lower_kv_write<
     let mut e = EmittedOp::bare(name);
     e.ktir = Some(k);
     Ok(e)
+}
+
+/// The context a KV writer's pools serve — the `valid_len` of the attention whose producer is this
+/// writer (a `RopeAppend`, or the float8 cache's `KvAppend`), the bridge's one mint of the context,
+/// read off the op that carries it.
+fn written_context<F: scratchy_subtile::subtile_ir::RopeForm>(
+    node: &SubtileNode<F>,
+    ir: &SubtileIR<F>,
+) -> Result<std::num::NonZeroU32, String> {
+    ir.nodes
+        .iter()
+        .find_map(|n| match &n.op {
+            SubOp::AttnDecode {
+                valid_len,
+                producer:
+                    scratchy_subtile::subtile_ir::KvCacheProducer::SameForwardRopeAppend {
+                        producer_node_idx,
+                        ..
+                    },
+                ..
+            } if *producer_node_idx as usize == node.id.index() => {
+                std::num::NonZeroU32::new(*valid_len)
+            }
+            _ => None,
+        })
+        .ok_or_else(|| {
+            format!(
+                "triton splice: {} t{}: no attention of a positive context reads the pools it \
+                 writes, so the context its view of them covers is unstated",
+                node.op.name(),
+                node.output.tensor.index()
+            )
+        })
 }
 
 /// ⭐ A POSITIVE COUNT OF A PAGED KERNEL'S GEOMETRY — one type per quantity, so a kernel's rows
@@ -2701,8 +2748,6 @@ paged_count! {
     /// A paged kernel's token rows: the write's `T`, the attention's `NUM_TOKENS`, the prefill
     /// kernel's `PADDED_QUERY_LEN`.
     TokenRows,
-    /// The pages a KV pool holds (`NUM_PAGES`; the write's `NUM_ROWS` is these pages' rows).
-    PoolPages,
     /// The pages a per-sequence walk reads (`NUM_BLOCKS`, [`walk_pages`]).
     WalkBlocks,
 }
@@ -2775,7 +2820,8 @@ fn int(v: u32) -> Val {
 }
 
 /// ⭐ THE PAGED KV WRITE'S GEOMETRY — what `reshape_and_cache_head_major` is compiled at: the token
-/// rows, the kv heads, the head width, the scheduler's block, and the pool's pages.
+/// rows, the kv heads, the head width, the scheduler's block, and the pages its view of the pools
+/// covers ([`ContextPages`]).
 #[derive(Clone, Copy, Debug)]
 pub struct KvWriteGeometry {
     pub rows: TokenRows,
@@ -2784,7 +2830,7 @@ pub struct KvWriteGeometry {
     /// The scheduler's block — the rows a page holds per kv head (production's is
     /// [`SchedulerBlockTokens::REFERENCE`]).
     pub block: SchedulerBlockTokens,
-    pub pages: PoolPages,
+    pub pages: ContextPages,
 }
 
 /// ⭐ THE KV WRITE'S KERNEL — spyre-inference's `reshape_and_cache_head_major_kernel` at `g` with its
@@ -2843,7 +2889,8 @@ pub struct PagedAttnGeometry {
     pub heads: HeadGeometry,
     /// `BLOCK_SIZE` — the scheduler's block (production's is [`SchedulerBlockTokens::REFERENCE`]).
     pub block: SchedulerBlockTokens,
-    pub pages: PoolPages,
+    /// `NUM_PAGES` — the pages the kernel's view of the pools covers: the context's ([`ContextPages`]).
+    pub pages: ContextPages,
     /// `NUM_BLOCKS` — the pages the walk reads ([`walk_pages`]).
     pub blocks: WalkBlocks,
     pub scale: AttnScale,
@@ -2907,8 +2954,8 @@ pub fn paged_attn_program<P: DataFormat>(g: PagedAttnGeometry) -> Result<KtirNod
 }
 
 /// ⭐ A BATCHED DECODE'S GEOMETRY — what `batched_decode_head_major` is compiled at: one query row a
-/// sequence, the class's heads, the scheduler's block, the pool's pages, the chunking
-/// ([`BatchChunking::of`]) and the scale.
+/// sequence, the class's heads, the scheduler's block, the pages its view of the pools covers, the
+/// chunking ([`BatchChunking::of`]) and the scale.
 #[derive(Clone, Copy, Debug)]
 pub struct BatchedDecodeGeometry {
     /// `NUM_TOKENS` — one query row a sequence.
@@ -2917,7 +2964,7 @@ pub struct BatchedDecodeGeometry {
     pub heads: HeadGeometry,
     /// `BLOCK_SIZE` — the scheduler's block (production's is [`SchedulerBlockTokens::REFERENCE`]).
     pub block: SchedulerBlockTokens,
-    pub pages: PoolPages,
+    pub pages: ContextPages,
     pub chunking: BatchChunking,
     pub scale: AttnScale,
 }
@@ -4898,7 +4945,7 @@ mod production_ktir_dump {
                 rows: TokenRows::new(nz(mq)),
                 heads: heads(hd),
                 block: SchedulerBlockTokens::REFERENCE,
-                pages: PoolPages::new(nz(pages)),
+                pages: ContextPages::new(nz(pages)),
                 blocks: WalkBlocks::new(nz(blocks)),
                 scale,
             })
@@ -4918,9 +4965,9 @@ mod production_ktir_dump {
             rows: TokenRows::new(nz(128)),
             heads: heads(64),
             block: SchedulerBlockTokens::REFERENCE,
-            pages: PoolPages::new(nz(4)),
+            pages: ContextPages::new(nz(4)),
             blocks: WalkBlocks::new(nz(walk_pages(
-                4,
+                4 * SchedulerBlockTokens::REFERENCE.get(),
                 64,
                 ktir_superdsc::ktir_node::ActiveCap::NONE,
             ))),
@@ -4948,7 +4995,7 @@ mod production_ktir_dump {
                     rows: TokenRows::new(nz(seqs)),
                     heads: heads(hd),
                     block: SchedulerBlockTokens::REFERENCE,
-                    pages: PoolPages::new(nz(2048)),
+                    pages: ContextPages::new(nz(2048)),
                     chunking: BatchChunking::of(seqs, walk, 8, 32 * hd, hd),
                     scale,
                 },
@@ -4972,7 +5019,7 @@ mod production_ktir_dump {
                 nkvh: KvHeads::new(nkvh),
                 hd: HeadWidth::of_whole_sticks(hd),
                 block: SchedulerBlockTokens::REFERENCE,
-                pages: PoolPages::new(nz(4)),
+                pages: ContextPages::new(nz(4)),
             })
             .unwrap_or_else(|e| panic!("{name}: {e}"));
             v.push((name, k.src, k.spec, vec![1]));
@@ -5469,8 +5516,25 @@ mod walk_on_the_card {
 
     /// [`walk`] at head dim `hd`.
     fn walk_at(mq: i128, blocks: i128, hd: i128) -> KtirNode {
-        let (mq, hd) = (mq as u32, hd as u32);
-        paged_attn_program::<ktir_superdsc::superdsc_opspec::Fp16>(PagedAttnGeometry {
+        walk_over::<ktir_superdsc::superdsc_opspec::Fp16>(
+            mq as u32,
+            blocks as u32,
+            hd as u32,
+            8,
+            2048,
+        )
+    }
+
+    /// [`walk_at`] at `kv_heads` kv heads of four query heads each, its pools held at `DF` and
+    /// viewed as `pages` pages.
+    fn walk_over<DF: DataFormat>(
+        mq: u32,
+        blocks: u32,
+        hd: u32,
+        kv_heads: u32,
+        pages: u32,
+    ) -> KtirNode {
+        paged_attn_program::<DF>(PagedAttnGeometry {
             seq: if mq == 1 {
                 PagedSequence::Decode
             } else {
@@ -5480,15 +5544,15 @@ mod walk_on_the_card {
             },
             rows: TokenRows::new(nz(mq)),
             heads: HeadGeometry::new(
-                QueryHeads::new(32),
-                KvHeads::new(8),
+                QueryHeads::new(4 * kv_heads),
+                KvHeads::new(kv_heads),
                 HeadDim::new(hd),
                 RotDim::new(hd),
                 BlockSize::new(SchedulerBlockTokens::REFERENCE.get()),
             ),
             block: SchedulerBlockTokens::REFERENCE,
-            pages: PoolPages::new(nz(2048)),
-            blocks: WalkBlocks::new(nz(blocks as u32)),
+            pages: ContextPages::new(nz(pages)),
+            blocks: WalkBlocks::new(nz(blocks)),
             scale: AttnScale::new(0.125),
         })
         .expect("the walk mints")
@@ -5677,23 +5741,36 @@ mod walk_on_the_card {
         kv_heads: u32,
         group: u32,
     ) -> (KtirNode, BatchChunking) {
+        batched_walk_over::<ktir_superdsc::superdsc_opspec::Fp16>(
+            seqs, walk, hd, kv_heads, group, 2048,
+        )
+    }
+
+    /// [`batched_walk_heads`] with its pools held at `DF` and viewed as `pages` pages.
+    fn batched_walk_over<DF: DataFormat>(
+        seqs: u32,
+        walk: u32,
+        hd: u32,
+        kv_heads: u32,
+        group: u32,
+        pages: u32,
+    ) -> (KtirNode, BatchChunking) {
         let c = BatchChunking::of(seqs, walk, kv_heads, kv_heads * group * hd, hd);
-        let node =
-            batched_decode_program::<ktir_superdsc::superdsc_opspec::Fp16>(BatchedDecodeGeometry {
-                rows: TokenRows::new(nz(seqs)),
-                heads: HeadGeometry::new(
-                    QueryHeads::new(kv_heads * group),
-                    KvHeads::new(kv_heads),
-                    HeadDim::new(hd),
-                    RotDim::new(hd),
-                    BlockSize::new(SchedulerBlockTokens::REFERENCE.get()),
-                ),
-                block: SchedulerBlockTokens::REFERENCE,
-                pages: PoolPages::new(nz(2048)),
-                chunking: c,
-                scale: AttnScale::new(0.125),
-            })
-            .expect("the batched walk mints");
+        let node = batched_decode_program::<DF>(BatchedDecodeGeometry {
+            rows: TokenRows::new(nz(seqs)),
+            heads: HeadGeometry::new(
+                QueryHeads::new(kv_heads * group),
+                KvHeads::new(kv_heads),
+                HeadDim::new(hd),
+                RotDim::new(hd),
+                BlockSize::new(SchedulerBlockTokens::REFERENCE.get()),
+            ),
+            block: SchedulerBlockTokens::REFERENCE,
+            pages: ContextPages::new(nz(pages)),
+            chunking: c,
+            scale: AttnScale::new(0.125),
+        })
+        .expect("the batched walk mints");
         (node, c)
     }
 
@@ -5863,6 +5940,25 @@ mod walk_on_the_card {
             8,
             "under the floor"
         );
+    }
+
+    /// ⭐ A BATCH CHUNK FITS ONLY A POOL LARGER THAN IT — a chunk gathers fewer pages than the pool
+    /// holds or its gather of the whole pool faults the card (torch-spyre#4033): [`chunk_fits_pool`]
+    /// is false at the pool's own count, true one page past it.
+    #[test]
+    fn a_batch_chunk_fits_only_a_pool_larger_than_it() {
+        // The `batched_walk_heads` shapes: granite's geometry and its rank shares, over the
+        // walk lengths the batch rungs bake.
+        for (seqs, walk, hd, kv_heads, group) in [
+            (4u32, 64u32, 64u32, 8u32, 4u32),
+            (1, 128, 64, 8, 4),
+            (32, 1, 64, 8, 4),
+            (4, 64, 128, 4, 8),
+        ] {
+            let c = BatchChunking::of(seqs, walk, kv_heads, kv_heads * group * hd, hd);
+            assert!(!chunk_fits_pool(&c, c.entries()), "{c:?}");
+            assert!(chunk_fits_pool(&c, c.entries() + 1), "{c:?}");
+        }
     }
 
     /// ⛔ A DECODE BATCH GATHERS EACH OF ITS PAGES WHOLE, ONE OP FOR ALL OF THEM — the whole-page
@@ -7134,7 +7230,7 @@ def two_pages(k_index, v_index, k_pages, v_pages, out, NUM_PAGES: tl.constexpr):
             nkvh: KvHeads::new(nkvh as u32),
             hd: HeadWidth::of_whole_sticks(hd as u32),
             block: SchedulerBlockTokens::REFERENCE,
-            pages: PoolPages::new(nz(4)),
+            pages: ContextPages::new(nz(4)),
         })?
         .spec;
         let module = compile_kernel(src, &spec, &[1])?;
@@ -7168,6 +7264,18 @@ def two_pages(k_index, v_index, k_pages, v_pages, out, NUM_PAGES: tl.constexpr):
     ) -> Vec<ktir_superdsc::emit::EmittedOp<ktir_superdsc::collective::TpWorld<1>>> {
         kv_write_lowered::<ktir_superdsc::superdsc_opspec::Fp16>(kv_write_src(), t, nkvh, hd)
             .unwrap_or_else(|e| panic!("t={t} nkvh={nkvh} hd={hd}: the write lowers: {e}"))
+    }
+
+    /// The write's production program at `DF`, its pools viewed as `pages` pages ([`kv_write_program`]).
+    fn kv_write_over<DF: DataFormat>(t: u32, nkvh: u32, hd: u32, pages: u32) -> KtirNode {
+        kv_write_program::<DF>(KvWriteGeometry {
+            rows: TokenRows::new(nz(t)),
+            nkvh: KvHeads::new(nkvh),
+            hd: HeadWidth::of_whole_sticks(hd),
+            block: SchedulerBlockTokens::REFERENCE,
+            pages: ContextPages::new(nz(pages)),
+        })
+        .unwrap_or_else(|e| panic!("t={t} nkvh={nkvh} hd={hd} pages={pages}: the write mints: {e}"))
     }
 
     /// ⭐ A HEAD TWO STICKS WIDE IS WRITTEN WHOLE, one index entry per row. The pool is row-outermost,
@@ -7218,6 +7326,126 @@ def two_pages(k_index, v_index, k_pages, v_pages, out, NUM_PAGES: tl.constexpr):
                 .iter()
                 .all(|n| !n.starts_with("clip") && !n.starts_with("qfp8ch")),
             "{names:?}"
+        );
+    }
+
+    /// `node` lowered through the door's walk over the pools `placed_from` places (its one-kernel
+    /// layout, the cache allocated as the bake allocates a pool), as the stable text of every
+    /// descriptor the card is handed: its name, its wire serialization, its bindings, its trips,
+    /// its strides and its walk.
+    fn over_placed_pool(node: &KtirNode, placed_from: &KtirNode) -> Result<Vec<String>, String> {
+        let layout =
+            triton_ktir_superdsc::layout::for_node(placed_from).map_err(|e| format!("{e:?}"))?;
+        allocate_paged_cache(node, &layout)?;
+        let mut sym = 0i64;
+        let ops = ktir_superdsc::emit::whole_function::lower_walk::<
+            ktir_superdsc::collective::TpWorld<1>,
+        >(
+            node,
+            Some(&layout),
+            &mut sym,
+            &mut ktir_superdsc::emit::ktir_matmul_fp8::QuantizedActivations::default(),
+        )
+        .map_err(|e| e.message)?;
+        Ok(ops
+            .iter()
+            .map(|e| {
+                format!(
+                    "{} {} {:?} {:?} {:?} {:?}",
+                    e.op_name,
+                    serde_json::to_string(&e.op)
+                        .unwrap_or_else(|err| panic!("serialize {}: {err}", e.op_name)),
+                    e.arg_bindings,
+                    e.time,
+                    e.affine_strides,
+                    e.walk
+                )
+            })
+            .collect())
+    }
+
+    /// ⭐ THE POOL'S PAGE COUNT NEVER REACHES A CARD PROGRAM. Every paged kernel compiled at two
+    /// views of its pools — `NUM_PAGES` (`NUM_ROWS` for the KV write), the context's pages the
+    /// splice states ([`context_pages`]) — lowers to the same descriptors over one placed pool: a
+    /// page is gathered and a row scattered through the index, at the placement's addresses, and
+    /// the one window a pool's extent decides reads the placement (`BundleLayout::pool_rows`). So
+    /// one compile serves a context at every pool the bake sizes.
+    #[test]
+    fn a_paged_kernel_lowers_alike_at_any_view_of_one_placed_pool() {
+        use ktir_superdsc::superdsc_opspec::{Fp8, Fp16};
+        let alike = |at: &str, narrow: &KtirNode, wide: &KtirNode| {
+            let lowered = |node: &KtirNode| {
+                over_placed_pool(node, wide).unwrap_or_else(|e| panic!("{at}: {e}"))
+            };
+            assert_eq!(
+                lowered(narrow),
+                lowered(wide),
+                "{at}: the view's pages reached a descriptor"
+            );
+        };
+        for hd in [64u32, 128] {
+            alike(
+                &format!("decode fp16 hd={hd}"),
+                &walk_over::<Fp16>(1, 4, hd, 8, 4),
+                &walk_over::<Fp16>(1, 4, hd, 8, 64),
+            );
+            alike(
+                &format!("prefill fp16 hd={hd}"),
+                &walk_over::<Fp16>(64, 4, hd, 8, 4),
+                &walk_over::<Fp16>(64, 4, hd, 8, 64),
+            );
+            alike(
+                &format!("decode batch fp16 hd={hd}"),
+                &batched_walk_over::<Fp16>(4, 64, hd, 8, 4, 64).0,
+                &batched_walk_over::<Fp16>(4, 64, hd, 8, 4, 2048).0,
+            );
+        }
+        // ⭐ AND OVER A FLOAT8 POOL, at granite-3.1-8b's 8 kv heads of 128 (a 64-wide head is #1371):
+        // its pages land widened by their own gathers, through the same window.
+        alike(
+            "decode fp8",
+            &walk_over::<Fp8>(1, 4, 128, 8, 4),
+            &walk_over::<Fp8>(1, 4, 128, 8, 64),
+        );
+        alike(
+            "prefill fp8",
+            &walk_over::<Fp8>(64, 4, 128, 8, 4),
+            &walk_over::<Fp8>(64, 4, 128, 8, 64),
+        );
+        alike(
+            "decode batch fp8",
+            &batched_walk_over::<Fp8>(4, 8, 128, 8, 4, 16).0,
+            &batched_walk_over::<Fp8>(4, 8, 128, 8, 4, 2048).0,
+        );
+        for (t, nkvh, hd) in [
+            (1u32, 8u32, 64u32),
+            (96, 8, 64),
+            (1, 8, 128),
+            (96, 8, 128),
+            (1, 2, 128),
+        ] {
+            alike(
+                &format!("kv write fp16 t={t} nkvh={nkvh} hd={hd}"),
+                &kv_write_over::<Fp16>(t, nkvh, hd, 4),
+                &kv_write_over::<Fp16>(t, nkvh, hd, 64),
+            );
+        }
+        for t in [1u32, 96] {
+            alike(
+                &format!("kv write fp8 t={t}"),
+                &kv_write_over::<Fp8>(t, 8, 128, 4),
+                &kv_write_over::<Fp8>(t, 8, 128, 64),
+            );
+        }
+        // ⭐ AND WHERE A VIEW'S HEIGHT WOULD DECIDE A WINDOW: the decode kernel under the gather floor
+        // reads a page's kv heads as one tile at a computed corner, as tall as a one-page view. The
+        // window reads the pool's placed rows, so a one-page view lowers exactly as the four-page
+        // view of the same pool does, whatever the door makes of that.
+        let wide = walk_over::<Fp16>(1, 1, 64, 2, 4);
+        assert_eq!(
+            over_placed_pool(&walk_over::<Fp16>(1, 1, 64, 2, 1), &wide).ok(),
+            over_placed_pool(&wide, &wide).ok(),
+            "a one-page view of a four-page pool"
         );
     }
 }
@@ -7341,7 +7569,7 @@ mod kv_pool_formats {
                 rows: TokenRows::new(nz(rows)),
                 heads: granite_8b(),
                 block: SchedulerBlockTokens::REFERENCE,
-                pages: PoolPages::new(nz(pages)),
+                pages: ContextPages::new(nz(pages)),
                 blocks: WalkBlocks::new(nz(8)),
                 scale: AttnScale::new(1.0 / 128f32.sqrt()),
             };
@@ -7361,7 +7589,7 @@ mod kv_pool_formats {
                 rows: TokenRows::new(nz(seqs)),
                 heads,
                 block: SchedulerBlockTokens::REFERENCE,
-                pages: PoolPages::new(nz(pages)),
+                pages: ContextPages::new(nz(pages)),
                 chunking: BatchChunking::of(
                     seqs,
                     8,

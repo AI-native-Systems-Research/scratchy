@@ -1529,6 +1529,56 @@ mod tests {
         }
     }
 
+    /// ⭐ THE WALK COVERS THE CONTEXT, NEVER THE POOL — a pool of 16 pages over a 4-page context
+    /// (a 16-position model on 4-slot pages): the walk is the context's 4 pages, so the
+    /// per-request page table and mask stack regions come out 4 pages wide, while `kv_row_pool`
+    /// alone stays pool-sized — it is indexed by page, never by walked block.
+    #[test]
+    fn the_walk_covers_the_context_not_the_pool() {
+        let s = PagedStep {
+            pages: 16,
+            rows: 1,
+            walk: 4,
+            extent: pair(1, 1),
+            ..step()
+        };
+        // The walk's one law, stated by [`walk_pages`] at the scheduler's own page: the context's
+        // 4 pages, whatever the pool holds.
+        assert_eq!(
+            walk_pages(
+                4 * SchedulerBlockTokens::REFERENCE.get(),
+                1,
+                ktir_superdsc::ktir_node::ActiveCap::FULL
+            ),
+            4
+        );
+        let placed = |tid: u32| {
+            s.card_placements()
+                .iter()
+                .find(|(t, ..)| *t == tid)
+                .map(|&(.., bytes)| bytes)
+                .unwrap()
+        };
+        assert_eq!(
+            placed(s.page_table),
+            4 * s.card_walk_step(),
+            "the page table is the walk's 4 pages, one trip each — not the pool's 16"
+        );
+        assert_eq!(
+            placed(s.mask),
+            u64::from(s.walk)
+                * u64::from(s.extent.per_request().get())
+                * u64::from(s.page_slots)
+                * 2,
+            "the mask stack is the walk's 4 pages of one request's row — not the pool's 16"
+        );
+        assert_eq!(
+            placed(s.kv_row_pool),
+            16 * ktir_superdsc::emit::lower_ktir_to_superdsc::INDEX_RUN_WORDS as u64 * 4,
+            "kv_row_pool is the pool's 16 pages, not the walk's 4"
+        );
+    }
+
     /// ⭐ A PACKED STEP STAGES EACH REQUEST AT ITS OWN WINDOW — the S=2 shape the packed prefill
     /// rung bakes: request `r`'s page table, mask stack and query rows at window `r`'s own tids
     /// ([`ktir_superdsc::reserved_tids::paged_window_tid`], window 0's being the step's own

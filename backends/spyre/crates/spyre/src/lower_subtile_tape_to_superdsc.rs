@@ -738,6 +738,22 @@ pub fn kv_pool_tids<F: RopeForm>(ir: &SubtileIR<F>) -> Vec<u32> {
     pools
 }
 
+/// ⭐ EVERY KV POOL, AS THE TAPE STATES IT — each pool [`kv_pool_tids`] names, in the same order, at
+/// its columns and the format its writer fills it at ([`scratchy_triton_splice::kv_pool_formats`]).
+pub fn kv_pools<F: RopeForm>(
+    ir: &SubtileIR<F>,
+) -> Result<Vec<crate::wiring::KvPool>, SuperDscError> {
+    Ok(scratchy_triton_splice::kv_pool_formats(ir)
+        .map_err(SuperDscError)?
+        .into_iter()
+        .map(|(tid, format)| crate::wiring::KvPool {
+            tid,
+            cols: ir.tensors[tid as usize].cols,
+            format,
+        })
+        .collect())
+}
+
 pub fn compute_bundle_layout<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     ir: &SubtileIR<F>,
     weight_ids: &std::collections::HashSet<u32>,
@@ -750,6 +766,9 @@ pub fn compute_bundle_layout<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     // ⭐ WHAT THE ROWS ARE — one sequence's, or a decode batch's: the paged step's sources differ.
     paged_rows: scratchy_triton_splice::PagedRows,
     per_layer_ext: &[std::collections::BTreeMap<u32, Vec<u32>>],
+    // ⭐ A ROLLED BODY'S PER-LAYER TWINS ([`per_layer_output_twins`]), each placed at its
+    // representative's bytes; EMPTY for an unrolled bundle.
+    twins: &std::collections::BTreeMap<u32, u32>,
     // The graph's query extents, minted by the bake — threaded to the registry walk below,
     // never re-derived from graph rows (see [`bundle_registry`]'s own parameter note).
     query_rows: ktir_superdsc::sdsc_abstract::QueryExtent,
@@ -994,10 +1013,10 @@ pub fn compute_bundle_layout<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     let (kv_bank_bytes, kv_block_banks) = place_kv_pools(
         &pools,
         per_layer_ext,
-        nbytes,
+        |tid| Ok(nbytes(tid)),
         &mut seg_bytes,
         &mut placements,
-    );
+    )?;
     // Logits (seg4) — the graph result (it is also produced by an op, but its role
     // is OUTPUT; classify it before intermediates so it is not pool-coalesced).
     let result = ir.result.index() as u32;
@@ -1418,10 +1437,11 @@ pub fn compute_bundle_layout<T: ktir_superdsc::collective::Tp, F: RopeForm>(
         .iter()
         .map(|(id, _, _)| ir.nodes[id.index()].output.tensor.index() as u32)
         .collect();
+    let is_intermediate = |t: u32| t >= ir.num_sources && t != result;
     let mut inter: Vec<u32> = first_def
         .keys()
         .copied()
-        .filter(|&t| t >= ir.num_sources && t != result && !folded_out.contains(&t))
+        .filter(|&t| is_intermediate(t) && !folded_out.contains(&t) && !twins.contains_key(&t))
         .collect();
     inter.sort_by_key(|t| (first_def[t], *t));
     // ── SEGMENT COLORING (the multi-op stitching fix): dxp's ModuleStitcher connects
@@ -1485,6 +1505,33 @@ pub fn compute_bundle_layout<T: ktir_superdsc::collective::Tp, F: RopeForm>(
         let fold_out = node.output.tensor.index() as u32;
         let p = placements[&producer_out];
         placements.insert(fold_out, TensorPlacement { tid: fold_out, ..p });
+    }
+
+    // ⭐ A ROLLED BODY'S PER-LAYER TWINS ARE THEIR REPRESENTATIVE'S BYTES ([`per_layer_output_twins`]):
+    //    no launch addresses a twin — every launch of a body reads and writes its representative's
+    //    placements, which no launch shifts — so a twin's placement is its representative's, at its
+    //    own size, which is the representative's (the same op in every layer). A twin a fold places
+    //    (its node a folded ScalarMul, as its representative's is) keeps the fold's placement.
+    //    A twin that is a source (a per-layer weight or cache) or the result keeps its own
+    //    placement: only intermediates are the body's to share.
+    for (&twin, &rep) in twins {
+        if !is_intermediate(twin) || folded_out.contains(&twin) {
+            continue;
+        }
+        let p = placements.get(&rep).copied().ok_or_else(|| {
+            SuperDscError(format!(
+                "t{twin}: a per-layer twin of t{rep}, which this layout never placed"
+            ))
+        })?;
+        if nbytes(twin) != p.size {
+            return Err(SuperDscError(format!(
+                "t{twin}: a per-layer twin of t{rep} holds {} B, its representative {} B — a twin \
+                 is the same op in another layer, so the two must be one size",
+                nbytes(twin),
+                p.size
+            )));
+        }
+        placements.insert(twin, TensorPlacement { tid: twin, ..p });
     }
 
     // ⛔ BUILD GUARD (guard-every-crash-at-build-time, structural class): every RESERVED
@@ -1561,9 +1608,13 @@ pub fn compute_bundle_layout<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     //    (`crate::paged_step`): the page index table, the mask stack, the KV write index and the
     //    query row index, at their reserved tids in the ACTIVATION segment like every per-step
     //    binding (the reserved-tid law above), and the decode kernel's `kv_row_pool` and int32 zero
-    //    in the intermediate segment, which neither a layer's launch nor a walk's relaunch shifts
-    //    (the KV segment moves with every layer). `PagedStep::card_placements` is
-    //    the one statement of what they are and how big — the card stagers stage within it.
+    //    in the second intermediate colour: a segment neither a layer's launch nor a walk's
+    //    relaunch shifts (the KV segment moves with every layer), and one the synthetic allocator
+    //    never grows. `kv_row_pool` is the pool's pages long and sits last in that colour, after its
+    //    intermediates and the int32 zero, so no synthetic's offset and no other placement depends
+    //    on the pool's page count.
+    //    `PagedStep::card_placements` is the one statement of what they are and how big — the card
+    //    stagers stage within it.
     if let Some(step) = crate::lower_subtile_tape_to_ktir::paged_step_of_ir(
         ir,
         ActiveCap::FULL,
@@ -1571,11 +1622,12 @@ pub fn compute_bundle_layout<T: ktir_superdsc::collective::Tp, F: RopeForm>(
         query_rows,
     )? {
         for (tid, seat, size) in step.card_placements() {
-            let role = match seat {
-                crate::wiring::CardSeat::Step => SegRole::Activation,
-                crate::wiring::CardSeat::Static => SegRole::Intermediate,
+            let (role, seg) = match seat {
+                crate::wiring::CardSeat::Step => {
+                    (SegRole::Activation, SegRole::Activation.segment())
+                }
+                crate::wiring::CardSeat::Static => (SegRole::Intermediate, inter_segs[1]),
             };
-            let seg = role.segment();
             let off = seg_bytes[seg];
             placements.insert(
                 tid,
@@ -1981,16 +2033,18 @@ mod weight_tail_tests {
 ///
 /// Returns the extra banks' bytes (banks `1..N`; bank 0's are written to `seg_bytes`) and each
 /// pool table's bank per iteration, keyed by the table's layer-0 tid.
+type KvPoolBanks = (Vec<u64>, std::collections::BTreeMap<u32, Vec<KvBank>>);
+
 fn place_kv_pools(
     pools: &[u32],
     per_layer_ext: &[std::collections::BTreeMap<u32, Vec<u32>>],
-    size_of: impl Fn(u32) -> u64,
+    size_of: impl Fn(u32) -> Result<u64, SuperDscError>,
     seg_bytes: &mut [u64; 7],
     placements: &mut std::collections::BTreeMap<u32, TensorPlacement>,
-) -> (Vec<u64>, std::collections::BTreeMap<u32, Vec<KvBank>>) {
+) -> Result<KvPoolBanks, SuperDscError> {
     let kv_seg = SegRole::Kv.segment();
     let is_pool: std::collections::BTreeSet<u32> = pools.iter().copied().collect();
-    let mut place = |tid: u32, bank: KvBank, offset: u64| {
+    let mut place = |tid: u32, bank: KvBank, offset: u64| -> Result<(), SuperDscError> {
         placements.insert(
             tid,
             TensorPlacement {
@@ -1999,9 +2053,10 @@ fn place_kv_pools(
                 segment: kv_seg,
                 bank: bank.get(),
                 offset,
-                size: size_of(tid),
+                size: size_of(tid)?,
             },
         );
+        Ok(())
     };
     let mut bank_bytes: Vec<u64> = Vec::new();
     let mut table_banks: std::collections::BTreeMap<u32, Vec<KvBank>> = Default::default();
@@ -2020,7 +2075,9 @@ fn place_kv_pools(
         let mut block = 0u64;
         for (_, tids) in &tables {
             intra.push(block);
-            let widest = tids.iter().map(|&t| size_of(t)).max().unwrap_or(0);
+            let widest = tids
+                .iter()
+                .try_fold(0u64, |w, &t| size_of(t).map(|s| w.max(s)))?;
             block = align128(block + widest);
         }
         let banks: Vec<KvBank> = (0..first.len())
@@ -2029,7 +2086,7 @@ fn place_kv_pools(
         bank_bytes.extend(std::iter::repeat_n(block, banks.len()));
         for ((t0, tids), &off) in tables.iter().zip(&intra) {
             for (&tid, &bank) in tids.iter().zip(&banks) {
-                place(tid, bank, off);
+                place(tid, bank, off)?;
             }
             table_banks.insert(*t0, banks.clone());
         }
@@ -2043,12 +2100,125 @@ fn place_kv_pools(
         .collect();
     let mut tail = bank_bytes[0];
     for &tid in pools.iter().filter(|t| !owned.contains(t)) {
-        place(tid, KvBank::BASE, tail);
-        tail = align128(tail + size_of(tid));
+        place(tid, KvBank::BASE, tail)?;
+        tail = align128(tail + size_of(tid)?);
     }
     bank_bytes[0] = tail;
     seg_bytes[kv_seg] = bank_bytes[0];
-    (bank_bytes.split_off(1), table_banks)
+    Ok((bank_bytes.split_off(1), table_banks))
+}
+
+/// ⭐ THE SESSION'S POOLS AT THE BAKE'S PAGES — every pool the layout placed, re-placed by [`place_kv_pools`] at `pages` pages of each pool's own page ([`crate::wiring::KvPool::page_bytes`], its format's), with the KV segment's banks and each table's banks. Each pool's row-outermost arrangement is re-sized with it ([`BundleLayout::resize_row_outermost`]). The row pool (`step`'s, at the bake's pages) is the LAST placement of its segment, so it grows in place at that segment's end; a row pool something sits after is refused. The pools are the KV segment's only tenants, so nothing else moves; a layout that placed no pool (every off-card bake) places none.
+pub fn place_kv_pools_at<T: ktir_superdsc::collective::Tp>(
+    rolled: &mut RolledSuperDsc<T>,
+    step: Option<crate::wiring::PagedStep>,
+    pages: crate::pool_pages::PoolPages,
+) -> Result<(), SuperDscError> {
+    // ⭐ THE BATCH RULE AT THE POOL THE CARD IS GIVEN ([`scratchy_triton_splice::chunk_fits_pool`]): the
+    // splice checked it at the context's pool; the bake's pool may hold fewer pages, so it is checked
+    // again here, a build error naming both counts.
+    if let Some(step) = step
+        && let Some(chunking) = step.batch()
+        && !scratchy_triton_splice::chunk_fits_pool(&chunking, pages.get())
+    {
+        return Err(SuperDscError(format!(
+            "a {}-sequence decode batch gathers {} page(s) a chunk, and the bake's KV pool holds {} \
+             — a gather of the whole pool faults the card (torch-spyre#4033)",
+            step.rows,
+            chunking.entries(),
+            pages.get()
+        )));
+    }
+    let RolledSuperDsc {
+        layout,
+        per_layer_ext,
+        kv_pools,
+        ..
+    } = rolled;
+    let placed: Vec<crate::wiring::KvPool> = kv_pools
+        .iter()
+        .copied()
+        .filter(|p| {
+            layout
+                .placements
+                .get(&p.tid)
+                .is_some_and(|pl| matches!(pl.role, SegRole::Kv))
+        })
+        .collect();
+    let tids: Vec<u32> = placed.iter().map(|p| p.tid).collect();
+    let (kv_bank_bytes, kv_block_banks) = place_kv_pools(
+        &tids,
+        per_layer_ext,
+        |tid| {
+            placed
+                .iter()
+                .find(|p| p.tid == tid)
+                .map(|p| u64::from(pages.get()) * p.page_bytes())
+                .ok_or_else(|| {
+                    SuperDscError(format!(
+                        "t{tid}: a KV pool table names it at a layer, but the tape states no pool of it"
+                    ))
+                })
+        },
+        &mut layout.segment_bytes,
+        &mut layout.placements,
+    )?;
+    layout.kv_bank_bytes = kv_bank_bytes;
+    layout.kv_block_banks = kv_block_banks;
+    for &tid in &tids {
+        layout.resize_row_outermost(tid)?;
+    }
+    if let Some(step) = step.filter(|s| s.reads_kv_row_pool())
+        && let Some(p) = layout.placements.get_mut(&step.kv_row_pool)
+    {
+        if align128(p.offset + p.size) != layout.segment_bytes[p.segment] {
+            return Err(SuperDscError(format!(
+                "t{}: the row pool ends at {} of seg{}, which runs to {} — it grows in place only as \
+                 its segment's last placement",
+                p.tid,
+                align128(p.offset + p.size),
+                p.segment,
+                layout.segment_bytes[p.segment]
+            )));
+        }
+        p.size = step.card_kv_row_pool_bytes();
+        layout.segment_bytes[p.segment] = align128(p.offset + p.size);
+    }
+    Ok(())
+}
+
+/// ⭐ A ROLLED BODY'S PER-LAYER TWINS — `twin tid → representative tid`: for every body `Compute`
+/// of the re-rolled tape, the output tensor of each of its per-layer copies
+/// (`Compute::per_layer_out[v]`, `v ≥ 1`) mapped to the output of copy 0 (the representative the body
+/// is lowered from). A launch of a rolled body shifts only the weight and KV segments, so every
+/// launch reads and writes its representative's intermediates; a twin is never addressed, and its
+/// placement IS its representative's ([`compute_bundle_layout`]). Empty for a tape with no layer loop.
+pub(crate) fn per_layer_output_twins<F: RopeForm>(
+    tape: &scratchy_subtile::subtile_tape::SubtileTape,
+    ir: &SubtileIR<F>,
+) -> std::collections::BTreeMap<u32, u32> {
+    use scratchy_subtile::subtile_tape::Instr;
+    let out = |n: &scratchy_subtile::subtile_ir::SubtileId| {
+        ir.nodes[n.index()].output.tensor.index() as u32
+    };
+    let mut twins = std::collections::BTreeMap::new();
+    for instr in tape.instrs() {
+        if let Instr::Compute {
+            node,
+            per_layer_out,
+            ..
+        } = instr
+        {
+            let rep = out(node);
+            for copy in per_layer_out.iter().skip(1) {
+                let twin = out(copy);
+                if twin != rep {
+                    twins.insert(twin, rep);
+                }
+            }
+        }
+    }
+    twins
 }
 
 /// ⭐ THE PER-LAYER EXTERNAL TID CLASSES, READ OFF THE RE-ROLLED TAPE **BEFORE** ANY PLACEMENT
@@ -6615,7 +6785,8 @@ fn bake_layout(l: &BundleLayout) -> bundle::BundleLayout<'static> {
     let BundleLayout {
         ids,
         placements,
-        segment_bytes,
+        // Read through `BundleLayout::segment_extents`, which covers every synthetic.
+        segment_bytes: _,
         weight_bank_bytes,
         kv_bank_bytes,
         // Read by the launch table (`lower_subtile_tape_to_ktir`), which carries each layer's bank
@@ -6727,22 +6898,14 @@ fn bake_layout(l: &BundleLayout) -> bundle::BundleLayout<'static> {
         );
     }
 
-    // ⛔ THE INTERMEDIATE SEGMENT MUST COVER EVERY SYNTH, WHENEVER IT WAS DECLARED. The SubtileIR
-    // walk grows this itself, right after its own node loop — but a synth can also be minted LATER,
-    // by `ktir_to_superdsc::lower` running inside `emit_bundle_inner`, long after that walk returned
-    // and its `segment_bytes` were final. Those intermediates then sat past the segment's end and
-    // every one of them was an address defect (MEASURED: 1777 of them, `t0_kt0 spans
-    // [6799360, 6803456) of seg0, which is only 6799360 B`).
-    //
-    // ⭐ SO THE GROW BELONGS HERE, not at either producer. This is the ONE place the final
-    // `segment_bytes` are produced, and it already reads `synth` for the placements above — so
-    // covering the allocator's high-water mark is a fact about the allocation rather than a step a
-    // caller can forget. A no-op for the SubtileIR path, which already grew it.
-    let mut segment_bytes = *segment_bytes;
-    let seg_i = SegRole::Intermediate.segment();
-    if synth.high_water() > segment_bytes[seg_i] {
-        segment_bytes[seg_i] = synth.high_water();
-    }
+    // ⛔ THE INTERMEDIATE SEGMENT MUST COVER EVERY SYNTH, WHENEVER IT WAS DECLARED. A synth can be
+    // minted by `ktir_to_superdsc::lower` running inside `emit_bundle_inner`, long after the
+    // SubtileIR walk returned and its `segment_bytes` were final; such an intermediate sits past the
+    // packed segment's end, an address defect (MEASURED: 1777 of them, `t0_kt0 spans
+    // [6799360, 6803456) of seg0, which is only 6799360 B`). The layout's own extents
+    // (`BundleLayout::segment_extents`) cover the allocator's high-water mark, and the session's
+    // residency reads the same extents.
+    let segment_bytes = l.segment_extents();
 
     // ⭐ EVERY ADDRESS THIS BUNDLE WILL USE IS NOW DECIDED. Prove them before emitting.
     audit_layout_addresses(
@@ -7671,6 +7834,13 @@ pub struct RolledSuperDsc<T: ktir_superdsc::collective::Tp> {
     /// A table's length is ITS class's `iters` — two classes of different layer counts
     /// carry different-length tables under the same map.
     pub per_layer: std::collections::BTreeMap<u32, Vec<u32>>,
+    /// ⭐ THE PER-CLASS EXTERNAL TABLES THE LAYOUT WAS PLACED BY — [`per_layer_external_tids`]' one
+    /// map per attention class, the shape [`place_kv_pools`] reads, so a pool re-placed at the
+    /// bake's pages ([`place_kv_pools_at`]) is banked as the layout first banked it.
+    pub per_layer_ext: Vec<std::collections::BTreeMap<u32, Vec<u32>>>,
+    /// ⭐ THE SESSION'S POOLS AS THE TAPE STATES THEM ([`kv_pools`]) — what its residency charges a
+    /// page by and the bake's pool re-places ([`place_kv_pools_at`]).
+    pub kv_pools: Vec<crate::wiring::KvPool>,
     /// ⭐ THE LAYER SEQUENCE, IN TRUE ORDER — one entry per layer of the whole model,
     /// naming its body (index into `bodies`) and its class-relative iteration. The
     /// executor runs exactly this; a single-class roll degenerates to
@@ -8885,6 +9055,7 @@ mod tests {
             &weight_ids,
             scratchy_triton_splice::PagedRows::Sequence,
             &[],
+            &Default::default(),
             one_request_of(4),
         )
         .expect("a layout for a plain matmul bundle");
@@ -9003,6 +9174,7 @@ mod tests {
             &weight_ids,
             scratchy_triton_splice::PagedRows::Sequence,
             &[],
+            &Default::default(),
             one_request_of(1),
         )
         .expect("plain lays out");
@@ -9011,6 +9183,7 @@ mod tests {
             &weight_ids,
             scratchy_triton_splice::PagedRows::Sequence,
             &[],
+            &Default::default(),
             one_request_of(1),
         )
         .expect("the minted graph lays out");
@@ -9108,6 +9281,7 @@ mod tests {
             &weight_ids,
             scratchy_triton_splice::PagedRows::Sequence,
             &[],
+            &Default::default(),
             one_request_of(4),
         )
         .expect("the minted graph lays out");
@@ -9520,6 +9694,7 @@ mod tests {
             &weight_ids,
             scratchy_triton_splice::PagedRows::Sequence,
             &[],
+            &Default::default(),
             one_request_of(mq),
         )
         .expect("the tail's layout mints");
@@ -9639,6 +9814,7 @@ mod tests {
             &weight_ids,
             scratchy_triton_splice::PagedRows::Sequence,
             &[],
+            &Default::default(),
             one_request_of(1),
         )
         .expect("the fp8 layout mints");
@@ -9654,6 +9830,7 @@ mod tests {
             &weight_ids,
             scratchy_triton_splice::PagedRows::Sequence,
             &[],
+            &Default::default(),
             one_request_of(1),
         )
         .expect("the fp16 layout mints");
@@ -10405,6 +10582,7 @@ mod tests {
             &weight_ids,
             scratchy_triton_splice::PagedRows::Sequence,
             &[],
+            &Default::default(),
             one_request_of(1),
         )
         .expect_err("the placement pass is the budget law and must refuse 32 GiB in seg1");
@@ -10802,6 +10980,69 @@ mod tests {
         layout.synth(ktir_superdsc::place::SynthId::Act(victim), &[1, 64]);
         let _ = bake_layout(&layout);
     }
+
+    /// ⭐ A ROLLED BODY'S TWINS ARE ITS REPRESENTATIVE'S BYTES: a four-layer stack re-rolled into one
+    /// body places every per-layer INTERMEDIATE twin at its representative's segment and offset,
+    /// and its intermediate segments hold less than the same layout with every twin given bytes of
+    /// its own. A twin that is a source (a per-layer weight or cache) or the forward's result keeps
+    /// its own placement: only intermediates are the body's to share.
+    #[test]
+    fn a_rolled_bodys_twins_share_their_representatives_bytes() {
+        use scratchy_subtile::subtile_ir::{ValidatedGraph, lower_region};
+        use scratchy_subtile::subtile_tape::{lower_dag_to_tape, reroll_subtile_tape};
+        let input = scratchy_subtile::fixtures::mlp_chain_distinct_m(4, 2048, 1);
+        let ir = lower_region(
+            &input,
+            std::num::NonZeroU32::new(8192).expect("8192 is nonzero"),
+        );
+        let unrolled = lower_dag_to_tape(&ValidatedGraph::new(&ir).expect("the stack validates"));
+        let rolled = reroll_subtile_tape(&unrolled, &ir);
+        let twins = per_layer_output_twins(&rolled, &ir);
+        assert!(!twins.is_empty(), "a four-layer roll has twins");
+        let per_layer_ext = per_layer_external_tids(&rolled);
+        let at = |twins: &std::collections::BTreeMap<u32, u32>| {
+            compute_bundle_layout::<ktir_superdsc::collective::TpWorld<1>, _>(
+                &ir,
+                &Default::default(),
+                scratchy_triton_splice::PagedRows::Sequence,
+                &per_layer_ext,
+                twins,
+                one_request_of(1),
+            )
+            .expect("the stack lays out")
+        };
+        let (shared, apart) = (at(&twins), at(&Default::default()));
+        let result = ir.result.index() as u32;
+        for (twin, rep) in &twins {
+            let (t, r) = (shared.placements[twin], shared.placements[rep]);
+            if *twin >= ir.num_sources && *twin != result {
+                assert_eq!(
+                    (t.segment, t.offset),
+                    (r.segment, r.offset),
+                    "t{twin} sits on t{rep}"
+                );
+            } else {
+                let own = apart.placements[twin];
+                assert_eq!(
+                    (t.segment, t.offset),
+                    (own.segment, own.offset),
+                    "t{twin} keeps its own placement"
+                );
+            }
+        }
+        let inter = |l: &BundleLayout| {
+            [SegRole::Intermediate.segment(), 5, 6]
+                .map(|s| l.segment_bytes[s])
+                .iter()
+                .sum::<u64>()
+        };
+        assert!(
+            inter(&shared) < inter(&apart),
+            "{} B shared vs {} B apart",
+            inter(&shared),
+            inter(&apart)
+        );
+    }
 }
 
 #[cfg(test)]
@@ -10864,10 +11105,11 @@ mod kv_pool_placement_tests {
         let (extra, banks) = place_kv_pools(
             &pools,
             &per_layer_ext,
-            |_| pool,
+            |_| Ok(pool),
             &mut seg_bytes,
             &mut placements,
-        );
+        )
+        .expect("the pools place");
         let kv = SegRole::Kv.segment();
         assert_eq!(seg_bytes[kv], 2 * pool, "bank 0 holds one layer's K and V");
         assert_eq!(
@@ -10897,14 +11139,15 @@ mod kv_pool_placement_tests {
         let per_layer_ext = one_class(2);
         let pools = vec![1000, 1001, 2000, 2001];
         let (mut seg_bytes, mut placements) = ([0u64; 7], Default::default());
-        let size_of = |t: u32| if t == 1001 { 2048 } else { 1024 };
+        let size_of = |t: u32| Ok(if t == 1001 { 2048 } else { 1024 });
         place_kv_pools(
             &pools,
             &per_layer_ext,
             size_of,
             &mut seg_bytes,
             &mut placements,
-        );
+        )
+        .expect("the pools place");
         assert_eq!(placements[&2000].offset, 2048, "V starts past the widest K");
         assert_eq!(placements[&2001].offset, 2048);
     }
@@ -10921,10 +11164,11 @@ mod kv_pool_placement_tests {
         let (extra, _) = place_kv_pools(
             &pools,
             &per_layer_ext,
-            |_| pool,
+            |_| Ok(pool),
             &mut seg_bytes,
             &mut placements,
-        );
+        )
+        .expect("the pools place");
         let lone = placements[&9000];
         assert_eq!((lone.bank, lone.offset), (0, 2 * pool));
         assert_eq!(seg_bytes[SegRole::Kv.segment()], 3 * pool);

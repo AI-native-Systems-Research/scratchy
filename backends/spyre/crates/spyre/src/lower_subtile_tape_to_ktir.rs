@@ -1241,6 +1241,7 @@ pub fn lower_graph_to_ktir<T: ktir_superdsc::collective::Tp, F: RopeForm>(
         weight_ids,
         scratchy_triton_splice::PagedRows::of_requests(rows_are_requests),
         &[],
+        &Default::default(),
         query_rows,
     )?;
     let mut ops: Vec<EmittedOp<T>> = Vec::with_capacity(ir.nodes.len());
@@ -1610,7 +1611,10 @@ pub fn paged_step_of_ir<F: RopeForm>(
     let mut out: Option<crate::wiring::PagedStep> = None;
     for n in &ir.nodes {
         let SubOp::AttnDecode {
-            mask, attention, ..
+            valid_len,
+            mask,
+            attention,
+            ..
         } = &n.op
         else {
             continue;
@@ -1641,7 +1645,7 @@ pub fn paged_step_of_ir<F: RopeForm>(
                 query_rows.requests().get(),
             )));
         }
-        let walk = scratchy_triton_splice::walk_pages(pages, mq, active_cap);
+        let walk = scratchy_triton_splice::walk_pages(*valid_len, mq, active_cap);
         let step = crate::wiring::PagedStep {
             mask: tids.mask,
             page_table: tids.page_table,
@@ -2500,6 +2504,8 @@ pub fn lower_subtile_tape_to_ktir<T: ktir_superdsc::collective::Tp, F: RopeForm>
     // ONE MAP PER ATTENTION CLASS: a class-split roll's loops carry different-length per-layer
     // tables, and the layout needs to know which class a tensor belongs to before it can pack.
     let per_layer_ext = per_layer_external_tids(tape);
+    // ⭐ AND THE BODY'S PER-LAYER TWINS, each placed at its representative's bytes.
+    let twins = per_layer_output_twins(tape, ir);
     // The layout's budget passes (spill/bank) take the per-loop maps directly: the spill reasons
     // over WHICH tids are per-layer at all (flattened internally), and the BANK needs the class
     // boundaries to know which (class, iteration) launches must stay in one bank.
@@ -2508,6 +2514,7 @@ pub fn lower_subtile_tape_to_ktir<T: ktir_superdsc::collective::Tp, F: RopeForm>
         weight_ids,
         scratchy_triton_splice::PagedRows::of_requests(rows_are_requests),
         &per_layer_ext,
+        &twins,
         query_rows,
     )?;
     // ── THE TAPE'S SEGMENTS: prefix, ONE RANGE PER LOOP (an attention class's body), suffix ──
@@ -3558,12 +3565,15 @@ pub fn lower_subtile_tape_to_ktir<T: ktir_superdsc::collective::Tp, F: RopeForm>
         }
     }
     let kv_request_stride = bundle_layout.kv_request_stride_bytes;
+    let kv_pools = crate::lower_subtile_tape_to_superdsc::kv_pools(ir)?;
     Ok(RolledSuperDsc {
         prefix,
         bodies,
         suffix,
         layout: bundle_layout,
         per_layer,
+        per_layer_ext,
+        kv_pools,
         launches,
         launch_w,
         launch_kv,

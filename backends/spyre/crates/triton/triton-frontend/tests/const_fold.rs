@@ -10,9 +10,9 @@
 
 use ktir_superdsc::superdsc_opspec::Fp16;
 use scratchy_triton_splice::{
-    AttnScale, BatchChunking, BatchedDecodeGeometry, BlockSize, HeadDim, HeadGeometry, KvHeads,
-    PagedAttnGeometry, PagedSequence, PoolPages, QueryHeads, RotDim, SchedulerBlockTokens,
-    TokenRows, WalkBlocks, batched_decode_kernel, paged_attn_kernel,
+    AttnScale, BatchChunking, BatchedDecodeGeometry, BlockSize, ContextPages, HeadDim,
+    HeadGeometry, KvHeads, PagedAttnGeometry, PagedSequence, QueryHeads, RotDim,
+    SchedulerBlockTokens, TokenRows, WalkBlocks, batched_decode_kernel, paged_attn_kernel,
 };
 use triton_frontend::codegen;
 use triton_frontend::target::Target;
@@ -418,7 +418,7 @@ fn batched_decode(bpc: i128, chunks: i128) -> Module {
             BlockSize::new(SchedulerBlockTokens::REFERENCE.get()),
         ),
         block: SchedulerBlockTokens::of_whole_sticks(64),
-        pages: PoolPages::new(nz(2048)),
+        pages: ContextPages::new(nz(2048)),
         chunking: BatchChunking {
             seqs: 4,
             blocks_per_chunk: bpc as u32,
@@ -540,7 +540,7 @@ fn sequence_decode(blocks: i128) -> Module {
             BlockSize::new(SchedulerBlockTokens::REFERENCE.get()),
         ),
         block: SchedulerBlockTokens::REFERENCE,
-        pages: PoolPages::new(nz(256)),
+        pages: ContextPages::new(nz(256)),
         blocks: WalkBlocks::new(nz(blocks as u32)),
         scale: AttnScale::new(0.125),
     })

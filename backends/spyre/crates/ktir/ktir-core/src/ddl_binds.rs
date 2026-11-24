@@ -282,6 +282,30 @@ pub struct DeviceOpRow {
     pub citation: &'static str,
 }
 
+/// The tensor memory one card holds for the program's buffers, in bytes —
+/// the quantity a budget over the card's tensors is spent from and capped
+/// at ([`DeviceGen::TENSOR_MEMORY_BYTES`]). A newtype, not a bare count:
+/// the value leaves through `get()`, and only a [`DeviceGen`] impl puts
+/// one in, at its own `TENSOR_MEMORY_BYTES` const.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub struct TensorMemoryBytes(u64);
+
+impl TensorMemoryBytes {
+    /// State the tensor memory a generation's card holds. Only a
+    /// [`DeviceGen`] impl calls this — the one statement per card is its
+    /// [`TENSOR_MEMORY_BYTES`](DeviceGen::TENSOR_MEMORY_BYTES) const — and
+    /// only this crate holds those impls, so the constructor is private to
+    /// it: no other crate can state a card's memory.
+    const fn new(bytes: u64) -> Self {
+        Self(bytes)
+    }
+
+    /// The bytes, for the arithmetic that spends them.
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
 /// A device GENERATION. Each generation states its own device facts — the
 /// op/dtype/layout table AND the geometry constants below — so a lowering
 /// reads them through the generation it bakes for, never as free constants.
@@ -381,6 +405,11 @@ pub trait DeviceGen {
     const NUM_SEGMENTS: usize;
     /// The bytes one segment may hold.
     const MAX_SEGMENT_BYTES: u64;
+    /// The tensor memory this card holds for the program's buffers, in
+    /// bytes — the LPDDR left after the program regions are reserved. The
+    /// ceiling a budget over the card's tensors is spent from, carried as
+    /// [`TensorMemoryBytes`], never a bare count.
+    const TENSOR_MEMORY_BYTES: TensorMemoryBytes;
     /// One flit, in bytes — the unit every CB address and length field
     /// counts in, and (by the device's own stick law) the width of every
     /// format's stick: elems per stick = `FLIT_BYTES / element size`.
@@ -405,10 +434,44 @@ pub trait DeviceGen {
 pub struct Gen1;
 
 /// The generation this tree bakes for — the ONE name the bake's readers
-/// hold. `Gen1` is spelled here alone; gen2 lands as a second [`DeviceGen`]
-/// impl with its own table and constants, and this alias moves to it — a
-/// one-line change in one place, not a grep.
-pub type Baked = Gen1;
+/// hold. It is [`Chip`], the feature-named selection: `Gen1` is spelled
+/// here alone; gen2 lands as a second [`DeviceGen`] impl with its own
+/// table and constants, and a `snt2p0`-style feature row moves `Chip` (and
+/// so this alias) to it — a one-line change in one place, not a grep.
+pub type Baked = Chip;
+
+/// The chip this build bakes for, named by its feature — `snt1p0` is Spyre
+/// generation 1, [`Gen1`]. THE ONE SELECTION: a build that names no chip
+/// does not compile (the `compile_error!` beside this), the law senlib-rs
+/// holds for flex-rs — whose same-named feature `backends/spyre-hw`'s
+/// workspace row already turns on, and whose meeting with this one the
+/// card crate states. Forwarded up the chain the way `tp-N` is:
+/// `scratchy-target-spyre` → its compiler → its models → the spyre-hw
+/// worker and CLI.
+#[cfg(feature = "snt1p0")]
+pub type Chip = Gen1;
+
+// The chip's facts are compile-time facts: a build that names no chip has
+// none, and a default chip would be a silently wrong one.
+#[cfg(not(feature = "snt1p0"))]
+compile_error!(
+    "this build names no spyre chip: name one with the `snt1p0` feature \
+     (ktir-core's, forwarded by scratchy-target-spyre and every crate above \
+     it, the way `tp-N` is forwarded)"
+);
+
+/// Gen1's own constants — the chip is the type of its constants, so the
+/// LPDDR facts sit beside the trait impl that derives from them, read as
+/// `Gen1::` (or `Self::` inside the impl), never as free module consts.
+impl Gen1 {
+    /// snt1p0's LPDDR as flex-rs carves it: the card's 112 GiB split into
+    /// this many equal regions — flex-rs's `allocator::DEFAULT_MAX_REGIONS`.
+    const LPDDR_REGIONS: u64 = 7;
+
+    /// Of [`Self::LPDDR_REGIONS`], the regions flex-rs reserves for program
+    /// memory — its `allocator::DEFAULT_NUM_PROGRAM_REGIONS`.
+    const LPDDR_PROGRAM_REGIONS: u64 = 1;
+}
 
 impl DeviceGen for Gen1 {
     /// GEN1'S TABLE. Every row cites the gen1 vendor templates (read on the
@@ -775,6 +838,17 @@ impl DeviceGen for Gen1 {
     /// 2^27 flits (16 GiB)") at 128 B per flit; flex-rs's
     /// `MAX_REGION_BYTES`, which the target crate pins equal.
     const MAX_SEGMENT_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+
+    /// TENSOR MEMORY = 96 GiB, as flex-rs carves snt1p0's 112 GiB of LPDDR:
+    /// [`Gen1::LPDDR_REGIONS`] regions of `Self::MAX_SEGMENT_BYTES` (16 GiB), of
+    /// which [`Gen1::LPDDR_PROGRAM_REGIONS`] are reserved for programs — the
+    /// buffers get the other six. The same law the card crate's
+    /// `CardMemory::tensor_capacity` states over flex-rs's own names, and
+    /// measured there (2026-11-18): the allocator's own OOM diagnostic
+    /// reports `total_capacity_bytes` at exactly 6 of 7 regions.
+    const TENSOR_MEMORY_BYTES: TensorMemoryBytes = TensorMemoryBytes::new(
+        (Self::LPDDR_REGIONS - Self::LPDDR_PROGRAM_REGIONS) * Self::MAX_SEGMENT_BYTES,
+    );
 
     /// FLIT = 128 B: senlib-rs `FLIT_SHIFT: u32 = 7` (snt1p0.rs:292) and
     /// the vendor's own `#define STICK_BYTESIZE 128`

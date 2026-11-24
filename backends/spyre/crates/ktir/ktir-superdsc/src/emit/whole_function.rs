@@ -3155,7 +3155,11 @@ fn presented_flat(r: &Region, axis: BcastAxis) -> Result<Region, String> {
 /// row count off the OUTPUT, which is the only place it can honestly come from. So the parameter's
 /// own region is exact here, and the one thing that would be wrong on it — a row corner — is what
 /// `base_addressed` refuses downstream.
-pub fn region_for_operand(k: &KtirNode, v: Ssa) -> Result<Option<Region>, Error> {
+pub fn region_for_operand(
+    k: &KtirNode,
+    v: Ssa,
+    layout: Option<&BundleLayout>,
+) -> Result<Option<Region>, Error> {
     // The parameter-rooted walk already computes every field of a `Region` correctly; the only
     // thing wrong for a multi-op function is WHICH parameter and WHICH tile. So find the parameter
     // this value reads and reuse that Region, rather than rebuilding one field by field and
@@ -3205,7 +3209,7 @@ pub fn region_for_operand(k: &KtirNode, v: Ssa) -> Result<Option<Region>, Error>
     // disagree about one tile. A tile whose corners are NOT constants names a window no descriptor
     // can carry, and is refused by name rather than silently falling back to the parameter's first
     // tile — the same discipline as `regions()`'s in-loop guard.
-    Ok(Some(windowed_region(k, r, tile)?))
+    Ok(Some(windowed_region(k, r, tile, layout)?))
 }
 
 /// ⭐⭐⭐⭐⭐ ONE ACCESS TILE's WINDOW, RESOLVED ONTO ITS PARAMETER's REGION — the walk the load side
@@ -3256,7 +3260,12 @@ pub fn region_for_operand(k: &KtirNode, v: Ssa) -> Result<Option<Region>, Error>
 /// (per-core tiles with gaps — the band would hold rows no core computes), a base below zero or a
 /// band past the view's end, a zero position count, or a corner that is not uniform at all is
 /// refused by name below. Everything refused here keeps the clone protocol.
-fn windowed_region(k: &KtirNode, mut r: Region, tile: &Operation<'_>) -> Result<Region, Error> {
+fn windowed_region(
+    k: &KtirNode,
+    mut r: Region,
+    tile: &Operation<'_>,
+    layout: Option<&BundleLayout>,
+) -> Result<Region, Error> {
     let f = &k.func;
     let consts = super::lower_ktir_to_superdsc::index_constants(f);
     let Some((tr, tc)) = super::lower_ktir_to_superdsc::shape_2d(tile) else {
@@ -3319,15 +3328,22 @@ fn windowed_region(k: &KtirNode, mut r: Region, tile: &Operation<'_>) -> Result<
     let cs = col
         .and_then(|s| consts.get(&s).copied())
         .map(|cs| cs as u32);
+    // ⭐ THE TENSOR'S ROWS IN THE VIEW'S FRAME — the view's own, but a pool's: a paged kernel views
+    // the context's pages and its page reads land anywhere in the pool, whose rows its placement
+    // states ([`BundleLayout::pool_rows`]), never the view.
+    let tensor_rows = layout
+        .and_then(|l| l.pool_rows(r.tid, r.v_cols))
+        .unwrap_or(r.v_rows);
     // The row corner: a CONSTANT states one window at the tile's own height; the per-core
     // uniform states the BAND the launch's own tiles tile. Anything else names a window no
     // descriptor can carry.
     let window = match row.and_then(|s| consts.get(&s).copied()) {
         Some(rs) => Some((rs as u32, tr)),
-        // ⭐ A TILE AS TALL AS ITS VIEW SITS AT ROW 0 whatever its corner computes: any other corner
-        // reads rows past the view. spyre-inference's prompt kernel under Triton's gather floor
-        // reads its `[P, D]` query as the one tile at `query_row_index[0]` over the `[P, D]` view.
-        None if tr == r.v_rows => Some((0, tr)),
+        // ⭐ A TILE AS TALL AS ITS TENSOR SITS AT ROW 0 whatever its corner computes: any other
+        // corner reads rows past the tensor. spyre-inference's prompt kernel under Triton's gather
+        // floor reads its `[P, D]` query as the one tile at `query_row_index[0]` over the `[P, D]`
+        // view.
+        None if tr == tensor_rows => Some((0, tr)),
         None => row.and_then(|s| {
             let u = uniform.get(&s)?;
             let band = positions.checked_mul(u.stride)?;
@@ -3689,6 +3705,7 @@ struct FoldAnalyses<'a> {
     rmsnorms: &'a [RmsNormChain],
     gelus: &'a [GeluChain],
     gathered_loads: &'a std::collections::HashMap<Ssa, usize>,
+    layout: Option<&'a BundleLayout>,
 }
 
 /// Classify one terminal op the way [`lower_function`]'s loop does, reduced to the foldable
@@ -3813,6 +3830,7 @@ fn row_tiled_family(
         rmsnorms: _,
         gelus,
         gathered_loads,
+        layout,
     } = analyses;
     let consts = super::lower_ktir_to_superdsc::index_constants(f);
     // The leader's own store — a family is keyed on the parameter its result is stored to. An
@@ -3883,7 +3901,7 @@ fn row_tiled_family(
     // exactly as it did before the fold existed — so this is a BAIL, not a refusal.
     let mut leader_regions: Vec<Region> = Vec::with_capacity(leader_in.len());
     for v in leader_in {
-        let Some(r) = region_for_operand(k, *v)? else {
+        let Some(r) = region_for_operand(k, *v, *layout)? else {
             return Ok(None);
         };
         leader_regions.push(r);
@@ -4037,7 +4055,7 @@ fn row_tiled_family(
                     f.name, term.op_type
                 ));
             };
-            let Some(r) = region_for_operand(k, v)? else {
+            let Some(r) = region_for_operand(k, v, *layout)? else {
                 return err(format!(
                     "{}: a row-block family member's input {:?} resolves to no parameter — the \
                      fold merges one op over the SAME parameters, never a mix of loads and \
@@ -4428,7 +4446,7 @@ pub fn staggered_sources<G: ktir_core::ddl_binds::DeviceGen>(
                         // A standard full-width operand of a staggered op would be READ
                         // permuted. It must be a PARAMETER the bake can restage — anything
                         // this function computed is the mixing refusal.
-                        match region_for_operand(k, src)? {
+                        match region_for_operand(k, src, None)? {
                             Some(r) => {
                                 marked.insert(r.tid, ElementArrangement::Dl16ToFp32);
                                 // ⭐ AND THE VALUE CARRIES IT FROM NOW ON: a marked parameter is
@@ -4736,6 +4754,7 @@ fn lower_function_folded<T: crate::collective::Tp>(
         rmsnorms: &rmsnorms,
         gelus: &gelus,
         gathered_loads: &gathered_loads,
+        layout,
     };
     // ⭐ THE INTEGER COMPUTE SET — [`integer_compute_of`]'s own doc states the fixpoint. Read once
     // here so the loop-top exemption and the derivation arm below read ONE set and cannot
@@ -5007,7 +5026,8 @@ fn lower_function_folded<T: crate::collective::Tp>(
             if !gathered_loads.contains_key(&src)
                 && let Some((t_res, frame, sticks)) = head_major_pair(f, op, &from, &to)
             {
-                let source = match region_for_operand(k, src)?.or_else(|| inter.get(&src).copied())
+                let source = match region_for_operand(k, src, layout)?
+                    .or_else(|| inter.get(&src).copied())
                 {
                     Some(r) => r,
                     None => {
@@ -5073,7 +5093,8 @@ fn lower_function_folded<T: crate::collective::Tp>(
                         f.name
                     ));
                 };
-                let Some(source) = region_for_operand(k, src)?.or_else(|| inter.get(&src).copied())
+                let Some(source) =
+                    region_for_operand(k, src, Some(layout))?.or_else(|| inter.get(&src).copied())
                 else {
                     return err(format!(
                         "{}: `{:?}` permutes a value this walk holds no buffer for",
@@ -5093,7 +5114,7 @@ fn lower_function_folded<T: crate::collective::Tp>(
                         });
                         let o = match tile {
                             Some(t) => region_of_view_operand(k, t, 0)?
-                                .map(|o| windowed_region(k, o, t))
+                                .map(|o| windowed_region(k, o, t, Some(layout)))
                                 .transpose()?,
                             None => None,
                         };
@@ -5192,7 +5213,8 @@ fn lower_function_folded<T: crate::collective::Tp>(
                         f.name
                     ));
                 };
-                let Some(source) = region_for_operand(k, src)?.or_else(|| inter.get(&src).copied())
+                let Some(source) =
+                    region_for_operand(k, src, Some(layout))?.or_else(|| inter.get(&src).copied())
                 else {
                     return err(format!(
                         "{}: `{:?}` permutes a value this walk holds no buffer for",
@@ -5220,7 +5242,7 @@ fn lower_function_folded<T: crate::collective::Tp>(
                         });
                         let o = match tile {
                             Some(t) => region_of_view_operand(k, t, 0)?
-                                .map(|o| windowed_region(k, o, t))
+                                .map(|o| windowed_region(k, o, t, Some(layout)))
                                 .transpose()?,
                             None => None,
                         };
@@ -5788,15 +5810,17 @@ fn lower_function_folded<T: crate::collective::Tp>(
                     gather_carried[gi] = true;
                     continue;
                 }
-                None => match region_for_operand(k, src)?.or_else(|| inter.get(&src).copied()) {
-                    Some(r) => Region { is_out: false, ..r },
-                    None => {
-                        return err(format!(
-                            "{}: `{:?}` re-frames a value this walk holds no buffer for",
-                            f.name, op.op_type
-                        ));
+                None => {
+                    match region_for_operand(k, src, layout)?.or_else(|| inter.get(&src).copied()) {
+                        Some(r) => Region { is_out: false, ..r },
+                        None => {
+                            return err(format!(
+                                "{}: `{:?}` re-frames a value this walk holds no buffer for",
+                                f.name, op.op_type
+                            ));
+                        }
                     }
-                },
+                }
             };
             // The same bytes, in the frame the result is held in — the frame its consumers read
             // (a `[1, 2048]` gathered query row is the `[8, 4, 64]` batched dot's `[32, 64]`; a
@@ -5839,7 +5863,8 @@ fn lower_function_folded<T: crate::collective::Tp>(
                     .unwrap_or_default()
             };
             if let Some((r_res, frame, sticks)) = head_major_pair(f, op, &dims(src), &dims(res)) {
-                let Some(source) = region_for_operand(k, src)?.or_else(|| inter.get(&src).copied())
+                let Some(source) =
+                    region_for_operand(k, src, layout)?.or_else(|| inter.get(&src).copied())
                 else {
                     return err(format!(
                         "{}: the head-major transpose reads a value this walk holds no buffer for",
@@ -6018,7 +6043,7 @@ fn lower_function_folded<T: crate::collective::Tp>(
                 // trip under Triton's scatter floor (`out_tile.store([first, 0], attn)`, fewer than 8
                 // query rows). Its window is the whole stick-major parameter, the same bytes as the
                 // result's, so one stick-runs copy moves them.
-                let r = match (layout, stored_whole(k, r_res, r)?) {
+                let r = match (layout, stored_whole(k, r_res, r, layout)?) {
                     (Some(layout), Some(dst)) => {
                         // The stored value's own stick-major frame on both sides — the pointwise
                         // identity every elementwise op of this tensor states.
@@ -6098,7 +6123,8 @@ fn lower_function_folded<T: crate::collective::Tp>(
                     f.name
                 ));
             };
-            let Some(src) = region_for_operand(k, data)?.or_else(|| inter.get(&data).copied())
+            let Some(src) =
+                region_for_operand(k, data, Some(layout))?.or_else(|| inter.get(&data).copied())
             else {
                 return err(format!(
                     "{}: a leading-axis reduction reads a value this walk holds no buffer for",
@@ -6692,7 +6718,7 @@ fn lower_function_folded<T: crate::collective::Tp>(
                 r.is_out = false;
                 Ok(r)
             };
-            match region_for_operand(k, *v)? {
+            match region_for_operand(k, *v, layout)? {
                 Some(r) => {
                     // ⭐ A POINTWISE OP's LOAD STATES ITS OWN WINDOW AS ITS EXTENT
                     // ([`at_own_extent`]) — the parameter's cover is evidence only where a fold
@@ -7183,7 +7209,7 @@ fn lower_function_folded<T: crate::collective::Tp>(
                     }
                 }
             };
-            let Some(mut ws_r) = region_for_operand(k, ws_src)? else {
+            let Some(mut ws_r) = region_for_operand(k, ws_src, layout)? else {
                 return err(format!(
                     "{}: the fp8 dot's scale row resolves to no bound parameter — the ws is a \
                      tensor the launch stages, and a scale computed inside this function is a \
@@ -7656,7 +7682,7 @@ fn lower_function_folded<T: crate::collective::Tp>(
                 f.name, op.op_type
             ));
         };
-        o = windowed_region(k, o, tile)?;
+        o = windowed_region(k, o, tile, layout)?;
         // ⭐ A POINTWISE OP's STORE STATES ITS OWN WINDOW AS ITS EXTENT ([`at_own_extent`]) —
         // the terminal's row basis is then the window it stores (the gelu longhand's `[0, 42)`
         // head block of a 64-row output), never the parameter's whole view: a value's extent
@@ -7740,7 +7766,7 @@ fn lower_function_folded<T: crate::collective::Tp>(
             || f.ops_deep().iter().any(|o| {
                 o.op_type == OpKind::KtdpLoad
                     && o.result.is_some_and(|v| {
-                        region_for_operand(k, v)
+                        region_for_operand(k, v, layout)
                             .ok()
                             .flatten()
                             .is_some_and(|r| r.tid == value_tid)
@@ -7840,7 +7866,12 @@ fn lower_function_folded<T: crate::collective::Tp>(
 /// exactly `value`'s stick-major bytes: the same extents at corner 0, a whole parameter. `None` for a
 /// value no direct store reads; a store to any other window is refused by name, since this value's
 /// bytes are not that window's.
-fn stored_whole(k: &KtirNode, value: Ssa, held: Region) -> Result<Option<Region>, Error> {
+fn stored_whole(
+    k: &KtirNode,
+    value: Ssa,
+    held: Region,
+    layout: Option<&BundleLayout>,
+) -> Result<Option<Region>, Error> {
     let f = &k.func;
     let deep = f.ops_deep();
     let Some(store) = deep.iter().find(|s| {
@@ -7856,7 +7887,7 @@ fn stored_whole(k: &KtirNode, value: Ssa, held: Region) -> Result<Option<Region>
         return Ok(None);
     };
     let Some(o) = region_of_view_operand(k, tile, 0)?
-        .map(|o| windowed_region(k, o, tile))
+        .map(|o| windowed_region(k, o, tile, layout))
         .transpose()?
     else {
         return Ok(None);

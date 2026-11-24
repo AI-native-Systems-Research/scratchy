@@ -34,6 +34,10 @@ spyre-hw = [
 ]
 # THE EMULATOR — a sibling of the card, not its absence.
 spyre-emu = ["scratchy-target-spyre-worker/spyre-emu"]
+# THE CHIP THIS BUILD BAKES FOR — ktir-core's `snt1p0` (Spyre generation 1), forwarded from
+# the worker and the models it serves, as `spyre-emu` is. No default: a build that names no
+# chip fails in ktir-core's `compile_error!`, never silently picks one.
+snt1p0 = ["scratchy-target-spyre-worker/snt1p0", "scratchy-target-spyre-models/snt1p0"]
 # THE ZERO-ALLOC PROOF INSTRUMENT: registers flex-rs's `CensusAllocator` as this
 # binary's global allocator (main.rs) and turns on the serving loop's census
 # window (the worker's and card crate's features of the same name). Run a serve

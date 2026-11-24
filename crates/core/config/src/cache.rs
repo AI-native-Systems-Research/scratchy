@@ -161,8 +161,12 @@ pub struct CacheConfig {
     pub kv_offloading_backend: Cow<'static, str>,
 }
 
+/// The fraction of a GPU's memory the KV pool may spend, when the config
+/// states none — vLLM's own default.
+pub const DEFAULT_GPU_MEMORY_UTILIZATION: f64 = 0.9;
+
 fn default_gpu_memory_utilization() -> f64 {
-    0.9
+    DEFAULT_GPU_MEMORY_UTILIZATION
 }
 
 fn default_swap_space() -> f64 {
@@ -185,7 +189,7 @@ impl Default for CacheConfig {
     fn default() -> Self {
         Self {
             block_size: None,
-            gpu_memory_utilization: 0.9,
+            gpu_memory_utilization: DEFAULT_GPU_MEMORY_UTILIZATION,
             swap_space: 4.0,
             cache_dtype: CacheDType::default(),
             is_attention_free: false,
@@ -437,6 +441,26 @@ const fn cdiv(a: usize, b: usize) -> usize {
 
 /// Compute vLLM's hybrid KV-cache layout for a model with mixed full + sliding
 /// attention layers (gemma4). Faithful to
+/// How many blocks of `bytes_per_block` a uniform KV pool fits in
+/// `available_bytes` — at least 16.
+pub fn blocks_within(available_bytes: usize, bytes_per_block: usize) -> usize {
+    if bytes_per_block == 0 {
+        return 1024; // Fallback.
+    }
+
+    let num_blocks = available_bytes / bytes_per_block;
+
+    // NOTE: bumping num_blocks for SWA here was REVERTED — the uniform
+    // `KvCachePool` sizes EVERY layer's buffer to num_blocks, and that VA is
+    // residency-attached to the command queue (so it counts against the GPU
+    // working set, not just committed pages). Doubling it OOMs the command
+    // buffer. Fitting 32k needs the sliding LAYERS' buffers to be window-sized
+    // (per-layer block counts), not a larger uniform pool.
+
+    // At least 16 blocks.
+    num_blocks.max(16)
+}
+
 /// `vllm/v1/core/kv_cache_utils.py`: page-size unification + uniform-page-size
 /// grouping + `num_blocks = available // page_size // group_size`.
 ///
@@ -718,6 +742,17 @@ mod hybrid_layout_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blocks_within_divides_plainly_and_floors_at_sixteen() {
+        // Plain division: the budget buys exactly available / bytes_per_block.
+        assert_eq!(blocks_within(1600, 16), 100);
+        assert_eq!(blocks_within(1 << 30, 1 << 20), 1024);
+        // The floor: a budget that divides to fewer than 16 blocks still
+        // yields 16 — the pool is never too small to schedule.
+        assert_eq!(blocks_within(15, 16), 16);
+        assert_eq!(blocks_within(0, 16), 16);
+    }
 
     #[test]
     fn test_default_cache_config() {

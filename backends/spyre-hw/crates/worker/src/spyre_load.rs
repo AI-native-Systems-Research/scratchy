@@ -37,18 +37,6 @@ use tracing::{debug, warn};
 /// `Owned`, the product of that rewrite.
 pub(crate) type StagedWeight = (usize, HostBytes, SDType, Vec<usize>);
 
-/// ⭐ THE RESIDENT SEGMENTS EVERY BORROWER ADOPTS, AS ONE LIST. Four sites alias these (the
-/// prefix-capable prefill, the prefill ladder rungs, the decode batch rungs, and the top prefill
-/// session), and a segment missing from ONE of them leaves that session pointing at a 128 B
-/// placeholder where the model's weights should be — which is not a crash, it is garbage output from
-/// one rung only. Mirrors `superdsc_exec::SEG_RESIDENT`, which is what the executor's own
-/// placeholder/H2D skips read; seg5 is empty for every model whose weights fit one segment, and
-/// aliasing an empty segment is a no-op the size/placement checks accept.
-///
-/// Card-only, like [`adopt_from_owner`], its only reader.
-#[cfg(feature = "spyre-hw")]
-const RESIDENT_SEGS: [(i64, &str); 2] = [(1, "resident WEIGHTS"), (2, "resident KV")];
-
 /// ⭐⭐ THE KV POOL'S TABLES A **PREFILL** SESSION MUST STAGE FOR ITSELF — `kv_row_pool` and the int32
 /// zero beside it, from the PREFILL bundle's own paged step.
 ///
@@ -92,7 +80,7 @@ fn prefill_pool_statics(
 /// ⛔ AND IT IS NOT OPTIONAL FOR ANY SESSION THAT PRODUCES LOGITS. The spilled tail IS the lm_head /
 /// tied embedding, and every prefill rung and decode rung runs the suffix. A session that skips this
 /// reads a zero-filled weight where the embedding should be: zero logits, so argmax returns token 0.
-/// Not a crash — one wrong token from one rung, exactly the failure shape [`RESIDENT_SEGS`] warns of.
+/// Not a crash — one wrong token from one rung, exactly the failure shape [`scratchy_target_spyre::bundle_code::RESIDENT_SEGMENTS`] warns of.
 /// The IMAGE is taken from the owner AFTER its prepare, so it is the converted, re-tiled device bytes
 /// and not the host weight layout, which is why this copies a segment rather than re-staging a
 /// tensor.
@@ -108,10 +96,11 @@ fn adopt_from_owner(
         scratchy_target_spyre::bundle_code::collective::PerRank<World, Vec<u8>>,
     )],
 ) -> Result<(), String> {
-    for (seg, what) in RESIDENT_SEGS {
+    for role in scratchy_target_spyre::bundle_code::RESIDENT_SEGMENTS {
+        let seg = role.segment() as i64;
         borrower
             .alias_seg_from(owner, seg)
-            .map_err(|e| format!("seg{seg} ({what}) alias failed: {e}"))?;
+            .map_err(|e| format!("seg{seg} (resident {role:?}) alias failed: {e}"))?;
     }
     for (seg, image) in spill {
         borrower.write_seg_prefix(*seg, image).map_err(|e| {
@@ -1349,13 +1338,6 @@ impl SpyreWorker {
             );
             (s, decode_rungs, prefill_rungs)
         };
-        // The KV byte budget the paged pool gets sized against — the card's real capacity ×
-        // `--gpu-memory-utilization` − the bundle's non-KV segments. Declared out here for the same reason
-        // `scalarmul_scales_v` is: it is computed in the SuperDsc branch below (sendnn only) but has to
-        // reach the `Loaded` this function returns, where `determine_available_memory` reads it so the
-        // ENGINE sizes the scheduler's block allocator off the SAME number the pool was cut from.
-        #[allow(unused_mut, unused_assignments)]
-        let mut kv_budget_bytes_v: Option<u64> = None;
         // The context the sized pool will actually serve (tokens) — the ONE context law's answer
         // (`resolve_served_context`) over the declaration and what the budget funds, decided in
         // the SuperDsc branch below where budget, page stride and launch rows first meet, and
@@ -1368,15 +1350,6 @@ impl SpyreWorker {
         let served_context_v: usize;
         #[cfg(not(feature = "spyre-hw"))]
         let served_context_v: usize = usize::MAX;
-        // The paged pool's page stride — filled beside `kv_budget_bytes_v` (the SuperDsc branch
-        // below is the one site both are derived, on EVERY path through it) so
-        // `Worker::kv_block_bytes` can hand the engine the same stride the pool was sized by.
-        // Card tier only: the emulator never sizes a pool. No initializer — the session block
-        // below assigns it on every path that reaches the read, and rustc's own
-        // possibly-uninitialized analysis is the proof (the `= None` it replaces was a dead
-        // assignment under spyre-hw, where the block always runs).
-        #[cfg(feature = "spyre-hw")]
-        let pool_stride_bytes_v: Option<u64>;
         // Where the shared host threads run, read from the cards when they join (below).
         #[cfg(feature = "spyre-hw")]
         let world_cpus_v: scratchy_target_spyre_card::runtime::WorldCpus;
@@ -1485,7 +1458,6 @@ impl SpyreWorker {
                 })?;
                 let num_blocks = step.pages as usize;
                 let pool_need_bytes = code.layout.kv_pool_bytes();
-                let pool_stride_bytes = pool_need_bytes / u64::from(step.pages).max(1);
                 // ⭐ THE CONTEXT THIS RUN SERVES — the declared `--max-model-len`, which the pool must
                 // hold: a declaration past it is REFUSED, never clamped. An unset flag serves the
                 // model's own limit, up to the pool.
@@ -1654,7 +1626,7 @@ impl SpyreWorker {
                 // ⛔⛔⛔ AND THE SPILLED WEIGHT TAIL IS CHARGED ONCE PER SESSION, NOT ONCE.
                 //
                 // `segment_bytes` describes ONE bundle, so summing it counts every segment a single
-                // time. That is right for the segments a borrower ADOPTS ([`RESIDENT_SEGS`]: it holds a
+                // time. That is right for the segments a borrower ADOPTS ([`scratchy_target_spyre::bundle_code::RESIDENT_SEGMENTS`]: it holds a
                 // 128 B placeholder and aliases the owner's region) and WRONG for the spill slot, which
                 // cannot be aliased — its co-tenant intermediate colour is m-dependent, so every
                 // borrowing session allocates the slot and takes its own COPY of the tail.
@@ -1794,13 +1766,6 @@ impl SpyreWorker {
                         + ladder_rung_bytes)
                         <= (card_bytes.tensor_capacity() as f64 * self.gpu_memory_utilization)
                             as u64;
-                let non_kv_bytes = non_kv_bytes
-                    + anchor_live_bytes
-                    + if anchor_reserves {
-                        anchor_spare_bytes + pool_need_bytes
-                    } else {
-                        0
-                    };
                 if prefill_code.is_some() {
                     tracing::info!(
                         "superdsc paged: prefill anchor {} — its {} MB spare (a twin of the weight \
@@ -1826,27 +1791,6 @@ impl SpyreWorker {
                         ladder_rung_bytes / (1024 * 1024),
                     );
                 }
-                // ⛔⛔⛔ THE ALLOCATABLE TENSOR CAPACITY, NOT THE CARD. `FlexAllocator` reserves one
-                // of its seven equal regions for PROGRAM memory, so a tensor allocation is served
-                // from six. See `CardMemory::tensor_capacity`.
-                let funded =
-                    (card_bytes.tensor_capacity() as f64 * self.gpu_memory_utilization) as u64;
-                if non_kv_bytes + pool_need_bytes > funded {
-                    return Err(werr(format!(
-                        "the Spyre card's {} MB of tensor memory × --gpu-memory-utilization {:.2} funds \
-                         {} MB, but this model's sessions reserve {} MB beside the bake's {} MB KV \
-                         pool. Raise --gpu-memory-utilization, or use a smaller model.",
-                        card_bytes.tensor_capacity() / (1024 * 1024),
-                        self.gpu_memory_utilization,
-                        funded / (1024 * 1024),
-                        non_kv_bytes / (1024 * 1024),
-                        pool_need_bytes / (1024 * 1024),
-                    )));
-                }
-                // Carried to `Loaded`, so the engine's block-count arithmetic divides the pool's own
-                // bytes by its own page — the two counts are then one count.
-                kv_budget_bytes_v = Some(pool_need_bytes);
-                pool_stride_bytes_v = Some(pool_stride_bytes);
                 info!(
                     "superdsc paged: KV pool {} page(s) of {} slot(s) = {capacity} positions ({} MB), \
                      as the bake placed it; serving {served_context_v} — {} block(s) offered to the \
@@ -2044,7 +1988,8 @@ impl SpyreWorker {
                                     kv_dim,
                                     num_blocks,
                                 },
-                                &RESIDENT_SEGS.map(|(seg, _)| seg),
+                                &scratchy_target_spyre::bundle_code::RESIDENT_SEGMENTS
+                                    .map(|role| role.segment() as i64),
                                 prefill_consts,
                                 &anchor_pool,
                                 &spill_tids,
@@ -3050,7 +2995,7 @@ impl SpyreWorker {
                 return Err(werr(
                     "sendnn: this bundle is not a SuperDSC bundle (no SUPERDSC_BUNDLE: sentinel on \
                      the decode slot). The sengraph offline_decoder runtime has been removed; \
-                     re-bake with SCRATCHY_SENDNN_MODE=superdsc.",
+                     every spyre bake emits the SuperDSC bundle.",
                 ));
             }
         };
@@ -3186,14 +3131,7 @@ impl SpyreWorker {
             decode,
             prefill,
             batched_prefill,
-            kv_budget_bytes: kv_budget_bytes_v,
-            pool_stride_bytes: {
-                #[cfg(feature = "spyre-hw")]
-                let stride = pool_stride_bytes_v;
-                #[cfg(not(feature = "spyre-hw"))]
-                let stride = None;
-                stride
-            },
+            pool: wirings.pool,
             served_context: served_context_v,
             #[cfg(feature = "spyre-hw")]
             world_cpus: world_cpus_v,

@@ -113,19 +113,16 @@ impl Worker for SpyreWorker {
         Ok(())
     }
 
-    /// THE KV POOL'S BYTES — on the card, the KV segment the bake placed ([`Loaded::kv_budget_bytes`]),
-    /// which the engine divides by [`Self::kv_block_bytes`] and [`Self::kv_cache_num_blocks_override`]
-    /// then holds to the pool's own page count. The emulator grows nothing on the device, so its number
-    /// is a host-RAM allowance.
+    /// THE KV POOL'S BYTES — the pool the bake placed, its pages at its page ([`Loaded::pool`]): the FINAL KV budget, which the engine divides by [`Self::kv_block_bytes`] into the pool's page count.
     fn determine_available_memory(&mut self) -> ExecutorResult<usize> {
-        if let Some(b) = self.model.as_ref().and_then(|m| m.kv_budget_bytes) {
-            return Ok(b as usize);
-        }
-        Ok(8usize << 30)
+        let model = self
+            .model
+            .as_ref()
+            .ok_or_else(|| werr("model not loaded"))?;
+        Ok(model.pool.bytes() as usize)
     }
 
-    /// ONE SCHEDULER BLOCK'S BYTES — a pool page ([`Loaded::pool_stride_bytes`]). `None` on the
-    /// emulator.
+    /// ONE SCHEDULER BLOCK'S BYTES — the baked pool's page ([`Loaded::pool`]).
     ///
     /// ⭐ A BLOCK IS A PAGE BY CONSTRUCTION, not by a check here. The scheduler's
     /// `slot = block · block_size + offset` and the worker's page map address the same cells
@@ -138,8 +135,7 @@ impl Worker for SpyreWorker {
     fn kv_block_bytes(&self, _block: scratchy_core_common::KvBlockTokens) -> Option<usize> {
         self.model
             .as_ref()
-            .and_then(|m| m.pool_stride_bytes)
-            .map(|page| page as usize)
+            .map(|m| m.pool.page().get().get() as usize)
     }
 
     /// ⭐ THE POOL'S PAGE COUNT, so every block id the scheduler hands out is a page this pool has —

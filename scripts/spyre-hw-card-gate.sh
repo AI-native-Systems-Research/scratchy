@@ -27,18 +27,20 @@ cd "$hw"
 
 # The workspace clippy CI ran before the seam: every member — card and flex-rs included.
 # The build script's FFI link directives are skipped (nothing here links); a model
-# feature must be named (zero-model is a build-time panic).
+# feature must be named (zero-model is a build-time panic), and so must the chip
+# (`snt1p0`, Spyre generation 1 — ktir-core's compile_error! refuses a build that
+# names none).
 SCRATCHY_SKIP_SENDNN_CXX=1 cargo clippy --workspace \
-    --features model/granite-3.1-8b-instruct -- -D warnings
+    --features model/granite-3.1-8b-instruct,snt1p0 -- -D warnings
 
 # The card surface alone, as the triton job stated it: the card runtime and flex-rs,
 # linted at -D warnings (it rotted between card runs once — #553).
-SCRATCHY_SKIP_SENDNN_CXX=1 cargo clippy -p scratchy-target-spyre-card -p flex-rs -- -D warnings
+SCRATCHY_SKIP_SENDNN_CXX=1 cargo clippy -p scratchy-target-spyre-card -p flex-rs --features snt1p0 -- -D warnings
 
 # The worker's CARD path, against the card's lowering (`spyre-lower`): same code with
 # or without device images, so no device compiler is needed.
 SCRATCHY_SKIP_SENDNN_CXX=1 cargo clippy -p scratchy-target-spyre-worker -p scratchy-target-spyre-cli \
-    --features scratchy-target-spyre-worker/spyre-hw,model/granite-3.1-2b-instruct \
+    --features scratchy-target-spyre-worker/spyre-hw,model/granite-3.1-2b-instruct,snt1p0 \
     --all-targets -- -D warnings
 
 # The card BINARY's real shape: the CLI crate at its own `spyre-hw` feature — the only
@@ -52,7 +54,7 @@ SCRATCHY_SKIP_SENDNN_CXX=1 cargo clippy -p scratchy-target-spyre-worker -p scrat
 # that nothing of the class crawls through again. Same model as the worker leg, so
 # the bake it rides is already paid for there.
 SCRATCHY_SKIP_SENDNN_CXX=1 cargo clippy -p scratchy-target-spyre-cli \
-    --features spyre-hw,model/granite-3.1-2b-instruct -- -D warnings
+    --features spyre-hw,model/granite-3.1-2b-instruct,snt1p0 -- -D warnings
 
 # The card crate's compile_fail doctests (the nightly job's leg).
-SCRATCHY_SKIP_SENDNN_CXX=1 cargo +nightly test --doc -p scratchy-target-spyre-card
+SCRATCHY_SKIP_SENDNN_CXX=1 cargo +nightly test --doc -p scratchy-target-spyre-card --features snt1p0

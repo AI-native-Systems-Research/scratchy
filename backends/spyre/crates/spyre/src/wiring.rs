@@ -25,6 +25,7 @@ use crate::lower_subtile_tape_to_superdsc::{FP16_ELEMS_PER_STICK, row_footprint_
 pub use ktir_superdsc::element_arrangement::{
     DL16TOFP32_PERMUTATION, ElementArrangement, dl16tofp32_stagger,
 };
+use ktir_superdsc::sdsc_abstract::SchedulerBlockTokens;
 use ktir_superdsc::superdsc_opspec::Df;
 use scratchy_tensors::GpuTensor;
 
@@ -678,7 +679,7 @@ pub struct PagedStep {
     /// ([`crate::paged_step::BatchChunking::of`]).
     pub head_size: u32,
     /// Blocks of the page table this bundle's attention walks — the bake's
-    /// `scratchy_triton_splice::walk_pages` for the rung, so at most [`Self::pages`].
+    /// `scratchy_triton_splice::walk_pages` for the rung, so at most the context's pages.
     pub walk: u32,
     /// What the rows are: one sequence's, or a decode batch's — one token of each of `rows`
     /// sequences, read by `batched_decode_head_major` ([`Self::batch`]).
@@ -694,6 +695,37 @@ pub struct PagedStep {
     pub extent: QueryExtent,
 }
 
+/// ⭐ THE ROW POOL'S PAGE — the bytes one page of `kv_row_pool` holds on the card: the run of
+/// [`INDEX_RUN_WORDS`](ktir_superdsc::emit::lower_ktir_to_superdsc::INDEX_RUN_WORDS) int32
+/// words the decode walk's chained index copies per page. The ONE spelling of the per-page
+/// bytes both the pool's placement ([`PagedStep::card_kv_row_pool_bytes`]) and the session's
+/// residency ([`crate::pool_pages`]) read.
+pub const KV_ROW_POOL_PAGE_BYTES: u64 =
+    ktir_superdsc::emit::lower_ktir_to_superdsc::INDEX_RUN_WORDS as u64 * 4;
+
+/// ⭐ ONE KV POOL AS THE TAPE STATES IT — its tensor, its columns and its element format
+/// ([`scratchy_triton_splice::KvPoolFormat`], read off the writer that fills it by
+/// [`scratchy_triton_splice::kv_pool_formats`], the one statement every paged kernel's pool pointers
+/// and the layout's placement read).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct KvPool {
+    pub tid: u32,
+    pub cols: u32,
+    pub format: scratchy_triton_splice::KvPoolFormat,
+}
+
+impl KvPool {
+    /// ⭐ THE POOL'S PAGE — the bytes one page of this pool holds on the card: the scheduler's own
+    /// block ([`SchedulerBlockTokens::REFERENCE`] slots) of rows, each at its format's row footprint
+    /// ([`row_footprint_bytes`] at [`scratchy_triton_splice::KvPoolFormat::df`]) the layout's pool
+    /// placement is sized at. The ONE statement both the bake's re-placement at its pool and the
+    /// session's per-page residency ([`crate::pool_pages`]) read.
+    pub fn page_bytes(self) -> u64 {
+        u64::from(SchedulerBlockTokens::REFERENCE.get())
+            * row_footprint_bytes(self.cols, self.format.df())
+    }
+}
+
 impl PagedStep {
     /// The blocks the scheduler may hand out — every page but the null page
     /// ([`crate::paged_step::page_of_block`]).
@@ -704,6 +736,19 @@ impl PagedStep {
     /// The pool's token capacity: every page's slots.
     pub const fn capacity(self) -> usize {
         self.pages as usize * self.page_slots as usize
+    }
+
+    /// ⭐ THE STEP OVER THE BAKE'S POOL — this step at the pool's pages
+    /// ([`crate::pool_pages::of_bake`]), every other field its own. A graph's step states its
+    /// context's pages ([`crate::lower_subtile_tape_to_ktir::paged_step_of_ir`]); the step's pages
+    /// are the bake's pool, which may hold fewer pages than the context: no request is scheduled
+    /// past the pool (the engine's context law), and the batch rule is checked against it at
+    /// placement ([`crate::lower_subtile_tape_to_superdsc::place_kv_pools_at`]).
+    pub const fn over_pool(self, pool: crate::pool_pages::PoolPages) -> Self {
+        PagedStep {
+            pages: pool.get(),
+            ..self
+        }
     }
 
     /// ⭐ THE BUNDLE'S REACH — the positions its attention's walk covers. A step whose positions end at
@@ -756,10 +801,10 @@ impl PagedStep {
     }
 
     /// `kv_row_pool` on the card: each page's run of `nkvh` rows held at
-    /// [`INDEX_RUN_WORDS`](ktir_superdsc::emit::lower_ktir_to_superdsc::INDEX_RUN_WORDS) int32
-    /// words, the run the decode walk's chained index copies per page.
+    /// [`KV_ROW_POOL_PAGE_BYTES`] int32 bytes — the run the decode walk's chained index
+    /// copies per page — the pool's pages at the one page law.
     pub const fn card_kv_row_pool_bytes(self) -> u64 {
-        self.pages as u64 * ktir_superdsc::emit::lower_ktir_to_superdsc::INDEX_RUN_WORDS as u64 * 4
+        self.pages as u64 * KV_ROW_POOL_PAGE_BYTES
     }
 
     /// The int32 zero stick on the card: one run of
@@ -770,7 +815,7 @@ impl PagedStep {
     }
 
     /// ⭐ THE STEP'S CARD PLACEMENTS — `(tid, seat, bytes)` for every source this bundle's attention
-    /// reads, sized for the pool's whole walk (a body walking fewer blocks stages and reads a
+    /// reads, sized for the step's own walk (a body walking fewer blocks stages and reads a
     /// prefix). The one statement the bake places by (`compute_bundle_layout`) and the card stagers
     /// ([`crate::paged_step::card_step_sources`], [`crate::paged_step::card_batch_sources`],
     /// [`crate::paged_step::card_statics`]) stage within; `self` is the bundle's own step, at its
@@ -809,7 +854,7 @@ impl PagedStep {
                 // ⭐ ONE ROW PER WINDOW, AT ITS OWN WINDOW TID — window `r`'s three tables (page
                 // table, mask stack, query rows) at
                 // [`ktir_superdsc::reserved_tids::paged_window_tid`] `r`, each its own region
-                // sized the ONE-REQUEST size (the pool's whole walk, as ever), the windows
+                // sized the ONE-REQUEST size (the step's walk), the windows
                 // packed in window order after the write rows. Window 0's tids ARE the step's
                 // own sentinels, so at one request the rows are exactly today's — same tids,
                 // same sizes, same order, byte for byte.
@@ -823,29 +868,32 @@ impl PagedStep {
                         (
                             window_tid(r, 1),
                             CardSeat::Step,
-                            u64::from(self.pages) * self.card_walk_step(),
+                            u64::from(self.walk) * self.card_walk_step(),
                         ),
                         (
                             window_tid(r, 2),
                             CardSeat::Step,
-                            u64::from(self.pages) * w * slots * 2,
+                            u64::from(self.walk) * w * slots * 2,
                         ),
                         (window_tid(r, 0), CardSeat::Step, sticks(w)),
                     ]);
                 }
             }
         }
+        // The int32 zero first: its bytes are the pool's page count's for no pool, so it is placed
+        // where no page count reaches, and `kv_row_pool` — the pool's pages long — is the last
+        // placement of its segment, growing in place at the end.
         if self.reads_kv_row_pool() {
             v.extend([
-                (
-                    self.kv_row_pool,
-                    CardSeat::Static,
-                    self.card_kv_row_pool_bytes(),
-                ),
                 (
                     self.int32_zero,
                     CardSeat::Static,
                     self.card_int32_zero_bytes(),
+                ),
+                (
+                    self.kv_row_pool,
+                    CardSeat::Static,
+                    self.card_kv_row_pool_bytes(),
                 ),
             ]);
         }
@@ -1973,6 +2021,11 @@ pub struct Wirings {
     /// entry whose pair matches the rung it loaded. EMPTY ⇒ no packed rungs baked (every model
     /// whose ladder bakes none, and every build before the packed table existed).
     pub packed_prefill: &'static [(u32, u32, Wiring)],
+    /// ⭐ THE KV POOL THE BAKE PLACED — its pages (every wiring's [`PagedStep::pages`]) and one
+    /// page of this world's pools: the serving step's KV budget and block. Every forward the bake
+    /// ships places one; a forward whose decode places none fails the BUILD (the bake's
+    /// `Declared::baked_pool`), so a pool-less wiring is unrepresentable.
+    pub pool: crate::pool_pages::BakedPool,
 }
 
 /// How each rank loads a source — the shared analysis's slice law, re-exported so the tokens
