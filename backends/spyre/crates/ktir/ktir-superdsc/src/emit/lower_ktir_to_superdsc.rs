@@ -58,7 +58,7 @@ use crate::reserved_tids::{LAST_HIDDEN_TID, scalarmul_scale_tid};
 use crate::sdsc_abstract::{KernelTag, Stk};
 use crate::sdsc_abstract::{MatK, MatM, MatN};
 use crate::superdsc_opspec::{
-    DataFormat, Df, Fp16, Fp32, ItDim, SdscFoldSet, SenUint32, StickExtent,
+    DataFormat, Df, Fp16, Fp32, Fp8, ItDim, SdscFoldSet, SenUint32, StickExtent,
 };
 use crate::work::{CoreSplit, DeviceWidth, EwDivision, FP16_ELEMS_PER_STICK};
 use ktir_core::affine::AffineExpr;
@@ -2105,10 +2105,22 @@ pub(crate) fn pointwise_tile_op_df(
         Df::SenUint32 => StickExtent::<SenUint32>::new(cols)
             .expect("check_pointwise_cols_df already proved cols a whole SENUINT32 stick")
             .elems(),
+        // FP8 — the COPY forms' own basis (1-byte / 128-element stick). Only the bridge's
+        // relayouts reach here at fp8: the scatter's stick permute, the runs copy and the bands
+        // copy ([`stick_permute_opspec`]/[`stick_runs_copy_opspec`]/[`stick_bands_opspec`]), each
+        // of which states its cols in whole sticks of the `df` it was handed — the scatter proved
+        // the row width whole at `RunAt::at`'s own `StickExtent::<DF>::new`. An fp8 page's KV
+        // write scatters rows of 2 sticks (a 256-wide head), so the relayout path fires where a
+        // 128-wide head's single-stick rows short-circuit it. ARITHMETIC elementwise at fp8 is
+        // still refused BY NAME at [`elementwise_df`]'s non-fp16 gate — this arm admits the
+        // byte-moving forms only, and the identity they lower is a copy, never a compute.
+        Df::Fp8 => StickExtent::<Fp8>::new(cols)
+            .expect("the copy forms state cols in whole fp8 sticks of their own df")
+            .elems(),
         // ⛔ NO OTHER FORMAT REACHES HERE: [`elementwise_df`] refuses a non-fp16/fp32 `df` by
-        // name before building a tile, because the pointwise builders below state exactly these
-        // three (same branch in `pointwise_broadcast_opspec_df`). Stated rather than `_`-ed so a
-        // new format is an E0004 here, at the seam that would have to learn it.
+        // name before building a tile, and the copy forms carry fp16/fp32/senuint32/fp8 only.
+        // Stated rather than `_`-ed so a new format is an E0004 here, at the seam that would
+        // have to learn it.
         other => unreachable!("elementwise_df refused the {other:?} pointwise form by name"),
     };
     TileOp::new(
