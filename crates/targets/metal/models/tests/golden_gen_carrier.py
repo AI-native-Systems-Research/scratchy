@@ -1983,9 +1983,10 @@ def round_to_stored(node, bundle=False):
 
 
 def rmsnorm_gain_keys(carrier_text):
-    """Manifest keys passed as an `rmsnorm(x, <key>)` gain."""
+    """Manifest keys passed as an `rmsnorm(x, <key>)` gain, `x` a name or one call
+    (`rmsnorm(gemm(x, w[layer]), <key>)`)."""
     return {m.group(1) for m in re.finditer(
-        r"\brmsnorm\(\s*[^,()]+,\s*([A-Za-z_][A-Za-z_0-9.]*)", carrier_text)}
+        r"\brmsnorm\(\s*(?:[^,()]|\([^()]*\))+,\s*([A-Za-z_][A-Za-z_0-9.]*)", carrier_text)}
 
 
 def embed_keys_of(carrier_text):
@@ -2716,6 +2717,11 @@ def main():
     # bounds (config.rs eval_params — additive over the flat harvest).
     eval_params(arch, cfg, bounds)
     manifest = json.loads((ARCH_DIR / arch / "weights.json").read_text())
+    # A `moe_block`'s bank: the manifest no longer declares its bundle marker (the typed shapes
+    # derive the bank from the carrier), so the marker the synthesis keys the bank by is restored
+    # here, from the carrier's own call.
+    for key in re.findall(r"\bmoe_block\([^,]+,\s*([A-Za-z_][A-Za-z_0-9.]*)\[", carrier):
+        manifest.setdefault(key, ["hidden_size"])
 
     # ── STATE the shims read ──
     STATE["bounds"] = bounds

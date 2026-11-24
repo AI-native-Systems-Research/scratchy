@@ -318,6 +318,8 @@ mod imp {
 
         let allocator = MetalAllocator::new((**device_arc).clone());
         let mut device = GpuDevice::new(device_arc.clone(), Arc::new(allocator.clone()));
+        // The gate reads the logits on the host: the pool keeps its terminal slot shared.
+        device.terminal_reads = scratchy_target_metal::interpreter::metal::TerminalReads::Host;
         let mut gw = GpuWeights::from_dir(&ckpt, allocator.clone()).expect("GpuWeights::from_dir");
         gw.set_target_dtype(DType::BF16);
         let model =
@@ -667,6 +669,8 @@ mod imp {
 
         let allocator = MetalAllocator::new((**device_arc).clone());
         let mut device = GpuDevice::new(device_arc.clone(), Arc::new(allocator.clone()));
+        // The gate reads the logits on the host: the pool keeps its terminal slot shared.
+        device.terminal_reads = scratchy_target_metal::interpreter::metal::TerminalReads::Host;
         let mut weights = GpuWeights::from_dir(dir.join("checkpoint"), allocator.clone())
             .expect("GpuWeights::from_dir");
         weights.set_target_dtype(DType::BF16);
