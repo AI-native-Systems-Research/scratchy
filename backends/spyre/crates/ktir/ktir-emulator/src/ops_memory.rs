@@ -1385,7 +1385,7 @@ fn write_to_lx(ctx: &mut CoreContext, data: &[f32], dtype: DType) {
     // case the latency model ever reads it).
     let size = (data.len() * dtype.bytes_per_elem()) as i64;
     let lx = ctx.get_lx(None);
-    let lxm = lx.borrow_mut();
+    let mut lxm = lx.borrow_mut();
     lxm.next_ptr = (lxm.next_ptr + size + STICK_BYTES - 1) & !(STICK_BYTES - 1);
 }
 
@@ -1774,7 +1774,8 @@ mod tests {
         let back = load_data(&mut ctx, &tr, Some(&coords), Some(vec![2])).unwrap();
         assert_eq!(back.as_f32().to_vec(), vec![7.0, 8.0]);
         // B's own allocation still holds its original zero bytes.
-        let (b_buf, _) = ctx.hbm.borrow().allocation_at(b).unwrap();
+        let hbm = ctx.hbm.borrow();
+        let (b_buf, _) = hbm.allocation_at(b).unwrap();
         assert!(
             b_buf.iter().all(|&x| x == 0),
             "the scatter must not touch B"

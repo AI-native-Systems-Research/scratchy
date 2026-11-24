@@ -737,18 +737,31 @@ fn test_coreid_pads_to_3d() {
 // ControlOps — TestControlOps
 // ===========================================================================
 
-/// Build a scf.for op with a body region (and optional iter_args), minting
-/// through `ir_ops` so its `%name`s resolve consistently with the caller's.
-#[allow(clippy::too_many_arguments)]
-fn for_op_ir(
-    ir_ops: &mut Ops,
+/// The SSA names of a `scf.for`: its result, bounds, step, induction variable, and its
+/// iter_args with their initial values.
+struct ForIr<'a> {
     result: Option<&'static str>,
     lb: &'static str,
     ub: &'static str,
     step: &'static str,
     iter_var: &'static str,
-    iter_inits: &[&'static str],
-    iter_args: &[&'static str],
+    iter_inits: &'a [&'static str],
+    iter_args: &'a [&'static str],
+}
+
+/// Build a scf.for op with a body region (and optional iter_args), minting
+/// through `ir_ops` so its `%name`s resolve consistently with the caller's.
+fn for_op_ir(
+    ir_ops: &mut Ops,
+    ForIr {
+        result,
+        lb,
+        ub,
+        step,
+        iter_var,
+        iter_inits,
+        iter_args,
+    }: ForIr<'_>,
     body: Vec<Operation<'static>>,
 ) -> Operation<'static> {
     let mut operands = vec![lb, ub, step];
@@ -860,13 +873,15 @@ fn test_for_op() {
     let body = vec![s, y];
     let f = for_op_ir(
         &mut ir_ops,
-        Some("%r"),
-        "%lb",
-        "%ub",
-        "%step",
-        "%i",
-        &["%init"],
-        &["%acc"],
+        ForIr {
+            result: Some("%r"),
+            lb: "%lb",
+            ub: "%ub",
+            step: "%step",
+            iter_var: "%i",
+            iter_inits: &["%init"],
+            iter_args: &["%acc"],
+        },
         body,
     );
     let ctx = run_seeded(
@@ -896,13 +911,15 @@ fn test_for_op_step_2() {
     let body = vec![one, cnt, sum, y];
     let f = for_op_ir(
         &mut ir_ops,
-        Some("%r"),
-        "%lb",
-        "%ub",
-        "%step",
-        "%i",
-        &["%init", "%c0"],
-        &["%acc", "%count"],
+        ForIr {
+            result: Some("%r"),
+            lb: "%lb",
+            ub: "%ub",
+            step: "%step",
+            iter_var: "%i",
+            iter_inits: &["%init", "%c0"],
+            iter_args: &["%acc", "%count"],
+        },
         body,
     );
     let ctx = run_seeded(
@@ -934,13 +951,15 @@ fn test_for_op_iter_args_running_sum() {
     let body = vec![s, y];
     let f = for_op_ir(
         &mut ir_ops,
-        Some("%r"),
-        "%lb",
-        "%ub",
-        "%step",
-        "%i",
-        &["%init"],
-        &["%acc"],
+        ForIr {
+            result: Some("%r"),
+            lb: "%lb",
+            ub: "%ub",
+            step: "%step",
+            iter_var: "%i",
+            iter_inits: &["%init"],
+            iter_args: &["%acc"],
+        },
         body,
     );
     let ctx = run_seeded(

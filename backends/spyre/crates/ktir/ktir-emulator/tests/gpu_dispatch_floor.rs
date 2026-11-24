@@ -12,7 +12,7 @@
 
 #![cfg(metal)]
 
-use ktir_emulator::metal::{Epilogue, NaxGemm};
+use ktir_emulator::metal::{FusedEpilogue, GemmDims, NaxGemm};
 
 /// Median ms of one resident `matmul_unified` over a fixed A and a B buffer that is
 /// f16 (`b_f16=true`, the `KTIR_F16_WEIGHTS` weight buffer) or f32. Isolates the
@@ -26,13 +26,27 @@ fn time_unified(g: &NaxGemm, m: usize, k: usize, n: usize, b_f16: bool, iters: u
         g.unified_from(&bvec).expect("b f32")
     };
     let mut c = g.unified(m * n).expect("c buf");
-    g.matmul_unified(m, k, n, &a, &b, &mut c, None, Epilogue::NONE, false)
-        .expect("warm gemm");
+    g.matmul_unified(
+        GemmDims { m, k, n },
+        &a,
+        &b,
+        &mut c,
+        FusedEpilogue::NONE,
+        false,
+    )
+    .expect("warm gemm");
     let mut ts: Vec<f64> = Vec::with_capacity(iters);
     for _ in 0..iters {
         let t = std::time::Instant::now();
-        g.matmul_unified(m, k, n, &a, &b, &mut c, None, Epilogue::NONE, false)
-            .expect("timed gemm");
+        g.matmul_unified(
+            GemmDims { m, k, n },
+            &a,
+            &b,
+            &mut c,
+            FusedEpilogue::NONE,
+            false,
+        )
+        .expect("timed gemm");
         ts.push(t.elapsed().as_secs_f64() * 1e3);
     }
     ts.sort_by(|x, y| x.partial_cmp(y).unwrap());

@@ -179,7 +179,6 @@ pub fn node_partition_dims(func: &IRFunction, node: &NodeSpec) -> PartitionDims 
     let mut reads: Vec<(u64, Option<usize>)> = Vec::new();
     let mut writes: Vec<(u64, Option<usize>)> = Vec::new();
 
-    #[allow(clippy::too_many_arguments)]
     fn walk(
         ops: &[Operation],
         arg_tensor: &HashMap<Ssa, u64>,
@@ -811,9 +810,6 @@ impl SliceForward {
 struct LoadChain {
     arg: Ssa,
     loaded: Ssa,
-    /// The view the access tile is built on (dropped when the arg is forwarded).
-    #[allow(dead_code)]
-    view: Ssa,
     /// The access tile — identifies the tile op to drop and the load to rewrite.
     tile: Ssa,
     whole_tensor: bool,
@@ -950,7 +946,6 @@ fn collect_loads_stores(
                     loads.push(LoadChain {
                         arg: *arg,
                         loaded,
-                        view: ti.view,
                         tile: *tile_ssa,
                         whole_tensor: whole,
                         offsets: ti.offsets.clone(),
@@ -1486,7 +1481,6 @@ mod tests {
     // --- partial fusion: segment plan keeps attention nodes native ----------
 
     /// Program: src(1) -[a]-> t(2) -[b]-> t(3) -[c]-> result(4).
-    #[allow(clippy::too_many_arguments)]
     fn three_node_spec(
         a_in: Ssa,
         a_out: Ssa,
