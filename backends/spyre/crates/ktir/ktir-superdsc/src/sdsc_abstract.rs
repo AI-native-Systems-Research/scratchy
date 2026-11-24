@@ -2257,17 +2257,17 @@ pub enum LayoutError {
 
 /// A typed device-tensor handle: an emitter name + the ONE [`StickLayout`], with KIND in the type.
 /// Threaded BY VALUE producer→consumer so two ops cannot hold divergent layouts for the same tensor;
-/// a leaf helper that requires kind `K'` accepts only `&Stk<K'>`, so handing a `RowScalar` reduce
-/// output to a matmul-A (which needs `RowBlocked`) does NOT type-check. `dev_off` is reachable only
+/// a leaf helper that requires kind `K'` accepts only `&Stk<K'>`, so handing a `Kernel` handle to a
+/// matmul-A (which needs `RowBlocked`) does NOT type-check. `dev_off` is reachable only
 /// through the handle's layout. The row count lives in `layout.m()` as a RUNTIME field — there is no
 /// M type parameter, so decode/prefill stay ONE code path (symbolic continuous-batching expressible).
 ///
-/// KIND guard — a `RowScalar` reduce-output handed to a matmul-A does not type-check:
-/// ```compile_fail
+/// KIND guard — a `Kernel` handle handed to a matmul-A does not type-check:
+/// ```compile_fail,E0308
 /// use ktir_superdsc::sdsc_abstract::*;
 /// fn matmul_a(_: &Stk<RowBlockedTag>) {}
-/// let recip = Stk::<RowScalarTag>::new("t1", StickLayout::row_scalar(8)).unwrap();
-/// matmul_a(&recip); // E0308: expected RowBlockedTag, found RowScalarTag
+/// let w = Stk::<KernelTag>::new("t1", StickLayout::kernel(2048, 16)).unwrap();
+/// matmul_a(&w); // E0308: expected RowBlockedTag, found KernelTag
 /// ```
 /// Correct usage compiles and the layout travels with the handle:
 /// ```

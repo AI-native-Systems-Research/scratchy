@@ -54,7 +54,7 @@ pub trait World:
 /// ⭐ THE WORLD OF `N` RANKS — the newtype a build's `tp/N` names (`tp/1` is the default, a world
 /// of one). `N = 0` does not compile:
 ///
-/// ```compile_fail
+/// ```compile_fail,E0080
 /// use scratchy_tp_world::{World, TpWorld};
 /// let () = <TpWorld<0> as World>::NONEMPTY;
 /// ```
@@ -113,7 +113,7 @@ pub struct Rank<T: World>(u32, PhantomData<T>);
 impl<T: World> Rank<T> {
     /// Rank `R`, proven below the world at build.
     ///
-    /// ```compile_fail
+    /// ```compile_fail,E0080
     /// use scratchy_tp_world::{Rank, TpWorld};
     /// let _ = Rank::<TpWorld<4>>::of::<4>();
     /// ```
@@ -125,7 +125,7 @@ impl<T: World> Rank<T> {
     /// Re-mint from the rank the `#[forward]` macro bakes into a `static` — a `const fn`, so a rank
     /// past the world fails the BUILD of the crate that bakes it.
     ///
-    /// ```compile_fail
+    /// ```compile_fail,E0080
     /// use scratchy_tp_world::{Rank, TpWorld};
     /// const R: Rank<TpWorld<4>> = Rank::baked(4);
     /// ```
@@ -169,7 +169,7 @@ impl<T: World> PairwiseRound<T> {
     /// Re-mint from the round the `#[forward]` macro bakes into a `static` — a `const fn`, so a
     /// round past the world fails the BUILD of the crate that bakes it.
     ///
-    /// ```compile_fail
+    /// ```compile_fail,E0080
     /// use scratchy_tp_world::{PairwiseRound, TpWorld};
     /// const R: PairwiseRound<TpWorld<4>> = PairwiseRound::baked(2);
     /// ```

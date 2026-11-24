@@ -76,9 +76,9 @@ pub mod sealed {
 /// Sealed slot id. The dense index identifying one writer / multi-reader
 /// arena cell on the tape. Constructable only via [`TapeBuilder::alloc_slot`].
 ///
-/// ```compile_fail
+/// ```compile_fail,E0451
 /// // Sealed; struct-literal construction is rejected.
-/// let _ = scratchy_subtile::subtile_tape::SlotId { id: 0 };
+/// let _ = scratchy_subtile::subtile_tape::SlotId { id: 0, _seal: todo!() };
 /// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SlotId {
@@ -129,9 +129,9 @@ impl SlotWritten {
 /// [`Instr::CloseLoop`]. Constructable only as the return value of
 /// [`TapeBuilder::open_loop`].
 ///
-/// ```compile_fail
+/// ```compile_fail,E0451
 /// // Sealed; struct-literal construction is rejected.
-/// let _ = scratchy_subtile::subtile_tape::LoopVarId { id: 0 };
+/// let _ = scratchy_subtile::subtile_tape::LoopVarId { id: 0, _seal: todo!() };
 /// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct LoopVarId {
@@ -492,14 +492,14 @@ mod builder_state_seal {
 /// `close_loop` on `Outside`, `finish` on `InsideLoop`, `alloc_slot`
 /// inside a loop) = no matching impl, **compile error**.
 ///
-/// ```compile_fail
+/// ```compile_fail,E0599
 /// use scratchy_subtile::subtile_tape::TapeBuilder;
 /// // close_loop is only impl'd on TapeBuilder<state::InsideLoop>.
 /// let b = TapeBuilder::new();
 /// let _ = b.close_loop();
 /// ```
 ///
-/// ```compile_fail
+/// ```compile_fail,E0599
 /// use scratchy_subtile::subtile_tape::{LoopBound, TapeBuilder};
 /// // finish is only impl'd on TapeBuilder<state::Outside>.
 /// let b = TapeBuilder::new();
@@ -525,38 +525,39 @@ mod builder_state_seal {
 /// so single-writer / read-before-write / read-after-free become
 /// use-after-move compile errors:
 ///
-/// ```compile_fail
+/// ```compile_fail,E0382
 /// // double-write: SlotHandle is consumed by the first compute_to.
 /// use scratchy_subtile::subtile_ir::SubtileId;
 /// use scratchy_subtile::subtile_tape::TapeBuilder;
 /// let mut b = TapeBuilder::new();
 /// let h = b.alloc_slot();
-/// let _w = b.compute_to(SubtileId(0), h, &[]);
+/// let _w = b.compute_to(SubtileId::from_index(0), h, &[]);
 /// // h is moved; cannot use it again.
-/// let _w2 = b.compute_to(SubtileId(0), h, &[]);
+/// let _w2 = b.compute_to(SubtileId::from_index(0), h, &[]);
 /// ```
 ///
-/// ```compile_fail
+/// ```compile_fail,E0308
 /// // read-before-write: only `&SlotWritten` is acceptable as a read.
 /// // `SlotHandle` cannot be borrowed where `&SlotWritten` is expected.
 /// use scratchy_subtile::subtile_ir::SubtileId;
-/// use scratchy_subtile::subtile_tape::TapeBuilder;
+/// use scratchy_subtile::subtile_tape::{ComputeInputBuild, TapeBuilder};
 /// let mut b = TapeBuilder::new();
 /// let h = b.alloc_slot();
-/// let _w = b.compute_to(SubtileId(0), b.alloc_slot(), &[&h]);
+/// let out = b.alloc_slot();
+/// let _w = b.compute_to(SubtileId::from_index(0), out, &[ComputeInputBuild::Computed(vec![&h])]);
 /// ```
 ///
-/// ```compile_fail
+/// ```compile_fail,E0382
 /// // read-after-free: free_slot consumes SlotWritten; further reads
 /// // of the same token are use-after-move.
 /// use scratchy_subtile::subtile_ir::SubtileId;
-/// use scratchy_subtile::subtile_tape::TapeBuilder;
+/// use scratchy_subtile::subtile_tape::{ComputeInputBuild, TapeBuilder};
 /// let mut b = TapeBuilder::new();
 /// let h0 = b.alloc_slot();
-/// let w0 = b.compute_to(SubtileId(0), h0, &[]);
+/// let w0 = b.compute_to(SubtileId::from_index(0), h0, &[]);
 /// b.free_slot(w0);
 /// let h1 = b.alloc_slot();
-/// let _w1 = b.compute_to(SubtileId(1), h1, &[&w0]);
+/// let _w1 = b.compute_to(SubtileId::from_index(1), h1, &[ComputeInputBuild::Computed(vec![&w0])]);
 /// ```
 pub struct TapeBuilder<S: BuilderState = state::Outside> {
     instrs: Vec<Instr>,

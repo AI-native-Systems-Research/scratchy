@@ -418,7 +418,11 @@ pub struct AllocNode {
 /// ```
 /// `coordinates_` is a [`Coordinates`], which only [`build_coordinates`] makes:
 /// ```compile_fail,E0451
-/// let c = ktir_superdsc::wire::Coordinates { coord_info: Default::default() }; // E0451: private
+/// let c = ktir_superdsc::wire::Coordinates {
+///     coord_info: Default::default(),
+///     core_id_to_wk_slice: Default::default(),
+///     stick: todo!(),
+/// }; // E0451: private fields
 /// ```
 #[derive(Serialize, Clone, Debug)]
 #[serde(transparent)]
