@@ -1530,11 +1530,95 @@ impl BundleLayout {
         .map(drop)
     }
 
-    /// Whether `tid`'s arrangement is row-major — allocated so ([`Self::allocate_row_outermost`]).
-    pub fn is_row_outermost(&self, tid: u32) -> bool {
+    /// `tid`'s arrangement where it is row-major — allocated so ([`Self::allocate_row_outermost`]).
+    fn row_outermost(&self, tid: u32) -> Option<StickLayout> {
         self.arrangements
             .borrow()
             .get(&crate::place::act_name(tid))
-            .is_some_and(|a| a.kind == StickKind::Flat)
+            .copied()
+            .filter(|a| a.kind == StickKind::Flat)
+    }
+
+    /// Whether `tid`'s arrangement is row-major — allocated so ([`Self::allocate_row_outermost`]).
+    pub fn is_row_outermost(&self, tid: u32) -> bool {
+        self.row_outermost(tid).is_some()
+    }
+
+    /// ⭐ A POOL'S ROWS IN A `cols`-WIDE FRAME — the rows of a buffer allocated row-outermost (the
+    /// paged KV cache's allocation, at the format its allocator stated: [`StickLayout::df`]), read off
+    /// its arrangement: its elements in order, whatever their format, so its rows in any frame are
+    /// its elements over the frame's width. `None` for a buffer this layout does not hold
+    /// row-outermost, or a width that does not divide it. A paged kernel's view of a pool is not this
+    /// — it states the context's pages ([`crate::sdsc_abstract::ContextPages`]) and its gathers and
+    /// scatters reach any page of the pool — so the pool's extent is the placement's fact, and this is
+    /// where the door reads it.
+    pub fn pool_rows(&self, tid: u32, cols: u32) -> Option<u32> {
+        let a = self.row_outermost(tid)?;
+        let elems = u64::try_from(a.rows)
+            .ok()?
+            .checked_mul(u64::try_from(a.cols).ok()?)?;
+        let cols = u64::from(cols);
+        let rows = elems
+            .checked_div(cols)
+            .filter(|&rows| rows * cols == elems)?;
+        u32::try_from(rows).ok()
+    }
+}
+
+#[cfg(test)]
+mod pool_rows_tests {
+    use super::*;
+    use crate::superdsc_opspec::{Fp8, Fp16};
+
+    /// A layout holding one pool — `bytes` bytes at `tid` in the KV segment.
+    fn pool_at(tid: u32, bytes: u64) -> BundleLayout {
+        let mut layout = BundleLayout::default();
+        layout.placements.insert(
+            tid,
+            TensorPlacement {
+                tid,
+                role: SegRole::Kv,
+                segment: SegRole::Kv.segment(),
+                bank: 0,
+                offset: 0,
+                size: bytes,
+            },
+        );
+        layout
+    }
+
+    /// A pool's rows are its elements over the frame's width — the placement's own bytes at the
+    /// allocation's own format — and a width that does not divide them is no frame of the pool.
+    #[test]
+    fn a_pools_rows_are_its_elements_over_the_frames_width() {
+        let mut layout = pool_at(7, 8 * 128);
+        layout
+            .allocate_row_outermost::<Fp16>(7)
+            .expect("1024 B is whole 64-element fp16 sticks");
+        assert_eq!(layout.pool_rows(7, 64), Some(8));
+        assert_eq!(layout.pool_rows(7, 128), Some(4));
+        assert_eq!(layout.pool_rows(7, 96), None);
+        // The same bytes held float8: twice the elements, twice the rows at a width.
+        let mut layout = pool_at(7, 8 * 128);
+        layout
+            .allocate_row_outermost::<Fp8>(7)
+            .expect("1024 B is whole 128-element fp8 sticks");
+        assert_eq!(layout.pool_rows(7, 128), Some(8));
+        assert_eq!(layout.pool_rows(7, 64), Some(16));
+        // A tid the layout placed but never allocated row-outermost holds no pool, and a tid it
+        // never placed at all holds none either.
+        layout.placements.insert(
+            9,
+            TensorPlacement {
+                tid: 9,
+                role: SegRole::Kv,
+                segment: SegRole::Kv.segment(),
+                bank: 0,
+                offset: 8 * 128,
+                size: 8 * 128,
+            },
+        );
+        assert_eq!(layout.pool_rows(9, 64), None);
+        assert_eq!(layout.pool_rows(8, 64), None);
     }
 }

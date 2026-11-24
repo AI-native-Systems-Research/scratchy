@@ -41,7 +41,7 @@ use ktir_superdsc::superdsc_opspec::{Df, Fp8, Fp16, StickExtent};
 use scratchy_target_spyre::superdsc_bake::{ChunkExplore, DxpTool};
 use scratchy_triton_splice::{
     AttnScale, BlockSize, HeadDim, HeadGeometry, HeadWidth, KvHeads, KvQuantizeGeometry,
-    KvWriteGeometry, PagedAttnGeometry, PagedSequence, PoolPages, QueryHeads, RotDim,
+    KvWriteGeometry, PagedAttnGeometry, PagedSequence, ContextPages, QueryHeads, RotDim,
     SchedulerBlockTokens, TokenRows, WalkBlocks, allocate_paged_cache, kv_quantize_program,
     kv_write_program, paged_attn_program,
 };
@@ -367,7 +367,7 @@ fn written_pools(root: &Path, dxp: &DxpTool) -> Result<(Vec<u8>, Vec<u8>)> {
         nkvh: KvHeads::new(NKVH),
         hd: HeadWidth::of_whole_sticks(HD),
         block: SchedulerBlockTokens::REFERENCE,
-        pages: PoolPages::new(nz(PAGES)),
+        pages: ContextPages::new(nz(PAGES)),
     })
     .map_err(|e| anyhow!(e))?;
     let (layout, ops) = lowered(&node)?;
@@ -580,7 +580,7 @@ fn main() -> Result<()> {
             BlockSize::new(BLOCK),
         ),
         block: SchedulerBlockTokens::REFERENCE,
-        pages: PoolPages::new(nz(PAGES)),
+        pages: ContextPages::new(nz(PAGES)),
         blocks: WalkBlocks::new(nz(1)),
         scale: AttnScale::new(SCALE),
     };
