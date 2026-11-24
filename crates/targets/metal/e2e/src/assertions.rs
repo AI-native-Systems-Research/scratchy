@@ -328,7 +328,7 @@ pub fn write_golden_refs(model_key: &str, golden: &GoldenReference) {
 ///   then break (sequences diverge from here)
 ///
 /// Due to bf16 numerical noise accumulating across layers and positions, late-position
-/// divergences (position >= `LATE_DIVERGENCE_THRESHOLD`) where the other side's token
+/// divergences (position >= 10) where the other side's token
 /// is NOT in the top-N are downgraded to warnings rather than hard failures. The first
 /// `MIN_EXACT_MATCH` positions must match exactly.
 pub fn check_logprobs_close(golden: &GoldenResult, engine: &EngineOutput, prompt_idx: usize) {
@@ -350,11 +350,6 @@ pub fn check_logprobs_close_with_threshold(
     prompt_idx: usize,
     late_divergence_threshold: usize,
 ) {
-    // Shadow the former `const` with the runtime value to keep the
-    // body below identical to the pre-existing implementation.
-    #[allow(non_snake_case)]
-    let LATE_DIVERGENCE_THRESHOLD: usize = late_divergence_threshold;
-
     let min_len = golden.output_tokens.len().min(engine.output_tokens.len());
 
     for idx in 0..min_len {
@@ -369,14 +364,14 @@ pub fn check_logprobs_close_with_threshold(
             let gold_in_eng = eng_lp.contains_key(gold_tok);
 
             if !eng_in_gold || !gold_in_eng {
-                if idx >= LATE_DIVERGENCE_THRESHOLD {
+                if idx >= late_divergence_threshold {
                     // Late-position divergence: bf16 noise has accumulated enough
                     // that tokens fall outside each other's top-N. Warn, don't fail.
                     eprintln!(
                         "WARN: Prompt {prompt_idx}, position {idx}: late divergence \
                          (golden={gold_tok:?}, engine={eng_tok:?}). \
                          eng_in_gold_topN={eng_in_gold}, gold_in_eng_topN={gold_in_eng}. \
-                         This is expected bf16 numerical noise at position >= {LATE_DIVERGENCE_THRESHOLD}."
+                         This is expected bf16 numerical noise at position >= {late_divergence_threshold}."
                     );
                     break;
                 }
