@@ -56,10 +56,6 @@ on a 64 GB Mac; `full` runs both where each fits); glm-4.5-air and the gemma
 and qwen3.6-27b models run by name. The run file records the class table
 (`config.classes`), and the page's overview reads its columns from it.
 
-**Not on a 36 GB M3 Pro yet.** At scratchy's default budget it has panicked
-the kernel twice mid long prefill (#780), restarting the Mac. Don't run it
-there until #540 lands; tell the user why and stop.
-
 ## Quick run
 
 Run it straight through. Don't ask about the commit, a dirty tree, the
