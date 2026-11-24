@@ -67,22 +67,27 @@ fn baked_sources() -> &'static Path {
     DIR.get_or_init(|| {
         let root = std::env::var_os("OUT_DIR").map_or_else(std::env::temp_dir, PathBuf::from);
         let dir = root.join(format!("metal-bake/src-{:016x}", sources_hash()));
-        if !dir.exists() {
-            let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-            let tmp = dir.with_extension(format!("{}.{seq}.tmp", std::process::id()));
-            for (path, text) in BAKED_SOURCES {
-                let path = tmp.join(path);
-                std::fs::create_dir_all(path.parent().expect("a source's dir"))
-                    .and_then(|()| std::fs::write(&path, text))
-                    .unwrap_or_else(|e| panic!("bake: write {}: {e}", path.display()));
-            }
-            // Another process may have put its copy — the same files — in place first.
-            if std::fs::rename(&tmp, &dir).is_err() {
-                let _ = std::fs::remove_dir_all(&tmp);
-            }
-        }
+        write_missing(&dir, BAKED_SOURCES);
         dir
     })
+}
+
+/// Write each of `sources` that is missing under `dir`. The OS can purge one old file from a temp
+/// dir that stays, so each file is checked, not the dir. A temp name and a rename mean another
+/// process reads a whole file or none, and two writers write the same bytes.
+fn write_missing(dir: &Path, sources: &[(&str, &str)]) {
+    for (path, text) in sources {
+        let path = dir.join(path);
+        if path.exists() {
+            continue;
+        }
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let tmp = path.with_extension(format!("{}.{seq}.tmp", std::process::id()));
+        std::fs::create_dir_all(path.parent().expect("a source's dir"))
+            .and_then(|()| std::fs::write(&tmp, text))
+            .and_then(|()| std::fs::rename(&tmp, &path))
+            .unwrap_or_else(|e| panic!("bake: write {}: {e}", path.display()));
+    }
 }
 
 /// Compile `source` — including from [`baked_sources`] — with `flags` to a metallib; empty on a
@@ -506,7 +511,20 @@ fn msl_literal(c: &ConstantValue) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{BakedDictionary, BakedMetallib, baked, pack};
+    use super::{BakedDictionary, BakedMetallib, baked, pack, write_missing};
+
+    /// A source the OS purged from a cache dir that stays is written again.
+    #[test]
+    fn write_missing_rewrites_a_purged_source() {
+        let dir = std::env::temp_dir().join(format!("metal-bake-test-{}", std::process::id()));
+        let sources = [("baked.h", "a"), ("sub/x.h", "b")];
+        write_missing(&dir, &sources);
+        std::fs::remove_file(dir.join("baked.h")).unwrap();
+        write_missing(&dir, &sources);
+        let read = |p: &str| std::fs::read_to_string(dir.join(p)).unwrap();
+        assert_eq!((read("baked.h"), read("sub/x.h")), ("a".into(), "b".into()));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     /// Each of `metallibs`, packed then decompressed.
     fn round_trip(metallibs: &[&[u8]]) -> (usize, Vec<Box<[u8]>>) {
