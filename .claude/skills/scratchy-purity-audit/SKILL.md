@@ -220,6 +220,7 @@ Enforced by the `p11_*` lints in `lints/scratchy-purity` (`scripts/purity.sh`); 
   That applies to `Cargo.toml` comments too.
 
 ### P12. Proper tests: in-tree Rust, never standing in for a type
+Enforced, for a `compile_fail` doctest that names no error code, by the `p12_*` lints in `lints/scratchy-purity` (`scripts/purity.sh`); a finding there is the verdict.
 - A test is never written where a type could carry the fact (the ranking at the top of §1).
 - Type proofs are `compile_fail` doctests that name their error code. Only nightly rustdoc checks the code (stable ignores it), so they're proved by the nightly run.
 - No out-of-tree gate pipelines (Python or shell comparers, tape dumpers, ad-hoc gate scripts): "we are a rust project; we need proper tests".

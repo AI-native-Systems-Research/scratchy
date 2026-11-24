@@ -109,42 +109,95 @@ pub fn check_comment(cx: &EarlyContext<'_>, span: rustc_span::Span, body: &str, 
     }
 }
 
-/// What one file's tokens hold for P11: its comments, and the names of the `fn`s it defines.
-#[derive(Default)]
-struct Found {
-    comments: Vec<(rustc_span::Span, String)>,
-    fns: Vec<(rustc_span::Span, String)>,
+/// What one file's tokens hold: its comments, the names of the `fn`s it defines (P11), and its
+/// doc text (P12), each at its span, or at its byte range in the file for `scan`.
+struct Found<At = rustc_span::Span> {
+    comments: Vec<(At, String)>,
+    fns: Vec<(At, String)>,
+    /// Each line of a doc comment, and each `#[doc = ".."]` string whole.
+    docs: Vec<(At, String)>,
 }
 
-/// Every comment in one source file, and every name a `fn` keyword defines, each with its span.
-/// Read from tokens, so code no build compiles (tests, a disabled feature) is read too.
+impl<At> Default for Found<At> {
+    fn default() -> Self {
+        Self { comments: Vec::new(), fns: Vec::new(), docs: Vec::new() }
+    }
+}
+
+/// The length of a doc comment's opening marker, `///`, `//!`, `/**` or `/*!`.
+const DOC_MARKER: usize = 3;
+
+/// Every comment in one source text, every name a `fn` keyword defines, and every line of doc
+/// text, each with its byte range. Read from tokens, so code no build compiles (tests, a
+/// disabled feature) is read too.
+fn scan(src: &str) -> Found<std::ops::Range<u32>> {
+    let mut found = Found::default();
+    let mut offset = 0u32;
+    // The last three tokens that are not whitespace or comments, newest last.
+    let mut last: [&str; 3] = [""; 3];
+    for token in rustc_lexer::tokenize(src, rustc_lexer::FrontmatterAllowed::No) {
+        let len = token.len;
+        let text = &src[offset as usize..(offset + len) as usize];
+        let range = offset..offset + len;
+        offset += len;
+        match token.kind {
+            rustc_lexer::TokenKind::LineComment { doc_style } | rustc_lexer::TokenKind::BlockComment { doc_style, .. } => {
+                let body = comment_body(text);
+                if doc_style.is_some() {
+                    let mut at = range.start + DOC_MARKER as u32;
+                    for line in body.split_inclusive('\n') {
+                        let trimmed = line.trim_end_matches(['\n', '\r']).trim_start();
+                        let lo = at + (line.len() - line.trim_start().len()) as u32;
+                        found.docs.push((lo..lo + trimmed.len() as u32, trimmed.to_owned()));
+                        at += line.len() as u32;
+                    }
+                }
+                found.comments.push((range, body.to_owned()));
+                continue;
+            }
+            rustc_lexer::TokenKind::Whitespace => continue,
+            rustc_lexer::TokenKind::Ident if last[2] == "fn" => found.fns.push((range, text.to_owned())),
+            rustc_lexer::TokenKind::Literal { kind, .. } if matches!(last, ["[" | "(" | ",", "doc", "="]) => {
+                if let Some(value) = str_value(text, kind) {
+                    found.docs.push((range, value));
+                }
+            }
+            _ => {}
+        }
+        last = [last[1], last[2], text];
+    }
+    found
+}
+
+/// The value of a string literal token, with `\n` escapes read as line breaks; `None` for any
+/// other literal.
+fn str_value(text: &str, kind: rustc_lexer::LiteralKind) -> Option<String> {
+    match kind {
+        rustc_lexer::LiteralKind::Str { .. } => {
+            Some(text.strip_prefix('"')?.strip_suffix('"')?.replace("\\n", "\n"))
+        }
+        rustc_lexer::LiteralKind::RawStr { n_hashes: Some(n) } => {
+            let hashes = "#".repeat(n.into());
+            let inner = text.strip_prefix('r')?.strip_prefix(hashes.as_str())?.strip_prefix('"')?;
+            Some(inner.strip_suffix(hashes.as_str())?.strip_suffix('"')?.to_owned())
+        }
+        _ => None,
+    }
+}
+
+/// One source file's tokens, at their spans in the source map.
 fn file_tokens(file: &rustc_span::SourceFile, found: &mut Found) {
     let Some(src) = file.src.as_deref() else {
         return;
     };
-    let mut offset = 0u32;
-    let mut after_fn = false;
-    for token in rustc_lexer::tokenize(src, rustc_lexer::FrontmatterAllowed::No) {
-        let len = token.len;
-        let text = &src[offset as usize..(offset + len) as usize];
-        let lo = file.start_pos + rustc_span::BytePos(offset);
-        let span = rustc_span::Span::with_root_ctxt(lo, lo + rustc_span::BytePos(len));
-        match token.kind {
-            rustc_lexer::TokenKind::LineComment { .. }
-            | rustc_lexer::TokenKind::BlockComment { .. } => {
-                found.comments.push((span, comment_body(text).to_owned()));
-            }
-            rustc_lexer::TokenKind::Whitespace => {}
-            rustc_lexer::TokenKind::Ident => {
-                if after_fn {
-                    found.fns.push((span, text.to_owned()));
-                }
-                after_fn = text == "fn";
-            }
-            _ => after_fn = false,
-        }
-        offset += len;
-    }
+    let at = |(r, text): (std::ops::Range<u32>, String)| {
+        let lo = file.start_pos + rustc_span::BytePos(r.start);
+        (rustc_span::Span::with_root_ctxt(lo, lo + rustc_span::BytePos(r.end - r.start)), text)
+    };
+    let scanned = scan(src);
+    found.comments.extend(scanned.comments.into_iter().map(at));
+    found.fns.extend(scanned.fns.into_iter().map(at));
+    found.docs.extend(scanned.docs.into_iter().map(at));
 }
 
 declare_lint_pass!(P11Track => []);
@@ -244,6 +297,9 @@ impl EarlyLintPass for P11 {
         for (span, body) in &found.comments {
             check_comment(cx, *span, body, "");
         }
+        for (span, text) in &found.docs {
+            crate::p12::check_doc(cx, *span, text);
+        }
         for (span, name) in found.fns.iter().filter(|(_, name)| escape_hatch(name)) {
             span_lint_and_help(
                 cx,
@@ -282,5 +338,37 @@ impl EarlyLintPass for P11 {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn docs(src: &str) -> Vec<(&str, String)> {
+        scan(src).docs.into_iter().map(|(r, text)| (&src[r.start as usize..r.end as usize], text)).collect()
+    }
+
+    #[test]
+    fn doc_text_is_read_from_doc_comments_and_doc_attributes_only() {
+        let src = "/// a\n//! b\n/** c\n * d */\n// e\n/* f */\n//// g\n#[doc = \"h\\ni\"]\n#[doc = r#\"j\"#]\nfn x() { let doc = \"k\"; }";
+        let found = docs(src);
+        let texts: Vec<_> = found.iter().map(|(_, t)| t.as_str()).collect();
+        assert_eq!(texts, ["a", "b", "c", "* d ", "h\ni", "j"]);
+        assert_eq!(found[0].0, "a");
+        assert_eq!(found[3].0, "* d ");
+        assert_eq!(found[4].0, "\"h\\ni\"");
+    }
+
+    #[test]
+    fn a_fence_in_a_plain_comment_or_a_string_is_not_doc_text() {
+        let src = "// ```compile_fail\n/* ```compile_fail */\nfn f() -> &'static str { \"```compile_fail\" }";
+        assert!(docs(src).is_empty());
+    }
+
+    #[test]
+    fn fn_names_follow_the_fn_keyword_across_comments() {
+        let names: Vec<_> = scan("fn a() {} fn /* c */ b() {} let fn_ = 1;").fns.into_iter().map(|(_, n)| n).collect();
+        assert_eq!(names, ["a", "b"]);
     }
 }
