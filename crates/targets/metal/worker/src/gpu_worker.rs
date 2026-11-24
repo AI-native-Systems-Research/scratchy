@@ -163,7 +163,6 @@ pub struct MetalWorker {
     /// Second KV cache pool, sized for the draft model. Lives on the
     /// same `MetalAllocator` / residency set as the target's pool —
     /// one allocator covers all weights + both pools.
-    #[allow(dead_code)]
     draft_kv_cache: Option<KvCachePool>,
     model_dtype: GpuDType,
     resolved_architecture: Option<String>,
@@ -183,8 +182,7 @@ pub struct MetalWorker {
     /// Per-request seeded RNGs for deterministic sampling.
     seeded_rngs: HashMap<String, rand::rngs::StdRng>,
     /// Optional progress callback for startup initialization.
-    #[allow(clippy::type_complexity)]
-    progress_callback: Option<std::sync::Arc<dyn Fn(&str) + Send + Sync>>,
+    progress_callback: Option<scratchy_serving_engine::worker_factory::ProgressCallback>,
 
     // ---------------------------------------------------------------
     // Metal-only state (Phase F: cfg-mutex extension).
@@ -1049,7 +1047,10 @@ impl MetalWorker {
     }
 
     /// Set the progress callback for startup loading.
-    pub fn set_progress_callback(&mut self, cb: std::sync::Arc<dyn Fn(&str) + Send + Sync>) {
+    pub fn set_progress_callback(
+        &mut self,
+        cb: scratchy_serving_engine::worker_factory::ProgressCallback,
+    ) {
         self.progress_callback = Some(cb);
     }
 
@@ -8097,12 +8098,11 @@ impl Worker for MetalWorker {
             Vec::with_capacity(attn.sliding_groups.len());
         for sliding in &attn.sliding_groups {
             let mut sm = StepSlotMapping::with_capacity(num_tokens);
-            // `i` indexes tokens_before / q_lens / sliding in lockstep.
-            #[allow(clippy::needless_range_loop)]
-            for i in 0..num_reqs {
-                let tokens_before = attn.tokens_before[i];
-                let q_len = attn.q_lens[i];
-                let block_ids = &sliding[i];
+            // tokens_before / q_lens / sliding walk the requests in lockstep.
+            let requests = (attn.tokens_before[..num_reqs].iter())
+                .zip(&attn.q_lens[..num_reqs])
+                .zip(&sliding[..num_reqs]);
+            for ((&tokens_before, &q_len), block_ids) in requests {
                 for t in 0..q_len {
                     let abs_pos = tokens_before + t;
                     let block_idx = abs_pos / block_size.get();
