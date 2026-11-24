@@ -77,6 +77,7 @@ fn spliced_rmsnorm_lowers_through_the_door() {
             &weight_ids,
             PagedRows::Sequence,
             &[],
+            &Default::default(),
             pair_of_one_request(m),
         )
         .unwrap_or_else(|e| panic!("layout minted m={m} c={c}: {e}"));
@@ -135,6 +136,7 @@ fn spliced_oneplus_rmsnorm_lowers_through_the_door() {
             &weight_ids,
             PagedRows::Sequence,
             &[],
+            &Default::default(),
             pair_of_one_request(m),
         )
         .unwrap_or_else(|e| panic!("layout minted m={m} c={c}: {e}"));
@@ -208,6 +210,7 @@ fn spliced_oneplus_rmsnorm_lowers_through_the_door() {
             &weight_ids,
             PagedRows::Sequence,
             &[],
+            &Default::default(),
             pair_of_one_request(m),
         )
         .unwrap_or_else(|e| panic!("scale layout minted m={m} c={c}: {e}"));
@@ -271,6 +274,7 @@ fn spliced_silumul_lowers_through_the_door() {
             &weight_ids,
             PagedRows::Sequence,
             &[],
+            &Default::default(),
             pair_of_one_request(m),
         )
         .unwrap_or_else(|e| panic!("layout minted m={m} c={c}: {e}"));
@@ -365,6 +369,7 @@ fn a_column_chunked_silumul_splices_through_the_door() {
         &weight_ids,
         PagedRows::Sequence,
         &[],
+        &Default::default(),
         pair_of_one_request(1),
     )
     .unwrap_or_else(|e| panic!("layout minted for the chunked node: {e}"));
@@ -467,6 +472,7 @@ fn spliced_elementwise_lowers_through_the_door() {
                 &weight_ids,
                 PagedRows::Sequence,
                 &[],
+                &Default::default(),
                 pair_of_one_request(m),
             )
             .unwrap_or_else(|e| panic!("layout minted {kind:?} m={m} c={c}: {e}"));
@@ -579,6 +585,7 @@ fn spliced_dense_matmul_lowers_through_the_door() {
             &weight_ids,
             PagedRows::Sequence,
             &[],
+            &Default::default(),
             pair_of_one_request(m),
         )
         .unwrap_or_else(|e| panic!("layout minted m={m} k={k} n={n}: {e}"));
@@ -1131,6 +1138,7 @@ fn spliced_scalarmul_lowers_through_the_door() {
             &weight_ids,
             PagedRows::Sequence,
             &[],
+            &Default::default(),
             pair_of_one_request(m),
         )
         .unwrap_or_else(|e| panic!("layout minted m={m} c={c}: {e}"));
@@ -1188,6 +1196,7 @@ fn spliced_column_chunked_scalarmul_lowers_per_chunk() {
         &weight_ids,
         PagedRows::Sequence,
         &[],
+        &Default::default(),
         pair_of_one_request(1),
     )
     .unwrap_or_else(|e| panic!("layout minted for the chunked logits: {e}"));
@@ -1475,6 +1484,7 @@ fn batched_decode_odd_vocab_lm_head_splices() {
         &weight_ids,
         PagedRows::Sequence,
         &[],
+        &Default::default(),
         pair_of_one_request(m),
     )
     .unwrap_or_else(|e| panic!("layout minted m={m} k={k} n={n}: {e}"));
@@ -1531,6 +1541,7 @@ fn spliced_prefill_lm_head_fold_lowers_through_the_door() {
             &weight_ids,
             PagedRows::Sequence,
             &[],
+            &Default::default(),
             pair_of_one_request(mq),
         )
         .unwrap_or_else(|e| panic!("layout minted mq={mq} k={k} n={n}: {e}"));
@@ -1609,6 +1620,7 @@ fn spliced_fp8_matmul_lowers_through_the_door() {
             &weight_ids,
             PagedRows::Sequence,
             &[],
+            &Default::default(),
             pair_of_one_request(m),
         )
         .unwrap_or_else(|e| panic!("layout minted m={m} k={k} n={n}: {e}"));
@@ -1901,6 +1913,7 @@ fn spliced_rope_lowers_through_the_door() {
                 &weight_ids,
                 PagedRows::Sequence,
                 &[],
+                &Default::default(),
                 pair_of_one_request(mq),
             )
             .unwrap_or_else(|e| {
@@ -2679,6 +2692,7 @@ fn the_pools_page_count_moves_no_synthetic() {
                 &HashSet::new(),
                 PagedRows::Sequence,
                 &[],
+                &Default::default(),
                 pair_of_one_request(s.mq),
             )
             .unwrap_or_else(|e| panic!("{format}: the layout at {pages} pages: {e}"))
@@ -3979,6 +3993,7 @@ fn the_tall_wide_hidden_rmsnorm_mean_splits_through_the_door() {
         &weight_ids,
         PagedRows::Sequence,
         &[],
+        &Default::default(),
         pair_of_one_request(m),
     )
     .unwrap_or_else(|e| panic!("layout minted m={m} c={c}: {e}"));

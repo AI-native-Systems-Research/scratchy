@@ -766,6 +766,9 @@ pub fn compute_bundle_layout<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     // ⭐ WHAT THE ROWS ARE — one sequence's, or a decode batch's: the paged step's sources differ.
     paged_rows: scratchy_triton_splice::PagedRows,
     per_layer_ext: &[std::collections::BTreeMap<u32, Vec<u32>>],
+    // ⭐ A ROLLED BODY'S PER-LAYER TWINS ([`per_layer_output_twins`]), each placed at its
+    // representative's bytes; EMPTY for an unrolled bundle.
+    twins: &std::collections::BTreeMap<u32, u32>,
     // The graph's query extents, minted by the bake — threaded to the registry walk below,
     // never re-derived from graph rows (see [`bundle_registry`]'s own parameter note).
     query_rows: ktir_superdsc::sdsc_abstract::QueryExtent,
@@ -1437,7 +1440,12 @@ pub fn compute_bundle_layout<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     let mut inter: Vec<u32> = first_def
         .keys()
         .copied()
-        .filter(|&t| t >= ir.num_sources && t != result && !folded_out.contains(&t))
+        .filter(|&t| {
+            t >= ir.num_sources
+                && t != result
+                && !folded_out.contains(&t)
+                && !twins.contains_key(&t)
+        })
         .collect();
     inter.sort_by_key(|t| (first_def[t], *t));
     // ── SEGMENT COLORING (the multi-op stitching fix): dxp's ModuleStitcher connects
@@ -1501,6 +1509,31 @@ pub fn compute_bundle_layout<T: ktir_superdsc::collective::Tp, F: RopeForm>(
         let fold_out = node.output.tensor.index() as u32;
         let p = placements[&producer_out];
         placements.insert(fold_out, TensorPlacement { tid: fold_out, ..p });
+    }
+
+    // ⭐ A ROLLED BODY'S PER-LAYER TWINS ARE THEIR REPRESENTATIVE'S BYTES ([`per_layer_output_twins`]):
+    //    no launch addresses a twin — every launch of a body reads and writes its representative's
+    //    placements, which no launch shifts — so a twin's placement is its representative's, at its
+    //    own size, which is the representative's (the same op in every layer). A twin a fold places
+    //    (its node a folded ScalarMul, as its representative's is) keeps the fold's placement.
+    for (&twin, &rep) in twins {
+        if folded_out.contains(&twin) {
+            continue;
+        }
+        let p = placements.get(&rep).copied().ok_or_else(|| {
+            SuperDscError(format!(
+                "t{twin}: a per-layer twin of t{rep}, which this layout never placed"
+            ))
+        })?;
+        if nbytes(twin) != p.size {
+            return Err(SuperDscError(format!(
+                "t{twin}: a per-layer twin of t{rep} holds {} B, its representative {} B — a twin \
+                 is the same op in another layer, so the two must be one size",
+                nbytes(twin),
+                p.size
+            )));
+        }
+        placements.insert(twin, TensorPlacement { tid: twin, ..p });
     }
 
     // ⛔ BUILD GUARD (guard-every-crash-at-build-time, structural class): every RESERVED
@@ -2139,6 +2172,40 @@ pub fn place_kv_pools_at<T: ktir_superdsc::collective::Tp>(
         layout.segment_bytes[p.segment] = align128(p.offset + p.size);
     }
     Ok(())
+}
+
+/// ⭐ A ROLLED BODY'S PER-LAYER TWINS — `twin tid → representative tid`: for every body `Compute`
+/// of the re-rolled tape, the output tensor of each of its per-layer copies
+/// (`Compute::per_layer_out[v]`, `v ≥ 1`) mapped to the output of copy 0 (the representative the body
+/// is lowered from). A launch of a rolled body shifts only the weight and KV segments, so every
+/// launch reads and writes its representative's intermediates; a twin is never addressed, and its
+/// placement IS its representative's ([`compute_bundle_layout`]). Empty for a tape with no layer loop.
+pub(crate) fn per_layer_output_twins<F: RopeForm>(
+    tape: &scratchy_subtile::subtile_tape::SubtileTape,
+    ir: &SubtileIR<F>,
+) -> std::collections::BTreeMap<u32, u32> {
+    use scratchy_subtile::subtile_tape::Instr;
+    let out = |n: &scratchy_subtile::subtile_ir::SubtileId| {
+        ir.nodes[n.index()].output.tensor.index() as u32
+    };
+    let mut twins = std::collections::BTreeMap::new();
+    for instr in tape.instrs() {
+        if let Instr::Compute {
+            node,
+            per_layer_out,
+            ..
+        } = instr
+        {
+            let rep = out(node);
+            for copy in per_layer_out.iter().skip(1) {
+                let twin = out(copy);
+                if twin != rep {
+                    twins.insert(twin, rep);
+                }
+            }
+        }
+    }
+    twins
 }
 
 /// ⭐ THE PER-LAYER EXTERNAL TID CLASSES, READ OFF THE RE-ROLLED TAPE **BEFORE** ANY PLACEMENT
@@ -8975,6 +9042,7 @@ mod tests {
             &weight_ids,
             scratchy_triton_splice::PagedRows::Sequence,
             &[],
+            &Default::default(),
             one_request_of(4),
         )
         .expect("a layout for a plain matmul bundle");
@@ -9093,6 +9161,7 @@ mod tests {
             &weight_ids,
             scratchy_triton_splice::PagedRows::Sequence,
             &[],
+            &Default::default(),
             one_request_of(1),
         )
         .expect("plain lays out");
@@ -9101,6 +9170,7 @@ mod tests {
             &weight_ids,
             scratchy_triton_splice::PagedRows::Sequence,
             &[],
+            &Default::default(),
             one_request_of(1),
         )
         .expect("the minted graph lays out");
@@ -9198,6 +9268,7 @@ mod tests {
             &weight_ids,
             scratchy_triton_splice::PagedRows::Sequence,
             &[],
+            &Default::default(),
             one_request_of(4),
         )
         .expect("the minted graph lays out");
@@ -9610,6 +9681,7 @@ mod tests {
             &weight_ids,
             scratchy_triton_splice::PagedRows::Sequence,
             &[],
+            &Default::default(),
             one_request_of(mq),
         )
         .expect("the tail's layout mints");
@@ -9729,6 +9801,7 @@ mod tests {
             &weight_ids,
             scratchy_triton_splice::PagedRows::Sequence,
             &[],
+            &Default::default(),
             one_request_of(1),
         )
         .expect("the fp8 layout mints");
@@ -9744,6 +9817,7 @@ mod tests {
             &weight_ids,
             scratchy_triton_splice::PagedRows::Sequence,
             &[],
+            &Default::default(),
             one_request_of(1),
         )
         .expect("the fp16 layout mints");
@@ -10495,6 +10569,7 @@ mod tests {
             &weight_ids,
             scratchy_triton_splice::PagedRows::Sequence,
             &[],
+            &Default::default(),
             one_request_of(1),
         )
         .expect_err("the placement pass is the budget law and must refuse 32 GiB in seg1");
@@ -10891,6 +10966,57 @@ mod tests {
         );
         layout.synth(ktir_superdsc::place::SynthId::Act(victim), &[1, 64]);
         let _ = bake_layout(&layout);
+    }
+
+    /// ⭐ A ROLLED BODY'S TWINS ARE ITS REPRESENTATIVE'S BYTES: a four-layer stack re-rolled into one
+    /// body places every per-layer twin at its representative's segment and offset, and its
+    /// intermediate segments hold less than the same layout with every twin given bytes of its own.
+    #[test]
+    fn a_rolled_bodys_twins_share_their_representatives_bytes() {
+        use scratchy_subtile::subtile_ir::{ValidatedGraph, lower_region};
+        use scratchy_subtile::subtile_tape::{lower_dag_to_tape, reroll_subtile_tape};
+        let input = scratchy_subtile::fixtures::mlp_chain_distinct_m(4, 2048, 1);
+        let ir = lower_region(
+            &input,
+            std::num::NonZeroU32::new(8192).expect("8192 is nonzero"),
+        );
+        let unrolled = lower_dag_to_tape(&ValidatedGraph::new(&ir).expect("the stack validates"));
+        let rolled = reroll_subtile_tape(&unrolled, &ir);
+        let twins = per_layer_output_twins(&rolled, &ir);
+        assert!(!twins.is_empty(), "a four-layer roll has twins");
+        let per_layer_ext = per_layer_external_tids(&rolled);
+        let at = |twins: &std::collections::BTreeMap<u32, u32>| {
+            compute_bundle_layout::<ktir_superdsc::collective::TpWorld<1>, _>(
+                &ir,
+                &Default::default(),
+                scratchy_triton_splice::PagedRows::Sequence,
+                &per_layer_ext,
+                twins,
+                one_request_of(1),
+            )
+            .expect("the stack lays out")
+        };
+        let (shared, apart) = (at(&twins), at(&Default::default()));
+        for (twin, rep) in &twins {
+            let (t, r) = (shared.placements[twin], shared.placements[rep]);
+            assert_eq!(
+                (t.segment, t.offset),
+                (r.segment, r.offset),
+                "t{twin} sits on t{rep}"
+            );
+        }
+        let inter = |l: &BundleLayout| {
+            [SegRole::Intermediate.segment(), 5, 6]
+                .map(|s| l.segment_bytes[s])
+                .iter()
+                .sum::<u64>()
+        };
+        assert!(
+            inter(&shared) < inter(&apart),
+            "{} B shared vs {} B apart",
+            inter(&shared),
+            inter(&apart)
+        );
     }
 }
 

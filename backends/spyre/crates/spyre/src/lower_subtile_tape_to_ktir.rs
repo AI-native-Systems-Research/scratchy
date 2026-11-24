@@ -1241,6 +1241,7 @@ pub fn lower_graph_to_ktir<T: ktir_superdsc::collective::Tp, F: RopeForm>(
         weight_ids,
         scratchy_triton_splice::PagedRows::of_requests(rows_are_requests),
         &[],
+        &Default::default(),
         query_rows,
     )?;
     let mut ops: Vec<EmittedOp<T>> = Vec::with_capacity(ir.nodes.len());
@@ -2503,6 +2504,8 @@ pub fn lower_subtile_tape_to_ktir<T: ktir_superdsc::collective::Tp, F: RopeForm>
     // ONE MAP PER ATTENTION CLASS: a class-split roll's loops carry different-length per-layer
     // tables, and the layout needs to know which class a tensor belongs to before it can pack.
     let per_layer_ext = per_layer_external_tids(tape);
+    // ⭐ AND THE BODY'S PER-LAYER TWINS, each placed at its representative's bytes.
+    let twins = per_layer_output_twins(tape, ir);
     // The layout's budget passes (spill/bank) take the per-loop maps directly: the spill reasons
     // over WHICH tids are per-layer at all (flattened internally), and the BANK needs the class
     // boundaries to know which (class, iteration) launches must stay in one bank.
@@ -2511,6 +2514,7 @@ pub fn lower_subtile_tape_to_ktir<T: ktir_superdsc::collective::Tp, F: RopeForm>
         weight_ids,
         scratchy_triton_splice::PagedRows::of_requests(rows_are_requests),
         &per_layer_ext,
+        &twins,
         query_rows,
     )?;
     // ── THE TAPE'S SEGMENTS: prefix, ONE RANGE PER LOOP (an attention class's body), suffix ──
