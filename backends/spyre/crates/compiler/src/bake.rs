@@ -1850,6 +1850,24 @@ fn launch_tokens<T: scratchy_target_spyre::bundle_code::collective::Tp>(
             // The window cut, re-minted through the const fn that refuses a cut the window
             // does not have.
             let cut = proc_macro2::Literal::u32_unsuffixed(c.cut.index() as u32);
+            // The exchange: every peer, or a pairwise round re-minted through
+            // `PairwiseRound::baked`, the const fn that refuses a round past the world's.
+            let exchange = {
+                use scratchy_target_spyre::lower_subtile_tape_to_superdsc::bundle::collective::Exchange as X;
+                match c.exchange {
+                    X::EveryPeer => {
+                        quote! { ::scratchy_target_spyre::bundle_code::collective::Exchange::EveryPeer }
+                    }
+                    X::Pairwise(round) => {
+                        let r = proc_macro2::Literal::u32_unsuffixed(round.get());
+                        quote! {
+                            ::scratchy_target_spyre::bundle_code::collective::Exchange::Pairwise(
+                                ::scratchy_target_spyre::bundle_code::collective::PairwiseRound::baked(#r),
+                            )
+                        }
+                    }
+                }
+            };
             quote! {
                 ::core::option::Option::Some(::scratchy_target_spyre::bundle_code::collective::TpConsume {
                     kind: #kind,
@@ -1859,6 +1877,7 @@ fn launch_tokens<T: scratchy_target_spyre::bundle_code::collective::Tp>(
                     ),
                     plays_at: #plays_at,
                     cut: ::scratchy_target_spyre::bundle_code::collective::WindowCut::baked(#cut),
+                    exchange: #exchange,
                 })
             }
         }

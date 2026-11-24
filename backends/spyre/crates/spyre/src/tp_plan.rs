@@ -145,27 +145,29 @@ mod tests {
 
     /// ⭐ THE EMISSION, END TO END ON THE HOST, AT EVERY WORLD: the analysis's decode layer,
     /// lowered to SubtileIR, through the producer's own node lowering and the launch index. Each
-    /// all-reduce becomes, PER RANK, `W - 1` device programs — the rank-order chain of adds over
-    /// every rank's share — all carrying ONE consume marker that plays at that rank. Its sends are
-    /// no program at all: F-send control blocks the CB pipeline issues from what the consume names.
-    /// Each rank's consume is its own launch group.
+    /// all-reduce becomes, PER RANK, `log2(W)` device programs — spyre-comms' pairwise rounds, one
+    /// add each — each carrying its round's consume marker that plays at that rank. Round 0 sends
+    /// and adds the partial; every later round the output the round before wrote. Its sends are no
+    /// program at all: F-send control blocks the CB pipeline issues from what the consume names.
+    /// Each (rank, round) consume is its own launch group.
     #[test]
-    fn an_all_reduce_lowers_to_one_consume_group_per_rank_naming_its_sends() {
+    fn an_all_reduce_lowers_to_one_consume_group_per_rank_and_round_naming_its_sends() {
         use crate::lower_subtile_tape_to_ktir::{NodeLowering, lower_one_node};
         use crate::lower_subtile_tape_to_superdsc::{FoldGrouping, launch_index};
-        use ktir_superdsc::collective::{CollectiveKind, WindowCut};
+        use ktir_superdsc::collective::{CollectiveKind, Exchange, WindowCut, pairwise_rounds};
         use ktir_superdsc::ktir_node::ActiveCap;
         use ktir_superdsc::place::PlaceId;
         use scratchy_subtile::subtile_ir::{SubOp, lower_region};
 
         fn check<T: Tp>() {
             let n = T::RANKS as usize;
+            let rounds = T::PAIRWISE_ROUNDS as usize;
             let b = tp_bake::<T>(&one_layer_input()).unwrap();
             let ir = lower_region(&b.sharded.local, std::num::NonZeroU32::new(128).unwrap());
             let mut ops = Vec::new();
-            let mut operands = Vec::new();
+            let mut nodes = Vec::new();
             for node in ir.nodes.iter().filter(|n| matches!(n.op, SubOp::AllReduce)) {
-                operands.push(PlaceId::Act(node.inputs[0].tensor.index() as u32));
+                nodes.push(node);
                 match lower_one_node::<T, _>(
                     node,
                     &ir,
@@ -180,15 +182,26 @@ mod tests {
             }
             assert_eq!(
                 ops.len(),
-                operands.len() * n * (n - 1),
-                "world {n}: per all-reduce, per rank, W - 1 adds — and no send program"
+                nodes.len() * n * rounds,
+                "world {n}: per all-reduce, per rank, log2(W) adds — and no send program"
             );
             for (i, e) in ops.iter().enumerate() {
                 let c = e.tp_consume.expect("every program is a consume");
-                let k = i / (n * (n - 1));
+                let k = i / (n * rounds);
+                let round = pairwise_rounds::<T>().nth(i % rounds).unwrap();
+                let sent = if round.get() == 0 {
+                    nodes[k].inputs[0].tensor
+                } else {
+                    nodes[k].output.tensor
+                };
                 assert_eq!(
-                    (c.kind, c.operand),
-                    (CollectiveKind::AllReduce, operands[k])
+                    (c.kind, c.operand, c.exchange),
+                    (
+                        CollectiveKind::AllReduce,
+                        PlaceId::Act(sent.index() as u32),
+                        Exchange::Pairwise(round)
+                    ),
+                    "round 0 sends the partial, later rounds the running sum"
                 );
                 assert_eq!(
                     c.cut,
@@ -202,43 +215,42 @@ mod tests {
                 );
                 assert_eq!(
                     c.plays_at.get() as usize,
-                    (i % (n * (n - 1))) / (n - 1),
-                    "each rank's chain plays at that rank"
+                    (i % (n * rounds)) / rounds,
+                    "each rank's rounds play at that rank"
                 );
-            }
-            // Every rank's chain reads every PEER's block of the cut, and never its own.
-            for (k, chain) in ops.chunks(n * (n - 1)).enumerate() {
-                for me in ranks::<T>() {
-                    let mine = &chain[me.get() as usize * (n - 1)..][..n - 1];
-                    let read: std::collections::BTreeSet<u32> = mine
-                        .iter()
-                        .flat_map(|e| e.ktir.as_ref().expect("a program").bindings.iter())
-                        .map(|b| b.get())
-                        .collect();
-                    let cut = WindowCut::of_collective(k);
-                    for s in ranks::<T>() {
-                        assert_eq!(
-                            read.contains(&cut.block_tid(s)),
-                            s != me,
-                            "world {n}: rank {} reads rank {}'s block iff it is a peer",
-                            me.get(),
-                            s.get()
-                        );
-                    }
+                // Each round's add reads its partner's block of the cut, and no other.
+                let read: std::collections::BTreeSet<u32> = e
+                    .ktir
+                    .as_ref()
+                    .expect("a program")
+                    .bindings
+                    .iter()
+                    .map(|b| b.get())
+                    .collect();
+                let partner = c.plays_at.partner(round);
+                for s in ranks::<T>() {
+                    assert_eq!(
+                        read.contains(&c.cut.block_tid(s)),
+                        s == partner,
+                        "world {n}: rank {} round {} reads rank {}'s block iff it is the partner",
+                        c.plays_at.get(),
+                        round.get(),
+                        s.get()
+                    );
                 }
             }
             let shifts = launch_index(&ops, FoldGrouping::Split);
             assert_eq!(
                 shifts.len(),
-                operands.len() * n,
-                "one launch group per (collective, rank)"
+                nodes.len() * n * rounds,
+                "one launch group per (collective, rank, round)"
             );
         }
         at_every_world!(check);
     }
 
     /// ⭐ THROUGH THE DOOR, AS A BAKE LOWERS IT: the consume marker survives the SuperDSC door, and
-    /// the launch index makes ONE group per (collective, rank) whose shifts carry the marker.
+    /// the launch index makes ONE group per (collective, rank, round) whose shifts carry the marker.
     #[test]
     fn the_consume_survives_the_door_as_one_group_per_rank() {
         use crate::lower_subtile_tape_to_ktir::lower_graph_to_superdsc;
@@ -264,12 +276,17 @@ mod tests {
             let consume_groups: Vec<_> = shifts.iter().filter_map(|s| s.tp).collect();
             assert_eq!(
                 consume_groups.len(),
-                T::RANKS as usize,
-                "one launch group per rank's consume"
+                (T::RANKS * T::PAIRWISE_ROUNDS) as usize,
+                "one launch group per (rank, round) consume"
             );
             let mut ranks: Vec<u32> = consume_groups.iter().map(|c| c.plays_at.get()).collect();
             ranks.sort_unstable();
-            assert_eq!(ranks, (0..T::RANKS).collect::<Vec<_>>());
+            assert_eq!(
+                ranks,
+                (0..T::RANKS)
+                    .flat_map(|r| std::iter::repeat_n(r, T::PAIRWISE_ROUNDS as usize))
+                    .collect::<Vec<_>>()
+            );
         }
         at_every_world!(check);
     }
@@ -418,14 +435,14 @@ mod tests {
         out
     }
 
-    /// ⭐ THE STATIC AUDIT (#1007 §5), AT EVERY WORLD: every peer's block a rank's consume reads is
-    /// addressed, in the very input dxp compiles, at its TYPED placement (`SEGMENT_OFFSETS[segment]`
-    /// plus the offset, the emitter's own segment law), once per core the reading descriptor runs on,
-    /// and the rank's OWN block
-    /// is never read. (Compiled by hand with `dxp_standalone` through the `dump_tp_consume_sdsc`
+    /// ⭐ THE STATIC AUDIT (#1007 §5), AT EVERY WORLD: every partner's block a rank's round consumes
+    /// read is addressed, in the very input dxp compiles, at its TYPED placement
+    /// (`SEGMENT_OFFSETS[segment]` plus the offset, the emitter's own segment law), once per core the
+    /// reading descriptor runs on; the rank's OWN block, and every peer that is no round's partner,
+    /// are never read. (Compiled by hand with `dxp_standalone` through the `dump_tp_consume_sdsc`
     /// example.)
     #[test]
-    fn each_consume_reads_every_peer_block_at_its_typed_placement() {
+    fn each_consume_reads_its_partners_blocks_at_their_typed_placement() {
         use crate::lower_subtile_tape_to_ktir::lower_graph_to_superdsc;
         use ktir_superdsc::ktir_node::ActiveCap;
         use ktir_superdsc::wire::SEGMENT_OFFSETS;
@@ -459,6 +476,9 @@ mod tests {
                     "rank {}'s consume states no address",
                     me.get()
                 );
+                let partners: Vec<_> = ktir_superdsc::collective::pairwise_rounds::<T>()
+                    .map(|round| me.partner(round))
+                    .collect();
                 for s in ranks::<T>() {
                     let (want, size) = at(cut.block_tid(s));
                     let reads: Vec<u64> = starts
@@ -466,8 +486,14 @@ mod tests {
                         .copied()
                         .filter(|a| (want..want + size).contains(a))
                         .collect();
-                    if s == me {
-                        assert!(reads.is_empty(), "rank {} reads its own block", me.get());
+                    if !partners.contains(&s) {
+                        assert!(
+                            reads.is_empty(),
+                            "world {}: rank {} reads rank {}'s block, no round's partner",
+                            T::RANKS,
+                            me.get(),
+                            s.get()
+                        );
                     } else {
                         assert!(
                             reads.contains(&want),

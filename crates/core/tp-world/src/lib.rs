@@ -37,6 +37,18 @@ pub trait World:
     );
     /// Whether this world exchanges anything at all.
     const SHARDED: bool = Self::RANKS > 1;
+    /// ⭐ HOW MANY PAIRWISE ROUNDS AN ALL-REDUCE TAKES — spyre-comms' `AllReduce_PairwisePow2`
+    /// (`src/coll/allreduce.cpp`): in round `r` each rank and its partner `rank ^ 2^r` swap their
+    /// running sums, so after `log2(RANKS)` rounds every rank holds every rank's. A world whose rank
+    /// count is not a power of two has no such pairing and fails the build here.
+    const PAIRWISE_ROUNDS: u32 = {
+        let () = Self::NONEMPTY;
+        assert!(
+            Self::RANKS.is_power_of_two(),
+            "a pairwise all-reduce pairs every rank each round: a power-of-two world"
+        );
+        Self::RANKS.trailing_zeros()
+    };
 }
 
 /// ⭐ THE WORLD OF `N` RANKS — the newtype a build's `tp/N` names (`tp/1` is the default, a world
@@ -131,6 +143,64 @@ impl<T: World> Rank<T> {
     pub fn peers(self) -> impl Iterator<Item = Rank<T>> {
         ranks::<T>().filter(move |p| *p != self)
     }
+
+    /// ⭐ THIS RANK'S PARTNER IN PAIRWISE ROUND `round` — [`pairwise_partner`], the one rank it
+    /// swaps running sums with in that round of the all-reduce. In range by construction: `round` is
+    /// below [`World::PAIRWISE_ROUNDS`], so `2^round` is below `RANKS`, a power of two, and the XOR
+    /// stays below it. The pairing is symmetric: each rank is its partner's partner.
+    pub const fn partner(self, round: PairwiseRound<T>) -> Self {
+        Self(pairwise_partner(self.0, round.0), PhantomData)
+    }
+}
+
+/// ⭐ THE PAIRWISE LAW — rank `rank`'s partner in round `round` of spyre-comms'
+/// `AllReduce_PairwisePow2`: `rank ^ 2^round`. [`Rank::partner`] mints it as a rank of its world;
+/// a host reference over a world's buffers (the shared analysis's `eval_collective`) indexes by it.
+pub const fn pairwise_partner(rank: u32, round: u32) -> u32 {
+    rank ^ (1 << round)
+}
+
+/// ⭐ ROUND `r` OF WORLD `T`'S PAIRWISE ALL-REDUCE — minted only by [`pairwise_rounds`] and
+/// [`PairwiseRound::baked`], so `r < T::PAIRWISE_ROUNDS` holds by construction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PairwiseRound<T: World>(u32, PhantomData<T>);
+
+impl<T: World> PairwiseRound<T> {
+    /// Re-mint from the round the `#[forward]` macro bakes into a `static` — a `const fn`, so a
+    /// round past the world fails the BUILD of the crate that bakes it.
+    ///
+    /// ```compile_fail
+    /// use scratchy_tp_world::{PairwiseRound, TpWorld};
+    /// const R: PairwiseRound<TpWorld<4>> = PairwiseRound::baked(2);
+    /// ```
+    pub const fn baked(r: u32) -> Self {
+        assert!(r < T::PAIRWISE_ROUNDS, "a baked pairwise round is below its world's");
+        Self(r, PhantomData)
+    }
+
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+
+    /// The distance to this round's partner: `2^round`.
+    pub const fn step(self) -> u32 {
+        1 << self.0
+    }
+}
+
+/// Every pairwise round of world `T`'s all-reduce, in order: `log2(RANKS)` of them, none in a world
+/// of one.
+///
+/// ```
+/// use scratchy_tp_world::{pairwise_rounds, ranks, TpWorld};
+/// type W = TpWorld<8>;
+/// assert_eq!(pairwise_rounds::<W>().count(), 3);
+/// let r1 = ranks::<W>().nth(1).unwrap();
+/// let partners: Vec<u32> = pairwise_rounds::<W>().map(|r| r1.partner(r).get()).collect();
+/// assert_eq!(partners, [0, 3, 5]);
+/// ```
+pub fn pairwise_rounds<T: World>() -> impl Iterator<Item = PairwiseRound<T>> {
+    (0..T::PAIRWISE_ROUNDS).map(|r| PairwiseRound(r, PhantomData))
 }
 
 /// ⭐ ONE `X` PER RANK OF WORLD `T` — minted only by [`PerRank::from_fn`] (or its fallible twin)
@@ -266,6 +336,34 @@ mod tests {
         check::<TpWorld<4>>();
         check::<TpWorld<8>>();
         check::<TpWorld<32>>();
+    }
+
+    /// Every pairwise round pairs every rank with a peer that pairs back (the swap is symmetric),
+    /// and a rank's partners over the rounds are `log2(RANKS)` distinct peers: each round's message
+    /// comes from a sender no other round of the same all-reduce hears from.
+    #[test]
+    fn a_pairwise_round_pairs_every_rank_with_a_distinct_peer() {
+        fn check<T: World>() {
+            assert_eq!(1 << T::PAIRWISE_ROUNDS, T::RANKS);
+            for me in ranks::<T>() {
+                let partners: alloc::vec::Vec<Rank<T>> =
+                    pairwise_rounds::<T>().map(|r| me.partner(r)).collect();
+                for (r, p) in pairwise_rounds::<T>().zip(&partners) {
+                    assert_ne!(*p, me);
+                    assert_eq!(p.partner(r), me);
+                }
+                let mut seen: alloc::vec::Vec<u32> = partners.iter().map(|p| p.get()).collect();
+                seen.sort_unstable();
+                seen.dedup();
+                assert_eq!(seen.len(), partners.len());
+                assert_eq!(partners.len() as u32, T::PAIRWISE_ROUNDS);
+            }
+        }
+        check::<TpWorld<1>>();
+        check::<TpWorld<2>>();
+        check::<TpWorld<4>>();
+        check::<TpWorld<8>>();
+        check::<TpWorld<16>>();
     }
 
     /// A per-rank list holds one value per rank, indexed by the rank itself.

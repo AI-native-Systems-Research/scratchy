@@ -220,7 +220,7 @@ pub(crate) struct SiteTp<T: ktir_superdsc::collective::Tp> {
 }
 
 /// ⭐ ONE (op, PASS)'S CONTROL BLOCKS — its launch, and in front of a collective's consume a send to
-/// every peer and a wait on every peer, in the bundle's own order ([`group_steps`]). The submit walk and
+/// and a wait on each of its exchange's peers, in the bundle's own order ([`group_steps`]). The submit walk and
 /// [`walk_items`] both stage through this, so the walk and the replay canvas cannot disagree about a
 /// collective's CBs any more than about a launch's.
 ///
@@ -292,22 +292,23 @@ pub(crate) fn site_cbs<T: ktir_superdsc::collective::Tp>(
             // messages is waited for N times, once per slot. Every rank's run is this rank's own —
             // the forward is SPMD and the fragment is the payload's — so this rank's messages name
             // `from`'s slots too.
-            // ⭐ ONE WAIT CB PER MESSAGE SLOT, OVER EVERY PEER AT ONCE. The wdone barrier waits on a
-            // SET of sids (its list bitmask) and consumes one count from each — measured on four
-            // cards (`cards_all_gather`, `ONE_WAIT=1`: byte-exact, every wdone back to 0) — so the
-            // `W - 1` peers' landings into slot `s` are one CB, not `W - 1`. The pipeline names
-            // every peer's wait step in order; the CB for the slot is staged at the first and covers
-            // them all, so the later steps stage nothing.
-            CbStep::Wait { from, .. } => {
-                let Some(BoundCollective { send, me }) = bound else {
+            // ⭐ ONE WAIT CB PER MESSAGE SLOT, OVER EVERY PEER OF THE EXCHANGE AT ONCE. The wdone
+            // barrier waits on a SET of sids (its list bitmask) and consumes one count from each —
+            // measured on four cards (`cards_all_gather`, `ONE_WAIT=1`: byte-exact, every wdone
+            // back to 0) — so the exchange's peers' landings into slot `s` are one CB, not one per
+            // peer. The pipeline names every peer's wait step in order (`TpConsume::peers`: every
+            // peer for an all-gather, the round's one partner for an all-reduce round); the CB for
+            // the slot is staged at the first and covers them all, so the later steps stage nothing.
+            CbStep::Wait { from, consume, .. } => {
+                let Some(BoundCollective { send, .. }) = bound else {
                     bail!("group {index} waits with no binding");
                 };
-                if me.peers().next() != Some(from) {
+                if consume.peers().next() != Some(from) {
                     continue;
                 }
                 for m in send.messages() {
                     out.push(BatchedCb::Wait {
-                        sids: me.peers().map(|p| Sid::of(p, m.slot).get()).collect(),
+                        sids: consume.peers().map(|p| Sid::of(p, m.slot).get()).collect(),
                     });
                 }
             }
@@ -465,8 +466,8 @@ mod tests {
     use flex_rs::address::{ByteOffset, RegionId};
     use flex_rs::memory_region::DomainId;
     use scratchy_target_spyre::bundle_code::collective::{
-        CollectiveKind, CutPayload, LandingSlot, Payload, Rank, Tp, TpWorld, WindowCut, WireBytes,
-        World, fragments, ranks,
+        CollectiveKind, CutPayload, Exchange, LandingSlot, Payload, Rank, Tp, TpWorld, WindowCut,
+        WireBytes, World, fragments, pairwise_rounds, ranks,
     };
 
     /// One launch over seven distinct segment bases, region `10 + segment`.
@@ -493,6 +494,7 @@ mod tests {
             fragment: fragments(1, 2048, Payload::from(WireBytes::CAP)).unwrap()[0],
             plays_at: me,
             cut: WindowCut::of_collective(0),
+            exchange: Exchange::EveryPeer,
         }
     }
 
@@ -560,6 +562,56 @@ mod tests {
         }
         check::<TpWorld<2>>();
         check::<TpWorld<3>>();
+        check::<TpWorld<4>>();
+        check::<TpWorld<8>>();
+    }
+
+    /// An all-reduce round's site, at every power-of-two world: ONE send, to the round's partner
+    /// alone (its BAT entry), barriered behind the compute that wrote the running sum; ONE wait,
+    /// on the partner's sid alone; then the barriered consume.
+    #[test]
+    fn a_pairwise_round_site_sends_to_and_waits_on_its_partner_alone() {
+        fn check<T: Tp>() {
+            let cut = WindowCut::of_collective(0);
+            let slot = LandingSlot::of(cut, 0).unwrap();
+            for me in ranks::<T>() {
+                for round in pairwise_rounds::<T>() {
+                    let send = TpSend {
+                        source_segment: 3,
+                        source_offset: 4096,
+                        window_offset: 1 << 20,
+                        bytes: CutPayload::new(Payload::new(4096).unwrap()).unwrap(),
+                        cut,
+                    };
+                    let cbs = site_cbs(
+                        SiteTp {
+                            index: 5,
+                            consume: Some(TpConsume {
+                                exchange: Exchange::Pairwise(round),
+                                ..consume(me)
+                            }),
+                            bound: Some(BoundCollective { send, me }),
+                        },
+                        launch(),
+                    )
+                    .unwrap();
+                    let partner = me.partner(round);
+                    assert_eq!(cbs.len(), 3, "world {} round {}", T::RANKS, round.get());
+                    let BatchedCb::Send(s) = &cbs[0] else {
+                        panic!("the send leads");
+                    };
+                    assert_eq!(
+                        (s.sid, s.dest_tid, s.barrier),
+                        (Sid::of(me, slot).get(), partner.get() as u8, true)
+                    );
+                    assert!(
+                        matches!(&cbs[1], BatchedCb::Wait { sids } if *sids == [Sid::of(partner, slot).get()])
+                    );
+                    assert!(matches!(cbs[2], BatchedCb::Consume(_)));
+                }
+            }
+        }
+        check::<TpWorld<2>>();
         check::<TpWorld<4>>();
         check::<TpWorld<8>>();
     }
