@@ -33,8 +33,8 @@ pub mod reduce;
 pub mod rmsnorm;
 
 pub use matmul::{
-    RowsOperand, RowsShape, SharedKernelBmmForm, assemble_matmul, assemble_matmul_batched_off,
-    assemble_matmul_batched_seeded, assemble_matmul_off, assemble_matmul_off_phys_m,
+    MatmulCounts, MatmulDims, MatmulNames, MatmulOperands, NamedOperands, RowsOperand, RowsShape,
+    SharedKernelBmmForm, assemble_matmul, assemble_matmul_off, assemble_matmul_off_phys_m,
     assemble_matmul_placed, assemble_matmul_rows, assemble_matmul_seeded, assemble_matmul_split,
     assemble_matmul_windowed, matmul_opspec, matmul_opspec_batched, matmul_opspec_batched_off,
     matmul_opspec_off, matmul_opspec_off_operands, matmul_opspec_split, try_assemble_matmul_seeded,
@@ -54,4 +54,4 @@ pub use reduce::{
     assemble_reduce_split, reduce_opspec, reduce_opspec_df, reduce_opspec_off,
     reduce_opspec_off_divided, win_reduce_accum, win_reduce_data,
 };
-pub use rmsnorm::{assemble_rmsnorm, assemble_rmsnorm_unit, assemble_tanhsoftcap};
+pub use rmsnorm::{RowIsland, assemble_rmsnorm, assemble_rmsnorm_unit, assemble_tanhsoftcap};

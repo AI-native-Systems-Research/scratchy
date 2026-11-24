@@ -387,7 +387,7 @@ fn row_blocks_that_tile_the_view_fold_into_one_whole_view_descriptor() {
     );
     let d = dsc(op);
     assert_eq!(
-        (d.N_.mb_, d.N_.out_),
+        (d.n.mb_, d.n.out_),
         (64, 128),
         "the folded descriptor spans the WHOLE view — the leader's r_cover is the hull of every \
          block's store, and node_rows folds that into the row count. A descriptor cut to block \
@@ -473,7 +473,7 @@ fn a_column_chunked_pair_is_not_a_row_family() {
         assert_eq!(op.time, 1, "a per-op lowering emits no tiling of its own");
         let d = dsc(op);
         assert_eq!(
-            (d.N_.mb_, d.N_.out_),
+            (d.n.mb_, d.n.out_),
             (64, 64),
             "each op's iteration space is its OWN `[64, 64]` chunk — the view's 128 cols would \
              be the fold's one whole-view descriptor"
@@ -488,12 +488,12 @@ fn a_column_chunked_pair_is_not_a_row_family() {
         op: &ktir_superdsc::emit::EmittedOp<ktir_superdsc::collective::TpWorld<1>>,
     ) -> std::collections::BTreeMap<String, std::collections::BTreeMap<String, u64>> {
         let mut out = std::collections::BTreeMap::new();
-        for n in &dsc(op).scheduleTree_ {
-            if n.nodeType_ != "allocate" {
+        for n in &dsc(op).schedule_tree {
+            if n.node_type != "allocate" {
                 continue;
             }
             let cores = n
-                .startAddressCoreCorelet_
+                .start_address_core_corelet
                 .data_
                 .iter()
                 .map(|(core, addr)| {
@@ -559,7 +559,7 @@ fn row_blocks_of_a_bare_silu_fold_into_one_whole_view_descriptor() {
     );
     let d = dsc(op);
     assert_eq!(
-        (d.N_.mb_, d.N_.out_),
+        (d.n.mb_, d.n.out_),
         (64, 128),
         "the folded descriptor spans the WHOLE view, exactly as the binary family's does"
     );

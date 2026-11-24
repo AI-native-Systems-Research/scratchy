@@ -34,21 +34,26 @@ use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::SharedKernelBmmForm;
 use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::matmul_opspec_off_operands;
 use ktir_superdsc::sdsc_abstract::{MatK, MatM, MatN, MatY};
 use ktir_superdsc::superdsc_opspec::Df;
+use scratchy_target_spyre::lower_subtile_tape_to_superdsc::{MatmulDims, NamedOperands};
 
 /// The split the emitter chose for one matmul, as `{axis: cores}`.
 fn splits(m: u32, n: u32, k: u32, df: Df) -> std::collections::BTreeMap<String, u32> {
     let spec = matmul_opspec_off_operands::<ktir_superdsc::superdsc_opspec::Fp16>(
-        MatM::of_token_rows(m),
-        MatN::of_out_features(n),
-        MatK::of_in_features(k),
+        MatmulDims {
+            m: MatM::of_token_rows(m),
+            n: MatN::of_out_features(n),
+            k: MatK::of_in_features(k),
+        },
         MatY::unbatched(),
         SharedKernelBmmForm::of_kv_cache_write(),
-        "t_a",
-        "t_w",
-        "t_o",
-        0,
-        0,
-        0,
+        NamedOperands {
+            a_name: "t_a",
+            w_name: "t_w",
+            o_name: "t_o",
+            a_off: 0,
+            w_off: 0,
+            o_off: 0,
+        },
         df,
     )
     .expect("a plain 2-D matmul opspec");

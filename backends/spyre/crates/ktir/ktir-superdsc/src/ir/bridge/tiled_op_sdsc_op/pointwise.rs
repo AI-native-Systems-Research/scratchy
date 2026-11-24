@@ -4,13 +4,14 @@
 //! than folded into a bigger one.
 
 use crate::addr::OutCorner;
+use crate::emit::EwSpec;
 use crate::emit::{EmittedOp, EwOperand, op_func_from_str};
 use crate::ir::island::tile_op::TileOp;
 use crate::placement::BundleLayout;
 use crate::sdsc_abstract::{KindTag, StickKind, Stk};
 use crate::superdsc_opspec::{
     Allocation, AnyTensorArg, DataFormat, Df, Fp16, OpFunc, OpInfo, OpSpec, Role, Scale,
-    SdscFoldSet, TensorArg,
+    SdscFoldSet, TensorArg, TensorArgDecl,
 };
 use crate::work::{CoreDivision, EwDivision};
 
@@ -832,16 +833,16 @@ fn landing_arg<DF: DataFormat>(
             DF::DF,
         ));
     Ok(AnyTensorArg::R4(
-        TensorArg::<4>::new(
+        TensorArg::<4>::new(TensorArgDecl {
             is_input,
-            name.to_string(),
+            name: name.to_string(),
             role,
-            [Scale::Active; 4],
-            plan.iter_syms(layout),
+            scale: [Scale::Active; 4],
+            device_dims: plan.iter_syms(layout),
             layout,
-            "out",
-            Allocation::Hbm,
-        )
+            stick: "out",
+            allocation: Allocation::Hbm,
+        })
         .map_err(|e| e.0)?
         .with_device_order(["x", "out", "y", "mb"])
         .map_err(|e| e.0)?
@@ -967,16 +968,16 @@ pub fn index_select_opspec<L: LandingOp>(
     let plan = landing_plan(&dims)?;
     let layout = ["mb", "y", "x", "out"];
     let input = AnyTensorArg::R4(
-        TensorArg::<4>::new(
-            true,
-            src.to_string(),
-            L::IN_ROLE,
-            [Scale::Active; 4],
-            plan.iter_syms(layout),
+        TensorArg::<4>::new(TensorArgDecl {
+            is_input: true,
+            name: src.to_string(),
+            role: L::IN_ROLE,
+            scale: [Scale::Active; 4],
+            device_dims: plan.iter_syms(layout),
             layout,
-            "out",
-            Allocation::Hbm,
-        )
+            stick: "out",
+            allocation: Allocation::Hbm,
+        })
         .map_err(|e| e.0)?
         .with_device_order(["out", "x", "y", "mb"])
         .map_err(|e| e.0)?
@@ -1087,16 +1088,16 @@ pub fn expand_blocks_opspec(
     let layout = ["mb", "x", "y", "out"];
     let arg = |is_input: bool, name: &str, scale: [Scale; 4]| -> Result<_, String> {
         Ok(AnyTensorArg::R4(
-            TensorArg::<4>::new(
+            TensorArg::<4>::new(TensorArgDecl {
                 is_input,
-                name.to_string(),
-                Role::Output,
+                name: name.to_string(),
+                role: Role::Output,
                 scale,
-                plan.iter_syms(layout),
+                device_dims: plan.iter_syms(layout),
                 layout,
-                "out",
-                Allocation::Hbm,
-            )
+                stick: "out",
+                allocation: Allocation::Hbm,
+            })
             .map_err(|e| e.0)?
             .with_device_order(["y", "out", "x", "mb"])
             .map_err(|e| e.0)?,
@@ -1181,16 +1182,16 @@ pub fn stick_permute_opspec(
     let (plan, time_tile) = (tiled.plan, tiled.time_tile);
     let arg = |is_input: bool, name: &str, order: SprayOrder| -> Result<AnyTensorArg, String> {
         Ok(AnyTensorArg::R3(
-            TensorArg::<3>::new(
+            TensorArg::<3>::new(TensorArgDecl {
                 is_input,
-                name.to_string(),
-                Role::Output,
-                [Scale::Active, Scale::Active, Scale::Active],
-                plan.iter_syms(order.layout()),
-                order.layout(),
-                "out",
-                Allocation::Hbm,
-            )
+                name: name.to_string(),
+                role: Role::Output,
+                scale: [Scale::Active, Scale::Active, Scale::Active],
+                device_dims: plan.iter_syms(order.layout()),
+                layout: order.layout(),
+                stick: "out",
+                allocation: Allocation::Hbm,
+            })
             .map_err(|e| e.0)?
             .with_df(df)
             .with_row_blocked(matches!(df, Df::Fp32))
@@ -1296,16 +1297,16 @@ pub fn stick_runs_copy_opspec(src: &str, dst: &str, runs: StickRuns) -> Result<O
     let (plan, time_tile) = (tiled.plan, tiled.time_tile);
     let arg =
         |is_input: bool, name: &str, pitch: u32, elems: u32| -> Result<AnyTensorArg, String> {
-            let t = TensorArg::<3>::new(
+            let t = TensorArg::<3>::new(TensorArgDecl {
                 is_input,
-                name.to_string(),
-                Role::Output,
-                [Scale::Active, Scale::Active, Scale::Active],
-                plan.iter_syms(["mb", "y", "out"]),
-                ["mb", "y", "out"],
-                "out",
-                Allocation::Hbm,
-            )
+                name: name.to_string(),
+                role: Role::Output,
+                scale: [Scale::Active, Scale::Active, Scale::Active],
+                device_dims: plan.iter_syms(["mb", "y", "out"]),
+                layout: ["mb", "y", "out"],
+                stick: "out",
+                allocation: Allocation::Hbm,
+            })
             .map_err(|e| e.0)?
             .with_df(df)
             .with_offset(elems)
@@ -1494,31 +1495,31 @@ where
     let mk = |is_input: bool, name: &str, off: u32| -> Result<AnyTensorArg, String> {
         if stickmajor {
             Ok(AnyTensorArg::R2(
-                TensorArg::<2>::new(
+                TensorArg::<2>::new(TensorArgDecl {
                     is_input,
-                    name.to_string(),
-                    Role::Output,
-                    [Scale::Active, Scale::Active],
-                    device_dims_r2,
-                    ["mb", "out"],
-                    "out",
-                    Allocation::Hbm,
-                )
+                    name: name.to_string(),
+                    role: Role::Output,
+                    scale: [Scale::Active, Scale::Active],
+                    device_dims: device_dims_r2,
+                    layout: ["mb", "out"],
+                    stick: "out",
+                    allocation: Allocation::Hbm,
+                })
                 .map_err(|e| e.0)?
                 .with_offset(off),
             ))
         } else {
             Ok(AnyTensorArg::R3(
-                TensorArg::<3>::new(
+                TensorArg::<3>::new(TensorArgDecl {
                     is_input,
-                    name.to_string(),
-                    Role::Output,
-                    [Scale::Active, Scale::Active, Scale::Active],
+                    name: name.to_string(),
+                    role: Role::Output,
+                    scale: [Scale::Active, Scale::Active, Scale::Active],
                     device_dims,
-                    ["mb", "out", "y"],
-                    "out",
-                    Allocation::Hbm,
-                )
+                    layout: ["mb", "out", "y"],
+                    stick: "out",
+                    allocation: Allocation::Hbm,
+                })
                 .map_err(|e| e.0)?
                 .with_offset(off),
             ))
@@ -1535,16 +1536,16 @@ where
     let output = match out_view.scatter_interleave {
         None => mk(false, o_name, out_view.offset)?,
         Some(interleave) => AnyTensorArg::R3(
-            TensorArg::<3>::new(
-                false,
-                o_name.to_string(),
-                Role::Output,
-                [Scale::Active, Scale::Active, Scale::Active],
-                plan.iter_syms(["mb", "y", "out"]),
-                ["mb", "y", "out"],
-                "out",
-                Allocation::Hbm,
-            )
+            TensorArg::<3>::new(TensorArgDecl {
+                is_input: false,
+                name: o_name.to_string(),
+                role: Role::Output,
+                scale: [Scale::Active, Scale::Active, Scale::Active],
+                device_dims: plan.iter_syms(["mb", "y", "out"]),
+                layout: ["mb", "y", "out"],
+                stick: "out",
+                allocation: Allocation::Hbm,
+            })
             .map_err(|e| e.0)?
             .with_offset(out_view.offset)
             .with_device_extent("y", interleave)
@@ -1574,16 +1575,17 @@ where
 /// pins). A gathered op passes [`CoreDivision::Gathered`] — its [`crate::work::GatherSplit`] is minted from
 /// its entries, not resolved from a layout, because only the entry axis may carry a split (the
 /// `skip_addr` law; see [`crate::work::GatherSplit`]).
-#[allow(clippy::too_many_arguments)]
 pub fn pointwise_broadcast_opspec_from_tile(
     tile_op: &TileOp,
-    rows: u32,
-    cols: u32,
-    op: OpFunc,
-    inputs: &[EwOperand<'_>],
-    o_name: &str,
-    out_offset: OutCorner,
-    head_major: bool,
+    crate::emit::EwSpec {
+        op,
+        rows,
+        cols,
+        inputs,
+        o_name,
+        out_offset,
+        head_major,
+    }: crate::emit::EwSpec<'_>,
     layout: Option<&BundleLayout>,
     division: CoreDivision,
 ) -> Result<OpSpec, String> {
@@ -1819,16 +1821,16 @@ pub fn pointwise_broadcast_opspec_from_tile(
               dev_rows: Option<u32>|
      -> Result<AnyTensorArg, String> {
         if stickmajor {
-            let t = TensorArg::<2>::new(
+            let t = TensorArg::<2>::new(TensorArgDecl {
                 is_input,
-                name.to_string(),
-                Role::Output,
-                [scale[0], scale[1]],
-                device_dims_r2,
-                ["mb", "out"],
-                "out",
-                Allocation::Hbm,
-            )
+                name: name.to_string(),
+                role: Role::Output,
+                scale: [scale[0], scale[1]],
+                device_dims: device_dims_r2,
+                layout: ["mb", "out"],
+                stick: "out",
+                allocation: Allocation::Hbm,
+            })
             .map_err(|e| e.0)?
             .with_offset(off)
             .with_df(df)
@@ -1840,19 +1842,19 @@ pub fn pointwise_broadcast_opspec_from_tile(
             Ok(AnyTensorArg::R2(t))
         } else {
             Ok(AnyTensorArg::R3({
-                let t = TensorArg::<3>::new(
+                let t = TensorArg::<3>::new(TensorArgDecl {
                     is_input,
-                    name.to_string(),
-                    Role::Output,
+                    name: name.to_string(),
+                    role: Role::Output,
                     scale,
                     device_dims,
-                    match spray {
+                    layout: match spray {
                         Some(order) => order.layout(),
                         None => ["mb", "out", "y"],
                     },
-                    "out",
-                    Allocation::Hbm,
-                )
+                    stick: "out",
+                    allocation: Allocation::Hbm,
+                })
                 .map_err(|e| e.0)?
                 .with_offset(off)
                 .with_df(df)
@@ -1915,13 +1917,14 @@ pub fn pointwise_broadcast_opspec_from_tile(
 /// params (needed for the SFP-transcendental guard and the stickmajor block-alignment calc — see
 /// [`pointwise_broadcast_opspec_from_tile`]'s doc for why they are not re-derived from
 /// `tile_op.dims`).
-#[allow(clippy::too_many_arguments)]
 pub fn assemble_pointwise_broadcast_off_from_tile<T: crate::collective::Tp, O: KindTag>(
-    op_name: &str,
+    crate::emit::OpDecl {
+        op_name,
+        op_func,
+        rows,
+        cols,
+    }: crate::emit::OpDecl<'_, u32, u32>,
     tile_op: &TileOp,
-    op_func: &'static str,
-    rows: u32,
-    cols: u32,
     inputs: &[EwOperand<'_>],
     o: &Stk<O>,
     out_offset: impl Into<OutCorner>,
@@ -1966,13 +1969,15 @@ pub fn assemble_pointwise_broadcast_off_from_tile<T: crate::collective::Tp, O: K
     }
     let op = pointwise_broadcast_opspec_from_tile(
         tile_op,
-        rows,
-        cols,
-        op_func_from_str(op_func),
-        inputs,
-        o_name,
-        out_offset,
-        head_major,
+        EwSpec {
+            op: op_func_from_str(op_func),
+            rows,
+            cols,
+            inputs,
+            o_name,
+            out_offset,
+            head_major,
+        },
         layout,
         CoreDivision::Ew(EwDivision::Law),
     )
@@ -2169,10 +2174,10 @@ mod stick_permute_tests {
         let sdsc = crate::emit::emit_sdsc("permute_o1", &op, &folds, None).expect("it emits");
         let dsc = &sdsc.dscs_[0]["permute_o1"];
         let side = |i: usize| {
-            let n = &dsc.scheduleTree_[i];
+            let n = &dsc.schedule_tree[i];
             (
-                n.layoutDimOrder_.clone(),
-                serde_json::to_value(&n.maxDimSizes_).expect("the walk serializes"),
+                n.layout_dim_order.clone(),
+                serde_json::to_value(&n.max_dim_sizes).expect("the walk serializes"),
             )
         };
         assert_eq!(

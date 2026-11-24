@@ -214,9 +214,9 @@ fn main() {
                     let Some(op) = &e.op else { continue };
                     for m in &op.dscs_ {
                         for dsc in m.values() {
-                            for n in &dsc.scheduleTree_ {
+                            for n in &dsc.schedule_tree {
                                 let a: Vec<&str> = n
-                                    .startAddressCoreCorelet_
+                                    .start_address_core_corelet
                                     .data_
                                     .values()
                                     .map(|s| s.as_str())

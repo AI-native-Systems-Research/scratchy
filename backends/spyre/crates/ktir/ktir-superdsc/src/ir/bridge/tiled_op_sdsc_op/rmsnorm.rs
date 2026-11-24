@@ -31,10 +31,22 @@ use super::reduce::{
     ReduceAccumLeg, ReduceDataLeg, ReduceDivision, ReduceGeometry, ReduceSplit,
     assemble_reduce_seeded, assemble_reduce_split,
 };
+use crate::emit::OpDecl;
 use crate::emit::{EmittedOp, In, op_func_from_str, pw1, pw2, rb};
 use crate::placement::BundleLayout;
 use crate::sdsc_abstract::{BlockCols, Lanes, RowCount};
 use crate::superdsc_opspec::{DataFormat, Df, Fp16};
+
+/// A row-wise island's input and output: the descriptor-name prefix its ops share, the
+/// `x[rows, cols]` it reads, and the synthesized output it writes.
+#[derive(Clone, Copy, Debug)]
+pub struct RowIsland<'a> {
+    pub prefix: &'a str,
+    pub rows: u32,
+    pub cols: u32,
+    pub x: &'a str,
+    pub out_id: crate::place::SynthId,
+}
 
 /// Assemble torch-spyre's `spyre_rms_norm` decomposition for one node: `x[rows,cols]`,
 /// `gamma[1,cols]`, `eps_const` a bound `[1,stick]` config constant → `out[rows,cols]`.
@@ -46,14 +58,15 @@ use crate::superdsc_opspec::{DataFormat, Df, Fp16};
 /// (`rmsnorm_oneplus_fwd`'s `w = load + GAIN_OFFSET`), never the algebraic
 /// `xn + xn·w` rewrite. `None` is the Scale convention: no add, the multiply
 /// reads the stored gamma, byte-identical to the form before the row existed.
-#[allow(clippy::too_many_arguments)]
 pub fn assemble_rmsnorm<T: crate::collective::Tp>(
-    prefix: &str,
-    rows: u32,
-    cols: u32,
-    x: &str,
+    RowIsland {
+        prefix,
+        rows,
+        cols,
+        x,
+        out_id,
+    }: RowIsland<'_>,
     gamma: &str,
-    out_id: crate::place::SynthId,
     eps_const: &str,
     ones_const: Option<&str>,
     sym_id_base: &mut i64,
@@ -165,10 +178,12 @@ pub fn assemble_rmsnorm<T: crate::collective::Tp>(
         ops.extend(split);
     } else {
         ops.push(assemble_reduce_seeded(
-            &rmmean_op,
-            "exx2",
-            rows,
-            cols,
+            OpDecl {
+                op_name: &rmmean_op,
+                op_func: "exx2",
+                rows,
+                cols,
+            },
             &x,
             &mean,
             sym_id_base,
@@ -180,10 +195,12 @@ pub fn assemble_rmsnorm<T: crate::collective::Tp>(
     //    unread (the tail reads element 8 only), the same computed-but-unread padding class the
     //    elementary chain always had.
     ops.push(pw2(
-        &format!("rmeps_{prefix}"),
-        "add",
-        t_rows,
-        s_cols,
+        OpDecl {
+            op_name: &format!("rmeps_{prefix}"),
+            op_func: "add",
+            rows: t_rows,
+            cols: s_cols,
+        },
         In::full(&mean),
         In::scalar(&eps),
         &meps,
@@ -248,10 +265,12 @@ pub fn assemble_rmsnorm<T: crate::collective::Tp>(
     let gamma_operand = match &gw_ones_h {
         Some((gw_handle, ones)) => {
             ops.push(pw2(
-                &format!("rmga_{prefix}"),
-                "add",
-                RowCount::of_token_rows(1),
-                BlockCols::of_feature_cols(cols),
+                OpDecl {
+                    op_name: &format!("rmga_{prefix}"),
+                    op_func: "add",
+                    rows: RowCount::of_token_rows(1),
+                    cols: BlockCols::of_feature_cols(cols),
+                },
                 In::mb(&gamma),
                 In::scalar(ones),
                 gw_handle,
@@ -263,10 +282,12 @@ pub fn assemble_rmsnorm<T: crate::collective::Tp>(
         None => In::mb(&gamma),
     };
     ops.push(pw2(
-        &format!("rmg_{prefix}"),
-        "multiply",
-        t_rows,
-        f_cols,
+        OpDecl {
+            op_name: &format!("rmg_{prefix}"),
+            op_func: "multiply",
+            rows: t_rows,
+            cols: f_cols,
+        },
         In::full(&xn),
         gamma_operand,
         &out,
@@ -289,13 +310,14 @@ pub fn assemble_rmsnorm<T: crate::collective::Tp>(
 /// The synthetic roles are the SHARED ones (`Sq16`/`Mean`/`Meps`/`Rinv`): the unit
 /// form mints no `Xn`, because the normalising multiply's result is the output
 /// buffer, not a synthetic intermediate.
-#[allow(clippy::too_many_arguments)]
 pub fn assemble_rmsnorm_unit<T: crate::collective::Tp>(
-    prefix: &str,
-    rows: u32,
-    cols: u32,
-    x: &str,
-    out_id: crate::place::SynthId,
+    RowIsland {
+        prefix,
+        rows,
+        cols,
+        x,
+        out_id,
+    }: RowIsland<'_>,
     eps_const: &str,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
@@ -335,10 +357,12 @@ pub fn assemble_rmsnorm_unit<T: crate::collective::Tp>(
     // Steps 1–4 are `assemble_rmsnorm` verbatim — the same formula up to the
     // normalising multiply, because a unit-gain norm is the same norm.
     ops.push(pw2(
-        &format!("rmsq_{prefix}"),
-        "mul",
-        t_rows,
-        f_cols,
+        OpDecl {
+            op_name: &format!("rmsq_{prefix}"),
+            op_func: "mul",
+            rows: t_rows,
+            cols: f_cols,
+        },
         In::full(&x),
         In::full(&x),
         &sq16,
@@ -371,10 +395,12 @@ pub fn assemble_rmsnorm_unit<T: crate::collective::Tp>(
         ops.extend(split);
     } else {
         ops.push(assemble_reduce_seeded(
-            &rmmean_op,
-            "mean",
-            rows,
-            cols,
+            OpDecl {
+                op_name: &rmmean_op,
+                op_func: "mean",
+                rows,
+                cols,
+            },
             &sq16,
             &mean,
             sym_id_base,
@@ -382,10 +408,12 @@ pub fn assemble_rmsnorm_unit<T: crate::collective::Tp>(
         )?);
     }
     ops.push(pw2(
-        &format!("rmeps_{prefix}"),
-        "add",
-        t_rows,
-        s_cols,
+        OpDecl {
+            op_name: &format!("rmeps_{prefix}"),
+            op_func: "add",
+            rows: t_rows,
+            cols: s_cols,
+        },
         In::full(&mean),
         In::scalar(&eps),
         &meps,
@@ -393,10 +421,12 @@ pub fn assemble_rmsnorm_unit<T: crate::collective::Tp>(
         layout,
     )?); // mean + eps
     ops.push(pw1(
-        &format!("rmrsqrt_{prefix}"),
-        "rsqrt",
-        t_rows,
-        s_cols,
+        OpDecl {
+            op_name: &format!("rmrsqrt_{prefix}"),
+            op_func: "rsqrt",
+            rows: t_rows,
+            cols: s_cols,
+        },
         In::full(&meps),
         &rinv,
         sym_id_base,
@@ -406,10 +436,12 @@ pub fn assemble_rmsnorm_unit<T: crate::collective::Tp>(
     // per-row reciprocal out-broadcast over cols — the same operand mode
     // (`In::col`) the gained form's `rmxn` uses for the same value.
     ops.push(pw2(
-        &format!("rmxn_{prefix}"),
-        "multiply",
-        t_rows,
-        f_cols,
+        OpDecl {
+            op_name: &format!("rmxn_{prefix}"),
+            op_func: "multiply",
+            rows: t_rows,
+            cols: f_cols,
+        },
         In::full(&x),
         In::col(&rinv),
         &out,
@@ -433,13 +465,14 @@ pub fn assemble_rmsnorm_unit<T: crate::collective::Tp>(
 /// like its producer and consumer, but it is a fresh buffer this lowering
 /// mints, so it takes a `SynthRole` (`Tanhc`) and is reserved through the
 /// layout exactly as `Sq16` is — placed, never aliased.
-#[allow(clippy::too_many_arguments)]
 pub fn assemble_tanhsoftcap<T: crate::collective::Tp>(
-    prefix: &str,
-    rows: u32,
-    cols: u32,
-    x: &str,
-    out_id: crate::place::SynthId,
+    RowIsland {
+        prefix,
+        rows,
+        cols,
+        x,
+        out_id,
+    }: RowIsland<'_>,
     cap_const: &str,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
@@ -461,10 +494,12 @@ pub fn assemble_tanhsoftcap<T: crate::collective::Tp>(
     // 1. scaled = x / cap (the cap `[1,1]` const, out-broadcast — the rmsnorm's
     //    `eps` operand mode).
     ops.push(pw2(
-        &format!("tscdiv_{prefix}"),
-        "realdiv",
-        t_rows,
-        f_cols,
+        OpDecl {
+            op_name: &format!("tscdiv_{prefix}"),
+            op_func: "realdiv",
+            rows: t_rows,
+            cols: f_cols,
+        },
         In::full(&x),
         In::scalar(&cap),
         &tanhc,
@@ -473,10 +508,12 @@ pub fn assemble_tanhsoftcap<T: crate::collective::Tp>(
     )?);
     // 2. tanh — in place on the scaled buffer's name, into the same synth.
     ops.push(pw1(
-        &format!("tscth_{prefix}"),
-        "tanh",
-        t_rows,
-        f_cols,
+        OpDecl {
+            op_name: &format!("tscth_{prefix}"),
+            op_func: "tanh",
+            rows: t_rows,
+            cols: f_cols,
+        },
         In::full(&tanhc),
         &tanhc,
         sym_id_base,
@@ -484,10 +521,12 @@ pub fn assemble_tanhsoftcap<T: crate::collective::Tp>(
     )?);
     // 3. out = cap · tanh(x/cap).
     ops.push(pw2(
-        &format!("tscmul_{prefix}"),
-        "multiply",
-        t_rows,
-        f_cols,
+        OpDecl {
+            op_name: &format!("tscmul_{prefix}"),
+            op_func: "multiply",
+            rows: t_rows,
+            cols: f_cols,
+        },
         In::full(&tanhc),
         In::scalar(&cap),
         &out,

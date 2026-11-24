@@ -52,6 +52,7 @@ use ktir_superdsc::emit as superdsc;
 use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::matmul::{
     SharedKernelBmmForm, matmul_opspec_off_operands_phys_gathered,
 };
+use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::{MatmulDims, NamedOperands};
 use ktir_superdsc::sdsc_abstract::{MatK, MatM, MatN, MatY, QueryRowCount};
 use ktir_superdsc::superdsc_opspec::{Fp16, GatherIndex, SdscFoldSet};
 
@@ -231,17 +232,21 @@ fn a_paged_gather_pins_a_page_axis_and_a_per_position_axis() {
 #[test]
 fn the_batch_invariant_matmul_form_is_refused_at_build_time() {
     let op = matmul_opspec_off_operands_phys_gathered::<Fp16>(
-        MatM::of_token_rows(8),
-        MatN::of_out_features(256),
-        MatK::of_in_features(64),
+        MatmulDims {
+            m: MatM::of_token_rows(8),
+            n: MatN::of_out_features(256),
+            k: MatK::of_in_features(64),
+        },
         MatY::of_batch(4),
         SharedKernelBmmForm::of_attn_rows(true, QueryRowCount::of_mq(8)),
-        "Tensor0",
-        "Tensor1",
-        "Tensor2",
-        0,
-        0,
-        0,
+        NamedOperands {
+            a_name: "Tensor0",
+            w_name: "Tensor1",
+            o_name: "Tensor2",
+            a_off: 0,
+            w_off: 0,
+            o_off: 0,
+        },
         <Fp16 as ktir_superdsc::superdsc_opspec::DataFormat>::DF,
         None,
         Some(GatherIndex::of_pool_blocks_per_row(

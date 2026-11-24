@@ -1094,10 +1094,10 @@ impl ChunkExplore {
     pub fn of_group<'a>(trips: impl IntoIterator<Item = &'a SdscOp>) -> ChunkExplore {
         let gathers_a_kernel = |op: &SdscOp| {
             op.dscs_.iter().flat_map(|m| m.values()).any(|d| {
-                d.primaryDsInfo_.contains_key("KERNEL")
-                    && d.computeOp_
+                d.primary_ds_info.contains_key("KERNEL")
+                    && d.compute_op
                         .iter()
-                        .any(|c| !c.indirectAccessIndexLabeledDs.is_empty())
+                        .any(|c| !c.indirect_access_index_labeled_ds.is_empty())
             })
         };
         if trips.into_iter().any(gathers_a_kernel) {

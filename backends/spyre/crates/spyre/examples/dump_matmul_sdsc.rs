@@ -5,9 +5,11 @@
 //!
 //!   cargo run -p scratchy-subtile --features spyre --example dump_matmul_sdsc
 
+use ktir_superdsc::emit::OpDecl;
 use ktir_superdsc::emit::{In, assemble_pointwise_broadcast};
 use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::assemble_matmul;
 use ktir_superdsc::sdsc_abstract::{KernelTag, RowBlockedTag, StickLayout, Stk};
+use scratchy_target_spyre::lower_subtile_tape_to_superdsc::MatmulCounts;
 
 /// The example's one error type: every builder's refusal, and the dump's own reads of the JSON it
 /// is handed, end the run with their message instead of panicking at a named `expect`.
@@ -96,10 +98,12 @@ fn main() -> Result<()> {
     if std::env::args().any(|a| a == "--full") {
         let e = assemble_matmul::<ktir_superdsc::collective::TpWorld<1>>(
             "MM",
-            8,
-            512,
-            2048,
-            1,
+            MatmulCounts {
+                m: 8,
+                n: 512,
+                k: 2048,
+                batch: 1,
+            },
             &rbh("Tensor0", 8, 2048)?,
             &kh("Tensor1", 2048, 512),
             &rbh("Tensor2", 8, 512)?,
@@ -112,10 +116,12 @@ fn main() -> Result<()> {
         // COMPLETE dsc JSON (every field) for the field-by-field diff vs the reference.
         let e = assemble_matmul::<ktir_superdsc::collective::TpWorld<1>>(
             "MM",
-            8,
-            512,
-            2048,
-            1,
+            MatmulCounts {
+                m: 8,
+                n: 512,
+                k: 2048,
+                batch: 1,
+            },
             &rbh("Tensor0", 8, 2048)?,
             &kh("Tensor1", 2048, 512),
             &rbh("Tensor2", 8, 512)?,
@@ -133,10 +139,12 @@ fn main() -> Result<()> {
         let ops = [In::full(&a0).ew(), In::full(&a1).ew()];
         let mut sib: i64 = 0;
         let e = assemble_pointwise_broadcast::<ktir_superdsc::collective::TpWorld<1>>(
-            "PW",
-            "multiply",
-            ktir_superdsc::sdsc_abstract::RowCount::of_token_rows(8),
-            ktir_superdsc::sdsc_abstract::BlockCols::of_feature_cols(2048),
+            OpDecl {
+                op_name: "PW",
+                op_func: "multiply",
+                rows: ktir_superdsc::sdsc_abstract::RowCount::of_token_rows(8),
+                cols: ktir_superdsc::sdsc_abstract::BlockCols::of_feature_cols(2048),
+            },
             &ops,
             &rbh("Tensor2", 8, 2048)?,
             &mut sib,
@@ -149,10 +157,12 @@ fn main() -> Result<()> {
         // v_proj: A[m, 2048] · W[2048, 512] -> O[m, 512]  (out=512=8 sticks → mb SPLIT to fill cores)
         let e = assemble_matmul::<ktir_superdsc::collective::TpWorld<1>>(
             "MM",
-            m,
-            512,
-            2048,
-            1,
+            MatmulCounts {
+                m,
+                n: 512,
+                k: 2048,
+                batch: 1,
+            },
             &rbh("Tensor0", m, 2048)?,
             &kh("Tensor1", 2048, 512),
             &rbh("Tensor2", m, 512)?,
@@ -166,10 +176,12 @@ fn main() -> Result<()> {
     // q_proj: out=2048=32 sticks → mb UNSPLIT (row_cores=1) like the pointwise. Does it still fail?
     let e = assemble_matmul::<ktir_superdsc::collective::TpWorld<1>>(
         "MM",
-        8,
-        2048,
-        2048,
-        1,
+        MatmulCounts {
+            m: 8,
+            n: 2048,
+            k: 2048,
+            batch: 1,
+        },
         &rbh("Tensor0", 8, 2048)?,
         &kh("Tensor1", 2048, 2048),
         &rbh("Tensor2", 8, 2048)?,

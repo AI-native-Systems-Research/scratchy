@@ -616,10 +616,10 @@ fn classify(
         return Err("the gather op states no descriptor".into());
     };
     let (mb, y, x, out) = (
-        dsc.N_.mb_ as u64,
-        dsc.N_.y_ as u64,
-        dsc.N_.x_ as u64,
-        dsc.N_.out_ as u64,
+        dsc.n.mb_ as u64,
+        dsc.n.y_ as u64,
+        dsc.n.x_ as u64,
+        dsc.n.out_ as u64,
     );
     // The restickify's one whole stick permute — present only at a rank-2 multi-stick
     // multi-entry frame, and then the runner reads ITS destination (the frame's own column).
@@ -639,7 +639,7 @@ fn classify(
                     .first()
                     .and_then(|m| m.values().next())
                     .ok_or("a chunk states no descriptor")?;
-                seen += d.N_.mb_ as u64;
+                seen += d.n.mb_ as u64;
             }
             if y != 1 || x != rows || out != cols || seen != entries {
                 return Err(format!(
@@ -665,7 +665,7 @@ fn classify(
                     .first()
                     .and_then(|m| m.values().next())
                     .ok_or("a chunk states no descriptor")?;
-                seen += d.N_.mb_ as u64;
+                seen += d.n.mb_ as u64;
             }
             if y != blocks || x != rows || out != cols || seen != entries {
                 return Err(format!(
@@ -694,7 +694,7 @@ fn classify(
                         .first()
                         .and_then(|m| m.values().next())
                         .ok_or("a chunk states no descriptor")?;
-                    seen += d.N_.mb_ as u64;
+                    seen += d.n.mb_ as u64;
                 }
                 if y != 1 || x != slab / w || out != w || seen != entries {
                     return Err(format!(
@@ -723,7 +723,7 @@ fn classify(
                         .first()
                         .and_then(|m| m.values().next())
                         .ok_or("a chunk states no descriptor")?;
-                    seen += d.N_.mb_ as u64;
+                    seen += d.n.mb_ as u64;
                 }
                 if y != slab / w || x != 1 || out != w || seen != entries {
                     return Err(format!(

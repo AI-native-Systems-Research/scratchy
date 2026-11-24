@@ -16,6 +16,7 @@
 //! [`one_row_core_fill`]: ktir_superdsc::work::one_row_core_fill
 
 use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::matmul_opspec;
+use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::{MatmulDims, NamedOperands};
 
 /// `(mb, out, in)` cores of the one-row matmul `[1, k] · [k, n]`, read off the plan the door built.
 fn split_triple(n: u32, k: u32) -> (u32, u32, u32) {
@@ -109,17 +110,21 @@ fn every_granite_8b_fp8_decode_contraction_runs_on_all_32_cores() {
         ("q_proj", 4096, 4096, (1, 32, 1), 1),
     ] {
         let spec = matmul_opspec_off_operands::<Fp16>(
-            MatM::of_token_rows(1),
-            MatN::of_out_features(n),
-            MatK::of_in_features(k),
+            MatmulDims {
+                m: MatM::of_token_rows(1),
+                n: MatN::of_out_features(n),
+                k: MatK::of_in_features(k),
+            },
             MatY::unbatched(),
             SharedKernelBmmForm::of_attn_rows(false, QueryRowCount::of_mq(1)),
-            "t_a",
-            "t_w",
-            "t_o",
-            0,
-            0,
-            0,
+            NamedOperands {
+                a_name: "t_a",
+                w_name: "t_w",
+                o_name: "t_o",
+                a_off: 0,
+                w_off: 0,
+                o_off: 0,
+            },
             Df::Fp8,
         )
         .expect("a one-row fp8 contraction");

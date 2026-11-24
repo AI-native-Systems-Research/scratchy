@@ -43,6 +43,7 @@ use ktir_superdsc::emit as superdsc;
 use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::matmul::{
     SharedKernelBmmForm, matmul_opspec_off_operands_phys_gathered,
 };
+use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::{MatmulDims, NamedOperands};
 use ktir_superdsc::sdsc_abstract::{MatK, MatM, MatN, MatY, QueryRowCount};
 use ktir_superdsc::superdsc_opspec::{
     EntryBase, Fp8, Fp16, GatherIndex, KernelAxis, PageExtent, SdscFoldSet,
@@ -56,18 +57,21 @@ use ktir_superdsc::superdsc_opspec::{
 /// first non-output operand's df).
 fn probe_matmul(gather: Option<GatherIndex>) -> ktir_superdsc::superdsc_opspec::OpSpec {
     let mut op = matmul_opspec_off_operands_phys_gathered::<Fp16>(
-        MatM::of_token_rows(96),
-        MatN::of_out_features(64),
-        MatK::of_in_features(2816),
+        MatmulDims {
+            m: MatM::of_token_rows(96),
+            n: MatN::of_out_features(64),
+            k: MatK::of_in_features(2816),
+        },
         MatY::unbatched(),
         SharedKernelBmmForm::of_attn_rows(false, QueryRowCount::of_mq(1)),
-        "Tensor0",
-        "Tensor1",
-        "Tensor3",
-        0,
-        0,
-        0,
-        // The W8A8 law: fp16 stick geometry, 1-byte operands — the door's own spelling.
+        NamedOperands {
+            a_name: "Tensor0",
+            w_name: "Tensor1",
+            o_name: "Tensor3",
+            a_off: 0,
+            w_off: 0,
+            o_off: 0,
+        }, // The W8A8 law: fp16 stick geometry, 1-byte operands — the door's own spelling.
         <Fp8 as ktir_superdsc::superdsc_opspec::DataFormat>::DF,
         None,
         gather,
@@ -414,17 +418,21 @@ fn the_index_plan_is_the_whole_table_per_core() {
 #[test]
 fn the_plan_under_a_token_plane_gather_splits_mb_only_at_a_multi_stick_out() {
     let mut op = matmul_opspec_off_operands_phys_gathered::<Fp16>(
-        MatM::of_token_rows(2),
-        MatN::of_out_features(704),
-        MatK::of_in_features(768),
+        MatmulDims {
+            m: MatM::of_token_rows(2),
+            n: MatN::of_out_features(704),
+            k: MatK::of_in_features(768),
+        },
         MatY::unbatched(),
         SharedKernelBmmForm::of_attn_rows(false, QueryRowCount::of_mq(1)),
-        "Tensor0",
-        "Tensor1",
-        "Tensor3",
-        0,
-        0,
-        0,
+        NamedOperands {
+            a_name: "Tensor0",
+            w_name: "Tensor1",
+            o_name: "Tensor3",
+            a_off: 0,
+            w_off: 0,
+            o_off: 0,
+        },
         <Fp8 as ktir_superdsc::superdsc_opspec::DataFormat>::DF,
         None,
         Some(token_plane()),

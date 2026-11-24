@@ -33,6 +33,7 @@ use ktir_superdsc::sdsc_abstract::{
     RowBlockedTag, StickLayout, Stk,
 };
 use ktir_superdsc::superdsc_opspec::Df;
+use scratchy_target_spyre::lower_subtile_tape_to_superdsc::{MatmulDims, MatmulOperands};
 
 const NKVH: u32 = 8;
 const STICK: u32 = 64;
@@ -65,21 +66,25 @@ fn cachewr_op(
     let mut sym = 0i64;
     assemble_matmul_placed(
         "cachewr_pin",
-        MatM::of_query_rows(QueryRowCount::of_mq(if per_request { 1 } else { mq })),
-        MatN::one_stick(Lanes::FP16),
-        MatK::one_stick(Lanes::FP16),
+        MatmulDims {
+            m: MatM::of_query_rows(QueryRowCount::of_mq(if per_request { 1 } else { mq })),
+            n: MatN::one_stick(Lanes::FP16),
+            k: MatK::one_stick(Lanes::FP16),
+        },
         MatY::of_gqa_group(NKVH, a_place, o_place),
         SharedKernelBmmForm::of_kv_cache_write(),
-        &Stk::<RowBlockedTag>::new(
-            "t_newk",
-            StickLayout::row_blocked(mq as usize, (NKVH * hd) as usize),
-        )
-        .unwrap(),
-        a_place,
-        &Stk::<KernelTag>::kernel(STICK as usize, STICK as usize, "t_ident"),
-        DevOff::ZERO,
-        &Stk::<KernelTag>::kernel(PLANE_SLOTS as usize, hd as usize, "t_kc"),
-        o_place,
+        MatmulOperands {
+            a: &Stk::<RowBlockedTag>::new(
+                "t_newk",
+                StickLayout::row_blocked(mq as usize, (NKVH * hd) as usize),
+            )
+            .unwrap(),
+            a_at: a_place,
+            w: &Stk::<KernelTag>::kernel(STICK as usize, STICK as usize, "t_ident"),
+            w_off: DevOff::ZERO,
+            o: &Stk::<KernelTag>::kernel(PLANE_SLOTS as usize, hd as usize, "t_kc"),
+            o_at: o_place,
+        },
         &mut sym,
         None,
     )

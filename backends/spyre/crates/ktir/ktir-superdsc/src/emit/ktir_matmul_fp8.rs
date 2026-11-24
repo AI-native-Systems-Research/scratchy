@@ -13,6 +13,7 @@
 //! 8 MB. fp8 W8A8 runs on hardware today through this code, so the card keeps using it — reached
 //! through the KTIR, from facts the KTIR itself states.
 
+use super::OpDecl;
 use super::{
     ClipOp, EmittedOp, In, assemble_clip, assemble_convert, assemble_convert_col,
     assemble_pointwise_broadcast_off, bmm_site, emit_sdsc_tiled, op_func_from_str, pw1, pw2, rb,
@@ -311,10 +312,12 @@ pub(crate) fn fp8_quantize_descriptors<T: crate::collective::Tp>(
                 // emission. (A reduction-core split is left to this path too: the partials+combine
                 // remedy below is derived for the pure time-tiling case.)
                 ops.push(assemble_reduce_seeded(
-                    &opn("fq_qspt_op"),
-                    "quantscalepertokenfp8",
-                    m,
-                    k,
+                    OpDecl {
+                        op_name: &opn("fq_qspt_op"),
+                        op_func: "quantscalepertokenfp8",
+                        rows: m,
+                        cols: k,
+                    },
                     &a_h,
                     &ascale_h,
                     sym_id_base,
@@ -363,11 +366,12 @@ pub(crate) fn fp8_quantize_descriptors<T: crate::collective::Tp>(
                         opn(&format!("fq_qspt_p{j}_op"))
                     };
                     ops.push(assemble_reduce_off(
-                        &op_name,
-                        "quantscalepertokenfp8",
-                        m_rows,
-                        crate::sdsc_abstract::BlockCols::of_feature_cols(k_part),
-                        // The data window is the j-th `[m, k/time]` slab — `col_of`'s whole-block
+                        OpDecl {
+                            op_name: &op_name,
+                            op_func: "quantscalepertokenfp8",
+                            rows: m_rows,
+                            cols: crate::sdsc_abstract::BlockCols::of_feature_cols(k_part),
+                        }, // The data window is the j-th `[m, k/time]` slab — `col_of`'s whole-block
                         // shift (k/time is a whole 64-stick, the TimeTile invariant), minted
                         // against the activation's own `[m, k]` handle.
                         win_reduce_data(
@@ -400,10 +404,12 @@ pub(crate) fn fp8_quantize_descriptors<T: crate::collective::Tp>(
                 for (i, p) in partials.iter().enumerate() {
                     let p_h = rb(p, m, stk);
                     ops.push(pw2(
-                        &opn(&format!("fq_qspt_c{}_op", i + 1)),
-                        "maximum",
-                        m_rows,
-                        scale_cols,
+                        OpDecl {
+                            op_name: &opn(&format!("fq_qspt_c{}_op", i + 1)),
+                            op_func: "maximum",
+                            rows: m_rows,
+                            cols: scale_cols,
+                        },
                         In::full(&ascale_h),
                         In::full(&p_h),
                         &ascale_h,
@@ -430,10 +436,12 @@ pub(crate) fn fp8_quantize_descriptors<T: crate::collective::Tp>(
             // works (m=1 always takes this path); prefill (m>1) now takes it too.
             let invs_h = rb(&invs, m, stk);
             ops.push(pw1(
-                &opn("fq_invs_op"),
-                "reciprocal",
-                m_rows,
-                scale_cols,
+                OpDecl {
+                    op_name: &opn("fq_invs_op"),
+                    op_func: "reciprocal",
+                    rows: m_rows,
+                    cols: scale_cols,
+                },
                 In::full(&ascale_h),
                 &invs_h,
                 sym_id_base,
@@ -442,10 +450,12 @@ pub(crate) fn fp8_quantize_descriptors<T: crate::collective::Tp>(
             // scaled = act·invs; clamp to [-448,448] (torch-spyre's `quantize_fp8_with_scale` ALWAYS clamps).
             let sc_h = rb(&sc, m, k);
             ops.push(pw2(
-                &opn("fq_sc_op"),
-                "mul",
-                m_rows,
-                k_cols,
+                OpDecl {
+                    op_name: &opn("fq_sc_op"),
+                    op_func: "mul",
+                    rows: m_rows,
+                    cols: k_cols,
+                },
                 In::full(&rb(&a_name, m, k)),
                 In::col(&invs_h),
                 &sc_h,
@@ -502,19 +512,15 @@ pub(crate) fn fp8_quantize_descriptors<T: crate::collective::Tp>(
             if cl_reach != k {
                 let zf_h = rb(&cl, m, cl_reach);
                 ops.push(assemble_pointwise_broadcast_off(
-                    &opn("fq_zfpad_op"),
-                    "sub",
-                    m_rows,
-                    // ⭐ ONE STICK WIDE (the pad width, not `cl_reach`): the write is aimed at the
+                    OpDecl { op_name: &opn("fq_zfpad_op"), op_func: "sub", rows: m_rows, cols: // ⭐ ONE STICK WIDE (the pad width, not `cl_reach`): the write is aimed at the
                     // pad WINDOW via the output offset, so the op's own width is the window's
                     // 64 elements — a `[m, cl_reach]` op would rewrite the logical window too
                     // (reading `sc`'s unpad-ded bytes at the pad position).
                     crate::sdsc_abstract::BlockCols::of_one_stick(
                         crate::sdsc_abstract::Lanes::FP16,
-                    ),
+                    ) },
                     &[In::scalar(&pos448).ew(), In::scalar(&pos448).ew()],
-                    &zf_h,
-                    // The RowBlocked stick-group law aims the write at the pad window: stick-
+                    &zf_h, // The RowBlocked stick-group law aims the write at the pad window: stick-
                     // group `k/64` of every row (whole — see the fill comment above).
                     crate::addr::col_of(m, cl_reach, k, Df::Fp16),
                     sym_id_base,
@@ -532,10 +538,12 @@ pub(crate) fn fp8_quantize_descriptors<T: crate::collective::Tp>(
                 // inn=2816) or the dense `pairs == 1` law (`cl_reach == k_pad`). Byte-identical
                 // to the pre-pair emission: same op, same name, same `[m, k_pad]` windows.
                 ops.push(assemble_convert(
-                    &opn("fq_afp8_op"),
-                    "qfp8ch",
-                    m,
-                    k_pad,
+                    OpDecl {
+                        op_name: &opn("fq_afp8_op"),
+                        op_func: "qfp8ch",
+                        rows: m,
+                        cols: k_pad,
+                    },
                     &rb(&cl, m, k_pad),
                     &rb_df(&afp8, m, k_pad, Df::Fp8),
                     sym_id_base,
@@ -577,10 +585,12 @@ pub(crate) fn fp8_quantize_descriptors<T: crate::collective::Tp>(
                     // inn_pad` / `k_pad = pairs·inn_pad` BY CONSTRUCTION (the zero fill the last
                     // slot's overhang reads is the `[k, cl_reach)` fill the clamp stage wrote).
                     ops.push(assemble_convert_col(
-                        &name,
-                        "qfp8ch",
-                        m,
-                        inn_pad,
+                        OpDecl {
+                            op_name: &name,
+                            op_func: "qfp8ch",
+                            rows: m,
+                            cols: inn_pad,
+                        },
                         &rb(&cl, m, cl_reach),
                         crate::addr::col_of(m, cl_reach, s * inn, Df::Fp16),
                         &rb_df(&afp8, m, k_pad, Df::Fp8),
@@ -651,24 +661,24 @@ pub(crate) fn matmul_fp8_descriptors<T: crate::collective::Tp>(
         // available early enough to reach the work-division and time-tiling decision (both run
         // inside the opspec builder); the `set_df` loop below is what they ARE on the wire.
         let mut spec = crate::ir::bridge::tiled_op_sdsc_op::matmul_opspec_off_operands::<Fp16>(
-            crate::sdsc_abstract::MatM::of_token_rows(m),
-            crate::sdsc_abstract::MatN::of_out_features(n),
-            // ⭐ `k_pad`, NOT `k`: the packed fp8 weight is staged with `fp8_k_pad` K rows
+            crate::ir::bridge::tiled_op_sdsc_op::MatmulDims { m: crate::sdsc_abstract::MatM::of_token_rows(m), n: crate::sdsc_abstract::MatN::of_out_features(n), k: // ⭐ `k_pad`, NOT `k`: the packed fp8 weight is staged with `fp8_k_pad` K rows
             // (the retile + the worker's staging both take it from the same rule), so the
             // contraction's K must match the staged weight or the tile walks past the
             // buffer. The activation operand is `[m, k_pad]` — the quantize chain's own
             // widened tail. No-op at every 128-aligned k.
-            crate::sdsc_abstract::MatK::of_in_features(k_pad),
+            crate::sdsc_abstract::MatK::of_in_features(k_pad) },
             crate::sdsc_abstract::MatY::unbatched(),
             crate::ir::bridge::tiled_op_sdsc_op::SharedKernelBmmForm::batch_inner_proven(
                 bmm_site::TapeLoweringSite::witness(),
             ),
-            &afp8,
-            &w_name,
-            &raw,
-            0,
-            0,
-            0,
+            crate::ir::bridge::tiled_op_sdsc_op::NamedOperands {
+                a_name: &afp8,
+                w_name: &w_name,
+                o_name: &raw,
+                a_off: 0,
+                w_off: 0,
+                o_off: 0,
+            },
             Df::Fp8,
         )
         .map_err(SuperDscError)?;
@@ -689,10 +699,12 @@ pub(crate) fn matmul_fp8_descriptors<T: crate::collective::Tp>(
     let raw_h = rb(&raw, m, n);
     let dqa_h = rb(&dqa, m, n);
     ops.push(pw2(
-        &opn("fq_dqa_op"),
-        "mul",
-        m_rows,
-        n_cols,
+        OpDecl {
+            op_name: &opn("fq_dqa_op"),
+            op_func: "mul",
+            rows: m_rows,
+            cols: n_cols,
+        },
         In::full(&raw_h),
         In::col(&ascale_h),
         &dqa_h,
@@ -707,10 +719,12 @@ pub(crate) fn matmul_fp8_descriptors<T: crate::collective::Tp>(
         In::full(&ws_h)
     };
     ops.push(pw2(
-        &opn("fq_dqw_op"),
-        "mul",
-        m_rows,
-        n_cols,
+        OpDecl {
+            op_name: &opn("fq_dqw_op"),
+            op_func: "mul",
+            rows: m_rows,
+            cols: n_cols,
+        },
         In::full(&dqa_h),
         w_scale_in,
         &out_h,
@@ -1110,11 +1124,11 @@ mod tests {
         let dsc = op.dsc();
         for dsc_map in dsc.dscs_.iter() {
             for dsc in dsc_map.values() {
-                for node in dsc.scheduleTree_.iter() {
-                    let binding = &op.arg_bindings[node.ldsIdx_ as usize];
+                for node in dsc.schedule_tree.iter() {
+                    let binding = &op.arg_bindings[node.lds_idx as usize];
                     if binding.is_input == want_input && binding.buffer.contains(needle) {
                         let v = node
-                            .startAddressCoreCorelet_
+                            .start_address_core_corelet
                             .data_
                             .values()
                             .next()

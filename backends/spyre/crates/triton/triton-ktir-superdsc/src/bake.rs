@@ -210,7 +210,7 @@ fn trips<T: ktir_superdsc::collective::Tp>(e: &EmittedOp<T>) -> Vec<SdscOp> {
             let mut op = e.dsc().clone();
             for dsc_map in op.dscs_.iter_mut() {
                 for dsc in dsc_map.values_mut() {
-                    for mut node in dsc.scheduleTree_.edit() {
+                    for mut node in dsc.schedule_tree.edit() {
                         let ti = node.operand();
                         let Some(stride) = e.affine_strides.get(ti).and_then(|m| m.get("out"))
                         else {

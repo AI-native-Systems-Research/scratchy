@@ -178,13 +178,17 @@ fn matmul_31x2048x2048_matches_torchspyre() {
     let mut sid = 0i64;
     let mm = superdsc::assemble_matmul_split(
         "mm",
-        31,
-        2048,
-        2048,
-        1,
-        "a",
-        "w",
-        "o",
+        superdsc::MatmulCounts {
+            m: 31,
+            n: 2048,
+            k: 2048,
+            batch: 1,
+        },
+        superdsc::MatmulNames {
+            a_name: "a",
+            w_name: "w",
+            o_name: "o",
+        },
         &mut sid,
         None,
         |_dims, _max_cores| {
@@ -592,10 +596,12 @@ fn decode_matmul_mb1_also_minus_one() {
     let mut sid = 0i64;
     let mm = superdsc::assemble_matmul_seeded(
         "dm",
-        1,
-        2048,
-        2048,
-        1,
+        superdsc::MatmulCounts {
+            m: 1,
+            n: 2048,
+            k: 2048,
+            batch: 1,
+        },
         &mm_a("a", 1, 2048),
         &mm_w("w", 2048, 2048),
         &mm_a("o", 1, 2048),

@@ -24,13 +24,15 @@
 //! which do not build on a plain `cargo test` here.
 
 use ktir_superdsc::emit;
+use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::RowIsland;
 use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::{assemble_reduce, assemble_rmsnorm};
 use ktir_superdsc::sdsc_abstract::{KernelTag, Stk};
 use ktir_superdsc::superdsc_opspec::{
     Allocation, DataFormat, Df, FP16_BYTES, Fp16, ItDim, OpFunc, Role, Scale, TensorArg,
-    USABLE_LX_BYTES, WorkPlan,
+    TensorArgDecl, USABLE_LX_BYTES, WorkPlan,
 };
 use scratchy_target_spyre::lower_subtile_tape_to_superdsc as superdsc;
+use scratchy_target_spyre::lower_subtile_tape_to_superdsc::MatmulCounts;
 use std::collections::BTreeMap;
 
 // ── GUARD (the LOOP, 2026-06-25): every emitted `opFuncName` MUST be in dxp's
@@ -142,41 +144,41 @@ fn phantom_scaled_stick_dim_is_unconstructible() {
     let dims = plan.iter_syms(["mb", "in", "x", "y"]);
     // OK: `in` (the stick dim) materialized (Active).
     assert!(
-        TensorArg::<4>::new(
-            true,
-            "ok".into(),
-            Role::Input,
-            [
+        TensorArg::<4>::new(TensorArgDecl {
+            is_input: true,
+            name: "ok".into(),
+            role: Role::Input,
+            scale: [
                 Scale::Active,
                 Scale::Active,
                 Scale::Active,
                 Scale::RedNonStick
             ],
-            dims,
-            ["mb", "in", "x", "y"],
-            "in",
-            Allocation::Hbm,
-        )
+            device_dims: dims,
+            layout: ["mb", "in", "x", "y"],
+            stick: "in",
+            allocation: Allocation::Hbm
+        })
         .is_ok(),
         "a materialized stick dim constructs fine"
     );
     // ERR: `in` (the stick dim) phantom-scaled (-1) → would be on-card 1535.
     assert!(
-        TensorArg::<4>::new(
-            true,
-            "bad".into(),
-            Role::Input,
-            [
+        TensorArg::<4>::new(TensorArgDecl {
+            is_input: true,
+            name: "bad".into(),
+            role: Role::Input,
+            scale: [
                 Scale::Active,
                 Scale::RedNonStick,
                 Scale::Active,
                 Scale::Active
             ],
-            dims,
-            ["mb", "in", "x", "y"],
-            "in",
-            Allocation::Hbm,
-        )
+            device_dims: dims,
+            layout: ["mb", "in", "x", "y"],
+            stick: "in",
+            allocation: Allocation::Hbm
+        })
         .is_err(),
         "a phantom-scaled stick dim MUST be a build Err (MaterializedStick witness)"
     );
@@ -239,12 +241,14 @@ fn reduce_and_multiop_invariants() {
     // rmsnorm.rs's module doc): the former `rmsq`+`rmmean` pair is ONE op, 6 → 5.
     let mut sym = 0i64;
     let ops = assemble_rmsnorm::<ktir_superdsc::collective::TpWorld<1>>(
-        "g",
-        64,
-        576,
-        "x",
+        RowIsland {
+            prefix: "g",
+            rows: 64,
+            cols: 576,
+            x: "x",
+            out_id: ktir_superdsc::place::SynthId::Act(7),
+        },
         "w",
-        ktir_superdsc::place::SynthId::Act(7),
         "eps",
         None,
         &mut sym,
@@ -383,14 +387,15 @@ fn rmsnorm_rinv_is_pinned_lx() {
         let l = layout_for(rows, 576);
         let mut sym = 0i64;
         assemble_rmsnorm(
-            "g",
-            rows,
-            576,
-            "t1",
+            RowIsland {
+                prefix: "g",
+                rows,
+                cols: 576,
+                x: "t1",
+                out_id: ktir_superdsc::place::SynthId::Act(7),
+            },
             "t2",
-            ktir_superdsc::place::SynthId::Act(7),
-            "t3",
-            // The Scale convention — no `γ+1` row, byte-identical to the emission before
+            "t3", // The Scale convention — no `γ+1` row, byte-identical to the emission before
             // the OnePlusScale row existed. The oneplus law has its own golden
             // (triton-numeric's `rmsnorm_oneplus`).
             None,
@@ -585,12 +590,14 @@ fn norm_in(
     ktir_superdsc::superdsc_error::SuperDscError,
 > {
     assemble_rmsnorm(
-        prefix,
-        64,
-        576,
-        "t1",
+        RowIsland {
+            prefix,
+            rows: 64,
+            cols: 576,
+            x: "t1",
+            out_id: ktir_superdsc::place::SynthId::Act(out),
+        },
         "t2",
-        ktir_superdsc::place::SynthId::Act(out),
         "t3",
         None,
         sym,
@@ -680,12 +687,14 @@ fn a_second_same_class_pin_refuses_without_a_layout_too() {
     let norm_no_layout = |out: u32, scope: &mut ktir_superdsc::placement::LxScope| {
         let mut sym = 0i64;
         assemble_rmsnorm::<ktir_superdsc::collective::TpWorld<1>>(
-            &format!("n{out}"),
-            64,
-            576,
-            "t1",
+            RowIsland {
+                prefix: &format!("n{out}"),
+                rows: 64,
+                cols: 576,
+                x: "t1",
+                out_id: ktir_superdsc::place::SynthId::Act(out),
+            },
             "t2",
-            ktir_superdsc::place::SynthId::Act(out),
             "t3",
             None,
             &mut sym,
@@ -851,10 +860,12 @@ fn per_core_addresses_use_distinct_segments_and_disjoint_cores() {
     // (arg0, seg0), W KERNEL (arg1, seg1), O OUTPUT (arg2, seg2).
     let e = superdsc::assemble_matmul(
         "mm",
-        384,
-        384,
-        64,
-        16,
+        MatmulCounts {
+            m: 384,
+            n: 384,
+            k: 64,
+            batch: 16,
+        },
         &emit::rb("a", 384, 64),
         &Stk::<KernelTag>::kernel(64_usize, 384_usize, "w"),
         &emit::rb("o", 384, 384),
@@ -987,10 +998,7 @@ fn batched_lx_overflowing_matmul() -> emit::EmittedOp<ktir_superdsc::collective:
     let (m, n, k, batch) = (64, 32768, 64, 16);
     superdsc::assemble_matmul(
         "matmul_o7",
-        m,
-        n,
-        k,
-        batch,
+        MatmulCounts { m, n, k, batch },
         &emit::rb("a", m, k),
         &Stk::<KernelTag>::kernel(k as usize, n as usize, "w"),
         &emit::rb("o", m, n),
@@ -1007,10 +1015,12 @@ fn assert_the_multi_stick_batched_matmul_is_refused() {
         ktir_superdsc::collective::TpWorld<1>,
     >(
         "matmul_o7",
-        64,
-        16384,
-        2048,
-        2,
+        MatmulCounts {
+            m: 64,
+            n: 16384,
+            k: 2048,
+            batch: 2,
+        },
         &emit::rb("a", 64, 2048),
         &Stk::<KernelTag>::kernel(2048_usize, 16384_usize, "w"),
         &emit::rb("o", 64, 16384),
@@ -1270,10 +1280,12 @@ fn tiled_bundle_mlir_is_concrete_unroll() {
 fn time1_bundle_mlir_is_byte_identical_to_flat() {
     let emitted = superdsc::assemble_matmul::<ktir_superdsc::collective::TpWorld<1>>(
         "MatMul_0",
-        384,
-        384,
-        64,
-        16,
+        MatmulCounts {
+            m: 384,
+            n: 384,
+            k: 64,
+            batch: 16,
+        },
         &emit::rb("act", 384, 64),
         &Stk::<KernelTag>::kernel(64_usize, 384_usize, "wt"),
         &emit::rb("out", 384, 384),
@@ -1303,10 +1315,12 @@ fn dump_gate_bundles() {
     // (A) FITTING 64×64×64 — time=1, no loop. Hypothesis-b probe.
     let fit = superdsc::assemble_matmul::<ktir_superdsc::collective::TpWorld<1>>(
         "gate1_mm",
-        64,
-        64,
-        64,
-        1,
+        MatmulCounts {
+            m: 64,
+            n: 64,
+            k: 64,
+            batch: 1,
+        },
         &emit::rb("g1_a", 64, 64),
         &Stk::<KernelTag>::kernel(64_usize, 64_usize, "g1_w"),
         &emit::rb("g1_o", 64, 64),
@@ -1345,10 +1359,7 @@ fn dump_gate_bundles() {
         if full > USABLE_LX_BYTES && stick <= USABLE_LX_BYTES {
             let ov = superdsc::assemble_matmul::<ktir_superdsc::collective::TpWorld<1>>(
                 "gate1b_mm",
-                m,
-                n,
-                k,
-                b,
+                MatmulCounts { m, n, k, batch: b },
                 &emit::rb("gb_a", m, k),
                 &Stk::<KernelTag>::kernel(k as usize, n as usize, "gb_w"),
                 &emit::rb("gb_o", m, n),
@@ -1386,12 +1397,14 @@ fn dump_gate_bundles() {
     //     multi-op + broadcast chain (exx2-reduce→add(eps)→rsqrt→broadcast-mul) on-card.
     let mut sym = 0i64;
     let rms = assemble_rmsnorm::<ktir_superdsc::collective::TpWorld<1>>(
-        "gate",
-        64,
-        576,
-        "rms_x",
+        RowIsland {
+            prefix: "gate",
+            rows: 64,
+            cols: 576,
+            x: "rms_x",
+            out_id: ktir_superdsc::place::SynthId::Act(7),
+        },
         "rms_w",
-        ktir_superdsc::place::SynthId::Act(7),
         "eps",
         None,
         &mut sym,

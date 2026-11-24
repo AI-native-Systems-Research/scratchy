@@ -1156,7 +1156,6 @@ fn divisors(n: u32) -> Vec<u32> {
 /// `(size, split)`; sizes are ELEMENTS (M,N,K) / count (B). Lower is better; `inf` if infeasible.
 /// Constants are torch-spyre's verbatim (AIU HW limits + measured kernel-time coefficients) so the
 /// split scratchy picks is the one torch-spyre picks — NOT a rewritten "fill the cores" heuristic.
-#[allow(clippy::too_many_arguments)]
 fn matmul_split_cost(
     b_axis: (u32, u32),
     m_axis: (u32, u32),

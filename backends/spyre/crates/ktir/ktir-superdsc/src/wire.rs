@@ -15,11 +15,8 @@
 //!
 //! ⛔ TRAILING UNDERSCORES ON KEYS ARE MANDATORY — DeepTools reads them verbatim.
 
-// ⛔ THIS TRAVELLED WITH THE STRUCTS; IT IS NOT A NEW SUPPRESSION. Every field name below IS the
-// JSON key DeepTools reads (`coreIdToWkSlice_`, `maxDimSizes_`, `dsType_`, …), so renaming one to
-// snake_case renames it on the wire. `lower_subtile_tape_to_superdsc.rs:31` carries exactly this
-// module-level attribute for exactly these structs; it moves where they moved.
-#![allow(non_snake_case)]
+// Every field serializes to the JSON key DeepTools reads (`coreIdToWkSlice_`, `maxDimSizes_`,
+// `dsType_`, …): a camelCase key is its snake_case field's `serde(rename)`.
 
 use crate::sdsc_abstract::{DeviceWalk, StickLayout};
 use crate::superdsc_error::SuperDscError;
@@ -133,17 +130,23 @@ pub struct IterSpace {
     #[serde(skip_serializing_if = "iter_slot_unused")]
     pub zj_: i64,
     #[serde(skip_serializing_if = "map_is_empty_i64")]
-    pub symbolicDimInfo_: BTreeMap<String, i64>,
+    #[serde(rename = "symbolicDimInfo_")]
+    pub symbolic_dim_info: BTreeMap<String, i64>,
     #[serde(skip_serializing_if = "map_is_empty_i64")]
-    pub maxSymbolicVolume_: BTreeMap<String, i64>,
+    #[serde(rename = "maxSymbolicVolume_")]
+    pub max_symbolic_volume: BTreeMap<String, i64>,
     #[serde(skip_serializing_if = "map_is_empty_veci64")]
-    pub coreletSplit_: BTreeMap<String, Vec<i64>>, // {dim: [per_corelet0, per_corelet1]}
+    #[serde(rename = "coreletSplit_")]
+    pub corelet_split: BTreeMap<String, Vec<i64>>, // {dim: [per_corelet0, per_corelet1]}
     #[serde(skip_serializing_if = "map_is_empty_i64")]
-    pub rowSplit_: BTreeMap<String, i64>,
+    #[serde(rename = "rowSplit_")]
+    pub row_split: BTreeMap<String, i64>,
     #[serde(skip_serializing_if = "map_is_empty_i64")]
-    pub peSfpSplit_: BTreeMap<String, i64>,
+    #[serde(rename = "peSfpSplit_")]
+    pub pe_sfp_split: BTreeMap<String, i64>,
     #[serde(skip_serializing_if = "map_is_empty_i64")]
-    pub paddingSizes_: BTreeMap<String, i64>,
+    #[serde(rename = "paddingSizes_")]
+    pub padding_sizes: BTreeMap<String, i64>,
 }
 
 impl IterSpace {
@@ -172,12 +175,12 @@ impl IterSpace {
             sj_: -1,
             zi_: -1,
             zj_: -1,
-            symbolicDimInfo_: BTreeMap::new(),
-            maxSymbolicVolume_: BTreeMap::new(),
-            coreletSplit_: BTreeMap::new(),
-            rowSplit_: BTreeMap::new(),
-            peSfpSplit_: BTreeMap::new(),
-            paddingSizes_: BTreeMap::new(),
+            symbolic_dim_info: BTreeMap::new(),
+            max_symbolic_volume: BTreeMap::new(),
+            corelet_split: BTreeMap::new(),
+            row_split: BTreeMap::new(),
+            pe_sfp_split: BTreeMap::new(),
+            padding_sizes: BTreeMap::new(),
         }
     }
 }
@@ -218,7 +221,8 @@ pub enum FoldFunc {
 /// DtException 1535 source). Just the presence flag here.
 #[derive(Serialize, Clone, Debug)]
 pub struct MemPresence {
-    pub isPresent: u8,
+    #[serde(rename = "isPresent")]
+    pub is_present: u8,
 }
 
 /// `memOrg_` = the components a tensor is resident in. SEALED to EXACTLY hbm/lx
@@ -234,14 +238,14 @@ impl MemOrg {
     /// Default residency: present in BOTH hbm and lx (the matmul/pointwise case).
     pub fn hbm_lx() -> Self {
         MemOrg {
-            hbm: Some(MemPresence { isPresent: 1 }),
-            lx: Some(MemPresence { isPresent: 1 }),
+            hbm: Some(MemPresence { is_present: 1 }),
+            lx: Some(MemPresence { is_present: 1 }),
         }
     }
     /// HBM-only (index tensors must reside in HBM — no LX indirect addressing).
     pub fn hbm_only() -> Self {
         MemOrg {
-            hbm: Some(MemPresence { isPresent: 1 }),
+            hbm: Some(MemPresence { is_present: 1 }),
             lx: None,
         }
     }
@@ -249,7 +253,7 @@ impl MemOrg {
     pub fn lx_only() -> Self {
         MemOrg {
             hbm: None,
-            lx: Some(MemPresence { isPresent: 1 }),
+            lx: Some(MemPresence { is_present: 1 }),
         }
     }
 }
@@ -278,13 +282,19 @@ impl Serialize for MemOrg {
 /// to the `Scale` enum upstream — never a free integer).
 #[derive(Serialize, Clone, Debug)]
 pub struct LabeledDs {
-    pub ldsIdx_: u32,
-    pub dsName_: String,
-    pub dsType_: &'static str, // "INPUT" | "KERNEL" | "OUTPUT"
+    #[serde(rename = "ldsIdx_")]
+    pub lds_idx: u32,
+    #[serde(rename = "dsName_")]
+    pub ds_name: String,
+    #[serde(rename = "dsType_")]
+    pub ds_type: &'static str, // "INPUT" | "KERNEL" | "OUTPUT"
     pub scale_: Vec<i64>,
-    pub wordLength: u32,           // 2 for fp16
-    pub dataFormat_: &'static str, // "SEN169_FP16"
-    pub memOrg_: MemOrg,
+    #[serde(rename = "wordLength")]
+    pub word_length: u32, // 2 for fp16
+    #[serde(rename = "dataFormat_")]
+    pub data_format: &'static str, // "SEN169_FP16"
+    #[serde(rename = "memOrg_")]
+    pub mem_org: MemOrg,
 }
 
 /// `computeOp_` entry. `exUnit` is a sealed `ExUnit` value from `OpFunc::ex_unit`
@@ -307,20 +317,27 @@ pub struct LabeledDs {
 /// conditional lists — skip-if-empty, populated when a paged op names them.
 #[derive(Serialize, Clone, Debug)]
 pub struct ComputeOp {
-    pub exUnit: &'static str, // "pt" | "sfp"
-    pub opFuncName: String,
+    #[serde(rename = "exUnit")]
+    pub ex_unit: &'static str, // "pt" | "sfp"
+    #[serde(rename = "opFuncName")]
+    pub op_func_name: String,
     pub attributes_: ComputeAttrs,
-    pub location: &'static str,      // "Inner"
-    pub inputLabeledDs: Vec<String>, // ["Tensor0-idx0", …]
+    pub location: &'static str, // "Inner"
+    #[serde(rename = "inputLabeledDs")]
+    pub input_labeled_ds: Vec<String>, // ["Tensor0-idx0", …]
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub interimLabeledDs: Vec<String>,
-    pub outputLabeledDs: Vec<String>,
+    #[serde(rename = "interimLabeledDs")]
+    pub interim_labeled_ds: Vec<String>,
+    #[serde(rename = "outputLabeledDs")]
+    pub output_labeled_ds: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub indirectAccessIndexLabeledDs: Vec<String>,
+    #[serde(rename = "indirectAccessIndexLabeledDs")]
+    pub indirect_access_index_labeled_ds: Vec<String>,
 }
 #[derive(Serialize, Clone, Debug)]
 pub struct ComputeAttrs {
-    pub dataFormat_: &'static str,
+    #[serde(rename = "dataFormat_")]
+    pub data_format: &'static str,
     pub fidelity_: &'static str, // "regular"
 }
 
@@ -329,9 +346,12 @@ pub struct ComputeAttrs {
 /// (no `stickRepl_` — torch-spyre does not emit it).
 #[derive(Serialize, Clone, Debug)]
 pub struct LayoutInfo {
-    pub layoutDimOrder_: Vec<&'static str>,
-    pub stickDimOrder_: Vec<&'static str>,
-    pub stickSize_: Vec<u32>, // [64] for fp16
+    #[serde(rename = "layoutDimOrder_")]
+    pub layout_dim_order: Vec<&'static str>,
+    #[serde(rename = "stickDimOrder_")]
+    pub stick_dim_order: Vec<&'static str>,
+    #[serde(rename = "stickSize_")]
+    pub stick_size: Vec<u32>, // [64] for fp16
 }
 
 /// `scheduleTree_` allocate node: a per-tensor HBM (or LX) buffer. FRONTEND-
@@ -351,26 +371,36 @@ pub struct LayoutInfo {
 /// [`build_coordinates`] over a real operand (so `coordInfo` holds one entry per dim of it).
 #[derive(Serialize, Clone, Debug)]
 pub struct AllocNode {
-    pub nodeType_: &'static str, // "allocate"
+    #[serde(rename = "nodeType_")]
+    pub node_type: &'static str, // "allocate"
     pub name_: String,
     pub prev_: String,
-    pub ldsIdx_: u32,
+    #[serde(rename = "ldsIdx_")]
+    pub lds_idx: u32,
     pub component_: &'static str, // "hbm" | "lx"
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub isStartAddrSymbolic_: Option<u8>,
-    pub layoutDimOrder_: Vec<&'static str>,
+    #[serde(rename = "isStartAddrSymbolic_")]
+    pub is_start_addr_symbolic: Option<u8>,
+    #[serde(rename = "layoutDimOrder_")]
+    pub layout_dim_order: Vec<&'static str>,
     // Opaque: the ONLY way to build one is `StickLayout::device_walk` (from the same layout as the start),
     // so a walk that disagrees with the start — or has the wrong rank — is unconstructable. Serializes to
     // the `[-1; rank]` / pinned-extents array dxp reads.
-    pub maxDimSizes_: DeviceWalk,
-    pub indirectAllocType_: &'static str, // "no_indirection"
+    #[serde(rename = "maxDimSizes_")]
+    pub max_dim_sizes: DeviceWalk,
+    #[serde(rename = "indirectAllocType_")]
+    pub indirect_alloc_type: &'static str, // "no_indirection"
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub relatedIndirectAccessAlloc_: Option<String>,
+    #[serde(rename = "relatedIndirectAccessAlloc_")]
+    pub related_indirect_access_alloc: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub indexTensorType_: Option<&'static str>,
-    pub startAddressCoreCorelet_: AddrFold,
+    #[serde(rename = "indexTensorType_")]
+    pub index_tensor_type: Option<&'static str>,
+    #[serde(rename = "startAddressCoreCorelet_")]
+    pub start_address_core_corelet: AddrFold,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub backGapCore_: Option<serde_json::Value>,
+    #[serde(rename = "backGapCore_")]
+    pub back_gap_core: Option<serde_json::Value>,
     pub coordinates_: Coordinates, // {coordInfo:{…}, coreIdToWkSlice_:{}}
 }
 
@@ -487,7 +517,7 @@ pub struct NodeEdit<'a>(&'a mut AllocNode);
 impl NodeEdit<'_> {
     /// The node's operand index (`ldsIdx_`).
     pub fn operand(&self) -> usize {
-        self.0.ldsIdx_ as usize
+        self.0.lds_idx as usize
     }
 
     /// The node's memory component (`"hbm"` | `"lx"`).
@@ -497,7 +527,7 @@ impl NodeEdit<'_> {
 
     /// The per-core start addresses, `"[c, 0, 0]"` → byte address.
     pub fn start_addrs(&mut self) -> &mut BTreeMap<String, String> {
-        &mut self.0.startAddressCoreCorelet_.data_
+        &mut self.0.start_address_core_corelet.data_
     }
 
     /// Rewrite the stick coordinate at its per-time extent ([`Coordinates::divide_stick`]).
@@ -695,17 +725,27 @@ pub struct SdscFolds {
 /// are all scheduler outputs — DROPPED. `coreIdToDscSchedule` stays (op-level).
 #[derive(Serialize, Clone, Debug)]
 pub struct Dsc {
-    pub numCoresUsed_: u32,
-    pub numCoreletsUsed_: u32, // 1 (ACTIVE_CORELETS) — frontend constant
-    pub coreIdsUsed_: Vec<u32>,
-    pub N_: IterSpace,
-    pub coordinateMasking_: BTreeMap<String, Vec<[i64; 2]>>,
-    pub maskingConstId_: i64,
-    pub dataStageParam_: BTreeMap<String, StageParam>,
-    pub primaryDsInfo_: BTreeMap<&'static str, LayoutInfo>,
+    #[serde(rename = "numCoresUsed_")]
+    pub num_cores_used: u32,
+    #[serde(rename = "numCoreletsUsed_")]
+    pub num_corelets_used: u32, // 1 (ACTIVE_CORELETS) — frontend constant
+    #[serde(rename = "coreIdsUsed_")]
+    pub core_ids_used: Vec<u32>,
+    #[serde(rename = "N_")]
+    pub n: IterSpace,
+    #[serde(rename = "coordinateMasking_")]
+    pub coordinate_masking: BTreeMap<String, Vec<[i64; 2]>>,
+    #[serde(rename = "maskingConstId_")]
+    pub masking_const_id: i64,
+    #[serde(rename = "dataStageParam_")]
+    pub data_stage_param: BTreeMap<String, StageParam>,
+    #[serde(rename = "primaryDsInfo_")]
+    pub primary_ds_info: BTreeMap<&'static str, LayoutInfo>,
     /// Never empty, every node's start fold from the op's own fold set ([`ScheduleTree`]).
-    pub scheduleTree_: ScheduleTree,
-    pub labeledDs_: Vec<LabeledDs>,
+    #[serde(rename = "scheduleTree_")]
+    pub schedule_tree: ScheduleTree,
+    #[serde(rename = "labeledDs_")]
+    pub labeled_ds: Vec<LabeledDs>,
     // EMPTY → the JSON *string* "{}"; POPULATED → a dict. VERIFIED on torch-spyre's
     // REAL frontend (compiled `torch.rsqrt`/`F.rms_norm`): rsqrt/add/mul emit
     // `"constantInfo_": "{}"` (a str), the `mean` op's scaling_factor a dict. The earlier
@@ -714,8 +754,10 @@ pub struct Dsc {
     // the SFP constant-table / NR-refine setup is skipped → transcendentals collapse to
     // their seed (rsqrt→1/x). The empty→string conversion lives at the `constant_info`
     // build site. serde_json::Value carries either form.
-    pub constantInfo_: serde_json::Value,
-    pub computeOp_: Vec<ComputeOp>,
+    #[serde(rename = "constantInfo_")]
+    pub constant_info: serde_json::Value,
+    #[serde(rename = "computeOp_")]
+    pub compute_op: Vec<ComputeOp>,
 }
 
 /// Top-level SuperDSC op (one `sdsc_{idx}.json`, serialized `{ "{op}_{id}": .. }`).
@@ -729,20 +771,29 @@ pub struct Dsc {
 /// outputs — DROPPED.
 #[derive(Serialize, Clone, Debug)]
 pub struct SdscOp {
-    pub sdscFoldProps_: Vec<FoldProp>,
-    pub sdscFolds_: SdscFolds,
+    #[serde(rename = "sdscFoldProps_")]
+    pub sdsc_fold_props: Vec<FoldProp>,
+    #[serde(rename = "sdscFolds_")]
+    pub sdsc_folds: SdscFolds,
     /// Read off the tree its nodes were minted from ([`ScheduleTree::core_fold`]) — the factor
     /// every allocate node's start fold carries.
-    pub coreFoldProp_: TreeFold,
-    pub coreletFoldProp_: TreeFold,
-    pub numCoresUsed_: u32,
-    pub coreIdToDsc_: BTreeMap<String, u32>,
-    pub numWkSlicesPerDim_: BTreeMap<&'static str, u32>,
+    #[serde(rename = "coreFoldProp_")]
+    pub core_fold_prop: TreeFold,
+    #[serde(rename = "coreletFoldProp_")]
+    pub corelet_fold_prop: TreeFold,
+    #[serde(rename = "numCoresUsed_")]
+    pub num_cores_used: u32,
+    #[serde(rename = "coreIdToDsc_")]
+    pub core_id_to_dsc: BTreeMap<String, u32>,
+    #[serde(rename = "numWkSlicesPerDim_")]
+    pub num_wk_slices_per_dim: BTreeMap<&'static str, u32>,
     /// Per-core slice indices, typed: a wire value here is provably a `SliceIndex` minted
     /// by `core_to_wk_slice`'s decomposition (serializes as the bare integer, wire-identical).
-    pub coreIdToWkSlice_:
+    #[serde(rename = "coreIdToWkSlice_")]
+    pub core_id_to_wk_slice:
         BTreeMap<String, BTreeMap<&'static str, crate::superdsc_opspec::SliceIndex>>,
-    pub coreIdToDscSchedule: BTreeMap<String, Vec<[i64; 4]>>, // {core:[[-1,0,0,0]]}
+    #[serde(rename = "coreIdToDscSchedule")]
+    pub core_id_to_dsc_schedule: BTreeMap<String, Vec<[i64; 4]>>, // {core:[[-1,0,0,0]]}
     pub dscs_: Vec<BTreeMap<String, Dsc>>,
 }
 
@@ -1077,11 +1128,11 @@ mod the_schedule_tree_is_whole_by_construction {
             let sdsc = crate::emit::emit_sdsc("mm_o1", &op, &folds, None).expect("emits");
             let dsc = &sdsc.dscs_[0]["mm_o1"];
             assert_eq!(
-                dsc.scheduleTree_.len(),
+                dsc.schedule_tree.len(),
                 op.args().len(),
                 "one node per operand"
             );
-            for node in &dsc.scheduleTree_ {
+            for node in &dsc.schedule_tree {
                 let j = serde_json::to_value(node).expect("serializes");
                 let factors: Vec<i64> = j["startAddressCoreCorelet_"]["dim_prop_attr"]
                     .as_array()
@@ -1089,9 +1140,9 @@ mod the_schedule_tree_is_whole_by_construction {
                     .iter()
                     .map(|f| f["factor_"].as_i64().expect("a factor"))
                     .collect();
-                assert_eq!(factors[0], sdsc.coreFoldProp_.factor_, "{m}x{n}x{k}: core");
+                assert_eq!(factors[0], sdsc.core_fold_prop.factor_, "{m}x{n}x{k}: core");
                 assert_eq!(
-                    factors[1], sdsc.coreletFoldProp_.factor_,
+                    factors[1], sdsc.corelet_fold_prop.factor_,
                     "{m}x{n}x{k}: corelet"
                 );
                 let ci = node.coordinates_.coord_info();
@@ -1108,7 +1159,7 @@ mod the_schedule_tree_is_whole_by_construction {
             let op = matmul_opspec(m, n, k, 1, "a", "w", "o").expect("a legal matmul");
             let folds = SdscFoldSet::new(op.iter.cores_used());
             let sdsc = crate::emit::emit_sdsc("mm_o1", &op, &folds, None).expect("emits");
-            for node in &sdsc.dscs_[0]["mm_o1"].scheduleTree_ {
+            for node in &sdsc.dscs_[0]["mm_o1"].schedule_tree {
                 let factor = |c: &super::Coordinates| {
                     c.coord_info()[c.stick.dim]["folds"]["dim_prop_attr"][0]["factor_"].as_i64()
                 };

@@ -10,8 +10,44 @@ use crate::ir::island::tile_op::TileOp;
 use crate::sdsc_abstract::{MatK, MatM, MatN, MatY, PhysM};
 use crate::superdsc_opspec::{
     Allocation, AnyTensorArg, DataFormat, Df, Fp16, OpFunc, OpSpec, Role, Scale, StickExtent,
-    TensorArg, WorkPlan,
+    TensorArg, TensorArgDecl, WorkPlan,
 };
+
+/// A matmul's typed extents: `A[m, k] · W[k, n] → O[m, n]`.
+#[derive(Clone, Copy, Debug)]
+pub struct MatmulDims {
+    pub m: MatM,
+    pub n: MatN,
+    pub k: MatK,
+}
+
+/// A matmul's extents as raw counts: `A[m, k] · W[k, n] → O[m, n]`, `batch` times.
+#[derive(Clone, Copy, Debug)]
+pub struct MatmulCounts {
+    pub m: u32,
+    pub n: u32,
+    pub k: u32,
+    pub batch: u32,
+}
+
+/// A matmul's three operands by tensor name: activation, kernel, output.
+#[derive(Clone, Copy, Debug)]
+pub struct MatmulNames<'a> {
+    pub a_name: &'a str,
+    pub w_name: &'a str,
+    pub o_name: &'a str,
+}
+
+/// A matmul's three operands by tensor name, each at its ELEMENT start-offset.
+#[derive(Clone, Copy, Debug)]
+pub struct NamedOperands<'a> {
+    pub a_name: &'a str,
+    pub w_name: &'a str,
+    pub o_name: &'a str,
+    pub a_off: u32,
+    pub w_off: u32,
+    pub o_off: u32,
+}
 
 /// Build the typed [`OpSpec`] for ONE matmul `A[m,k]·W[k,n]→O[m,n]` (batch `b`).
 /// N (output stick) and K (reduction stick) are wrapped in [`StickExtent`] so a
@@ -19,7 +55,6 @@ use crate::superdsc_opspec::{
 /// split is wrapped in a validated `WorkPlan` (witnesses (b)(f)); the three
 /// `TensorArg`s carry rank-pinned scale/dim/layout arrays (witness (d)) whose
 /// `IterSym`s come only from the plan (witness (e)).
-#[allow(clippy::too_many_arguments)]
 pub fn matmul_opspec(
     m: u32,
     n: u32,
@@ -33,17 +68,21 @@ pub fn matmul_opspec(
     // dense-projection lowerings whose dims are unambiguous token rows / feature widths — none of
     // them a batch of requests, so the proven form is stated here, not defaulted below.
     matmul_opspec_off::<Fp16>(
-        MatM::of_token_rows(m),
-        MatN::of_out_features(n),
-        MatK::of_in_features(k),
+        MatmulDims {
+            m: MatM::of_token_rows(m),
+            n: MatN::of_out_features(n),
+            k: MatK::of_in_features(k),
+        },
         MatY::of_batch(batch),
         SharedKernelBmmForm::batch_inner_proven(MatmulWrapperSite::witness()),
-        a_name,
-        w_name,
-        o_name,
-        0,
-        0,
-        0,
+        NamedOperands {
+            a_name,
+            w_name,
+            o_name,
+            a_off: 0,
+            w_off: 0,
+            o_off: 0,
+        },
     )
 }
 
@@ -54,77 +93,38 @@ pub fn matmul_opspec(
 /// `batch=nqh` bmm makes ALL query heads attend with head-0's K/V — WRONG for
 /// GQA/MHA. The fix emits one bmm PER kv-head group (`batch=gqa`, the group's q-heads
 /// legitimately SHARE their kv-head's K/V), each sliced to the group via `*_off`.
-#[allow(clippy::too_many_arguments)]
 pub fn matmul_opspec_off<DF: DataFormat>(
-    m: MatM,
-    n: MatN,
-    k: MatK,
+    dims: MatmulDims,
     batch: MatY,
     // WHICH shared-kernel batched form this op takes (walk order + split policy) — threaded from
     // the caller that knows the bundle's row kind; see [`SharedKernelBmmForm`].
     form: SharedKernelBmmForm,
-    a_name: &str,
-    w_name: &str,
-    o_name: &str,
-    a_off: u32,
-    w_off: u32,
-    o_off: u32,
+    operands: NamedOperands<'_>,
 ) -> Result<OpSpec, String> {
     // Default work-division = the monolith cost-model split. The Kani-verified tower drives its OWN
     // (`CoreSplit`) via `matmul_opspec_split`, reusing everything below the split.
-    matmul_opspec_off_operands::<DF>(
-        m,
-        n,
-        k,
-        batch,
-        form,
-        a_name,
-        w_name,
-        o_name,
-        a_off,
-        w_off,
-        o_off,
-        DF::DF,
-    )
+    matmul_opspec_off_operands::<DF>(dims, batch, form, operands, DF::DF)
 }
 
 /// [`matmul_opspec_off`] with an EXPLICIT operand residency, decoupled from the `DF` stick geometry.
 /// Only fp8 W8A8 needs this: its geometry is `::<Fp16>` while its operands are 1 byte.
-#[allow(clippy::too_many_arguments)]
 pub fn matmul_opspec_off_operands<DF: DataFormat>(
-    m: MatM,
-    n: MatN,
-    k: MatK,
+    dims: MatmulDims,
     batch: MatY,
     form: SharedKernelBmmForm,
-    a_name: &str,
-    w_name: &str,
-    o_name: &str,
-    a_off: u32,
-    w_off: u32,
-    o_off: u32,
+    operands: NamedOperands<'_>,
     operand_df: Df,
 ) -> Result<OpSpec, String> {
-    matmul_opspec_off_operands_phys::<DF>(
-        m, n, k, batch, form, a_name, w_name, o_name, a_off, w_off, o_off, operand_df, None,
-    )
+    matmul_opspec_off_operands_phys::<DF>(dims, batch, form, operands, operand_df, None)
 }
 
 /// [`matmul_opspec_off_operands`] for an op that sweeps only PART of the activation's rows — see
 /// `phys_mb` on [`matmul_opspec_split`].
-#[allow(clippy::too_many_arguments)]
 pub fn matmul_opspec_off_operands_phys<DF: DataFormat>(
-    m: MatM,
-    n: MatN,
-    k: MatK,
+    MatmulDims { m, n, k }: MatmulDims,
     batch: MatY,
     form: SharedKernelBmmForm,
-    a_name: &str,
-    w_name: &str,
-    o_name: &str,
-    a_off: u32,
-    w_off: u32,
-    o_off: u32,
+    operands: NamedOperands<'_>,
     operand_df: Df,
     phys_mb: Option<PhysM>,
 ) -> Result<OpSpec, String> {
@@ -133,16 +133,13 @@ pub fn matmul_opspec_off_operands_phys<DF: DataFormat>(
     // form picks the LIVE splitter in the same breath as it will pick the walks below, so the
     // split policy and the declared order come from one value.
     matmul_opspec_split::<DF, _>(
-        m.get(),
-        n.get(),
-        k.get(),
-        batch.get(),
-        a_name,
-        w_name,
-        o_name,
-        a_off,
-        w_off,
-        o_off,
+        MatmulCounts {
+            m: m.get(),
+            n: n.get(),
+            k: k.get(),
+            batch: batch.get(),
+        },
+        operands,
         operand_df,
         phys_mb.map(PhysM::get),
         form,
@@ -171,26 +168,18 @@ const KERNEL_OPERAND: usize = 1;
 /// own.
 ///
 /// `None` builds byte-for-byte what the ungathered builder does.
-#[allow(clippy::too_many_arguments)]
 pub fn matmul_opspec_off_operands_phys_gathered<DF: DataFormat>(
-    m: MatM,
-    n: MatN,
-    k: MatK,
+    dims: MatmulDims,
     batch: MatY,
     form: SharedKernelBmmForm,
-    a_name: &str,
-    w_name: &str,
-    o_name: &str,
-    a_off: u32,
-    w_off: u32,
-    o_off: u32,
+    operands: NamedOperands<'_>,
     operand_df: Df,
     phys_mb: Option<PhysM>,
     gather: Option<crate::superdsc_opspec::GatherIndex>,
 ) -> Result<OpSpec, String> {
-    let mut op = matmul_opspec_off_operands_phys::<DF>(
-        m, n, k, batch, form, a_name, w_name, o_name, a_off, w_off, o_off, operand_df, phys_mb,
-    )?;
+    let mut op =
+        matmul_opspec_off_operands_phys::<DF>(dims, batch, form, operands, operand_df, phys_mb)?;
+    let NamedOperands { w_name, w_off, .. } = operands;
     if let Some(g) = gather {
         // ⭐⭐⭐⭐⭐ A BATCH-PAGED GATHER NEEDS THE KERNEL TO **DECLARE** `mb`, so re-declare it rank-3
         // before the pins are resolved against its layout.
@@ -216,16 +205,16 @@ pub fn matmul_opspec_off_operands_phys_gathered<DF: DataFormat>(
             // ⭐ THE `["in","out"]` PREFIX IS PRESERVED, so the ungathered walk's dim order is the
             // rank-3 walk's prefix and only the appended `mb` is new. A reordering here would move
             // every stride on the operand, which is not what declaring one more axis should do.
-            let kernel = TensorArg::<3>::new(
-                true,
-                w_name.to_string(),
-                Role::Kernel,
-                [Scale::Active; 3],
-                op.iter.iter_syms(layout),
+            let kernel = TensorArg::<3>::new(TensorArgDecl {
+                is_input: true,
+                name: w_name.to_string(),
+                role: Role::Kernel,
+                scale: [Scale::Active; 3],
+                device_dims: op.iter.iter_syms(layout),
                 layout,
                 stick,
-                Allocation::Hbm,
-            )
+                allocation: Allocation::Hbm,
+            })
             .map_err(|e| e.0)?
             .with_offset(w_off)
             .with_df(operand_df);
@@ -285,16 +274,16 @@ pub fn matmul_opspec_off_operands_phys_gathered<DF: DataFormat>(
                 crate::superdsc_opspec::KernelAxis::Feature.dim(),
                 stick,
             ];
-            let kernel = TensorArg::<3>::new(
-                true,
-                w_name.to_string(),
-                Role::Kernel,
-                [Scale::Active; 3],
-                op.iter.iter_syms(layout),
+            let kernel = TensorArg::<3>::new(TensorArgDecl {
+                is_input: true,
+                name: w_name.to_string(),
+                role: Role::Kernel,
+                scale: [Scale::Active; 3],
+                device_dims: op.iter.iter_syms(layout),
                 layout,
                 stick,
-                Allocation::Hbm,
-            )
+                allocation: Allocation::Hbm,
+            })
             .map_err(|e| e.0)?
             .with_offset(w_off)
             .with_df(operand_df);
@@ -317,18 +306,9 @@ pub fn matmul_opspec_off_operands_phys_gathered<DF: DataFormat>(
 /// (`scratchy-sdsc`) drives: it passes a `CoreSplit`-derived splitter so the emitted SDSC uses the PROVEN
 /// 32-core partition (disjoint+covering, #50-free by proof), while this fn keeps owning the ABI OpSpec /
 /// TensorArg assembly. `splitter` matches `WorkPlan::divide`'s: `(dims, max_cores) -> {name → >1 split}`.
-#[allow(clippy::too_many_arguments)]
 pub fn matmul_opspec_split<DF: DataFormat, S>(
-    m: u32,
-    n: u32,
-    k: u32,
-    batch: u32,
-    a_name: &str,
-    w_name: &str,
-    o_name: &str,
-    a_off: u32,
-    w_off: u32,
-    o_off: u32,
+    MatmulCounts { m, n, k, batch }: MatmulCounts,
+    operands: NamedOperands<'_>,
     operand_df: Df,
     // PHYSICAL `mb` extent when this op iterates only PART of the activation's rows. `None` (every
     // caller until the row-batched fold) means "the tensor has exactly the rows this op sweeps".
@@ -354,6 +334,14 @@ pub fn matmul_opspec_split<DF: DataFormat, S>(
 where
     S: Fn(&[crate::superdsc_opspec::ItDim], u32) -> std::collections::BTreeMap<&'static str, u32>,
 {
+    let NamedOperands {
+        a_name,
+        w_name,
+        o_name,
+        a_off,
+        w_off,
+        o_off,
+    } = operands;
     // N and K are constructed as typed [`StickExtent<DF>`] — for `DF = Fp8` this is a
     // 128-multiple witness, so a non-128 fp8 extent is a Rust `Err` at emit, NEVER the
     // on-card `L3DlOpsScheduler:1070 multiple-of-stick` DtException. The `DF` also flows
@@ -451,16 +439,16 @@ where
     // OUTPUT [mb,out,y] stick=out  scale[1,1,1] (reduction = OMIT `in`).
     // KERNEL is always the bare 2-D shared weight [in,out] (broadcast across mb+batch).
     let kernel_walk = Walk2::kernel_shared();
-    let kernel = TensorArg::<2>::new(
-        true,
-        w_name.to_string(),
-        Role::Kernel,
-        [Scale::Active, Scale::Active],
-        plan.iter_syms(kernel_walk.order()),
-        kernel_walk.order(),
-        kernel_walk.stick(),
-        Allocation::Hbm,
-    )
+    let kernel = TensorArg::<2>::new(TensorArgDecl {
+        is_input: true,
+        name: w_name.to_string(),
+        role: Role::Kernel,
+        scale: [Scale::Active, Scale::Active],
+        device_dims: plan.iter_syms(kernel_walk.order()),
+        layout: kernel_walk.order(),
+        stick: kernel_walk.stick(),
+        allocation: Allocation::Hbm,
+    })
     .map_err(|e| e.0)?
     .with_offset(w_off);
 
@@ -469,16 +457,16 @@ where
     // prefill collapse). A true batched matmul (batch>1, attention bmm) keeps the `y`(=batch) dim.
     let args = if batch <= 1 {
         let input_walk = Walk2::input_rows_by_k();
-        let input = TensorArg::<2>::new(
-            true,
-            a_name.to_string(),
-            Role::Input,
-            [Scale::Active, Scale::Active],
-            plan.iter_syms(input_walk.order()),
-            input_walk.order(),
-            input_walk.stick(),
-            Allocation::Hbm,
-        )
+        let input = TensorArg::<2>::new(TensorArgDecl {
+            is_input: true,
+            name: a_name.to_string(),
+            role: Role::Input,
+            scale: [Scale::Active, Scale::Active],
+            device_dims: plan.iter_syms(input_walk.order()),
+            layout: input_walk.order(),
+            stick: input_walk.stick(),
+            allocation: Allocation::Hbm,
+        })
         .map_err(|e| e.0)?
         .with_offset(a_off);
         // ⭐ THE ACTIVATION'S OWN ROW COUNT, WHEN THIS OP SWEEPS A SLICE OF IT — the same law the
@@ -492,16 +480,16 @@ where
             _ => input,
         };
         let output_walk = Walk2::output_rows_by_n();
-        let output = TensorArg::<2>::new(
-            false,
-            o_name.to_string(),
-            Role::Output,
-            [Scale::Active, Scale::Active],
-            plan.iter_syms(output_walk.order()),
-            output_walk.order(),
-            output_walk.stick(),
-            Allocation::Hbm,
-        )
+        let output = TensorArg::<2>::new(TensorArgDecl {
+            is_input: false,
+            name: o_name.to_string(),
+            role: Role::Output,
+            scale: [Scale::Active, Scale::Active],
+            device_dims: plan.iter_syms(output_walk.order()),
+            layout: output_walk.order(),
+            stick: output_walk.stick(),
+            allocation: Allocation::Hbm,
+        })
         .map_err(|e| e.0)?
         .with_offset(o_off);
         // ⭐⭐⭐⭐⭐ THE OUTPUT'S OWN ROW COUNT, WHEN IT IS A SLICE OF A TALLER BUFFER — and this is what
@@ -640,12 +628,12 @@ where
             }
         }
         let (input, output) = match form.regime() {
-            SharedKernelBmmRegime::Proven(regime) => batched_walk_args(
-                regime, &plan, a_name, o_name, a_off, o_off, phys_mb, pitches,
-            )?,
-            SharedKernelBmmRegime::Requests(regime) => batched_walk_args(
-                regime, &plan, a_name, o_name, a_off, o_off, phys_mb, pitches,
-            )?,
+            SharedKernelBmmRegime::Proven(regime) => {
+                batched_walk_args(regime, &plan, operands, phys_mb, pitches)?
+            }
+            SharedKernelBmmRegime::Requests(regime) => {
+                batched_walk_args(regime, &plan, operands, phys_mb, pitches)?
+            }
         };
         [
             AnyTensorArg::R3(input),
@@ -679,14 +667,10 @@ where
 /// ([`batched_output_arg`]) only a stick-`out` walk, so handing either half to the other's
 /// descriptor is an `E0308` — there is no point between the regime and the descriptor write where
 /// the two halves exist as interchangeable values.
-#[allow(clippy::too_many_arguments)]
 fn batched_walk_args<R: RungRegime>(
     regime: R,
     plan: &WorkPlan,
-    a_name: &str,
-    o_name: &str,
-    a_off: u32,
-    o_off: u32,
+    operands: NamedOperands<'_>,
     phys_mb: Option<u32>,
     // ⭐ EACH OPERAND'S OWN DECLARED ROW PITCH, from its own placement law (see `BatchStrides`). The
     // two genuinely differ on the score leg: a token-stream activation stepped one stick at a time
@@ -694,6 +678,13 @@ fn batched_walk_args<R: RungRegime>(
     // only one of them, which is what made a one-stick contraction look unrepresentable.
     pitches: Option<(u32, u32)>,
 ) -> Result<(TensorArg<3>, TensorArg<3>), String> {
+    let NamedOperands {
+        a_name,
+        o_name,
+        a_off,
+        o_off,
+        ..
+    } = operands;
     let input = batched_input_arg(a_name, regime.input_walk(), plan)?.with_offset(a_off);
     // A phys SMALLER than the swept extent is a mis-declaration, not a window (same rule the
     // kernel override enforces): the walk would describe less memory than the op reads.
@@ -738,16 +729,16 @@ fn batched_input_arg<A: WalkAxis, B: WalkAxis>(
     walk: Walk3<A, B, InAxis>,
     plan: &WorkPlan,
 ) -> Result<TensorArg<3>, String> {
-    TensorArg::<3>::new(
-        true,
-        name.to_string(),
-        Role::Input,
-        [Scale::Active, Scale::Active, Scale::Active],
-        plan.iter_syms(walk.order()),
-        walk.order(),
-        walk.stick(),
-        Allocation::Hbm,
-    )
+    TensorArg::<3>::new(TensorArgDecl {
+        is_input: true,
+        name: name.to_string(),
+        role: Role::Input,
+        scale: [Scale::Active, Scale::Active, Scale::Active],
+        device_dims: plan.iter_syms(walk.order()),
+        layout: walk.order(),
+        stick: walk.stick(),
+        allocation: Allocation::Hbm,
+    })
     .map_err(|e| e.0)
 }
 
@@ -758,16 +749,16 @@ fn batched_output_arg<A: WalkAxis, B: WalkAxis>(
     walk: Walk3<A, B, OutAxis>,
     plan: &WorkPlan,
 ) -> Result<TensorArg<3>, String> {
-    TensorArg::<3>::new(
-        false,
-        name.to_string(),
-        Role::Output,
-        [Scale::Active, Scale::Active, Scale::Active],
-        plan.iter_syms(walk.order()),
-        walk.order(),
-        walk.stick(),
-        Allocation::Hbm,
-    )
+    TensorArg::<3>::new(TensorArgDecl {
+        is_input: false,
+        name: name.to_string(),
+        role: Role::Output,
+        scale: [Scale::Active, Scale::Active, Scale::Active],
+        device_dims: plan.iter_syms(walk.order()),
+        layout: walk.order(),
+        stick: walk.stick(),
+        allocation: Allocation::Hbm,
+    })
     .map_err(|e| e.0)
 }
 
@@ -802,16 +793,20 @@ pub fn matmul_opspec_batched(
     // The untyped wrapper boundary. Its own contract (the fn doc above) fixes the meanings: `m` is
     // the query rows and `batch` carries the HEADS of the per-batch bmm.
     matmul_opspec_batched_off(
-        MatM::of_query_rows(crate::sdsc_abstract::QueryRowCount::of_mq(m)),
-        MatN::of_out_features(n),
-        MatK::of_in_features(k),
+        MatmulDims {
+            m: MatM::of_query_rows(crate::sdsc_abstract::QueryRowCount::of_mq(m)),
+            n: MatN::of_out_features(n),
+            k: MatK::of_in_features(k),
+        },
         MatY::of_heads(batch),
-        a_name,
-        w_name,
-        o_name,
-        0,
-        0,
-        0,
+        NamedOperands {
+            a_name,
+            w_name,
+            o_name,
+            a_off: 0,
+            w_off: 0,
+            o_off: 0,
+        },
         None,
     )
 }
@@ -835,18 +830,17 @@ pub fn matmul_opspec_batched(
 ///
 /// `None` reproduces [`matmul_opspec_batched`] exactly (all offsets 0, strides from iteration
 /// extents), so this is a strict superset and existing behaviour is byte-identical.
-#[allow(clippy::too_many_arguments)]
 pub fn matmul_opspec_batched_off(
-    m: MatM,
-    n: MatN,
-    k: MatK,
+    MatmulDims { m, n, k }: MatmulDims,
     batch: MatY,
-    a_name: &str,
-    w_name: &str,
-    o_name: &str,
-    a_off: u32,
-    w_off: u32,
-    o_off: u32,
+    NamedOperands {
+        a_name,
+        w_name,
+        o_name,
+        a_off,
+        w_off,
+        o_off,
+    }: NamedOperands<'_>,
     kernel_device_extent: Option<(&'static str, u32)>,
 ) -> Result<OpSpec, String> {
     // ⛔⛔⛔ THIS FORM IS NOT FOR REQUESTS, AND THAT IS A CARD MEASUREMENT. A `RequestAxis` parameter here
@@ -875,31 +869,31 @@ pub fn matmul_opspec_batched_off(
     let (plan, time_tile) = (tiled.plan, tiled.time_tile);
     // INPUT [y,mb,in] stick=in (batch-outermost; reduction = OMIT `in` from OUTPUT).
     let input_walk = Walk3::input_head_outermost();
-    let input = TensorArg::<3>::new(
-        true,
-        a_name.to_string(),
-        Role::Input,
-        [Scale::Active, Scale::Active, Scale::Active],
-        plan.iter_syms(input_walk.order()),
-        input_walk.order(),
-        input_walk.stick(),
-        Allocation::Hbm,
-    )
+    let input = TensorArg::<3>::new(TensorArgDecl {
+        is_input: true,
+        name: a_name.to_string(),
+        role: Role::Input,
+        scale: [Scale::Active, Scale::Active, Scale::Active],
+        device_dims: plan.iter_syms(input_walk.order()),
+        layout: input_walk.order(),
+        stick: input_walk.stick(),
+        allocation: Allocation::Hbm,
+    })
     .map_err(|e| e.0)?
     .with_offset(a_off);
     // KERNEL [y,in,out] stick=out — the 3-D PER-BATCH weight (`y` carries the head),
     // NOT the 2-D shared kernel. This is the entire difference from `matmul_opspec`.
     let kernel_walk = Walk3::kernel_per_head();
-    let kernel = TensorArg::<3>::new(
-        true,
-        w_name.to_string(),
-        Role::Kernel,
-        [Scale::Active, Scale::Active, Scale::Active],
-        plan.iter_syms(kernel_walk.order()),
-        kernel_walk.order(),
-        kernel_walk.stick(),
-        Allocation::Hbm,
-    )
+    let kernel = TensorArg::<3>::new(TensorArgDecl {
+        is_input: true,
+        name: w_name.to_string(),
+        role: Role::Kernel,
+        scale: [Scale::Active, Scale::Active, Scale::Active],
+        device_dims: plan.iter_syms(kernel_walk.order()),
+        layout: kernel_walk.order(),
+        stick: kernel_walk.stick(),
+        allocation: Allocation::Hbm,
+    })
     .map_err(|e| e.0)?
     .with_offset(w_off);
     // The `y`-stride override (see the fn doc): declare the kernel dim whose PHYSICAL extent
@@ -924,16 +918,16 @@ pub fn matmul_opspec_batched_off(
         None => kernel,
     };
     let output_walk = Walk3::output_head_outermost();
-    let output = TensorArg::<3>::new(
-        false,
-        o_name.to_string(),
-        Role::Output,
-        [Scale::Active, Scale::Active, Scale::Active],
-        plan.iter_syms(output_walk.order()),
-        output_walk.order(),
-        output_walk.stick(),
-        Allocation::Hbm,
-    )
+    let output = TensorArg::<3>::new(TensorArgDecl {
+        is_input: false,
+        name: o_name.to_string(),
+        role: Role::Output,
+        scale: [Scale::Active, Scale::Active, Scale::Active],
+        device_dims: plan.iter_syms(output_walk.order()),
+        layout: output_walk.order(),
+        stick: output_walk.stick(),
+        allocation: Allocation::Hbm,
+    })
     .map_err(|e| e.0)?
     .with_offset(o_off);
     Ok(OpSpec::new(
@@ -998,43 +992,43 @@ pub fn matmul_opspec_x_batched(
         std::collections::BTreeMap::from([("x", cores)])
     })?;
     let active = [Scale::Active, Scale::Active, Scale::Active];
-    let input = TensorArg::<3>::new(
-        true,
-        a_name.to_string(),
-        Role::Input,
-        active,
-        plan.iter_syms(["x", MbAxis::NAME, InAxis::NAME]),
-        ["x", MbAxis::NAME, InAxis::NAME],
-        InAxis::NAME,
-        Allocation::Hbm,
-    )
+    let input = TensorArg::<3>::new(TensorArgDecl {
+        is_input: true,
+        name: a_name.to_string(),
+        role: Role::Input,
+        scale: active,
+        device_dims: plan.iter_syms(["x", MbAxis::NAME, InAxis::NAME]),
+        layout: ["x", MbAxis::NAME, InAxis::NAME],
+        stick: InAxis::NAME,
+        allocation: Allocation::Hbm,
+    })
     .map_err(|e| e.0)?
     .with_frame(ViewFrame::FoldedRows)
     .with_device_order([MbAxis::NAME, "x", InAxis::NAME])
     .map_err(|e| e.0)?;
-    let kernel = TensorArg::<3>::new(
-        true,
-        w_name.to_string(),
-        Role::Kernel,
-        active,
-        plan.iter_syms(["x", InAxis::NAME, OutAxis::NAME]),
-        ["x", InAxis::NAME, OutAxis::NAME],
-        OutAxis::NAME,
-        Allocation::Hbm,
-    )
+    let kernel = TensorArg::<3>::new(TensorArgDecl {
+        is_input: true,
+        name: w_name.to_string(),
+        role: Role::Kernel,
+        scale: active,
+        device_dims: plan.iter_syms(["x", InAxis::NAME, OutAxis::NAME]),
+        layout: ["x", InAxis::NAME, OutAxis::NAME],
+        stick: OutAxis::NAME,
+        allocation: Allocation::Hbm,
+    })
     .map_err(|e| e.0)?
     .with_device_order([InAxis::NAME, OutAxis::NAME, "x"])
     .map_err(|e| e.0)?;
-    let output = TensorArg::<3>::new(
-        false,
-        o_name.to_string(),
-        Role::Output,
-        active,
-        plan.iter_syms(["x", MbAxis::NAME, OutAxis::NAME]),
-        ["x", MbAxis::NAME, OutAxis::NAME],
-        OutAxis::NAME,
-        Allocation::Hbm,
-    )
+    let output = TensorArg::<3>::new(TensorArgDecl {
+        is_input: false,
+        name: o_name.to_string(),
+        role: Role::Output,
+        scale: active,
+        device_dims: plan.iter_syms(["x", MbAxis::NAME, OutAxis::NAME]),
+        layout: ["x", MbAxis::NAME, OutAxis::NAME],
+        stick: OutAxis::NAME,
+        allocation: Allocation::Hbm,
+    })
     .map_err(|e| e.0)?
     .with_frame(ViewFrame::FoldedRows)
     .with_device_order([MbAxis::NAME, "x", OutAxis::NAME])
@@ -1133,32 +1127,32 @@ pub fn matmul_opspec_rows_split(
                 order: BatchRows,
                 stick: &'static str|
      -> Result<TensorArg<3>, String> {
-        TensorArg::<3>::new(
+        TensorArg::<3>::new(TensorArgDecl {
             is_input,
-            name.to_string(),
+            name: name.to_string(),
             role,
-            active,
-            plan.iter_syms(order.layout(stick)),
-            order.layout(stick),
+            scale: active,
+            device_dims: plan.iter_syms(order.layout(stick)),
+            layout: order.layout(stick),
             stick,
-            Allocation::Hbm,
-        )
+            allocation: Allocation::Hbm,
+        })
         .map_err(|e| e.0)?
         .with_frame(ViewFrame::FoldedRows)
         .with_device_order(order.device(stick))
         .map_err(|e| e.0)
     };
     let input = rows(true, a_name, Role::Input, a_rows, InAxis::NAME)?;
-    let kernel = TensorArg::<3>::new(
-        true,
-        w_name.to_string(),
-        Role::Kernel,
-        active,
-        plan.iter_syms(["x", InAxis::NAME, OutAxis::NAME]),
-        ["x", InAxis::NAME, OutAxis::NAME],
-        OutAxis::NAME,
-        Allocation::Hbm,
-    )
+    let kernel = TensorArg::<3>::new(TensorArgDecl {
+        is_input: true,
+        name: w_name.to_string(),
+        role: Role::Kernel,
+        scale: active,
+        device_dims: plan.iter_syms(["x", InAxis::NAME, OutAxis::NAME]),
+        layout: ["x", InAxis::NAME, OutAxis::NAME],
+        stick: OutAxis::NAME,
+        allocation: Allocation::Hbm,
+    })
     .map_err(|e| e.0)?
     .with_device_order([InAxis::NAME, OutAxis::NAME, "x"])
     .map_err(|e| e.0)?;
@@ -1189,16 +1183,16 @@ mod x_batched_tests {
             .next()
             .expect("one dsc")
             .clone();
-        dsc.scheduleTree_
+        dsc.schedule_tree
             .iter()
-            .filter(|n| n.nodeType_ == "allocate")
+            .filter(|n| n.node_type == "allocate")
             .map(|n| {
                 let at = |c: u32| -> u64 {
-                    n.startAddressCoreCorelet_.data_[&format!("[{c}, 0, 0]")]
+                    n.start_address_core_corelet.data_[&format!("[{c}, 0, 0]")]
                         .parse()
                         .expect("a decimal address")
                 };
-                let order = serde_json::to_value(&n.layoutDimOrder_).expect("an order");
+                let order = serde_json::to_value(&n.layout_dim_order).expect("an order");
                 let order = order
                     .as_array()
                     .expect("a list")
@@ -1275,17 +1269,17 @@ mod rows_split_tests {
             .expect("one dsc")
             .clone();
         let cores = op.iter.cores_used().get();
-        dsc.scheduleTree_
+        dsc.schedule_tree
             .iter()
-            .filter(|n| n.nodeType_ == "allocate")
+            .filter(|n| n.node_type == "allocate")
             .map(|n| {
                 let at = |c: u32| -> u64 {
-                    n.startAddressCoreCorelet_.data_[&format!("[{c}, 0, 0]")]
+                    n.start_address_core_corelet.data_[&format!("[{c}, 0, 0]")]
                         .parse()
                         .expect("a decimal address")
                 };
                 (
-                    serde_json::to_value(&n.layoutDimOrder_).expect("an order"),
+                    serde_json::to_value(&n.layout_dim_order).expect("an order"),
                     (0..cores).map(|c| at(c) - at(0)).collect(),
                 )
             })

@@ -4054,13 +4054,13 @@ fn the_tall_wide_hidden_rmsnorm_mean_splits_through_the_door() {
                     .values()
                     .next()
                     .expect("one dsc")
-                    .scheduleTree_
+                    .schedule_tree
                     .iter()
-                    .find(|n| n.nodeType_ == "allocate" && n.ldsIdx_ as usize == ti)
+                    .find(|n| n.node_type == "allocate" && n.lds_idx as usize == ti)
                     .unwrap_or_else(|| {
                         panic!("op '{}': an allocate node per operand {ti}", e.op_name)
                     })
-                    .startAddressCoreCorelet_
+                    .start_address_core_corelet
                     .data_
                     .values()
                     .next()

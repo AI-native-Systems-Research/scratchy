@@ -24,12 +24,6 @@
 //! span limit 256 MiB. fp16 everywhere → dataFormat_ "SEN169_FP16", wordLength 2,
 //! stickSize_ 64.
 
-// The SuperDSC struct fields mirror the DeepTools fixture JSON keys VERBATIM
-// (trailing-underscore / camelCase, e.g. `coreFoldProp_`, `numWkSlicesPerDim_`),
-// so the serde field name IS the JSON key. snake_case renaming would break the
-// wire format — silence the lint for the whole module.
-#![allow(non_snake_case)]
-
 pub use crate::ir::bridge::tiled_op_sdsc_op::matmul_opspec_off;
 // Re-exports: external crates reference these matmul-family functions directly through this
 // module's path (`scratchy-forward-compiler-macro`'s codegen: `superdsc::assemble_matmul`;
@@ -44,7 +38,8 @@ pub use crate::ir::bridge::tiled_op_sdsc_op::matmul_opspec_off;
 // bytes against torch-spyre, i.e. exactly the machinery under suspicion for the composite-m
 // garble. Nothing caught it because CI never builds this crate with `--features superdsc`.
 pub use crate::ir::bridge::tiled_op_sdsc_op::{
-    assemble_matmul, assemble_matmul_off, assemble_matmul_seeded, assemble_matmul_split,
+    MatmulCounts, MatmulDims, MatmulNames, MatmulOperands, NamedOperands, assemble_matmul,
+    assemble_matmul_off, assemble_matmul_seeded, assemble_matmul_split,
 };
 use ktir_core::attrkey::AttrKey;
 use ktir_core::ir::Attr;
@@ -6181,7 +6176,7 @@ pub fn concrete_trips<T: ktir_superdsc::collective::Tp>(e: &EmittedOp<T>) -> Vec
             let mut op = e.dsc().clone();
             for dsc_map in op.dscs_.iter_mut() {
                 for dsc in dsc_map.values_mut() {
-                    for mut node in dsc.scheduleTree_.edit() {
+                    for mut node in dsc.schedule_tree.edit() {
                         let ti = node.operand();
                         let Some(stride) = e.affine_strides.get(ti).and_then(|m| m.get("out"))
                         else {
@@ -6334,7 +6329,7 @@ fn primary_compute_op<T: ktir_superdsc::collective::Tp>(
     e: &EmittedOp<T>,
 ) -> Option<(&Dsc, &ComputeOp)> {
     let dsc = e.dsc().dscs_.first()?.values().next()?;
-    let cop = dsc.computeOp_.first()?;
+    let cop = dsc.compute_op.first()?;
     Some((dsc, cop))
 }
 
@@ -6366,7 +6361,7 @@ fn print_fusion_candidates<T: ktir_superdsc::collective::Tp>(ops: &[EmittedOp<T>
         let Some((_, a_cop)) = primary_compute_op(a) else {
             continue;
         };
-        if !MATMUL_OP_FUNCS.contains(&a_cop.opFuncName.as_str()) {
+        if !MATMUL_OP_FUNCS.contains(&a_cop.op_func_name.as_str()) {
             continue;
         }
         let Some((b_dsc, b_cop)) = primary_compute_op(b) else {
@@ -6397,7 +6392,7 @@ fn print_fusion_candidates<T: ktir_superdsc::collective::Tp>(ops: &[EmittedOp<T>
         n += 1;
         eprintln!(
             "[fusion-scan] {:>3}. {} (matmul:{}) -> {} ({}:{}) shares '{shared}', in_place={in_place}",
-            n, a.op_name, a_cop.opFuncName, b.op_name, b_cop.exUnit, b_cop.opFuncName,
+            n, a.op_name, a_cop.op_func_name, b.op_name, b_cop.ex_unit, b_cop.op_func_name,
         );
         for extra in b_inputs.iter().filter(|&&x| x != shared) {
             // `labeledDs_`/`arg_bindings` are BOTH parallel to `op.args` (ldsIdx_ == position ==
@@ -6407,7 +6402,7 @@ fn print_fusion_candidates<T: ktir_superdsc::collective::Tp>(ops: &[EmittedOp<T>
             // matching by NAME (as opposed to by shared position) would silently find nothing.
             let idx = b.arg_bindings.iter().position(|ab| ab.buffer == *extra);
             let scale = idx
-                .and_then(|i| b_dsc.labeledDs_.get(i))
+                .and_then(|i| b_dsc.labeled_ds.get(i))
                 .map(|l| l.scale_.clone());
             eprintln!("[fusion-scan]      extra operand '{extra}' scale_={scale:?}");
         }
@@ -7760,18 +7755,18 @@ fn tiled_trips_alias<T: ktir_superdsc::collective::Tp>(e: &EmittedOp<T>) -> bool
         for dsc_map in &trip.dscs_ {
             for dsc in dsc_map.values() {
                 let out_lds: std::collections::BTreeSet<u32> = dsc
-                    .labeledDs_
+                    .labeled_ds
                     .iter()
-                    .filter(|l| l.dsType_ == "OUTPUT")
-                    .map(|l| l.ldsIdx_)
+                    .filter(|l| l.ds_type == "OUTPUT")
+                    .map(|l| l.lds_idx)
                     .collect();
-                for node in &dsc.scheduleTree_ {
-                    if node.component_ != "hbm" || !out_lds.contains(&node.ldsIdx_) {
+                for node in &dsc.schedule_tree {
+                    if node.component_ != "hbm" || !out_lds.contains(&node.lds_idx) {
                         continue;
                     }
-                    for v in node.startAddressCoreCorelet_.data_.values() {
+                    for v in node.start_address_core_corelet.data_.values() {
                         if let Ok(a) = v.parse::<u64>() {
-                            this_trip.insert((node.ldsIdx_, a));
+                            this_trip.insert((node.lds_idx, a));
                         }
                     }
                 }
@@ -9398,9 +9393,9 @@ mod tests {
         assert!(!j.contains("hbmStartAddress_") && !j.contains("lxBufferSize_"));
         assert!(!j.contains("stickRepl_") && !j.contains("unpadN_"));
         // exUnit is pt (sealed from OpFunc), and the fold factors agree.
-        assert_eq!(sdsc.dscs_[0]["MatMul_0"].computeOp_[0].exUnit, "pt");
-        assert_eq!(sdsc.coreFoldProp_.factor_, 32);
-        assert_eq!(sdsc.coreletFoldProp_.factor_, 1);
+        assert_eq!(sdsc.dscs_[0]["MatMul_0"].compute_op[0].ex_unit, "pt");
+        assert_eq!(sdsc.core_fold_prop.factor_, 32);
+        assert_eq!(sdsc.corelet_fold_prop.factor_, 1);
     }
 
     #[test]
@@ -9458,10 +9453,10 @@ mod tests {
         // shape's layout, or produced a silently-wrong scale_ if the marker were dropped).
         let folds = SdscFoldSet::new(op.iter.cores_used());
         let sdsc = emit_sdsc("MatMul_0", &op, &folds, None).unwrap();
-        let labeled = &sdsc.dscs_[0]["MatMul_0"].labeledDs_;
+        let labeled = &sdsc.dscs_[0]["MatMul_0"].labeled_ds;
         let mask_lds = labeled
             .iter()
-            .find(|l| l.dsName_ == format!("Tensor{epi_idx}"))
+            .find(|l| l.ds_name == format!("Tensor{epi_idx}"))
             .expect("mask labeledDs_ entry");
         // Wire `scale_` is parallel to the operand's own layout, so it is read the same way: -1 for a
         // broadcast dim, 1 for an active one. Two broadcast dims and one active, whatever the order.
@@ -9535,7 +9530,7 @@ mod tests {
         });
         let folds = SdscFoldSet::new(op.iter.cores_used());
         let sdsc = emit_sdsc("MatMul_0", &op, &folds, None).unwrap();
-        let ops = &sdsc.dscs_[0]["MatMul_0"].computeOp_;
+        let ops = &sdsc.dscs_[0]["MatMul_0"].compute_op;
         assert_eq!(
             ops.len(),
             2,
@@ -9543,21 +9538,27 @@ mod tests {
         );
 
         // computeOp_[0]: the matmul itself, UNCHANGED — no trace of the mask operand.
-        assert_eq!(ops[0].opFuncName, "batchmatmul");
-        assert_eq!(ops[0].inputLabeledDs, vec!["Tensor0-idx0", "Tensor1-idx1"]);
-        assert_eq!(ops[0].outputLabeledDs, vec!["Tensor3-idx3"]);
+        assert_eq!(ops[0].op_func_name, "batchmatmul");
+        assert_eq!(
+            ops[0].input_labeled_ds,
+            vec!["Tensor0-idx0", "Tensor1-idx1"]
+        );
+        assert_eq!(ops[0].output_labeled_ds, vec!["Tensor3-idx3"]);
 
         // computeOp_[1]: the epilogue, reading+writing the MATMUL'S OWN output in place, plus the
         // mask as its second input — exactly the golden's `biasadd` shape.
-        assert_eq!(ops[1].exUnit, "sfp");
-        assert_eq!(ops[1].opFuncName, "stridedadd");
-        assert_eq!(ops[1].inputLabeledDs, vec!["Tensor3-idx3", "Tensor2-idx2"]);
-        assert_eq!(ops[1].outputLabeledDs, vec!["Tensor3-idx3"]);
+        assert_eq!(ops[1].ex_unit, "sfp");
+        assert_eq!(ops[1].op_func_name, "stridedadd");
+        assert_eq!(
+            ops[1].input_labeled_ds,
+            vec!["Tensor3-idx3", "Tensor2-idx2"]
+        );
+        assert_eq!(ops[1].output_labeled_ds, vec!["Tensor3-idx3"]);
 
         // The mask tensor still gets its OWN labeledDs_ entry (the on-card walk must address it), typed
         // OUTPUT to match `bmm.ddl`'s bias/resadd convention (same layout bucket as the real
         // output, not INPUT).
-        let labeled = &sdsc.dscs_[0]["MatMul_0"].labeledDs_;
+        let labeled = &sdsc.dscs_[0]["MatMul_0"].labeled_ds;
         assert_eq!(
             labeled.len(),
             4,
@@ -9565,9 +9566,9 @@ mod tests {
         );
         let mask_lds = labeled
             .iter()
-            .find(|l| l.dsName_ == "Tensor2")
+            .find(|l| l.ds_name == "Tensor2")
             .expect("mask labeledDs_ entry");
-        assert_eq!(mask_lds.dsType_, "OUTPUT");
+        assert_eq!(mask_lds.ds_type, "OUTPUT");
     }
 
     #[test]
@@ -10249,10 +10250,12 @@ mod tests {
         // bmm 384×384×64 batch16 fits LX (576 KiB < 1.6 MiB) → time=1 EmittedOp.
         let emitted = assemble_matmul::<ktir_superdsc::collective::TpWorld<1>>(
             "MatMul_0",
-            384,
-            384,
-            64,
-            16,
+            MatmulCounts {
+                m: 384,
+                n: 384,
+                k: 64,
+                batch: 16,
+            },
             &rb("act", 384, 64),
             &Stk::<KernelTag>::kernel(64, 384, "wt"),
             &rb("out", 384, 384),
@@ -10262,11 +10265,11 @@ mod tests {
         assert_eq!(emitted.time, 1, "bmm must NOT time-tile (fits LX)");
         let op = emitted.dsc();
         // numWkSlices product = 32 cores.
-        let prod: u32 = op.numWkSlicesPerDim_.values().product();
+        let prod: u32 = op.num_wk_slices_per_dim.values().product();
         assert_eq!(
             prod, 32,
             "matmul must use 32 cores: {:?}",
-            op.numWkSlicesPerDim_
+            op.num_wk_slices_per_dim
         );
         // serializes to JSON with the mandatory trailing-underscore keys.
         let j = serde_json::to_string(op).expect("SuperDSC serializes");
@@ -10281,8 +10284,8 @@ mod tests {
         );
         // per-core stage dims = full / split.
         let dsc = &op.dscs_[0]["MatMul_0"];
-        assert_eq!(dsc.numCoresUsed_, 32);
-        assert_eq!(dsc.computeOp_[0].exUnit, "pt");
+        assert_eq!(dsc.num_cores_used, 32);
+        assert_eq!(dsc.compute_op[0].ex_unit, "pt");
     }
 
     #[test]
@@ -10294,10 +10297,12 @@ mod tests {
         // A time=1 EmittedOp routes through emit_bundle_mlir → the SAME flat body.
         let emitted = assemble_matmul::<ktir_superdsc::collective::TpWorld<1>>(
             "MatMul_0",
-            384,
-            384,
-            64,
-            16,
+            MatmulCounts {
+                m: 384,
+                n: 384,
+                k: 64,
+                batch: 16,
+            },
             &rb("act", 384, 64),
             &Stk::<KernelTag>::kernel(64, 384, "wt"),
             &rb("out", 384, 384),
@@ -10324,10 +10329,7 @@ mod tests {
         let (m, n, k, batch) = (64, 32768, 64, 16);
         let whole = assemble_matmul::<ktir_superdsc::collective::TpWorld<1>>(
             "matmul_o7",
-            m,
-            n,
-            k,
-            1,
+            MatmulCounts { m, n, k, batch: 1 },
             &rb("a", m, k),
             &Stk::<KernelTag>::kernel(k as usize, n as usize, "w"),
             &rb("o", m, n),
@@ -10342,10 +10344,12 @@ mod tests {
             ktir_superdsc::collective::TpWorld<1>,
         >(
             "matmul_o7",
-            64,
-            16384,
-            2048,
-            2,
+            MatmulCounts {
+                m: 64,
+                n: 16384,
+                k: 2048,
+                batch: 2,
+            },
             &rb("a", 64, 2048),
             &Stk::<KernelTag>::kernel(2048, 16384, "w"),
             &rb("o", 64, 16384),
@@ -10362,10 +10366,7 @@ mod tests {
         );
         let emitted = assemble_matmul::<ktir_superdsc::collective::TpWorld<1>>(
             "matmul_o7",
-            m,
-            n,
-            k,
-            batch,
+            MatmulCounts { m, n, k, batch },
             &rb("a", m, k),
             &Stk::<KernelTag>::kernel(k as usize, n as usize, "w"),
             &rb("o", m, n),
@@ -10378,11 +10379,11 @@ mod tests {
         let dsc = &emitted.dsc().dscs_[0]["matmul_o7"];
         let split_out = emitted
             .dsc()
-            .numWkSlicesPerDim_
+            .num_wk_slices_per_dim
             .get("out")
             .copied()
             .unwrap_or(1);
-        let per_core_out_per_time = (dsc.N_.out_ as u32) / split_out;
+        let per_core_out_per_time = (dsc.n.out_ as u32) / split_out;
         assert_eq!(
             per_core_out_per_time % 64,
             0,
@@ -11095,10 +11096,12 @@ mod fingerprint_tests {
         let at = |m: u32| {
             assemble_matmul::<ktir_superdsc::collective::TpWorld<1>>(
                 "MatMul_0",
-                m,
-                384,
-                64,
-                16,
+                MatmulCounts {
+                    m,
+                    n: 384,
+                    k: 64,
+                    batch: 16,
+                },
                 &rb("act", m, 64),
                 &Stk::<KernelTag>::kernel(64, 384, "wt"),
                 &rb("out", m, 384),
