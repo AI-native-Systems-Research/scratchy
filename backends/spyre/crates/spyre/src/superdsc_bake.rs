@@ -1369,20 +1369,8 @@ impl DxpTool {
     /// DIFFERENT worker's failure can reach and kill this child (via [`Reaper::fail`]) instead of leaving
     /// it to be orphaned when the build exits.
     fn compile(&self, group: &SealedGroup, reaper: &Reaper) -> Result<(), String> {
-        self.run_dxp(group.path(), group.explore(), reaper)
-    }
-
-    /// ⭐ ONE BUNDLE DIRECTORY COMPILED IN PLACE, OUTSIDE A BAKE — the same command, environment,
-    /// knob guard and verdict every bake group takes ([`Self::run_dxp`]), for a card leg that bakes
-    /// its own bundles (`scratchy-target-spyre-card`'s `kv_fp8_round_trip`). `explore` is the
-    /// directory's own ([`ChunkExplore::of_group`] over its trips).
-    pub fn compile_dir(&self, dir: &Path, explore: ChunkExplore) -> Result<(), String> {
-        self.run_dxp(dir, explore, &Reaper::default())
-    }
-
-    /// The body of [`Self::compile`]: `group` compiled in place under `explore`, its child
-    /// registered with `reaper`.
-    fn run_dxp(&self, group: &Path, explore: ChunkExplore, reaper: &Reaper) -> Result<(), String> {
+        let explore = group.explore();
+        let group = group.path();
         // ⛔ THE SILENT-ENV-DRIFT GUARD runs before anything is spawned: a knob name the
         // toolchain cannot read must fail HERE, with the knob named — not silently at its
         // default, changing what the whole bake validates (see `env_knob_guard`'s doc for the

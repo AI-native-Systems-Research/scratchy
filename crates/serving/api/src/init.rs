@@ -475,6 +475,7 @@ fn init_cache(
     hf_config: &HfModelConfig,
     dtype_elem_bytes: usize,
     gpu_memory_utilization: f64,
+    kv_cache_dtype: &str,
     declared_max_model_len: Option<usize>,
     max_model_len: usize,
 ) -> Result<(
@@ -502,6 +503,7 @@ fn init_cache(
         hf_config,
         dtype_elem_bytes,
         utilization,
+        kv_cache_dtype,
         worker.kv_block_bytes(block_size),
         worker.supports_hybrid_swa_kv(),
         worker.kv_layer_geometry(),
@@ -1453,6 +1455,7 @@ fn initialize_core(
         &hf_config,
         model_dtype,
         config.gpu_memory_utilization,
+        &config.kv_cache_dtype,
         config.max_model_len,
         max_model_len,
     )?;
@@ -2082,16 +2085,21 @@ fn compute_num_blocks(
     hf_config: &HfModelConfig,
     dtype_elem_bytes: usize,
     _gpu_memory_utilization: f64,
+    kv_cache_dtype: &str,
 ) -> usize {
     let num_layers = resolve_num_layers(hf_config);
     let num_kv_heads = hf_config.num_kv_heads().unwrap_or(0);
     let head_dim = hf_config.head_dim().unwrap_or(0);
 
-    // Each block holds block_size tokens of KV for all layers: the DENSE row, at the model's dtype —
-    // KV per token per layer = 2 * num_kv_heads * head_dim * sizeof(dtype). A cache stored any other
-    // way (a float8 or int8 codec) is its worker's own statement from the model's built codec
-    // ([`Worker::kv_block_bytes`]), never a CLI string here.
-    let bytes_per_token_per_layer = 2 * num_kv_heads * head_dim * dtype_elem_bytes;
+    // Each block holds block_size tokens of KV for all layers.
+    // KV per token per layer = 2 * num_kv_heads * head_dim * sizeof(dtype)
+    // FP8 KV cache stores 1 byte/element instead of 2 (BF16), doubling capacity.
+    let elem_bytes = if kv_cache_dtype == "fp8_e4m3" || kv_cache_dtype == "fp8" {
+        1
+    } else {
+        dtype_elem_bytes
+    };
+    let bytes_per_token_per_layer = 2 * num_kv_heads * head_dim * elem_bytes;
     blocks_within(
         available_bytes,
         block_size.get() * num_layers * bytes_per_token_per_layer,
@@ -2141,6 +2149,7 @@ fn compute_kv_blocks(
     hf_config: &HfModelConfig,
     dtype_elem_bytes: usize,
     utilization: f64,
+    kv_cache_dtype: &str,
     block_bytes: Option<usize>,
     allow_hybrid: bool,
     kv_layers: Option<Vec<scratchy_core_config::LayerKvGeometry>>,
@@ -2153,6 +2162,7 @@ fn compute_kv_blocks(
             hf_config,
             dtype_elem_bytes,
             utilization,
+            kv_cache_dtype,
         ),
     };
     // Not every worker wires the `sliding_groups` decode. A worker that reads a single
@@ -2164,13 +2174,16 @@ fn compute_kv_blocks(
     let Some(geom) = kv_layers else {
         return (uniform, None);
     };
-    // The dense pages at the model's dtype; a worker whose block costs otherwise states it
-    // (`block_bytes`, below).
+    let elem_bytes = if kv_cache_dtype == "fp8_e4m3" || kv_cache_dtype == "fp8" {
+        1
+    } else {
+        dtype_elem_bytes
+    };
     match scratchy_core_config::compute_hybrid_kv_layout(
         &geom,
         block_size,
         available_bytes,
-        dtype_elem_bytes,
+        elem_bytes,
     ) {
         Some(layout) => {
             // The WHOLE budget, at what a block really costs. The scheduler admits
@@ -2395,6 +2408,7 @@ mod tests {
             &config,
             4,
             0.9,
+            "auto",
         );
         assert!(blocks >= 16);
     }
@@ -2415,6 +2429,7 @@ mod tests {
             &config,
             4,
             0.9,
+            "auto",
         );
         let blocks_f16 = compute_num_blocks(
             4 * 1024 * 1024 * 1024,
@@ -2422,6 +2437,7 @@ mod tests {
             &config,
             2,
             0.9,
+            "auto",
         );
         assert!(blocks_f16 > blocks_f32);
         // F16 should give approximately 2x the blocks.
@@ -2437,6 +2453,7 @@ mod tests {
             &config,
             4,
             0.9,
+            "auto",
         );
         // Should fall back to 1024.
         assert_eq!(blocks, 1024);
@@ -2494,6 +2511,7 @@ mod tests {
                 &config,
                 2,
                 0.9,
+                "auto",
                 Some(block_bytes),
                 true,
                 kv_layers(),
@@ -2504,7 +2522,7 @@ mod tests {
             assert_eq!(groups.len(), 6, "1 full + 5 sliding groups");
             // No worker cost: the dense shared pages alone.
             let (dense, _) =
-                compute_kv_blocks(budget, bs, &config, 2, 0.9, None, true, kv_layers());
+                compute_kv_blocks(budget, bs, &config, 2, 0.9, "auto", None, true, kv_layers());
             assert_eq!(dense, budget / (page * group_size), "budget {budget}");
         }
     }
@@ -2522,8 +2540,8 @@ mod tests {
             ..Default::default()
         };
         let bs = KvBlockTokens::new(16).expect("16 > 0");
-        let blocks_full = compute_num_blocks(4 * 1024 * 1024 * 1024, bs, &config, 2, 0.9);
-        let blocks_half = compute_num_blocks(2 * 1024 * 1024 * 1024, bs, &config, 2, 0.9);
+        let blocks_full = compute_num_blocks(4 * 1024 * 1024 * 1024, bs, &config, 2, 0.9, "auto");
+        let blocks_half = compute_num_blocks(2 * 1024 * 1024 * 1024, bs, &config, 2, 0.9, "auto");
         let ratio = blocks_half as f64 / blocks_full as f64;
         assert!((ratio - 0.5).abs() < 0.01, "ratio was {ratio}");
     }

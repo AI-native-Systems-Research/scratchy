@@ -127,7 +127,7 @@ pub(crate) struct HostBuf {
 
 /// A host buffer's page-rounded extent — the size actually mapped for `len` logical bytes.
 fn pages_of(len: usize) -> usize {
-    PageExtent::covering(len).bytes()
+    len.div_ceil(HOST_PAGE) * HOST_PAGE
 }
 
 /// Why a host shadow buffer could not be made: the kernel's errno, by stage.
@@ -300,31 +300,6 @@ impl std::ops::Deref for HostBuf {
     }
 }
 
-impl HostBuf {
-    /// ⭐ THE MAPPING ITSELF — the buffer's whole page cover ([`PageExtent`]`::covering(len)`): its
-    /// `len` bytes, then the mapping's own zeros to the next page. Every host→device send takes its
-    /// bytes off it, at a window the host page law states ([`Self::page_prefix`] at boot, an
-    /// [`h2d_run`] at the refill), and the region it lands in is allocated at that same law — so a
-    /// send's window is a window of this slice by construction.
-    fn mapped(&self) -> &[u8] {
-        if self.len == 0 {
-            &[]
-        } else {
-            // SAFETY: `ptr` names our own mapping of `pages_of(len)` bytes, uniquely held; the
-            // bytes past `len` are the mapping's own zeros, read and never written here.
-            unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), pages_of(self.len)) }
-        }
-    }
-
-    /// ⭐ THE PAGE COVER OF A STAGED PREFIX, off the mapping itself: the first `staged` bytes and
-    /// the zeros past them to the next page ([`PageExtent`]). `staged` is a cursor the staging split
-    /// carved out of this buffer, so it is at most `len`; the mapping is [`pages_of`]`(len)` long
-    /// and reads as zeros past `len`, so the cover is inside it.
-    fn page_prefix(&self, staged: usize) -> &[u8] {
-        &self.mapped()[..PageExtent::covering(staged).bytes()]
-    }
-}
-
 impl std::ops::DerefMut for HostBuf {
     fn deref_mut(&mut self) -> &mut [u8] {
         if self.len == 0 {
@@ -378,15 +353,6 @@ impl HostShadow {
     /// The buffer, or `None` on a device-only slot — the answer every reader must give a
     /// reason for.
     fn host(&self) -> Option<&[u8]> {
-        match self {
-            HostShadow::Host(v) => Some(v),
-            HostShadow::DeviceOnly => None,
-        }
-    }
-
-    /// The buffer itself, or `None` on a device-only slot — what a boot send reads its page cover
-    /// off ([`HostBuf::page_prefix`]).
-    fn host_buf(&self) -> Option<&HostBuf> {
         match self {
             HostShadow::Host(v) => Some(v),
             HostShadow::DeviceOnly => None,
@@ -929,21 +895,20 @@ impl<T: ktir_superdsc::collective::Tp> OpProg<T> {
 /// A launch sequence — a body rung, the prefix, the suffix, or a fold-fused twin.
 pub(crate) type Ops<T> = Vec<OpProg<T>>;
 
-/// ⭐ THE H2D WINDOW AN ACTIVATION AT `[offset, offset + len)` GOES OUT IN — `offset` down to its
-/// page and the end up to its page cover, the host page law ([`PageExtent`], [`HOST_PAGE`]). Slicing
-/// to a bind's EXACT range was tried and tripped a DMA sub-address/alignment error; any alignment
-/// coarser than the hardware's is also legal, so this needs no knowledge of the exact requirement.
-/// The one law both refill sources take — a `bound` activation converted at the refill and one
-/// `bind_input_f32` converted at bind — so they go out alike. A bind lies inside its segment's
-/// shadow and covering is monotone, so the window lies inside the shadow's mapping
-/// ([`HostBuf::mapped`]), the bytes it is sent from.
+/// ⭐ THE H2D WINDOW AN ACTIVATION AT `[offset, offset + len)` GOES OUT IN — `offset` down and the end
+/// up to [`H2D_ALIGN`]. Slicing to a bind's EXACT range was tried and tripped a DMA
+/// sub-address/alignment error; any alignment coarser than the hardware's is also legal, so this needs
+/// no knowledge of the exact requirement. The one law both refill sources take — a `bound` activation
+/// converted at the refill and one `bind_input_f32` converted at bind — so they go out alike.
 fn h2d_run(offset: u64, len: u64) -> (u64, u64) {
-    let page = HOST_PAGE as u64;
     (
-        (offset / page) * page,
-        PageExtent::covering((offset + len) as usize).bytes() as u64,
+        (offset / H2D_ALIGN) * H2D_ALIGN,
+        (offset + len).div_ceil(H2D_ALIGN) * H2D_ALIGN,
     )
 }
+
+/// The H2D window alignment [`h2d_run`] rounds to.
+const H2D_ALIGN: u64 = 4096;
 
 /// The fill window step — the walk step of EVERY device-side zero fill, so `zero_seg` and
 /// `prepare`'s fills submit the same single-chunk window shapes (the window size only
@@ -1013,26 +978,34 @@ fn fill_zero_walk_from(stream: &Stream<'_>, addr: &DevAddr, skip: usize, what: &
 /// region's boot state is byte-identical to what the whole-region send produced: the staged
 /// bytes, then zeros.
 ///
-/// The prefix's end is rounded UP to a page so the DMA's sub-address law holds ([`HOST_PAGE`], the
-/// alignment [`h2d_run`] states for the plain door too): the send is the staged prefix's page cover
-/// off the shadow's own mapping ([`HostBuf::page_prefix`]), whose bytes past the staged prefix are
-/// the walk's born zeros and the mapping's own. The region is allocated at the same law
-/// ([`PageExtent`]), so the cover fits it by construction.
+/// The prefix's end is rounded UP to a page so the DMA's sub-address law holds
+/// ([`HOST_PAGE`], the alignment [`h2d_run`] states for the plain door too); the bytes that
+/// rounding adds are the walk's own born zeros inside the shadow, so the device sees exactly
+/// the bytes it always did. `staged` is clamped to the shadow and the region first — the
+/// shadow covers its whole segment by `stage_weights`' sizing, and the region is the
+/// allocation of exactly that size, so the clamp is structural, not a check.
 fn send_prefix_and_fill<'a, 'ctx>(
     stream: &'a Stream<'ctx>,
-    shadow: &'a HostBuf,
+    shadow: &'a [u8],
     staged: usize,
     addr: &DevAddr,
     mapper: &std::sync::Arc<PfIommuMapper<'ctx>>,
     alive: &mut Vec<H2dPin<'a, 'ctx>>,
     what: &str,
 ) -> Result<()> {
-    let src = shadow.page_prefix(staged);
-    if !src.is_empty() {
+    let region = addr.total_size().as_u64() as usize;
+    let send = staged.min(shadow.len()).min(region).div_ceil(HOST_PAGE) * HOST_PAGE;
+    if send > 0 {
+        let src = shadow.get(..send).ok_or_else(|| {
+            anyhow!(
+                "{what}: the {} B shadow cannot cover a {send} B prefix",
+                shadow.len()
+            )
+        })?;
         send_premapped(stream, src, addr, mapper, alive, what)?;
     }
-    if addr.total_size().as_u64() as usize > src.len() {
-        fill_zero_walk_from(stream, addr, src.len(), what)?;
+    if region > send {
+        fill_zero_walk_from(stream, addr, send, what)?;
     }
     Ok(())
 }
@@ -1112,27 +1085,6 @@ fn send_premapped<'a, 'ctx>(
 /// The smallest page a host maps. One write per this many bytes faults in every page of a buffer,
 /// whatever page size the host actually uses.
 const HOST_PAGE: usize = 4096;
-
-/// ⭐ THE HOST PAGE LAW — a byte extent rounded up to whole [`HOST_PAGE`]s, its ONE statement. A
-/// host shadow is mapped at it ([`pages_of`]), the device region a host-owned slot sends to is
-/// allocated at it, and a boot send is the page cover of the staged prefix taken off the shadow's
-/// own mapping ([`HostBuf::page_prefix`]). The staged prefix is carved out of the shadow, so it is
-/// at most the shadow's length, and covering is monotone: the send fits the mapping and the region
-/// by construction, with no clamp and no refusal between them.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-struct PageExtent(usize);
-
-impl PageExtent {
-    /// The whole pages covering `bytes`.
-    const fn covering(bytes: usize) -> Self {
-        Self(bytes.div_ceil(HOST_PAGE) * HOST_PAGE)
-    }
-
-    /// The extent in bytes.
-    const fn bytes(self) -> usize {
-        self.0
-    }
-}
 
 /// ⭐ THE STAGING WORTH OF ONE THREAD — the byte floor under a staging spawn (see
 /// `stage_weights`' thread count). Pinned, not tuned: it only has to sit far enough above a
@@ -3097,9 +3049,6 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
             } else {
                 128
             };
-            // ⭐ AT THE HOST PAGE LAW ([`PageExtent`]) — the extent the slot's shadow is mapped at, so
-            // a boot send's page cover never passes the region.
-            let bytes = PageExtent::covering(bytes as usize).bytes() as u64;
             self.seg_addr[i] = Some(
                 DevAddr::alloc(self.card, ByteSize(bytes), MemoryType::Tensor)
                     .map_err(|e| anyhow!("prepare: seg{i} alloc of {bytes} B failed: {e}"))?,
@@ -3113,14 +3062,12 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
         for b in 0..self.weight_bank_bytes.len() {
             // A HOST placeholder allowance, NOT the flit (see the host-buffer twin
             // of this loop above): a borrowed bank gets a minimal alloc so the
-            // address exists — an owner's region replaces it. Either way the region is at the host
-            // page law ([`PageExtent`]), the extent the bank's shadow is mapped at.
+            // address exists — an owner's region replaces it.
             let bytes = if self.seg_borrowed[SEG_WEIGHT.get()] {
                 128
             } else {
                 self.weight_bank_bytes[b].max(128)
             };
-            let bytes = PageExtent::covering(bytes as usize).bytes() as u64;
             self.weight_bank_addr[b] = Some(
                 DevAddr::alloc(self.card, ByteSize(bytes), MemoryType::Tensor).map_err(|e| {
                     anyhow!(
@@ -3234,7 +3181,7 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
             // fill (see `send_prefix_and_fill`). A host-owned slot with no shadow is the same
             // role-statement disagreement it always was, refused.
             let shadow = self.seg_host[i]
-                .host_buf()
+                .host()
                 .ok_or_else(|| anyhow!("prepare: seg{i} is host-owned but holds no host shadow"))?;
             let staged = self.staged_extent_of(i);
             if d.prep_time {
@@ -3268,7 +3215,7 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
                         .as_ref()
                         .ok_or_else(|| anyhow!("prepare: weight bank {} has no region", b + 1))?,
                 );
-                let shadow = self.weight_bank_host[b].host_buf().ok_or_else(|| {
+                let shadow = self.weight_bank_host[b].host().ok_or_else(|| {
                     anyhow!(
                         "prepare: weight bank {} is host-owned but holds no host shadow",
                         b + 1
@@ -5403,14 +5350,14 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
                     let win = addr
                         .window(ByteOffset(a), ByteSize(b - a))
                         .ok_or_else(|| anyhow!("seg{i} window {a}..{b} unaddressable"))?;
-                    // The run's bytes off the shadow's mapping ([`HostBuf::mapped`]): the window is
-                    // the page cover of a bind inside the shadow, so it is a window of the mapping.
-                    let shadow = self.seg_host[i]
-                        .host_buf()
-                        .ok_or_else(|| anyhow!("preamble: seg{i} is dirty but DEVICE-ONLY"))?;
                     last_h2d = Some(
                         stream
-                            .h2d_on_compute_signaled(&shadow.mapped()[a as usize..b as usize], &win)
+                            .h2d_on_compute_signaled(
+                                &self.seg_host[i].host().ok_or_else(|| {
+                                    anyhow!("preamble: seg{i} is dirty but DEVICE-ONLY")
+                                })?[a as usize..b as usize],
+                                &win,
+                            )
                             .map_err(|e| anyhow!("preamble H2D seg{i} window: {e}"))?,
                     );
                 }
@@ -7021,12 +6968,9 @@ mod tests {
                 a <= offset && offset + len <= b,
                 "the window covers the bind"
             );
+            assert!(a % H2D_ALIGN == 0 && b % H2D_ALIGN == 0, "on the grid");
             assert!(
-                a.is_multiple_of(HOST_PAGE as u64) && b.is_multiple_of(HOST_PAGE as u64),
-                "on the grid"
-            );
-            assert!(
-                b - a < len + 2 * HOST_PAGE as u64,
+                b - a < len + 2 * H2D_ALIGN,
                 "and no wider than the grid forces"
             );
             // The two shadows: the refill's two-pass write, and the one-pass write at bind.

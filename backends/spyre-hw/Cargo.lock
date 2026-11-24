@@ -2642,7 +2642,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "inventory",
- "scratchy-core-config",
  "scratchy-ir",
  "scratchy-layers",
  "scratchy-tensors",
@@ -2699,13 +2698,6 @@ dependencies = [
  "scratchy-quantizations",
  "scratchy-tensors",
  "scratchy-tp-world",
-]
-
-[[package]]
-name = "scratchy-kv"
-version = "0.1.0"
-dependencies = [
- "scratchy-target-spyre-worker",
 ]
 
 [[package]]
@@ -2919,18 +2911,15 @@ dependencies = [
  "anyhow",
  "flex-rs",
  "half",
- "ktir-core",
  "ktir-superdsc",
  "libc",
  "scratchy-spyre-bundle",
  "scratchy-target-spyre",
  "scratchy-tensors",
- "scratchy-triton-splice",
  "serde",
  "serde_json",
  "tracing",
  "tracing-subscriber",
- "triton-ktir-superdsc",
  "zstd",
 ]
 
@@ -2941,10 +2930,8 @@ dependencies = [
  "anyhow",
  "clap",
  "dotenvy",
- "flex-rs",
  "libc",
  "scratchy-cli",
- "scratchy-kv",
  "scratchy-models",
  "scratchy-quantizations",
  "scratchy-target-spyre-card",

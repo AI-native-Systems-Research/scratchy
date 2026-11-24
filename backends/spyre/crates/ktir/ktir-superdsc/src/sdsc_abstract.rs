@@ -5020,26 +5020,10 @@ impl SchedulerBlockTokens {
     /// user's size up to, and which every torch-spyre serve runs (its compiled decode walk
     /// steps the page table and mask by 128 a trip). Half the trips of a 64-slot block for
     /// the same context. The ONE statement of the value.
-    pub const REFERENCE: Self = Self::of_whole_sticks(128);
-
-    /// ⭐ A SCHEDULER BLOCK OF `tokens` SLOTS, under the reference's law for one: a positive
-    /// multiple of the 64-slot fp16 stick ([`POOL_STICK`]; their `_BLOCK_SIZE_MULTIPLE`). The
-    /// paged kernels are general over their `BLOCK_SIZE`: production compiles them at
-    /// [`Self::REFERENCE`], and a kernel compiled at another block — a recording made at 64 —
-    /// states its own here, under the same law. The refusal is a literal panic, so a const
-    /// context gets it as a build error.
-    pub const fn of_whole_sticks(tokens: u32) -> Self {
-        match (
-            tokens.is_multiple_of(POOL_STICK),
-            std::num::NonZeroU32::new(tokens),
-        ) {
-            (true, Some(nz)) => Self(nz),
-            _ => panic!(
-                "SchedulerBlockTokens: a scheduler block is a positive multiple of the 64-slot \
-                 stick (`_BLOCK_SIZE_MULTIPLE`)"
-            ),
-        }
-    }
+    pub const REFERENCE: Self = Self(match std::num::NonZeroU32::new(128) {
+        Some(v) => v,
+        None => panic!("128 is nonzero"),
+    });
 
     /// The block's token count — the accessor every integer boundary calls.
     pub const fn get(self) -> u32 {

@@ -6,7 +6,7 @@
 //! through `kv_stage` (`attention.metal`).
 
 use objc2_metal::MTLDevice;
-use scratchy_layers::kv_int8::CodedHeads;
+use scratchy_layers::kv_int8::{CodedHeads, KvCodec};
 
 use crate::kv_int8_heads::{MAX_CODED_HEAD_DIM, MIN_CODED_HEAD_DIM};
 
@@ -29,15 +29,15 @@ const SCRATCH_ELEM_BYTES: usize = 2;
 /// layer's codes and scales plus the one-layer fp16 scratch — what
 /// [`build_int8_provision`] allocates per token.
 pub fn kv_bytes_per_token(
-    codec: crate::MetalKvCodec,
+    codec: KvCodec,
     num_layers: usize,
     num_kv_heads: usize,
     head_dim: usize,
     dense_elem_bytes: usize,
 ) -> usize {
     match codec {
-        crate::MetalKvCodec::Dense => num_layers * 2 * num_kv_heads * head_dim * dense_elem_bytes,
-        crate::MetalKvCodec::Int8 => {
+        KvCodec::Dense => num_layers * 2 * num_kv_heads * head_dim * dense_elem_bytes,
+        KvCodec::Int8 => {
             num_layers * 2 * num_kv_heads * (head_dim + SCALE_BYTES)
                 + scratch_bytes_per_token(num_kv_heads, head_dim)
         }

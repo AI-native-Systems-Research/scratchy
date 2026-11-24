@@ -114,10 +114,6 @@ def batched_decode_head_major_kernel(query, rep_row_ids, k_pages, v_pages,  #
             page_ids = ids_desc.load([c * ROWS])
             k_page = tl.reshape(k_rows.gather(page_ids, 0), [ENTRIES * KV, BLOCK_SIZE, D])
             v_page = tl.reshape(v_rows.gather(page_ids, 0), [ENTRIES * KV, BLOCK_SIZE, D])
-            # if k_page.dtype != q.dtype: k_page = k_page.to(q.dtype); v_page = v_page.to(q.dtype)
-            if k_page.dtype != q.dtype:
-                k_page = k_page.to(q.dtype)
-                v_page = v_page.to(q.dtype)
             # scores = torch.matmul(q, k_page.transpose(-2, -1)) * scale
             scores = tl.dot(q, tl.trans(k_page, (0, 2, 1)), out_dtype=tl.float16) * SCALE
             # sc = scores.reshape(J, B, KV, G, block) + mask_rows
@@ -152,10 +148,6 @@ def batched_decode_head_major_kernel(query, rep_row_ids, k_pages, v_pages,  #
             page_ids = ids_desc.load([c * ROWS])
             k_page = tl.reshape(k_rows.gather(page_ids, 0), [ENTRIES * KV, BLOCK_SIZE, D])
             v_page = tl.reshape(v_rows.gather(page_ids, 0), [ENTRIES * KV, BLOCK_SIZE, D])
-            # if k_page.dtype != q.dtype: k_page = k_page.to(q.dtype); v_page = v_page.to(q.dtype)
-            if k_page.dtype != q.dtype:
-                k_page = k_page.to(q.dtype)
-                v_page = v_page.to(q.dtype)
             scores = tl.dot(q, tl.trans(k_page, (0, 2, 1)), out_dtype=tl.float16) * SCALE
             # one mask row per (block slot, sequence), sprayed over its kv heads' query rows
             mask_rows = tl.reshape(masks.load([c * ENTRIES, 0]), [J, B, BLOCK_SIZE])

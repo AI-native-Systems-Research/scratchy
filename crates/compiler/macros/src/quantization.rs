@@ -196,18 +196,6 @@ pub struct QuantizationConfig {
     /// HF's canonical use: `["lm_head"]` to leave the tied or
     /// untied output projection unquantized.
     pub modules_to_not_convert: Vec<String>,
-    /// Whether the checkpoint quantizes its KV cache ([`KvCacheScheme`]).
-    pub kv_cache_scheme: KvCacheScheme,
-}
-
-/// ⭐ THE CHECKPOINT'S KV CACHE SCHEME — compressed-tensors' `quantization_config.kv_cache_scheme`,
-/// read as vLLM reads it (`config.get("kv_cache_scheme")`, `compressed_tensors.py:262`): absent or
-/// `null` is `Absent`; an object is `Stated`, a per-tensor (k, v) scale pair per layer whose values
-/// the checkpoint's tensors hold (`….self_attn.{k,v}_scale`, vLLM's `maybe_remap_kv_scale_name`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum KvCacheScheme {
-    Absent,
-    Stated,
 }
 
 /// The parsed `quant_method` discriminator. One variant per HF-
@@ -487,20 +475,9 @@ impl QuantizationConfig {
             })
             .unwrap_or_default();
 
-        let kv_cache_scheme = match obj.get("kv_cache_scheme") {
-            None | Some(serde_json::Value::Null) => KvCacheScheme::Absent,
-            Some(serde_json::Value::Object(_)) => KvCacheScheme::Stated,
-            Some(_) => {
-                return Err(ParseError::BadField {
-                    field: "kv_cache_scheme",
-                    reason: "neither null nor an object",
-                });
-            }
-        };
         Ok(Some(Self {
             method,
             modules_to_not_convert,
-            kv_cache_scheme,
         }))
     }
 }

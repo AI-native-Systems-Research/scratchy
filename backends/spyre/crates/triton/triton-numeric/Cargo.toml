@@ -51,13 +51,6 @@ ktir-core = { path = "../../ktir/ktir-core" }
 # already declare this edge and the pod's cache holds it (see ../vendor/PROVENANCE.md).
 serde_json = "1"
 
-[dev-dependencies]
-# THE PAGED KERNELS' ONE SPEC BUILDERS: every executed paged kernel is compiled at the spec
-# production compiles it at (`scratchy_triton_splice::PagedKernel`), never a copy that can miss a
-# constexpr.
-scratchy-triton-splice = { path = "../splice" }
-ktir-superdsc = { path = "../../ktir/ktir-superdsc" }
-
 [features]
 default = []
 # ⭐ NO `accelerate` FEATURE, DELIBERATELY. The snapshot this crate was re-hosted from

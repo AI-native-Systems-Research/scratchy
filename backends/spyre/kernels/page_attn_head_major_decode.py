@@ -17,8 +17,7 @@ theirs, in their order:
 * `out`, which the kernel stores into through `query_row_index` (`out.index_copy_`).
 
 The walk is `walk_tiles` at `SPYRE_ATTN_FOR_EACH_TILE=1` (their default): ONE block body over
-`num_blocks` trips, the carry seeded `(-inf, 0, 0)`. A float8 cache's page is widened to the query's
-dtype right after its gather, as theirs is (spyre-inference 4a7d21d, `page_attn_decode.py:94-96`).
+`num_blocks` trips, the carry seeded `(-inf, 0, 0)`.
 
 Where Triton spells a torch op differently, the spelling is Triton's and the op is theirs:
 `tl.exp` takes f32, so each `exp` widens its f16 argument and narrows the result (the ladder folds
@@ -94,10 +93,6 @@ def page_attn_head_major_decode_kernel(query, query_row_index, k_pages, v_pages,
             first = tl.min(kv_rows, 0)
             k_page = tl.reshape(k_tiles.load([first, 0]), [NUM_KV_HEADS, BLOCK_SIZE, HEAD_SIZE])
             v_page = tl.reshape(v_tiles.load([first, 0]), [NUM_KV_HEADS, BLOCK_SIZE, HEAD_SIZE])
-        # if k_page.dtype != q.dtype: k_page = k_page.to(q.dtype); v_page = v_page.to(q.dtype)
-        if k_page.dtype != q.dtype:
-            k_page = k_page.to(q.dtype)
-            v_page = v_page.to(q.dtype)
         # scores = torch.matmul(q, k_page.permute(0, 2, 1)) * scale
         scores = tl.dot(q, tl.trans(k_page, (0, 2, 1)), out_dtype=tl.float16) * SCALE
         # scores = scores + mask_tile[0]

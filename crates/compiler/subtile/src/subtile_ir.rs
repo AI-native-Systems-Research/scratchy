@@ -973,8 +973,6 @@ impl<F: RopeForm, S: OpStage> SubOp<F, S> {
             SubOp::ExpertAct { act } => act.hash(h),
             SubOp::ExpertCombine { hidden, shared } => (hidden, shared).hash(h),
             SubOp::KvEncode { operand } | SubOp::KvStage { operand } => operand.hash(h),
-            // Two scale facts are two programs.
-            SubOp::KvQuantize { operand, scales } => (operand, scales).hash(h),
             SubOp::AttnPackedKv
             | SubOp::SampleRowsGather
             | SubOp::SampleRowsScatter
@@ -1699,18 +1697,6 @@ pub enum SubOp<F: RopeForm = NeoX, S: OpStage = Tiled> {
         pad_vocab: u32,
         table_rows: u32,
         k: u32,
-    },
-
-    // ── The float8 KV cache (see `kv_codec::expand_kv_quantize`) ──────
-    /// A float8 KV writer's new `operand` rows, saturated to ± the format's max and cast to float8
-    /// e4m3 (`KvCodec::Fp8E4m3`; spyre-inference's `quantize_kv`) — ONE elementwise pass over the
-    /// writer's whole `[m, kv_width]` value, BEFORE the writer. `inputs` = `[x]`; the output is the
-    /// rows the writer's `KvAppend` stores, at the model's KV scales (`scales`, the codec fact's own,
-    /// copied onto the op by the expansion). Appended last, so every other op keeps its
-    /// discriminant (the reroll class key).
-    KvQuantize {
-        operand: KvOperand,
-        scales: scratchy_ir::KvCacheScales,
     },
 }
 
@@ -4010,11 +3996,11 @@ pub fn eval_node<F: RopeForm>(
                 dyn_width as usize,
             )
         }
-        expansion_ops!() | SubOp::KvQuantize { .. } => panic!(
+        expansion_ops!() => panic!(
             "{} has no host reference: the router and expert weights arrive as opaque \
-             bundle sources, a KV codec's packed stores as runtime buffers, a float8 KV \
-             cache's rows as the device quantizer's bytes, and the sampled rows at the \
-             runtime's sequence boundaries, none of which `gather` can read as a tensor region",
+             bundle sources, a KV codec's packed stores as runtime buffers, and the sampled \
+             rows at the runtime's sequence boundaries, none of which `gather` can read as \
+             a tensor region",
             node.op.name()
         ),
 
@@ -4689,7 +4675,6 @@ pub fn lower_region(
             SubOp::ExpertCombine { hidden, shared } => SubOp::ExpertCombine { hidden, shared },
             SubOp::KvEncode { operand } => SubOp::KvEncode { operand },
             SubOp::KvStage { operand } => SubOp::KvStage { operand },
-            SubOp::KvQuantize { operand, scales } => SubOp::KvQuantize { operand, scales },
             SubOp::AttnPackedKv => SubOp::AttnPackedKv,
             SubOp::SampleRowsGather => SubOp::SampleRowsGather,
             SubOp::SampleRowsScatter => SubOp::SampleRowsScatter,

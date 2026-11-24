@@ -46,12 +46,6 @@ zstd = { version = "0.14", default-features = false }
 # write its CB-error lines — the `hmi_syndrome` / `qgi_syndrome` / `job_count` that say why a launch
 # was rejected. Without one, a rejected launch is a bare `sync rc=-1`.
 tracing-subscriber = { workspace = true }
-# EXAMPLES ONLY. `kv_fp8_round_trip` mints the production KV write and paged attention programs
-# (the splice's own constructors), lowers and places them as a one-kernel bundle, and reads the
-# e4m3 codec it checks its pattern against.
-scratchy-triton-splice = { path = "../../../spyre/crates/triton/splice" }
-triton-ktir-superdsc = { path = "../../../spyre/crates/triton/triton-ktir-superdsc" }
-ktir-core = { path = "../../../spyre/crates/ktir/ktir-core" }
 
 # The examples run on a card: every one launches through flex-rs.
 #
@@ -79,10 +73,3 @@ name = "fill_zero_probe"
 # One process, N cards: an all-gather over the real flex card-to-card path, byte-exact on every card.
 [[example]]
 name = "cards_all_gather"
-
-# The fp8 KV cache's card leg: the production write and paged attention programs at granite-8b's
-# geometry, ONE run separating the write from the read — the write's pool bytes against the
-# device's own `qfp8ch`, the read over that reference pool and over the write's, an fp16-pool
-# control, every check bit-exact.
-[[example]]
-name = "kv_fp8_round_trip"

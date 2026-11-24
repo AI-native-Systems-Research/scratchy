@@ -45,21 +45,7 @@ pub(crate) fn emit(cx: &DispatchCx<'_>) -> TokenStream {
             })
             .collect()
     };
-    // The KV codec's arms mint metal's own codec type in a `const` block, so a float8 model is a
-    // build error by name ([`scratchy_target_metal::MetalKvCodec::of`]), never a runtime arm.
-    let kv_codec_arms: Vec<proc_macro2::TokenStream> = arms
-        .iter()
-        .map(|a| {
-            let variant_ident = a.variant_ident.clone();
-            let model_ident = &a.model_ident;
-            quote! {
-                Weights::#variant_ident(_) => const {
-                    ::scratchy_target_metal::MetalKvCodec::of(<#model_ident::Weights as
-                        ::scratchy_forward_compiler::CanonicalParams>::KV_CODEC)
-                },
-            }
-        })
-        .collect();
+    let kv_codec_arms = canonical_const_arms(quote! { KV_CODEC });
     let kv_cache_layers_arms = canonical_const_arms(quote! { KV_CACHE_LAYERS });
 
     let forward_arms: Vec<proc_macro2::TokenStream> = arms
@@ -327,7 +313,7 @@ pub(crate) fn emit(cx: &DispatchCx<'_>) -> TokenStream {
 
         #[cfg(scratchy_target = "metal")]
         impl ::scratchy_target_metal::MetalWeights for Weights {
-            fn kv_codec(&self) -> ::scratchy_target_metal::MetalKvCodec {
+            fn kv_codec(&self) -> ::scratchy_forward_compiler::KvCodec {
                 match self {
                     #(#kv_codec_arms)*
                 }

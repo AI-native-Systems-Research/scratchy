@@ -11,27 +11,15 @@ mod weights;
 use proc_macro2::TokenStream;
 use quote::quote;
 use scratchy_forward_compiler_macro::target::{
-    BakeCx, DispatchCx, KvStore, LoadCx, StructCx, TargetEmitter, WeightsStruct,
+    BakeCx, DispatchCx, LoadCx, StructCx, TargetEmitter, WeightsStruct,
 };
 
 /// The spyre target's emitter.
-pub struct Spyre {
-    /// The float8 (e4m3) KV cache (`kv/fp8` from the CLI): every model the build bakes that holds
-    /// KV stores it as float8, the reference's `kv_cache_dtype=fp8`.
-    pub kv_fp8: bool,
-}
+pub struct Spyre;
 
 impl TargetEmitter for Spyre {
     fn name(&self) -> &'static str {
         "spyre"
-    }
-
-    fn kv_store(&self) -> KvStore {
-        if self.kv_fp8 {
-            KvStore::Fp8E4m3
-        } else {
-            KvStore::Dense
-        }
     }
 
     fn facade(&self) -> TokenStream {

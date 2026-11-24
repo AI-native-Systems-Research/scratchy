@@ -8,21 +8,15 @@
 //! test; the last two run the shipped decode-batch kernel, whose one-chunk walk is the
 //! measurement the identities were written for.
 
-use ktir_superdsc::superdsc_opspec::Fp16;
-use scratchy_triton_splice::{
-    AttnScale, BatchChunking, BatchedDecodeGeometry, BlockSize, HeadDim, HeadGeometry, KvHeads,
-    PagedAttnGeometry, PagedSequence, PoolPages, QueryHeads, RotDim, SchedulerBlockTokens,
-    TokenRows, WalkBlocks, batched_decode_kernel, paged_attn_kernel,
-};
-use triton_frontend::codegen;
+mod common;
+
+use std::collections::HashMap;
+
+use triton_frontend::codegen::{self, ArgSpec, KernelSpec};
+use triton_frontend::semantic::Val;
 use triton_frontend::target::Target;
 use triton_frontend::ttir::{Attr, Module, Op, ValueId};
 use triton_frontend::{opt, ttir};
-
-/// A test's positive extent, as the nonzero a geometry takes.
-fn nz(v: u32) -> std::num::NonZeroU32 {
-    std::num::NonZeroU32::new(v).expect("a test extent is positive")
-}
 
 /// One public function of `args` returning one `ret`, whose body is `body` and whose result
 /// is `%r`.
@@ -406,29 +400,45 @@ fn maxnum_of_minus_infinity_folds_where_x_is_never_nan() {
 // ---------------------------------------------------------------------------------------------
 
 /// `batched_decode_head_major_kernel` over 4 sequences, `bpc` block slots a chunk, `chunks`
-/// chunks — its spec from the kernel's ONE builder (`batched_decode_kernel`).
+/// chunks.
 fn batched_decode(bpc: i128, chunks: i128) -> Module {
-    let k = batched_decode_kernel::<Fp16>(BatchedDecodeGeometry {
-        rows: TokenRows::new(nz(4)),
-        heads: HeadGeometry::new(
-            QueryHeads::new(32),
-            KvHeads::new(8),
-            HeadDim::new(64),
-            RotDim::new(64),
-            BlockSize::new(SchedulerBlockTokens::REFERENCE.get()),
-        ),
-        block: SchedulerBlockTokens::of_whole_sticks(64),
-        pages: PoolPages::new(nz(2048)),
-        chunking: BatchChunking {
-            seqs: 4,
-            blocks_per_chunk: bpc as u32,
-            num_chunks: chunks as u32,
-            rows_per_page: 1,
-        },
-        scale: AttnScale::new(0.125),
-    })
-    .expect("the batched decode's spec");
-    let mut m = codegen::compile(k.src, &k.spec, Target::spyre()).expect("compiles");
+    let mut signature = HashMap::new();
+    for (k, v) in [
+        ("query", "*fp16"),
+        ("rep_row_ids", "*i32"),
+        ("k_pages", "*fp16"),
+        ("v_pages", "*fp16"),
+        ("chunk_page_ids", "*i32"),
+        ("mask_by_chunk", "*fp16"),
+        ("out", "*fp16"),
+    ] {
+        signature.insert(k.to_string(), ArgSpec::parse(v).expect("spec"));
+    }
+    let mut constexprs = HashMap::new();
+    for (k, v) in [
+        ("NUM_TOKENS", Val::Int(4)),
+        ("NUM_SEQS", Val::Int(4)),
+        ("BLOCKS_PER_CHUNK", Val::Int(bpc)),
+        ("NUM_CHUNKS", Val::Int(chunks)),
+        ("NUM_KV_HEADS", Val::Int(8)),
+        ("NUM_QUERIES_PER_KV", Val::Int(4)),
+        ("BLOCK_SIZE", Val::Int(64)),
+        ("HEAD_SIZE", Val::Int(64)),
+        ("NUM_PAGES", Val::Int(2048)),
+        ("ROWS_PER_PAGE", Val::Int(1)),
+        ("SCALE", Val::Float(0.125)),
+    ] {
+        signature.insert(k.to_string(), ArgSpec::Constexpr);
+        constexprs.insert(k.to_string(), v);
+    }
+    let spec = KernelSpec {
+        kernel: "batched_decode_head_major_kernel".to_string(),
+        signature,
+        constexprs,
+        file: "batched_decode_head_major.py".to_string(),
+    };
+    let src = common::fixture_src("spyre/batched_decode_head_major");
+    let mut m = codegen::compile(&src, &spec, Target::spyre()).expect("compiles");
     opt::make_ttir(&mut m).expect("make_ttir");
     m
 }
@@ -526,26 +536,43 @@ fn a_many_chunk_decode_batch_keeps_its_rescale_chain() {
 }
 
 /// `page_attn_head_major_decode_kernel` -- one sequence's decode -- at granite-3.1-2b's tp/8
-/// head slice (one kv head, four query heads) walking `blocks` blocks, its spec from the kernel's
-/// ONE builder (`paged_attn_kernel`).
+/// head slice (one kv head, four query heads) walking `blocks` blocks.
 fn sequence_decode(blocks: i128) -> Module {
-    let k = paged_attn_kernel::<Fp16>(PagedAttnGeometry {
-        seq: PagedSequence::Decode,
-        rows: TokenRows::new(nz(1)),
-        heads: HeadGeometry::new(
-            QueryHeads::new(4),
-            KvHeads::new(1),
-            HeadDim::new(64),
-            RotDim::new(64),
-            BlockSize::new(SchedulerBlockTokens::REFERENCE.get()),
-        ),
-        block: SchedulerBlockTokens::REFERENCE,
-        pages: PoolPages::new(nz(256)),
-        blocks: WalkBlocks::new(nz(blocks as u32)),
-        scale: AttnScale::new(0.125),
-    })
-    .expect("the sequence decode's spec");
-    let mut m = codegen::compile(k.src, &k.spec, Target::spyre()).expect("compiles");
+    let mut signature = HashMap::new();
+    for (k, v) in [
+        ("query", "*fp16"),
+        ("query_row_index", "*i32"),
+        ("k_pages", "*fp16"),
+        ("v_pages", "*fp16"),
+        ("page_index_table", "*i32"),
+        ("kv_row_pool", "*i32"),
+        ("mask_stack", "*fp16"),
+        ("out", "*fp16"),
+    ] {
+        signature.insert(k.to_string(), ArgSpec::parse(v).expect("spec"));
+    }
+    let mut constexprs = HashMap::new();
+    for (k, v) in [
+        ("NUM_TOKENS", Val::Int(1)),
+        ("NUM_HEADS", Val::Int(4)),
+        ("NUM_KV_HEADS", Val::Int(1)),
+        ("HEAD_SIZE", Val::Int(64)),
+        ("BLOCK_SIZE", Val::Int(128)),
+        ("NUM_PAGES", Val::Int(256)),
+        ("NUM_BLOCKS", Val::Int(blocks)),
+        ("SCALE", Val::Float(0.125)),
+    ] {
+        signature.insert(k.to_string(), ArgSpec::Constexpr);
+        constexprs.insert(k.to_string(), v);
+    }
+    let spec = KernelSpec {
+        kernel: "page_attn_head_major_decode_kernel".to_string(),
+        signature,
+        constexprs,
+        file: "page_attn_head_major_decode.py".to_string(),
+    };
+    let src = common::fixture_src("spyre/page_attn_head_major_decode");
+    let mut m = codegen::compile(&src, &spec, Target::spyre()).expect("compiles");
     opt::make_ttir(&mut m).expect("make_ttir");
     m
 }

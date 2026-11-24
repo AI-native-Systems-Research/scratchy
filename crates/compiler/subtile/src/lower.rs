@@ -190,8 +190,7 @@ impl<F: RopeForm, S: OpStage> SubOp<F, S> {
             | O::RmsNormApply { .. }
             | O::RmsNormUnit { .. } => Some(AdditiveOffset::Absent),
             O::Elementwise(EwKind::BiasAdd) => Some(AdditiveOffset::Bias),
-            // A float8 quantize carries its operand's offset: it rounds the values it is given.
-            O::Reshape { .. } | O::KvQuantize { .. } => Some(AdditiveOffset::OfOperand0),
+            O::Reshape { .. } => Some(AdditiveOffset::OfOperand0),
             O::Elementwise(
                 EwKind::Silu
                 | EwKind::Gelu

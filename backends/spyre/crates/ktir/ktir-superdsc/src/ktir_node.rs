@@ -264,10 +264,6 @@ pub enum Program {
     /// (`ktdp.store` through an indirect access tile). Their parameters: `key`, `value`, the K pool,
     /// the V pool, the per-kv-head row index.
     PagedKvWrite,
-    /// THE FLOAT8 KV CACHE'S QUANTIZE — `kernels/quantize_kv.py`, spyre-inference's `quantize_kv`:
-    /// one whole `[T, kv_width]` tensor saturated and cast to float8 e4m3, its ops lowered one by one
-    /// by the walk. Its parameters: the f16 rows, then the float8 rows.
-    KvQuantize,
     /// A 2-D BLOCK TRANSPOSE of a whole tensor — `[mb, out]` → `[out, mb]`, one
     /// `interslicetranspose_fp16` on the PT unit. See
     /// [`transpose`](crate::emit::lower_ktir_to_superdsc::transpose).

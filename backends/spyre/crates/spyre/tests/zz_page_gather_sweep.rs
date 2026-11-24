@@ -313,7 +313,7 @@ fn dump_cell(frame: Frame, entries: u64, slab: u64, root: &std::path::Path, sha:
         );
         off += size;
     }
-    l.allocate_row_outermost::<ktir_superdsc::superdsc_opspec::Fp16>(pool_tid)
+    l.allocate_row_outermost(pool_tid)
         .expect("the pool is whole sticks");
     l.segment_bytes[3] = off + 4096; // + the H2D window pad
 

@@ -23,8 +23,6 @@ spyre-emu = ["scratchy-target-spyre/spyre-emu", "scratchy-target-spyre-models/sp
 tp-2 = ["spyre-hw", "scratchy-target-spyre-models/tp-2", "scratchy-target-spyre/tp-2", "scratchy-target-spyre-card/tp-2"]
 tp-4 = ["spyre-hw", "scratchy-target-spyre-models/tp-4", "scratchy-target-spyre/tp-4", "scratchy-target-spyre-card/tp-4"]
 tp-8 = ["spyre-hw", "scratchy-target-spyre-models/tp-8", "scratchy-target-spyre/tp-8", "scratchy-target-spyre-card/tp-8"]
-# THE FLOAT8 KV CACHE (`kv/fp8` through scratchy-kv): the models' bake selects the shared fact.
-kv-fp8 = ["scratchy-target-spyre-models/kv-fp8"]
 # THE ON-CARD ALLOC-CENSUS WINDOW (flex-rs's zero-alloc proof instrument): frames
 # `arm()`..`disarm()` around N collected decode steps in the serving loop, so the
 # steady-state per-step allocation count is measurable on a real serve, not only in

@@ -129,10 +129,6 @@ pub enum Refused {
     /// metal tape carries no Sample node by construction — one that does is a wiring bug named
     /// here, not a missing lowering to write.
     DeviceSampler,
-    /// The float8 KV cache's quantize: metal stores no float8 cache (`MetalKvCodec::of` refuses a
-    /// float8 model at build), so a metal tape carries no KvQuantize node by construction — one that
-    /// does is a wiring bug named here.
-    Fp8KvCache,
     /// A device-side chain mint's cross-step pair — metal's pick never left the host, so
     /// there is no metal lowering to write; a node here is a wiring bug (a chain-minted
     /// graph handed to the metal tape), never a missing kernel.
@@ -2606,9 +2602,6 @@ impl Recording<'_> {
             }
             L::SumReduce { .. } | L::RmsNormReduce { .. } | L::RmsNormApply { .. } => {
                 return Err(self.no(i, Refused::TileLevel));
-            }
-            L::KvQuantize { .. } => {
-                return Err(self.no(i, Refused::Fp8KvCache));
             }
             // The minted token draw is a device-sampler op; metal keeps the host pick. Reached
             // only by a wiring bug (a minted graph handed to the metal tape), and the refusal

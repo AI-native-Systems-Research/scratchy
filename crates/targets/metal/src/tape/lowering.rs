@@ -12698,9 +12698,9 @@ mod tests {
             let writer = kv_writer(0, Causal, LLAMA_KV);
             // A dense model's tape carries the layer as written; a coded one's, as the codec
             // pass expands it.
-            let rows = match crate::MetalKvCodec::of(codec) {
-                crate::MetalKvCodec::Dense => plain(&[writer, attention]),
-                crate::MetalKvCodec::Int8 => coded(writer, attention),
+            let rows = match codec {
+                KvCodec::Dense => plain(&[writer, attention]),
+                KvCodec::Int8 => coded(writer, attention),
             };
             let tape = lower_int8(&p, rows, 64);
             let gated = |g: RuntimeGate| {
@@ -12760,9 +12760,9 @@ mod tests {
             );
             let attention = attention(MetalStep::AttentionPrefillPaged, 0, NeoX);
             let writer = kv_writer(0, Causal, LLAMA_KV);
-            let rows = match crate::MetalKvCodec::of(codec) {
-                crate::MetalKvCodec::Dense => plain(&[writer, attention]),
-                crate::MetalKvCodec::Int8 => coded(writer, attention),
+            let rows = match codec {
+                KvCodec::Dense => plain(&[writer, attention]),
+                KvCodec::Int8 => coded(writer, attention),
             };
             let tape = lower_int8(&p, rows, 64);
             let commands: Vec<_> = tape.commands.iter().map(|c| c.lowered()).collect();

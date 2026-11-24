@@ -218,11 +218,6 @@ macro_rules! for_each_subop {
             // pick row (the write-through is GPU-only, RopeAppend's law).
             ChainStage [SubOp::ChainStage { .. }] arity = (|n| n == 5), cols = [ustick],
                 rows = [in0], gemm_w = [none], tp = [whole];
-            // A float8 KV writer's whole-tensor quantize: `[x]`, the writer's value operand, out at
-            // its shape — an arena activation, so not an expansion row (an expansion op's output is
-            // a runtime store off the arena).
-            KvQuantize [SubOp::KvQuantize { .. }] arity = (|n| n == 1), cols = [in0], rows = [in0],
-                gemm_w = [none], tp = [pointwise];
             // The ops one construct expands to (a MoE block, a KV codec's steps, sampled rows) —
             // also generating `expansion_ops!()`, the pattern a target without them refuses by.
             @expansion

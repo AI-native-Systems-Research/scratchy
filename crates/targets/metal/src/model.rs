@@ -53,57 +53,12 @@ impl<'a> MetalRuntimeHandle<'a> {
     }
 }
 
-/// ⭐ HOW A METAL MODEL'S KV CACHE IS STORED — the shared [`KvCodec`] at the two stores metal has,
-/// minted at macro time by [`MetalKvCodec::of`]. Metal stores no float8 KV cache, so a model built
-/// with one (`KvCodec::Fp8E4m3`) is a build error by name, and no runtime arm exists for it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum MetalKvCodec {
-    /// Uncompressed, in the model's own dtype.
-    Dense,
-    /// int8 codes ([`KvCodec::Int8`]).
-    Int8,
-}
-
-impl MetalKvCodec {
-    /// The shared fact at metal's stores. A const fn: the generated dispatch evaluates it in a
-    /// `const` block, so a float8 model's refusal is the build's.
-    pub const fn of(codec: KvCodec) -> Self {
-        match codec {
-            KvCodec::Dense => Self::Dense,
-            KvCodec::Int8 => Self::Int8,
-            KvCodec::Fp8E4m3(_) => panic!(
-                "metal stores no float8 (e4m3) KV cache: a model built with `KvCodec::Fp8E4m3` \
-                 is not a metal model"
-            ),
-        }
-    }
-
-    /// The shared fact again, whose name the cache is displayed by.
-    pub const fn codec(self) -> KvCodec {
-        match self {
-            Self::Dense => KvCodec::Dense,
-            Self::Int8 => KvCodec::Int8,
-        }
-    }
-
-    /// Whether the cache is int8 codes.
-    pub const fn is_int8(self) -> bool {
-        matches!(self, Self::Int8)
-    }
-}
-
-impl std::fmt::Display for MetalKvCodec {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.codec().fmt(f)
-    }
-}
-
 /// A loaded model's metal surface. Every metal-compiled arch's `Weights` implements it beside
 /// [`ScratchyWeights`].
 pub trait MetalWeights: ScratchyWeights {
-    /// The loaded variant's `CanonicalParams::KV_CODEC` at metal's stores ([`MetalKvCodec`]): how
-    /// its KV cache is stored, fixed when it was built.
-    fn kv_codec(&self) -> MetalKvCodec;
+    /// The loaded variant's `CanonicalParams::KV_CODEC`: how its KV cache is stored, fixed when
+    /// it was built.
+    fn kv_codec(&self) -> KvCodec;
 
     /// The loaded variant's `CanonicalParams::KV_CACHE_LAYERS`: the layers that hold KV when not
     /// every layer does (a recurrent hybrid's attention layers). The worker's KV pool holds

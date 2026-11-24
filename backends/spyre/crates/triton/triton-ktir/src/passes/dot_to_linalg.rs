@@ -71,37 +71,6 @@ pub(crate) fn weight_is_n_by_k(op: &Op) -> bool {
     }
 }
 
-/// ⭐ THE fp8 W8A8 WEIGHT LEG — the ONE shape predicate of the W8A8 fold: `v` reached through at most
-/// two `arith.extf` / `tt.trans` links from a DIRECT `tt.descriptor_load` whose descriptor states
-/// `f8E4M3FN` elements, answered as that load's result. The rank-2 peel claims it; the rank-3 arm
-/// refuses it by name (no batched W8A8 contract is stated). An extf of anything else — a gathered
-/// page through its reshape (`k_page.to(q.dtype)`), a computed value — is not this pattern, and
-/// neither arm claims it: the dot reads the f16 value the extf produces, and the extf lowers as the
-/// convert it is.
-fn fp8_weight_load(index: &DefIndex, v: Ssa) -> Option<Ssa> {
-    let mut v = v;
-    let mut peeled = 0;
-    loop {
-        match index
-            .def_of(v)
-            .filter(|o| o.kind == OpKind::ArithExtf || o.kind == OpKind::TtTrans)
-        {
-            Some(o) if peeled < 2 => {
-                v = o.operands[0];
-                peeled += 1;
-            }
-            _ => break,
-        }
-    }
-    index
-        .def_of(v)
-        .filter(|o| o.kind == OpKind::TtDescriptorLoad)
-        .and_then(|ld| ld.operands.first().copied())
-        .and_then(|desc| index.type_of(desc))
-        .is_some_and(|t| t.elem() == Some(DType::Fp8E4m3))
-        .then_some(v)
-}
-
 pub fn run(module: &mut Module) -> Result<()> {
     // ANTI-FORGERY (review P1.0). `spyre.canonical_verified` is TRUST that THIS
     // pass verified the matmul, and an IRSource author can hand-write the
@@ -184,6 +153,7 @@ pub fn run(module: &mut Module) -> Result<()> {
         // `tl.dot`, "Both operands must be same dtype"), so the dot's operands are all f16
         // here and the fp8-ness is carried by the WEIGHT LOAD's descriptor elem -- read below,
         // not assumed. An f32 operand is still refused: nothing widens that away.
+        let mut is_fp8_kernel = false;
         if a_ty.elem() != Some(DType::F16)
             || b_ty.elem() != Some(DType::F16)
             || d_ty.elem() != Some(DType::F16)
@@ -215,26 +185,23 @@ pub fn run(module: &mut Module) -> Result<()> {
         // `tt.trans` on a rank-3 operand is NOT FOLDED: it stays the op it is, and
         // `to_ktir`'s `convert_trans` lowers it to a real `linalg.transpose`, whose result
         // the batch matmul reads in the standard orientation (spyre-inference's
-        // `torch.matmul(q, k_page.permute(0, 2, 1))`). The fp8 W8A8 weight leg
-        // ([`fp8_weight_load`]) is refused: the W8A8 door is the rank-2 standalone contract's
-        // own, and no batched form of it is stated. A widening that is not that leg (a gathered
-        // float8 page's `.to(q.dtype)`) is the convert it is, and the batched dot reads its f16
-        // result.
+        // `torch.matmul(q, k_page.permute(0, 2, 1))`). The fp8 widening is refused: the
+        // W8A8 door is the rank-2 standalone contract's own, and no batched form of it is
+        // stated.
         if batched {
             let (da, db, dd) = (
                 da.expect("batched implies rank-3 dims"),
                 db.expect("batched implies rank-3 dims"),
                 dd.expect("batched implies rank-3 dims"),
             );
-            if fp8_weight_load(&index, dot.operands[0]).is_some()
-                || fp8_weight_load(&index, dot.operands[1]).is_some()
-            {
+            let widened = |v: Ssa| index.def_of(v).is_some_and(|o| o.kind == OpKind::ArithExtf);
+            if widened(dot.operands[0]) || widened(dot.operands[1]) {
                 return Err(Refusal::new(
                     PASS,
-                    "a rank-3 tt.dot operand is the fp8 W8A8 weight leg (an `arith.extf` of a \
-                     direct fp8 `tt.descriptor_load`): the W8A8 widening is a rank-2 \
-                     presented-weight law (the host stages those bytes), and no batched form \
-                     of it is stated. Present the batched operands as f16 values",
+                    "a rank-3 tt.dot operand reaches the dot through an `arith.extf`: the \
+                     fp8 W8A8 widening is a rank-2 presented-weight law (the host stages \
+                     those bytes), and no batched form of it is stated. Present the batched \
+                     operands as f16 values",
                 ));
             }
             if da[0] != db[0] || da[0] != dd[0] {
@@ -269,10 +236,35 @@ pub fn run(module: &mut Module) -> Result<()> {
         // is accepted (`extf(trans(load))` and `trans(extf(load))`); anything else on the
         // chain -- a reshape, a second op -- is not a load with a spelling on it and falls
         // through to the direct-load guard below, which refuses by name.
-        // The peeled chain is the fp8 leg ONLY IF it lands on an fp8-typed load
-        // ([`fp8_weight_load`], the one statement of the pattern).
-        let fp8_b_load = fp8_weight_load(&index, dot.operands[1]);
-        let is_fp8_kernel = fp8_b_load.is_some();
+        let fp8_b_load = {
+            let mut v = dot.operands[1];
+            let mut peeled = 0;
+            loop {
+                match index
+                    .def_of(v)
+                    .filter(|o| o.kind == OpKind::ArithExtf || o.kind == OpKind::TtTrans)
+                {
+                    Some(o) if peeled < 2 => {
+                        v = o.operands[0];
+                        peeled += 1;
+                    }
+                    _ => break,
+                }
+            }
+            // The peeled chain is the fp8 leg ONLY IF it lands on an fp8-typed load.
+            let fp8 = index
+                .def_of(v)
+                .filter(|o| o.kind == OpKind::TtDescriptorLoad)
+                .and_then(|ld| ld.operands.first().copied())
+                .and_then(|desc| index.type_of(desc))
+                .is_some_and(|t| t.elem() == Some(DType::Fp8E4m3));
+            if fp8 {
+                is_fp8_kernel = true;
+                Some(v)
+            } else {
+                None
+            }
+        };
 
         // ⭐⭐⭐ RUNG 4 — THE GATHERED-B LEG: `tt.descriptor_gather` on B, with or without
         // a `tt.trans` over it. The rows the contraction's K axis reads are chosen AT
@@ -2005,112 +1997,26 @@ module {
         );
     }
 
-    /// CONTROL — a batched operand that IS the fp8 W8A8 weight leg (an `arith.extf` of a direct fp8
-    /// `tt.descriptor_load`): the fp8 door is the rank-2 standalone contract's own, and no batched
-    /// form of it is stated, so it is refused by name.
+    /// CONTROL — a batched operand through an `arith.extf` (the fp8 W8A8
+    /// widening): the fp8 door is the rank-2 standalone contract's own, and no
+    /// batched form of it is stated.
     #[test]
-    fn a_batched_operand_that_is_the_w8a8_weight_leg_is_refused() {
-        let src = BATCHED
-            .replacen(
-                "  tt.func public @k(%q: !tt.ptr<f16>) attributes {noinline = false} {",
-                "  tt.func public @k(%q: !tt.ptr<f16>, %w: !tt.ptr<f8E4M3FN>) attributes {noinline = false} {\n    \
-                 %z = arith.constant 0 : i32\n    \
-                 %r = arith.constant 8 : i32\n    \
-                 %c4 = arith.constant 4 : i32\n    \
-                 %c64 = arith.constant 64 : i32\n    \
-                 %s0 = arith.constant 256 : i64\n    \
-                 %s1 = arith.constant 64 : i64\n    \
-                 %one = arith.constant 1 : i64\n    \
-                 %w_desc = tt.make_tensor_descriptor %w, [%r, %c4, %c64], [%s0, %s1, %one] : <f8E4M3FN>, <8x4x64xf8E4M3FN>\n    \
-                 %a8 = tt.descriptor_load %w_desc[%z, %z, %z] : !tt.tensordesc<8x4x64xf8E4M3FN> -> tensor<8x4x64xf8E4M3FN>",
-                1,
-            )
-            .replacen(
-                "    %o = tt.dot %a, %b, %cst",
-                "    %aw = arith.extf %a8 : tensor<8x4x64xf8E4M3FN> to tensor<8x4x64xf16>\n    %o = tt.dot %aw, %b, %cst",
-                1,
-            );
+    fn a_batched_operand_through_an_extf_is_refused() {
+        let src = BATCHED.replacen(
+            "    %o = tt.dot %a, %b, %cst",
+            "    %aw = arith.extf %a8 : tensor<8x4x64xf8E4M3FN> to tensor<8x4x64xf16>\n    %o = tt.dot %aw, %b, %cst",
+            1,
+        )
+        .replacen(
+            "    %a = arith.constant dense<1.000000e+00> : tensor<8x4x64xf16>",
+            "    %a8 = arith.constant dense<1.000000e+00> : tensor<8x4x64xf8E4M3FN>",
+            1,
+        );
         let mut m = parse::parse(&src).unwrap();
         let e = run(&mut m).unwrap_err();
         assert!(
             e.message.contains("rank-2 presented-weight law"),
-            "the W8A8 leg's refusal must name the law; got {e}"
-        );
-    }
-
-    /// NEAR-MISS — a batched operand widened from a COMPUTED fp8 value (an `arith.constant`, not a
-    /// descriptor load) is not the W8A8 leg: the fold leaves it unclaimed and the dot lowers.
-    #[test]
-    fn a_batched_operand_widened_from_a_computed_value_is_left_unclaimed() {
-        let src = BATCHED
-            .replacen(
-                "    %o = tt.dot %a, %b, %cst",
-                "    %aw = arith.extf %a8 : tensor<8x4x64xf8E4M3FN> to tensor<8x4x64xf16>\n    %o = tt.dot %aw, %b, %cst",
-                1,
-            )
-            .replacen(
-                "    %a = arith.constant dense<1.000000e+00> : tensor<8x4x64xf16>",
-                "    %a8 = arith.constant dense<1.000000e+00> : tensor<8x4x64xf8E4M3FN>",
-                1,
-            );
-        let mut m = parse::parse(&src).unwrap();
-        run(&mut m).expect("an extf that is not the W8A8 leg is not the fold's to refuse");
-        let c = m.census();
-        let get = |n: &str| c.iter().find(|(k, _)| k == n).map(|(_, v)| *v).unwrap_or(0);
-        assert_eq!(get("linalg.batch_matmul"), 1, "the dot lowered");
-        assert_eq!(
-            get("arith.extf"),
-            1,
-            "the widen is left standing, unclaimed"
-        );
-    }
-
-    /// NEIGHBOUR — the attention's own form: a gathered fp8 page, reshaped, widened, and contracted
-    /// (`tl.dot(probs, v_page.to(q.dtype))`). Not the W8A8 leg (the extf reads a reshape of a
-    /// gather), so the batched dot lowers and the widen stands.
-    #[test]
-    fn a_batched_operand_widened_from_a_gathered_fp8_page_is_left_unclaimed() {
-        let src = BATCHED
-            .replacen(
-                "  tt.func public @k(%q: !tt.ptr<f16>) attributes {noinline = false} {",
-                "  tt.func public @k(%q: !tt.ptr<f16>, %v: !tt.ptr<f8E4M3FN>, %ids: !tt.ptr<i32>) attributes {noinline = false} {\n    \
-                 %z = arith.constant 0 : i32\n    \
-                 %vr = arith.constant 512 : i32\n    \
-                 %c64 = arith.constant 64 : i32\n    \
-                 %c8 = arith.constant 8 : i32\n    \
-                 %s64 = arith.constant 64 : i64\n    \
-                 %one = arith.constant 1 : i64\n    \
-                 %v_desc = tt.make_tensor_descriptor %v, [%vr, %c64], [%s64, %one] : <f8E4M3FN>, <1x64xf8E4M3FN>\n    \
-                 %ids_desc = tt.make_tensor_descriptor %ids, [%c8], [%one] : <i32>, <8xsi32>\n    \
-                 %rows_ids = tt.descriptor_load %ids_desc[%z] : !tt.tensordesc<8xsi32> -> tensor<8xi32>\n    \
-                 %g = tt.descriptor_gather %v_desc[%rows_ids, %z] : (!tt.tensordesc<1x64xf8E4M3FN>, tensor<8xi32>, i32) -> tensor<8x64xf8E4M3FN>",
-                1,
-            )
-            .replacen(
-                "    %b = arith.constant dense<2.000000e+00> : tensor<8x64x64xf16>",
-                "    %g3 = tt.reshape %g : tensor<8x64xf8E4M3FN> -> tensor<8x1x64xf8E4M3FN>\n    \
-                 %b = arith.extf %g3 : tensor<8x1x64xf8E4M3FN> to tensor<8x1x64xf16>",
-                1,
-            )
-            .replacen(
-                "    %a = arith.constant dense<1.000000e+00> : tensor<8x4x64xf16>",
-                "    %a = arith.constant dense<1.000000e+00> : tensor<8x4x1xf16>",
-                1,
-            )
-            .replacen(
-                "    %o = tt.dot %a, %b, %cst : tensor<8x4x64xf16> * tensor<8x64x64xf16> -> tensor<8x4x64xf16>",
-                "    %o = tt.dot %a, %b, %cst : tensor<8x4x1xf16> * tensor<8x1x64xf16> -> tensor<8x4x64xf16>",
-                1,
-            );
-        let mut m = parse::parse(&src).unwrap();
-        run(&mut m).expect("a gathered page's widen is not the W8A8 leg");
-        let c = m.census();
-        let get = |n: &str| c.iter().find(|(k, _)| k == n).map(|(_, v)| *v).unwrap_or(0);
-        assert_eq!(get("linalg.batch_matmul"), 1, "the dot lowered");
-        assert_eq!(
-            get("arith.extf"),
-            1,
-            "the widen is left standing, unclaimed"
+            "the extf refusal must name the law; got {e}"
         );
     }
 

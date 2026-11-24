@@ -7429,47 +7429,19 @@ impl KvCacheLayers {
     }
 }
 
-/// ⭐ A FLOAT8 CACHE'S SCALES, from the config's own statement (`quantization_config.kv_cache_scheme`,
-/// [`crate::quantization::KvCacheScheme`]) — the reference's `_k_scale_float` / `_v_scale_float`
-/// (spyre-inference `spyre_attn.py:1993-2002`, set by vLLM's `BaseKVCacheMethod` from the
-/// checkpoint). A config that states no scheme stores K and V unscaled. A config that states one
-/// holds its per-layer values only in the checkpoint's tensors, which no build-time path reads: a
-/// build error naming the model, never an assumed scale.
-fn kv_cache_scales(model: &ModelParams) -> scratchy_forward_compiler::KvCacheScales {
-    match model.quantization.as_ref().map(|q| q.kv_cache_scheme) {
-        None | Some(crate::quantization::KvCacheScheme::Absent) => {
-            scratchy_forward_compiler::KvCacheScales::Unscaled
-        }
-        Some(crate::quantization::KvCacheScheme::Stated) => panic!(
-            "config `{}`: its quantization_config states a kv_cache_scheme — per-layer KV scales \
-             whose values live only in the checkpoint's tensors, which this build does not read; \
-             a float8 KV cache for it needs those values as build constants",
-            model.source_stem
-        ),
-    }
-}
-
-/// The model's KV codec, at the target's store (`store`, [`crate::target::KvStore`]): float8 for
-/// every body that holds KV on a target storing it; int8 on a target whose kernels code its heads
-/// (`coded`), wherever `codec_for` takes its geometry; dense everywhere else. A model it would
-/// compress but can't is named in the build output.
+/// The model's KV codec. Int8 on a target whose kernels code its heads (`coded`), wherever
+/// `codec_for` takes its geometry; dense everywhere else. A model it would compress but can't is named in the
+/// build output.
 fn kv_codec_for(
     model: &ModelParams,
     head_dim: u32,
     global_head_dim: u32,
     kv_layers: &KvCacheLayers,
-    store: crate::target::KvStore,
+    coded: Option<scratchy_ir::CodedHeads>,
 ) -> scratchy_forward_compiler::KvCodec {
     use scratchy_ir::{DenseReason, KvRows, codec_for};
-    let coded = match store {
-        crate::target::KvStore::Dense => return scratchy_forward_compiler::KvCodec::Dense,
-        // A float8 cache holds any head: no geometry admission, the reference's own. A body that
-        // holds no KV stores none.
-        crate::target::KvStore::Fp8E4m3 if kv_layers.any() => {
-            return scratchy_forward_compiler::KvCodec::Fp8E4m3(kv_cache_scales(model));
-        }
-        crate::target::KvStore::Fp8E4m3 => return scratchy_forward_compiler::KvCodec::Dense,
-        crate::target::KvStore::Int8(coded) => coded,
+    let Some(coded) = coded else {
+        return scratchy_forward_compiler::KvCodec::Dense;
     };
     let latent = model.bounds.get("kv_lora_rank").is_some_and(|&r| r > 0);
     let rows = match (kv_layers.any(), latent) {
@@ -7639,11 +7611,6 @@ fn model_facts_tokens(f: scratchy_ir::model_facts::ModelFacts) -> TokenStream {
     let kv_codec = match f.kv_codec() {
         scratchy_ir::KvCodec::Dense => quote! { ::scratchy_forward_compiler::KvCodec::Dense },
         scratchy_ir::KvCodec::Int8 => quote! { ::scratchy_forward_compiler::KvCodec::Int8 },
-        scratchy_ir::KvCodec::Fp8E4m3(scratchy_ir::KvCacheScales::Unscaled) => quote! {
-            ::scratchy_forward_compiler::KvCodec::Fp8E4m3(
-                ::scratchy_forward_compiler::KvCacheScales::Unscaled
-            )
-        },
     };
     let act_dtype = match f.act_dtype() {
         scratchy_ir::model_facts::ActDtype::Bf16 => quote! { #m::ActDtype::Bf16 },
@@ -7781,8 +7748,8 @@ pub(crate) fn fill_canonical_params(
     // For a body that reads its target's hidden rows (a head), how its width stands to its
     // target's ([`target_width`]): the facts state its target then.
     target: Option<scratchy_ir::model_facts::TargetWidth>,
-    // How the target stores a KV cache (`TargetEmitter::kv_store`).
-    kv_store: crate::target::KvStore,
+    // The heads the target's kernels code as int8 KV (`TargetEmitter::coded_kv_heads`).
+    coded_kv: Option<scratchy_ir::CodedHeads>,
 ) -> (scratchy_ir::model_facts::ModelFacts, TokenStream) {
     let tp = tp_world_size as u32;
     let tp_us = tp_world_size as usize;
@@ -8108,7 +8075,7 @@ pub(crate) fn fill_canonical_params(
         is_bf16_scale || is_nvfp4
     };
 
-    let kv_codec = kv_codec_for(model, head_dim, global_head_dim, kv_layers, kv_store);
+    let kv_codec = kv_codec_for(model, head_dim, global_head_dim, kv_layers, coded_kv);
 
     let num_hidden_layers = model.text.layers.get();
 
@@ -8554,7 +8521,7 @@ pub fn emit_model(
         fuf_uses_rotary(fuf),
         &KvCacheLayers::of(fuf),
         fuf_reads_target_hidden(fuf).then(|| target_width(program, inferred)),
-        emitter.kv_store(),
+        emitter.coded_kv_heads(),
     );
     let canonical_params_impl = emit_canonical_params_impl(model_facts, &mla_consts);
     let crate::target::ModelEmission { weights, items } = emitter.model(&crate::target::ModelCx {
@@ -8820,15 +8787,7 @@ mod tests {
             ) else {
                 continue;
             };
-            let facts = fill_canonical_params(
-                &model,
-                1,
-                false,
-                &every_layer(&model),
-                None,
-                crate::target::KvStore::Dense,
-            )
-            .0;
+            let facts = fill_canonical_params(&model, 1, false, &every_layer(&model), None, None).0;
             // A body with no decoder attention (a vision tower, a drafter head) states
             // no scale — the law is over the configs that do.
             let Some(attention) = facts.attention() else {
@@ -8935,14 +8894,7 @@ mod tests {
             "SCALE_DTYPE",
         ];
         let m = shard_test_model(32, 8, 128, 11008);
-        let (facts, mla) = fill_canonical_params(
-            &m,
-            1,
-            false,
-            &every_layer(&m),
-            None,
-            crate::target::KvStore::Dense,
-        );
+        let (facts, mla) = fill_canonical_params(&m, 1, false, &every_layer(&m), None, None);
         let ts = emit_canonical_params_impl(facts, &mla).to_string();
         assert!(ts.contains("const FACTS"), "the impl states FACTS: {ts}");
         for name in DERIVED {
@@ -8958,15 +8910,7 @@ mod tests {
         // Llama-2-7B-ish numbers: 32 q heads, 32 kv heads,
         // head_dim=128, intermediate=11008.
         let m = shard_test_model(32, 32, 128, 11008);
-        let facts = fill_canonical_params(
-            &m,
-            1,
-            false,
-            &every_layer(&m),
-            None,
-            crate::target::KvStore::Dense,
-        )
-        .0;
+        let facts = fill_canonical_params(&m, 1, false, &every_layer(&m), None, None).0;
         // Q size = 32 * 128 = 4096; KV size = 32 * 128 = 4096.
         assert!(
             raw::num_q_heads(facts) == 32,
@@ -8998,15 +8942,7 @@ mod tests {
     #[test]
     fn canonical_params_at_tp_eq_2_shards_column_parallel_dims() {
         let m = shard_test_model(32, 32, 128, 11008);
-        let facts = fill_canonical_params(
-            &m,
-            2,
-            false,
-            &every_layer(&m),
-            None,
-            crate::target::KvStore::Dense,
-        )
-        .0;
+        let facts = fill_canonical_params(&m, 2, false, &every_layer(&m), None, None).0;
         assert!(
             raw::num_q_heads(facts) == 16,
             "tp=2 must shard NUM_Q_HEADS to 16; got {}",
@@ -9052,15 +8988,7 @@ mod tests {
         // Llama-3-8B-ish numbers: 32 q heads, 8 kv heads,
         // head_dim=128, intermediate=14336.
         let m = shard_test_model(32, 8, 128, 14336);
-        let facts = fill_canonical_params(
-            &m,
-            8,
-            false,
-            &every_layer(&m),
-            None,
-            crate::target::KvStore::Dense,
-        )
-        .0;
+        let facts = fill_canonical_params(&m, 8, false, &every_layer(&m), None, None).0;
         // 32 / 8 = 4
         assert!(
             raw::num_q_heads(facts) == 4,
