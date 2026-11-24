@@ -12,3 +12,4 @@ scratchy-tensors = { workspace = true }
 scratchy-tp-world = { workspace = true }
 scratchy-layers = { workspace = true }
 scratchy-quantizations = { workspace = true }   # AffineQuantEmbedding in WeightAccessors::affine_quant_embedding_at
+scratchy-state-decoder-gdn = { workspace = true }

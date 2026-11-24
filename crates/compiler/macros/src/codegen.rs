@@ -7610,7 +7610,9 @@ fn model_facts_tokens(f: scratchy_ir::model_facts::ModelFacts) -> TokenStream {
             n(g.conv_kernel().get()),
             unsigned_tokens(g.conv_dim().get() as u64),
         );
-        quote! { #m::Gdn::of::<#kh, #vh, #kd, #vd, #ck, #cd>() }
+        quote! {
+            ::scratchy_state_decoder_gdn::geometry::Gdn::of::<#kh, #vh, #kd, #vd, #ck, #cd>()
+        }
     }));
     let drafter = opt(f.drafter().map(|d| {
         let (g, r, t) = (
@@ -8116,6 +8118,9 @@ pub(crate) fn fill_canonical_params(
 
     let facts = {
         use scratchy_ir::model_facts as mf;
+        use scratchy_state_decoder_gdn::geometry::{
+            ConvDim, ConvKernel, Gdn, GdnHeadDim, GdnHeads,
+        };
         let positive = |v: u32| (v > 0).then_some(v);
         // A decoder's attention. A vision-only body's text consts above carry its tower's numbers
         // (`is_vision_only`); it has no decoder attention, and its tower is `vision`.
@@ -8171,13 +8176,13 @@ pub(crate) fn fill_canonical_params(
             )
         });
         let gdn = RecurrentDims::of(model).map(|d| {
-            mf::Gdn::new(
-                mf::GdnHeads::new(d.num_k_heads),
-                mf::GdnHeads::new(d.num_v_heads),
-                mf::GdnHeadDim::new(d.head_k_dim),
-                mf::GdnHeadDim::new(d.head_v_dim),
-                mf::ConvKernel::new(d.conv_kernel),
-                mf::ConvDim::new(d.conv_dim as usize),
+            Gdn::new(
+                GdnHeads::new(d.num_k_heads),
+                GdnHeads::new(d.num_v_heads),
+                GdnHeadDim::new(d.head_k_dim),
+                GdnHeadDim::new(d.head_v_dim),
+                ConvKernel::new(d.conv_kernel),
+                ConvDim::new(d.conv_dim as usize),
             )
         });
         let drafter = positive(draft_selector_rank).map(|rank| {
@@ -8313,7 +8318,7 @@ impl RecurrentDims {
 /// Emit a per-variant arm body — the `GdnRuntimeConfig` literal for one
 /// specialization. Returns `None` if the variant has no recurrent mixer
 /// (`OpKind::GatedDeltaNet` / `OpKind::Mamba2`) — caller emits a `None` arm.
-pub fn emit_gdn_runtime_config_arm_body(
+pub fn emit_recurrent_state_arm_body(
     fuf: &Fuf,
     model: &ModelParams,
 ) -> Option<proc_macro2::TokenStream> {
@@ -8357,7 +8362,7 @@ pub fn emit_gdn_runtime_config_arm_body(
     let bits = linear.iter().copied();
     Some(quote! {
         ::core::option::Option::Some(
-            ::scratchy_forward_compiler::gdn_state_layout::GdnRuntimeConfig {
+            ::scratchy_state_decoder_gdn::layout::GdnRuntimeConfig {
                 conv_dim: #conv_dim,
                 conv_kernel: #conv_kernel,
                 num_k_heads: #num_k_heads,

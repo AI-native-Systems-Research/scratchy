@@ -32,7 +32,8 @@ use std::sync::Arc;
 use scratchy_core_config::{compact_kv_layer_to_tensor, compute_hybrid_kv_layout};
 use scratchy_core_model::weight::HfModelConfig;
 use scratchy_forward_compiler::{ArchLoad, HfFingerprint, hash_json_value};
-use scratchy_target_metal::gdn_state::{GDN_SSM_STATE_DTYPE, GdnSeqSlots, GdnSlot, GdnStatePool};
+use scratchy_state_decoder_gdn::pool::{GdnSeqSlots, GdnSlot, GdnStatePool};
+use scratchy_target_metal::gdn_state::GDN_SSM_STATE_DTYPE;
 use scratchy_target_metal::interpreter::metal::{
     BLOCKS_PER_CHUNK, MetalDtype, MetalRungs, TerminalReads,
 };
@@ -377,14 +378,14 @@ fn load(repo: &str, bucket_cap: u32) -> Loaded {
     residency.commit();
     kv.fill_chunk_tables(|m| m.gpu_address());
 
-    let gdn = model.gdn_runtime_config().map(|cfg| {
+    let gdn = model.recurrent_state().map(|cfg| {
         unsafe {
             GdnStatePool::new(
                 layers,
                 &cfg.linear_layers,
                 1,
                 // A lane for a model that drafts: its tapes bind one, though this one never does.
-                scratchy_target_metal::gdn_state::DraftLanes::new(cfg.checkpoint_rows(), 1),
+                scratchy_state_decoder_gdn::pool::DraftLanes::new(cfg.checkpoint_rows(), 1),
                 cfg.state_dims(),
                 GDN_SSM_STATE_DTYPE,
                 |bytes| Ok(MetalMem::new_pinned(&device, &residency, bytes)),
@@ -532,12 +533,12 @@ fn run_step(l: &mut Loaded, path: ExecPath, s: &StepInputs) -> (Vec<u8>, usize) 
         vision_window_index: None,
         vision_reverse_indices: None,
         vision_position_ids: None,
-        gdn_state: l.gdn.as_ref(),
-        gdn_state_indices: l
+        recurrent_state: l.gdn.as_ref(),
+        recurrent_state_indices: l
             .gdn
             .as_ref()
             .map(|_| view(&s.gdn_indices, &[s.gdn_indices.len()], DType::I32)),
-        gdn_is_fresh: l.gdn.as_ref().map(|_| view(&s.gdn_fresh, &[1], u32t)),
+        recurrent_is_fresh: l.gdn.as_ref().map(|_| view(&s.gdn_fresh, &[1], u32t)),
         draft_ring: None,
         draft: None,
         sampled_rows: Some(view(&s.sampled_rows, &[1], u32t)),

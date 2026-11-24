@@ -2645,6 +2645,7 @@ dependencies = [
  "scratchy-core-config",
  "scratchy-ir",
  "scratchy-layers",
+ "scratchy-state-decoder-gdn",
  "scratchy-tensors",
  "serde_json",
 ]
@@ -2669,6 +2670,7 @@ dependencies = [
  "scratchy-forward-compiler",
  "scratchy-forward-compiler-frontend",
  "scratchy-ir",
+ "scratchy-state-decoder-gdn",
  "scratchy-subtile",
  "scratchy-tensors",
  "serde_json",
@@ -2697,6 +2699,7 @@ version = "0.1.0"
 dependencies = [
  "scratchy-layers",
  "scratchy-quantizations",
+ "scratchy-state-decoder-gdn",
  "scratchy-tensors",
  "scratchy-tp-world",
 ]
@@ -2874,6 +2877,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "scratchy-state-decoder-gdn"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "scratchy-tensors",
+ "tracing",
+]
+
+[[package]]
 name = "scratchy-subtile"
 version = "0.1.0"
 dependencies = [
@@ -2987,6 +2999,7 @@ dependencies = [
  "scratchy-models",
  "scratchy-models-build",
  "scratchy-quantizations",
+ "scratchy-state-decoder-gdn",
  "scratchy-target-spyre",
  "scratchy-target-spyre-compiler",
  "scratchy-tensors",

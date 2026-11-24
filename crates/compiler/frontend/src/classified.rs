@@ -563,8 +563,8 @@ pub enum OpKind {
     /// `qkv = in_proj_qkv` `[T, conv_dim]`, `z = in_proj_z` `[T, value_dim]`,
     /// `a/b = in_proj_{a,b}` `[T, num_v_heads]`, and `linear_attn[layer]`
     /// resolves to a `GatedDeltaNetLayer` (conv1d / A_log / dt_bias / norm).
-    /// The recurrent + conv state is the ambient `ForwardCtx::gdn_state`
-    /// (non-paged, one slot/seq) selected by `gdn_state_indices`, read at
+    /// The recurrent + conv state is the ambient `ForwardCtx::recurrent_state`
+    /// (non-paged, one slot/seq) selected by `recurrent_state_indices`, read at
     /// the `layer` carried on the `Instruction`. Output: `[T, value_dim]`
     /// (feeds `out_proj`). Used by Qwen3.5 / Qwen3-Next linear layers.
     GatedDeltaNet,

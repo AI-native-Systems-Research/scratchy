@@ -159,11 +159,16 @@ jobs:
       - name: Scheduler tests (backend-neutral)
         run: cargo test -p scratchy-serving-scheduler --lib
 
-      # The GDN state-slot allocator is plain Rust: no backend, no GPU, and no other step runs its
-      # unit tests. The engine's (its memory-budget arithmetic) run in the guided-decoding step
-      # below, whose feature only adds code.
-      - name: Slot-allocator unit tests (no backend feature)
+      # The forward compiler's unit tests are plain Rust: no backend, no GPU, and no other step runs
+      # them. The engine's (its memory-budget arithmetic) run in the guided-decoding step below,
+      # whose feature only adds code.
+      - name: Forward-compiler unit tests (no backend feature)
         run: cargo test -p scratchy-forward-compiler --lib
+
+      # GDN's recurrent state (its pool, slot allocator and layout) is plain Rust: no backend, no
+      # GPU, and no other step runs its unit tests.
+      - name: GDN state unit tests (no backend feature)
+        run: cargo test -p scratchy-state-decoder-gdn
 
       # The `--workspace` clippy above has no `--all-targets`: it builds
       # lib+bins only, so every `#[cfg(test)]` block in the workspace is

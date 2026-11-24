@@ -3079,6 +3079,7 @@ dependencies = [
  "scratchy-hf-hub-downloader",
  "scratchy-ir",
  "scratchy-layers",
+ "scratchy-state-decoder-gdn",
  "scratchy-tensors",
  "scratchy-vision",
  "serde",
@@ -3106,6 +3107,7 @@ dependencies = [
  "scratchy-forward-compiler",
  "scratchy-forward-compiler-frontend",
  "scratchy-ir",
+ "scratchy-state-decoder-gdn",
  "scratchy-subtile",
  "scratchy-tensors",
  "serde_json",
@@ -3134,6 +3136,7 @@ version = "0.1.0"
 dependencies = [
  "scratchy-layers",
  "scratchy-quantizations",
+ "scratchy-state-decoder-gdn",
  "scratchy-tensors",
  "scratchy-tp-world",
 ]
@@ -3317,6 +3320,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "scratchy-state-decoder-gdn"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "scratchy-tensors",
+ "tracing",
+]
+
+[[package]]
 name = "scratchy-subtile"
 version = "0.1.0"
 dependencies = [
@@ -3354,6 +3366,7 @@ dependencies = [
  "scratchy-ir",
  "scratchy-layers",
  "scratchy-quantizations",
+ "scratchy-state-decoder-gdn",
  "scratchy-subtile",
  "scratchy-tensors",
  "scratchy-vision",
@@ -3413,6 +3426,7 @@ dependencies = [
  "scratchy-models",
  "scratchy-models-build",
  "scratchy-quantizations",
+ "scratchy-state-decoder-gdn",
  "scratchy-target-metal",
  "scratchy-target-metal-compiler",
  "scratchy-tensors",
@@ -3440,6 +3454,7 @@ dependencies = [
  "scratchy-serving-engine",
  "scratchy-serving-scheduler",
  "scratchy-serving-worker",
+ "scratchy-state-decoder-gdn",
  "scratchy-target-metal",
  "scratchy-target-metal-models",
  "serde_json",

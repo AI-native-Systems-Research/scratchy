@@ -15,6 +15,7 @@ pub mod device_allocator;
 pub mod dtype;
 pub mod lowering_dtype;
 pub mod owned_tensor;
+pub mod positive;
 pub mod raw_mem;
 pub mod tensor;
 pub mod typed;

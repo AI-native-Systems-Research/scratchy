@@ -74,9 +74,9 @@ pub struct ForwardInputs<'a> {
     /// leaves their logits at the front of its logits buffer, row `i` sampled row `i`'s. A caller
     /// that names none samples each sequence's last ([`Self::last_rows`]).
     pub sampled_rows: &'a [u32],
-    /// `[num_seqs * 6]` i32 — a [`GdnSeqSlots`](crate::gdn_state::GdnSeqSlots) record per
-    /// batched sequence (cu_seqlens order), flattened as `GdnSeqSlots::words`. `None` for
-    /// non-hybrid arches; required for any bucket that runs `Instruction::GatedDeltaNet`.
+    /// `[num_seqs * 6]` i32 — a [`GdnSeqSlots`](scratchy_state_decoder_gdn::pool::GdnSeqSlots)
+    /// record per batched sequence (cu_seqlens order), flattened as `GdnSeqSlots::words`. `None`
+    /// for non-hybrid arches; required for any bucket that runs `Instruction::GatedDeltaNet`.
     pub gdn_state_indices: Option<&'a [i32]>,
     /// `[num_seqs]` u32 — 1 when the sequence is on its first (fresh)
     /// forward (GDN kernels treat its state as zero). `None` for

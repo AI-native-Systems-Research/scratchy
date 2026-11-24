@@ -1,0 +1,12 @@
+[package]
+name = "scratchy-state-decoder-gdn"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Gated-DeltaNet's backend-neutral recurrent state (conv ring and ssm state), shared by Mamba-2. No backend: the state pool and its slot arithmetic only."
+
+[dependencies]
+scratchy-tensors = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }

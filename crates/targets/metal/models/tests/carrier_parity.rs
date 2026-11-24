@@ -429,13 +429,13 @@ mod imp {
         // GDN / Mamba-2 state pool (recurrent hybrid arches). One slot for
         // our single sequence, marked fresh on the prefill step — the oracle
         // zero-inits state — and carried into every decode step after it.
-        let gdn_pool = model.gdn_runtime_config().map(|gdn_cfg| unsafe {
-            scratchy_target_metal::gdn_state::GdnStatePool::new(
+        let gdn_pool = model.recurrent_state().map(|gdn_cfg| unsafe {
+            scratchy_state_decoder_gdn::pool::GdnStatePool::new(
                 layers,
                 &gdn_cfg.linear_layers,
                 1,
                 // A lane for a model that drafts: its tapes bind one, though this one never does.
-                scratchy_target_metal::gdn_state::DraftLanes::new(gdn_cfg.checkpoint_rows(), 1),
+                scratchy_state_decoder_gdn::pool::DraftLanes::new(gdn_cfg.checkpoint_rows(), 1),
                 gdn_cfg.state_dims(),
                 scratchy_target_metal::gdn_state::GDN_SSM_STATE_DTYPE,
                 |bytes| {
@@ -452,8 +452,8 @@ mod imp {
         });
 
         // Recurrent-state slot 0 for our one sequence: its `state_indices` record.
-        let gdn_idx = scratchy_target_metal::gdn_state::GdnSeqSlots::plain(
-            scratchy_target_metal::gdn_state::GdnSlot::new(0),
+        let gdn_idx = scratchy_state_decoder_gdn::pool::GdnSeqSlots::plain(
+            scratchy_state_decoder_gdn::pool::GdnSlot::new(0),
         )
         .words();
 
@@ -534,11 +534,11 @@ mod imp {
                 max_seqlen_q: len,
                 max_seqlen_k: end,
                 kv_cache: &kv,
-                gdn_state: gdn_pool.as_ref(),
-                gdn_state_indices: gdn_pool
+                recurrent_state: gdn_pool.as_ref(),
+                recurrent_state_indices: gdn_pool
                     .as_ref()
                     .map(|_| host_view(&gdn_idx, &[gdn_idx.len()], DType::I32)),
-                gdn_is_fresh: gdn_pool.as_ref().map(|_| host_view(&fresh, &[1], u32t)),
+                recurrent_is_fresh: gdn_pool.as_ref().map(|_| host_view(&fresh, &[1], u32t)),
                 draft_ring: None,
                 draft: None,
                 mm_embeds: None,

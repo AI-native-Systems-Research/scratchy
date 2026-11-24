@@ -147,16 +147,16 @@ pub struct RuntimeBindings {
     /// dummy / emptiness contract as [`Self::gdn_state_conv`].
     pub gdn_state_ssm: Vec<Buffer>,
     /// Per-layer GDN draft lanes' conv checkpoints and ssm records
-    /// (`scratchy_layers::gdn_state::DraftLanes`). Same indexing / dummy contract as
+    /// (`scratchy_state_decoder_gdn::pool::DraftLanes`). Same indexing / dummy contract as
     /// [`Self::gdn_state_conv`]; empty for a model that drafts nothing (its tapes bind none).
     pub gdn_lanes_conv: Vec<Buffer>,
     pub gdn_lanes_ssm: Vec<Buffer>,
-    /// `[num_seqs]` [`GdnSeqSlots`](crate::gdn_state::GdnSeqSlots) — 24 bytes (6 i32s) per
-    /// batched sequence: its state-pool slot, the snapshot a restore reads its start state from,
-    /// the snapshots a save stores into. Shared storage; the pool overwrites `contents()` each
-    /// forward and zeroes the tail past them: an all-zero record is a plain step on slot 0, and a
-    /// padding sequence past them has no rows (`cu_seqlens_q`'s zeroed tail), so no kernel runs
-    /// it.
+    /// `[num_seqs]` [`GdnSeqSlots`](scratchy_state_decoder_gdn::pool::GdnSeqSlots) — 24 bytes (6
+    /// i32s) per batched sequence: its state-pool slot, the snapshot a restore reads its start
+    /// state from, the snapshots a save stores into. Shared storage; the pool overwrites
+    /// `contents()` each forward and zeroes the tail past them: an all-zero record is a plain step
+    /// on slot 0, and a padding sequence past them has no rows (`cu_seqlens_q`'s zeroed tail), so
+    /// no kernel runs it.
     pub gdn_state_indices: Buffer,
     /// `[num_seqs]` u32 — per-sequence fresh flag. Shared storage.
     pub gdn_is_fresh: Buffer,

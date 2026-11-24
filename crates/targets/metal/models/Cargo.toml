@@ -21,6 +21,8 @@ scratchy-models = { path = "../../../models/arch", default-features = false }
 scratchy-target-metal = { path = ".." }
 scratchy-forward-compiler = { workspace = true }
 scratchy-layers = { workspace = true }
+# The recurrent state the emitted code names for an arch that runs a recurrent mixer.
+scratchy-state-decoder-gdn = { workspace = true }
 # The dim markers and typed weight handles each model's emitted `Weights` holds.
 scratchy-tensors = { workspace = true }
 scratchy-quantizations = { workspace = true }

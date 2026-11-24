@@ -7,9 +7,10 @@
 use super::lowered::{Lacked, LoweringError};
 use super::step::AttnMask;
 use scratchy_ir::model_facts::{
-    Attention, AttnClass, AttnWindow, Drafter, Gdn, HeadGeometry, IntermediateSize, KvRope,
-    ModelFacts, SoftCap, Target, Vision, VocabSize,
+    Attention, AttnClass, AttnWindow, Drafter, HeadGeometry, IntermediateSize, KvRope, ModelFacts,
+    SoftCap, Target, Vision, VocabSize,
 };
+use scratchy_state_decoder_gdn::geometry::Gdn;
 
 /// The decoder's attention.
 pub(crate) fn attention(p: &ModelFacts) -> Result<Attention, LoweringError> {

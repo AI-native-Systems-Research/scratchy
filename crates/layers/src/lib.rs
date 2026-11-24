@@ -7,7 +7,6 @@
 //! methods (kernel-calling `forward`, `GpuWeights`-bound `load`) stay in the
 //! target crates as extension traits — this crate names no backend.
 
-pub mod gdn_state;
 pub mod kv_cache;
 pub mod kv_int8;
 pub mod layers;
@@ -26,7 +25,6 @@ pub mod weights;
 // re-exports) is sufficient.
 pub use scratchy_tensors::{device_allocator, dtype, tensor};
 
-pub use gdn_state::{GDN_CONV_AND_RECORD_DTYPE, GdnStatePool};
 pub use kv_cache::KvCachePool;
 pub use layers::{
     Bnb4bitLinear, CohereLayerNorm, Embedding, Fp8AnyLinear, Fp8BlockLinear, Fp8Linear,

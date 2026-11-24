@@ -30,12 +30,13 @@ const LAW_ASSERTS: usize = 29;
 /// The value→type doors left: value constructors beside a typed one, and value→const match arms.
 const VALUE_DOORS: usize = 10;
 
-/// The crates scanned, from the repository root: the root workspace's compiler, tensor, layer and
-/// target crates, and the spyre backend's own two workspaces (its crates left `crates/targets`).
+/// The crates scanned, from the repository root: the root workspace's compiler, tensor, layer,
+/// decoder-state and target crates, and the spyre backend's own two workspaces (its crates left `crates/targets`).
 const ROOTS: &[&str] = &[
     "crates/compiler",
     "crates/tensors",
     "crates/layers",
+    "crates/state",
     "crates/targets",
     "backends/spyre/crates",
     "backends/spyre-hw/crates",
