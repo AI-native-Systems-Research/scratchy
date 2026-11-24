@@ -30,10 +30,7 @@ pub trait FusedMoEOps {
     fn load(
         gw: &mut crate::weights::GpuWeights,
         prefix: &str,
-        num_experts: usize,
-        top_k: usize,
-        intermediate_size: usize,
-        hidden_size: usize,
+        bank: ExpertBank,
         stream: crate::LoadStream,
     ) -> anyhow::Result<Self>
     where
@@ -42,13 +39,8 @@ pub trait FusedMoEOps {
     fn load_affine(
         gw: &mut crate::weights::GpuWeights,
         prefix: &str,
-        num_experts: usize,
-        top_k: usize,
-        intermediate_size: usize,
-        hidden_size: usize,
-        group_size: u32,
-        bits: ExpertBits,
-        gate_bits: u32,
+        bank: ExpertBank,
+        quant: AffineExperts,
     ) -> anyhow::Result<Self>
     where
         Self: Sized;
@@ -60,10 +52,7 @@ impl FusedMoEOps for FusedMoELayer {
     fn load(
         _gw: &mut crate::weights::GpuWeights,
         _prefix: &str,
-        _num_experts: usize,
-        _top_k: usize,
-        _intermediate_size: usize,
-        _hidden_size: usize,
+        _bank: ExpertBank,
         _stream: crate::LoadStream,
     ) -> anyhow::Result<Self> {
         anyhow::bail!("scratchy-target-spyre: FusedMoELayer load not yet implemented")
@@ -74,13 +63,8 @@ impl FusedMoEOps for FusedMoELayer {
     fn load_affine(
         _gw: &mut crate::weights::GpuWeights,
         _prefix: &str,
-        _num_experts: usize,
-        _top_k: usize,
-        _intermediate_size: usize,
-        _hidden_size: usize,
-        _group_size: u32,
-        _bits: ExpertBits,
-        _gate_bits: u32,
+        _bank: ExpertBank,
+        _quant: AffineExperts,
     ) -> anyhow::Result<Self> {
         anyhow::bail!("scratchy-target-spyre: FusedMoELayer affine load not yet implemented")
     }
@@ -94,11 +78,8 @@ pub trait SharedFusedMoEOps {
     fn load(
         gw: &mut crate::weights::GpuWeights,
         prefix: &str,
-        num_experts: usize,
-        top_k: usize,
-        moe_intermediate_size: usize,
+        bank: ExpertBank,
         shared_expert_intermediate_size: usize,
-        hidden_size: usize,
         stream: crate::LoadStream,
     ) -> anyhow::Result<Self>
     where
@@ -107,14 +88,9 @@ pub trait SharedFusedMoEOps {
     fn load_affine(
         gw: &mut crate::weights::GpuWeights,
         prefix: &str,
-        num_experts: usize,
-        top_k: usize,
-        moe_intermediate_size: usize,
+        bank: ExpertBank,
         shared_expert_intermediate_size: usize,
-        hidden_size: usize,
-        group_size: u32,
-        bits: ExpertBits,
-        gate_bits: u32,
+        quant: AffineExperts,
     ) -> anyhow::Result<Self>
     where
         Self: Sized;
@@ -126,11 +102,8 @@ impl SharedFusedMoEOps for SharedFusedMoELayer {
     fn load(
         _gw: &mut crate::weights::GpuWeights,
         _prefix: &str,
-        _num_experts: usize,
-        _top_k: usize,
-        _moe_intermediate_size: usize,
+        _bank: ExpertBank,
         _shared_expert_intermediate_size: usize,
-        _hidden_size: usize,
         _stream: crate::LoadStream,
     ) -> anyhow::Result<Self> {
         anyhow::bail!("scratchy-target-spyre: SharedFusedMoELayer load not yet implemented")
@@ -141,14 +114,9 @@ impl SharedFusedMoEOps for SharedFusedMoELayer {
     fn load_affine(
         _gw: &mut crate::weights::GpuWeights,
         _prefix: &str,
-        _num_experts: usize,
-        _top_k: usize,
-        _moe_intermediate_size: usize,
+        _bank: ExpertBank,
         _shared_expert_intermediate_size: usize,
-        _hidden_size: usize,
-        _group_size: u32,
-        _bits: ExpertBits,
-        _gate_bits: u32,
+        _quant: AffineExperts,
     ) -> anyhow::Result<Self> {
         anyhow::bail!("scratchy-target-spyre: SharedFusedMoELayer affine load not yet implemented")
     }
@@ -298,10 +266,7 @@ pub trait SwitchGluExpertsOps {
     fn load(
         gw: &mut crate::weights::GpuWeights,
         prefix: &str,
-        num_experts: usize,
-        top_k: usize,
-        moe_intermediate_size: usize,
-        hidden_size: usize,
+        bank: ExpertBank,
         group_size: u32,
         bits: u32,
     ) -> anyhow::Result<Self>
@@ -331,13 +296,16 @@ impl SwitchGluExpertsOps for SwitchGluExpertsLayer {
     fn load(
         gw: &mut crate::weights::GpuWeights,
         prefix: &str,
-        num_experts: usize,
-        top_k: usize,
-        moe_intermediate_size: usize,
-        hidden_size: usize,
+        bank: ExpertBank,
         group_size: u32,
         bits: u32,
     ) -> anyhow::Result<Self> {
+        let ExpertBank {
+            num_experts,
+            top_k,
+            intermediate_size: moe_intermediate_size,
+            hidden_size,
+        } = bank;
         let experts_base = prefix.strip_suffix(".switch_glu").unwrap_or(prefix);
         let fp8 = format!("{experts_base}.0.gate_proj.weight");
         if !gw.contains(&fp8) {
@@ -433,16 +401,9 @@ pub trait DeepSeekV2MoEOps {
     fn load(
         gw: &mut crate::weights::GpuWeights,
         prefix: &str,
-        n_routed_experts: usize,
+        bank: ExpertBank,
         n_shared_experts: usize,
-        top_k: usize,
-        moe_intermediate_size: usize,
-        hidden_size: usize,
-        norm_topk_prob: bool,
-        routed_scaling_factor: f32,
-        use_sigmoid: bool,
-        n_expert_group: usize,
-        topk_group: usize,
+        routing: GroupedRouting,
         stream: crate::LoadStream,
     ) -> anyhow::Result<Self>
     where
@@ -455,16 +416,9 @@ impl DeepSeekV2MoEOps for DeepSeekV2MoELayer {
     fn load(
         _gw: &mut crate::weights::GpuWeights,
         _prefix: &str,
-        _n_routed_experts: usize,
+        _bank: ExpertBank,
         _n_shared_experts: usize,
-        _top_k: usize,
-        _moe_intermediate_size: usize,
-        _hidden_size: usize,
-        _norm_topk_prob: bool,
-        _routed_scaling_factor: f32,
-        _use_sigmoid: bool,
-        _n_expert_group: usize,
-        _topk_group: usize,
+        _routing: GroupedRouting,
         _stream: crate::LoadStream,
     ) -> anyhow::Result<Self> {
         anyhow::bail!("scratchy-target-spyre: DeepSeekV2MoELayer load not yet implemented")

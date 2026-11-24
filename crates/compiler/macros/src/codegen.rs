@@ -5351,16 +5351,20 @@ fn emit_unindexed_let(
                 let #name = crate::__gpu::layers_moe::DeepSeekV2MoELayer::load(
                     gw,
                     #prefix,
-                    #n_routed_experts,
+                    crate::__gpu::layers_moe::ExpertBank {
+                        num_experts: #n_routed_experts,
+                        top_k: #top_k,
+                        intermediate_size: #moe_intermediate_size,
+                        hidden_size: #hidden_size,
+                    },
                     #n_shared_experts,
-                    #top_k,
-                    #moe_intermediate_size,
-                    #hidden_size,
-                    #norm_topk_prob,
-                    #routed_scaling_factor,
-                    #use_sigmoid,
-                    #n_expert_group,
-                    #topk_group,
+                    crate::__gpu::layers_moe::GroupedRouting {
+                        norm_topk_prob: #norm_topk_prob,
+                        routed_scaling_factor: #routed_scaling_factor,
+                        use_sigmoid: #use_sigmoid,
+                        n_expert_group: #n_expert_group,
+                        topk_group: #topk_group,
+                    },
                     stream,
                 )?;
             }
@@ -5468,13 +5472,17 @@ fn emit_unindexed_let(
                     let #name = crate::__gpu::layers_moe::FusedMoELayer::load_affine(
                         gw,
                         #prefix,
-                        #num_experts,
-                        #top_k,
-                        #intermediate_size,
-                        #hidden_size,
-                        #group_size,
-                        #bits,
-                        #gate_bits,
+                        crate::__gpu::layers_moe::ExpertBank {
+                            num_experts: #num_experts,
+                            top_k: #top_k,
+                            intermediate_size: #intermediate_size,
+                            hidden_size: #hidden_size,
+                        },
+                        crate::__gpu::layers_moe::AffineExperts {
+                            group_size: #group_size,
+                            bits: #bits,
+                            gate_bits: #gate_bits,
+                        },
                     )?;
                 }
             } else {
@@ -5482,10 +5490,12 @@ fn emit_unindexed_let(
                     let #name = crate::__gpu::layers_moe::FusedMoELayer::load(
                         gw,
                         #prefix,
-                        #num_experts,
-                        #top_k,
-                        #intermediate_size,
-                        #hidden_size,
+                        crate::__gpu::layers_moe::ExpertBank {
+                            num_experts: #num_experts,
+                            top_k: #top_k,
+                            intermediate_size: #intermediate_size,
+                            hidden_size: #hidden_size,
+                        },
                         stream,
                     )?;
                 }
@@ -5513,14 +5523,18 @@ fn emit_unindexed_let(
                     let #name = crate::__gpu::layers_moe::SharedFusedMoELayer::load_affine(
                         gw,
                         #prefix,
-                        #num_experts,
-                        #top_k,
-                        #moe_intermediate_size,
+                        crate::__gpu::layers_moe::ExpertBank {
+                            num_experts: #num_experts,
+                            top_k: #top_k,
+                            intermediate_size: #moe_intermediate_size,
+                            hidden_size: #hidden_size,
+                        },
                         #shared_expert_intermediate_size,
-                        #hidden_size,
-                        #group_size,
-                        #bits,
-                        #gate_bits,
+                        crate::__gpu::layers_moe::AffineExperts {
+                            group_size: #group_size,
+                            bits: #bits,
+                            gate_bits: #gate_bits,
+                        },
                     )?;
                 }
             } else {
@@ -5528,11 +5542,13 @@ fn emit_unindexed_let(
                     let #name = crate::__gpu::layers_moe::SharedFusedMoELayer::load(
                         gw,
                         #prefix,
-                        #num_experts,
-                        #top_k,
-                        #moe_intermediate_size,
+                        crate::__gpu::layers_moe::ExpertBank {
+                            num_experts: #num_experts,
+                            top_k: #top_k,
+                            intermediate_size: #moe_intermediate_size,
+                            hidden_size: #hidden_size,
+                        },
                         #shared_expert_intermediate_size,
-                        #hidden_size,
                         stream,
                     )?;
                 }
@@ -5576,10 +5592,12 @@ fn emit_unindexed_let(
                 let #name = crate::__gpu::layers_moe::SwitchGluExpertsLayer::load(
                     gw,
                     #prefix,
-                    #num_experts,
-                    #top_k,
-                    #moe_intermediate_size,
-                    #hidden_size,
+                    crate::__gpu::layers_moe::ExpertBank {
+                        num_experts: #num_experts,
+                        top_k: #top_k,
+                        intermediate_size: #moe_intermediate_size,
+                        hidden_size: #hidden_size,
+                    },
                     #group_size,
                     #bits,
                 )?;
@@ -5608,10 +5626,12 @@ fn emit_unindexed_let(
                 let #name = crate::__gpu::layers_moe::GptOssMoELayer::load(
                     gw,
                     #prefix,
-                    #num_experts,
-                    #top_k,
-                    #intermediate_size,
-                    #hidden_size,
+                    crate::__gpu::layers_moe::ExpertBank {
+                        num_experts: #num_experts,
+                        top_k: #top_k,
+                        intermediate_size: #intermediate_size,
+                        hidden_size: #hidden_size,
+                    },
                     #group_size,
                     #bits,
                     #gate_bits,
@@ -6309,16 +6329,20 @@ fn emit_layered_load_body(
                         crate::__gpu::layers_moe::DeepSeekV2MoELayer::load(
                             gw,
                             &#p,
-                            #n_routed_experts,
+                            crate::__gpu::layers_moe::ExpertBank {
+                                num_experts: #n_routed_experts,
+                                top_k: #top_k,
+                                intermediate_size: #moe_intermediate_size,
+                                hidden_size: #hidden_size,
+                            },
                             #n_shared_experts,
-                            #top_k,
-                            #moe_intermediate_size,
-                            #hidden_size,
-                            #norm_topk_prob,
-                            #routed_scaling_factor,
-                            #use_sigmoid,
-                            #n_expert_group,
-                            #topk_group,
+                            crate::__gpu::layers_moe::GroupedRouting {
+                                norm_topk_prob: #norm_topk_prob,
+                                routed_scaling_factor: #routed_scaling_factor,
+                                use_sigmoid: #use_sigmoid,
+                                n_expert_group: #n_expert_group,
+                                topk_group: #topk_group,
+                            },
                             stream,
                         )
                     })
@@ -6486,13 +6510,17 @@ fn emit_layered_load_body(
                             crate::__gpu::layers_moe::FusedMoELayer::load_affine(
                                 gw,
                                 &#p,
-                                #num_experts,
-                                #top_k,
-                                #intermediate_size,
-                                #hidden_size,
-                                #group_size,
-                                #bits_expr,
-                                #gate_bits,
+                                crate::__gpu::layers_moe::ExpertBank {
+                                    num_experts: #num_experts,
+                                    top_k: #top_k,
+                                    intermediate_size: #intermediate_size,
+                                    hidden_size: #hidden_size,
+                                },
+                                crate::__gpu::layers_moe::AffineExperts {
+                                    group_size: #group_size,
+                                    bits: #bits_expr,
+                                    gate_bits: #gate_bits,
+                                },
                             )
                         })
                         .collect::<::anyhow::Result<::std::vec::Vec<_>>>()?
@@ -6504,10 +6532,12 @@ fn emit_layered_load_body(
                             crate::__gpu::layers_moe::FusedMoELayer::load(
                                 gw,
                                 &#p,
-                                #num_experts,
-                                #top_k,
-                                #intermediate_size,
-                                #hidden_size,
+                                crate::__gpu::layers_moe::ExpertBank {
+                                    num_experts: #num_experts,
+                                    top_k: #top_k,
+                                    intermediate_size: #intermediate_size,
+                                    hidden_size: #hidden_size,
+                                },
                                 stream,
                             )
                         })
@@ -6547,14 +6577,18 @@ fn emit_layered_load_body(
                             crate::__gpu::layers_moe::SharedFusedMoELayer::load_affine(
                                 gw,
                                 &#p,
-                                #num_experts,
-                                #top_k,
-                                #moe_intermediate_size,
+                                crate::__gpu::layers_moe::ExpertBank {
+                                    num_experts: #num_experts,
+                                    top_k: #top_k,
+                                    intermediate_size: #moe_intermediate_size,
+                                    hidden_size: #hidden_size,
+                                },
                                 #shared_expert_intermediate_size,
-                                #hidden_size,
-                                #group_size,
-                                #bits_expr,
-                                #gate_bits,
+                                crate::__gpu::layers_moe::AffineExperts {
+                                    group_size: #group_size,
+                                    bits: #bits_expr,
+                                    gate_bits: #gate_bits,
+                                },
                             )
                         })
                         .collect::<::anyhow::Result<::std::vec::Vec<_>>>()?
@@ -6566,11 +6600,13 @@ fn emit_layered_load_body(
                             crate::__gpu::layers_moe::SharedFusedMoELayer::load(
                                 gw,
                                 &#p,
-                                #num_experts,
-                                #top_k,
-                                #moe_intermediate_size,
+                                crate::__gpu::layers_moe::ExpertBank {
+                                    num_experts: #num_experts,
+                                    top_k: #top_k,
+                                    intermediate_size: #moe_intermediate_size,
+                                    hidden_size: #hidden_size,
+                                },
                                 #shared_expert_intermediate_size,
-                                #hidden_size,
                                 stream,
                             )
                         })
@@ -6640,10 +6676,12 @@ fn emit_layered_load_body(
                         crate::__gpu::layers_moe::SwitchGluExpertsLayer::load(
                             gw,
                             &#p,
-                            #num_experts,
-                            #top_k,
-                            #moe_intermediate_size,
-                            #hidden_size,
+                            crate::__gpu::layers_moe::ExpertBank {
+                                num_experts: #num_experts,
+                                top_k: #top_k,
+                                intermediate_size: #moe_intermediate_size,
+                                hidden_size: #hidden_size,
+                            },
                             #group_size,
                             #bits_expr,
                         )
@@ -6687,10 +6725,12 @@ fn emit_layered_load_body(
                         crate::__gpu::layers_moe::GptOssMoELayer::load(
                             gw,
                             &#p,
-                            #num_experts,
-                            #top_k,
-                            #intermediate_size,
-                            #hidden_size,
+                            crate::__gpu::layers_moe::ExpertBank {
+                                num_experts: #num_experts,
+                                top_k: #top_k,
+                                intermediate_size: #intermediate_size,
+                                hidden_size: #hidden_size,
+                            },
                             #group_size,
                             #bits_expr,
                             #gate_bits,
