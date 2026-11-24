@@ -1579,9 +1579,9 @@ pub fn compute_bundle_layout<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     //    binding (the reserved-tid law above), and the decode kernel's `kv_row_pool` and int32 zero
     //    in the second intermediate colour: a segment neither a layer's launch nor a walk's
     //    relaunch shifts (the KV segment moves with every layer), and one the synthetic allocator
-    //    never grows. `kv_row_pool` is the pool's pages long, so in the Intermediate segment it sat
-    //    under every synthetic the door declares and moved each one with the pool's page count;
-    //    last in the colour, after its intermediates and the int32 zero, it moves nothing.
+    //    never grows. `kv_row_pool` is the pool's pages long and sits last in that colour, after its
+    //    intermediates and the int32 zero, so no synthetic's offset and no other placement depends
+    //    on the pool's page count.
     //    `PagedStep::card_placements` is the one statement of what they are and how big — the card
     //    stagers stage within it.
     if let Some(step) = crate::lower_subtile_tape_to_ktir::paged_step_of_ir(
