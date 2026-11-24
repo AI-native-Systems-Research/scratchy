@@ -56,9 +56,8 @@ on a 64 GB Mac; `full` runs both where each fits); glm-4.5-air and the gemma
 and qwen3.6-27b models run by name. The run file records the class table
 (`config.classes`), and the page's overview reads its columns from it.
 
-**Not on a 36 GB M3 Pro yet.** At scratchy's default budget it has panicked
-the kernel twice mid long prefill (#780), restarting the Mac. Don't run it
-there until #540 lands; tell the user why and stop.
+**On a 36 GB M3 Pro, runs finish, but #780 is open:** at scratchy's default budget a long
+prefill can still panic and restart the Mac. Save work and close other sessions first.
 
 ## Quick run
 
@@ -237,6 +236,16 @@ echo "exit ${PIPESTATUS[0]}"
 `--full` is what makes it a full run. Without it the script runs a quick
 run under the pins: scratchy alone, no frozen rung, one rep, and step 4
 reports its scope as `quick`.
+
+**A full run of scratchy alone** keeps everything else a full run does (the
+frozen rung, three reps, the longer grid answers, the larger MuSiQue sets) and
+times no comparison engine. It needs only scratchy's pin. With no engine to
+compare, the mlx-lm parity gate is skipped; `--parity` runs it anyway:
+
+```bash
+./scripts/bench_metal_matrix.sh --full --engines scratchy --fail-fast [--models full] \
+  --pin scratchy=<sha> [--parity] 2>&1 | tee ~/metal-matrix-run.log
+```
 
 With `--engines all`, pin the others too: `--pin mlx-lm=<v> --pin ollama=<v>
 --pin llama.cpp=b<build> --pin vllm-metal=<v> --pin mistral.rs=<v> --pin
