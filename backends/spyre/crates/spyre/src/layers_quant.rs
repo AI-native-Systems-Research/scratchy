@@ -144,7 +144,6 @@ pub trait MarlinLoadOps {
     ) -> Result<Self>
     where
         Self: Sized;
-    #[allow(clippy::too_many_arguments)]
     fn load_gptq(
         weights: &mut GpuWeights,
         prefix: &str,
@@ -156,7 +155,6 @@ pub trait MarlinLoadOps {
     ) -> Result<Self>
     where
         Self: Sized;
-    #[allow(clippy::too_many_arguments)]
     fn load_gptq_concat(
         weights: &mut GpuWeights,
         prefixes: &[&str],
@@ -213,7 +211,6 @@ impl MarlinLoadOps for MarlinLinear {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn load_gptq(
         _weights: &mut GpuWeights,
         _prefix: &str,
@@ -226,7 +223,6 @@ impl MarlinLoadOps for MarlinLinear {
         anyhow::bail!("scratchy-target-spyre: MarlinLinear::load_gptq load not yet implemented")
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn load_gptq_concat(
         _weights: &mut GpuWeights,
         _prefixes: &[&str],
@@ -364,24 +360,23 @@ pub enum BnbQuantType {
 }
 
 /// NF4 code table — 16 quantiles of the standard normal distribution, rescaled
-/// to `[-1, 1]`. Straight from bitsandbytes; fixed forever.
-#[allow(clippy::excessive_precision)]
+/// to `[-1, 1]`: bitsandbytes' table, each entry written at the precision of its `f32`.
 pub const NF4_CODE: [f32; 16] = [
     -1.0,
-    -0.6961928009986877,
-    -0.5250730514526367,
-    -0.39491748809814453,
-    -0.28444138169288635,
-    -0.18477343022823334,
-    -0.09105003625154495,
+    -0.6961928,
+    -0.52507305,
+    -0.3949175,
+    -0.28444138,
+    -0.18477343,
+    -0.091050036,
     0.0,
-    0.07958029955625534,
-    0.16093020141124725,
-    0.24611230194568634,
-    0.33791524171829224,
-    0.44070982933044434,
-    0.5626170039176941,
-    0.7229568362236023,
+    0.0795803,
+    0.1609302,
+    0.2461123,
+    0.33791524,
+    0.44070983,
+    0.562617,
+    0.72295684,
     1.0,
 ];
 
@@ -412,7 +407,6 @@ pub fn alloc_bnb_dequant_scratch(
 /// BitsAndBytes 4-bit loaders on [`Bnb4bitLinear`]. Method names + signatures
 /// match the macro's emitted calls.
 pub trait Bnb4bitLoadOps {
-    #[allow(clippy::too_many_arguments)]
     fn load(
         weights: &mut GpuWeights,
         prefix: &str,
@@ -424,7 +418,6 @@ pub trait Bnb4bitLoadOps {
     ) -> Result<Self>
     where
         Self: Sized;
-    #[allow(clippy::too_many_arguments)]
     fn load_concat(
         weights: &mut GpuWeights,
         prefixes: &[&str],
@@ -439,7 +432,6 @@ pub trait Bnb4bitLoadOps {
 }
 
 impl Bnb4bitLoadOps for Bnb4bitLinear {
-    #[allow(clippy::too_many_arguments)]
     fn load(
         _weights: &mut GpuWeights,
         _prefix: &str,
@@ -452,7 +444,6 @@ impl Bnb4bitLoadOps for Bnb4bitLinear {
         anyhow::bail!("scratchy-target-spyre: Bnb4bitLinear::load load not yet implemented")
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn load_concat(
         _weights: &mut GpuWeights,
         _prefixes: &[&str],

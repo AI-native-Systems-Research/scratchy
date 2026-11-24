@@ -137,14 +137,6 @@ pub fn switch_glu_down_s(l: &scratchy_layers::layers_moe::SwitchGluExpertsLayer)
 
 /// The bundle's own answers about what it placed.
 ///
-/// ⛔ THE WORKER USED TO ASK THE ARTIFACT, ONE QUESTION AT A TIME. `load_inner` carried six
-/// mutable locals — `prefill_uses_ones`, `prefill_ones_len`, `prefill_uses_identity`,
-/// `decode_uses_identity`, `scalarmul_scales_v`, `baked_lm_head_ksplit` — each declared next to
-/// the others, assigned inside a `#[cfg(feature = "spyre-hw")]` branch, and read somewhere else
-/// entirely. Every one of them needed `#[allow(unused_mut, unused_assignments)]` to compile,
-/// which is the shape of the problem: an `#[allow]` was load-bearing, and it is what let
-/// `baked_lm_head_ksplit` go on being derived for a bind that no longer existed.
-///
 /// Asked once, here, where the artifact lives.
 #[derive(Clone, Copy, Debug)]
 pub struct BakeFacts {
