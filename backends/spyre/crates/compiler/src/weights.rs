@@ -21,7 +21,7 @@ use scratchy_subtile::subtile_ir::SubOp;
 /// `from_tape` reads only `LoweredDecode.bindings` + the op that consumes each one, so it is a
 /// fact about the MODEL. The struct it feeds is target-neutral (`crate::__gpu::layers::*`, where
 /// `__gpu` is the target's runtime crate), so the same fields compile and load on any backend.
-pub(crate) fn weights_struct(emitter: &crate::Spyre, cx: &StructCx<'_>) -> WeightsStruct {
+pub(crate) fn weights_struct(cx: &StructCx<'_>) -> WeightsStruct {
     let StructCx {
         program,
         model,
