@@ -25,7 +25,7 @@ pub mod weights;
 // re-exports) is sufficient.
 pub use scratchy_tensors::{device_allocator, dtype, tensor};
 
-pub use kv_cache::KvCachePool;
+pub use kv_cache::{ChunkedKvLayout, KvCachePool};
 pub use layers::{
     Bnb4bitLinear, CohereLayerNorm, Embedding, Fp8AnyLinear, Fp8BlockLinear, Fp8Linear,
     GatedDeltaNetLayer, GgmlLinear, LayerNorm, LayerNormBias, Linear, LinearLayer, MarlinLinear,

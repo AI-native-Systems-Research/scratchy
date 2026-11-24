@@ -50,7 +50,7 @@ mod imp {
     use objc2_metal::MTLCreateSystemDefaultDevice;
     use scratchy_forward_compiler::{ArchLoad, HfFingerprint, hash_json_value};
     use scratchy_target_metal::device::Device;
-    use scratchy_target_metal::kv_cache::KvCachePool;
+    use scratchy_target_metal::kv_cache::{ChunkedKvLayout, KvCachePool};
     use scratchy_target_metal::try_load;
     use scratchy_target_metal::{
         DType, ForwardCtx, GpuDevice, GpuTensor, GpuWeights, MetalAllocator, MetalMem, TensorView,
@@ -385,29 +385,31 @@ mod imp {
             });
         let mut kv = unsafe {
             KvCachePool::new_chunked(
-                layers,
-                NUM_BLOCKS,
-                BLOCK_SIZE,
-                kv_heads,
-                head_dim,
-                NUM_BLOCKS.max(1),
-                // Page-unified elems on the hybrid path (uniform size, so
-                // the pool's default is correct); `None` on the uniform
-                // path too (no per-layer override there).
-                None,
-                // The worker's tensors (`kv_pool_tensors`): the hybrid's
-                // group-shared positions, else a tensor per layer that holds
-                // KV (a recurrent hybrid's attention layers), else per layer.
-                match (hybrid.as_ref(), model.kv_cache_layers()) {
-                    (Some(l), _) => Some(l.layer_to_tensor.clone()),
-                    (None, Some(kv)) => {
-                        Some(scratchy_core_config::compact_kv_layer_to_tensor(layers, kv))
-                    }
-                    (None, None) => None,
+                ChunkedKvLayout {
+                    num_layers: layers,
+                    num_blocks: NUM_BLOCKS,
+                    block_size: BLOCK_SIZE,
+                    num_kv_heads: kv_heads,
+                    head_dim,
+                    max_blocks_per_seq: NUM_BLOCKS.max(1),
+                    // Page-unified elems on the hybrid path (uniform size, so
+                    // the pool's default is correct); `None` on the uniform
+                    // path too (no per-layer override there).
+                    per_layer_block_elems: None,
+                    // The worker's tensors (`kv_pool_tensors`): the hybrid's
+                    // group-shared positions, else a tensor per layer that holds
+                    // KV (a recurrent hybrid's attention layers), else per layer.
+                    layer_to_tensor: match (hybrid.as_ref(), model.kv_cache_layers()) {
+                        (Some(l), _) => Some(l.layer_to_tensor.clone()),
+                        (None, Some(kv)) => {
+                            Some(scratchy_core_config::compact_kv_layer_to_tensor(layers, kv))
+                        }
+                        (None, None) => None,
+                    },
+                    dtype: DType::BF16,
+                    blocks_per_chunk: 128, // BLOCKS_PER_CHUNK (metal target const)
+                    initial_chunks: usize::MAX, // eager: one chunk covers our tokens
                 },
-                DType::BF16,
-                128,        // BLOCKS_PER_CHUNK (metal target const)
-                usize::MAX, // eager: one chunk covers our tokens
                 |bytes| {
                     // new_pinned: allocates + holds residency in the set —
                     // a non-resident chunk reads structured garbage.

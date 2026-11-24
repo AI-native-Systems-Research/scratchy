@@ -25,7 +25,7 @@
 
 use half::bf16;
 use objc2_metal::MTLCreateSystemDefaultDevice;
-use scratchy_target_metal::kv_cache::KvCachePool;
+use scratchy_target_metal::kv_cache::{ChunkedKvLayout, KvCachePool};
 use scratchy_target_metal::{DType, ForwardCtx, GpuDevice, GpuWeights, MetalAllocator};
 use std::sync::Arc;
 
@@ -145,17 +145,19 @@ fn qwen3_py_carrier_parity() {
     // usize::MAX covers the one chunk our 8 tokens touch).
     let kv = unsafe {
         KvCachePool::new_chunked(
-            LAYERS,
-            NUM_BLOCKS,
-            BLOCK_SIZE,
-            KV_HEADS,
-            HEAD_DIM,
-            NUM_BLOCKS.max(1),
-            None, // uniform geometry
-            None, // one tensor per layer
-            DType::BF16,
-            128,        // BLOCKS_PER_CHUNK (metal target const)
-            usize::MAX, // eager: allocate all chunks now
+            ChunkedKvLayout {
+                num_layers: LAYERS,
+                num_blocks: NUM_BLOCKS,
+                block_size: BLOCK_SIZE,
+                num_kv_heads: KV_HEADS,
+                head_dim: HEAD_DIM,
+                max_blocks_per_seq: NUM_BLOCKS.max(1),
+                per_layer_block_elems: None, // uniform geometry
+                layer_to_tensor: None,       // one tensor per layer
+                dtype: DType::BF16,
+                blocks_per_chunk: 128, // BLOCKS_PER_CHUNK (metal target const)
+                initial_chunks: usize::MAX, // eager: allocate all chunks now
+            },
             |bytes| {
                 // new_pinned: allocates and holds residency in the
                 // allocator's set. The interpreter's command buffers attach

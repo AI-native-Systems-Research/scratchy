@@ -163,6 +163,12 @@ impl CpuTensorRef {
 // GpuWeights
 // ---------------------------------------------------------------------------
 
+/// One shard's tensors by name, with the mapping that backs them.
+type LoadedShard = (HashMap<String, CpuTensorRef>, Arc<memmap2::Mmap>);
+
+/// A LoRA layer's `lora_A` and `lora_B` weights, each as its bytes and shape.
+type LoraPair<'a> = (Option<&'a [u8]>, Vec<usize>, Option<&'a [u8]>, Vec<usize>);
+
 /// Parse a single shard file into a map of tensor references.
 ///
 /// Mmaps the file, issues madvise(WILLNEED) + madvise(SEQUENTIAL) to trigger
@@ -171,7 +177,7 @@ impl CpuTensorRef {
 ///
 /// This is a free function (not `&mut self`) so it can be called from parallel
 /// threads during multi-shard loading.
-fn load_shard_into_map(path: &Path) -> Result<(HashMap<String, CpuTensorRef>, Arc<memmap2::Mmap>)> {
+fn load_shard_into_map(path: &Path) -> Result<LoadedShard> {
     let _t_total = std::time::Instant::now();
     let _t_open = std::time::Instant::now();
     let file = std::fs::File::open(path)?;
@@ -565,10 +571,7 @@ impl<A: DeviceAllocator> GpuWeights<A> {
         // disk I/O and CPU-side parsing across shards.
         tracing::info!("Loading {total} shards in parallel");
 
-        #[allow(clippy::type_complexity)]
-        let shard_results: Vec<
-            Result<(HashMap<String, CpuTensorRef>, Arc<memmap2::Mmap>)>,
-        > = std::thread::scope(|scope| {
+        let shard_results: Vec<Result<LoadedShard>> = std::thread::scope(|scope| {
             let handles: Vec<_> = shard_files
                 .iter()
                 .map(|shard_name| {
@@ -2032,11 +2035,7 @@ impl<A: DeviceAllocator> GpuWeights<A> {
 
         // 3. Group A/B pairs by layer prefix.
         //    PEFT names: base_model.model.{prefix}.lora_A.weight
-        #[allow(clippy::type_complexity)]
-        let mut pairs: HashMap<
-            String,
-            (Option<&[u8]>, Vec<usize>, Option<&[u8]>, Vec<usize>),
-        > = HashMap::new();
+        let mut pairs: HashMap<String, LoraPair<'_>> = HashMap::new();
 
         for name in st.names() {
             let view = st
