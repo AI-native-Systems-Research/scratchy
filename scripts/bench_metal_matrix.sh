@@ -22,9 +22,11 @@
 #   peak RSS, major faults             scr bench startup --exec (per child, wait4)
 #   TTFT/TPOT/ITL p50+p99, tok/s       scr bench serve (warm, conc 1)
 #   energy: J per rail, Wh + avg/peak W scratchy-power-sampler (CLPC counters,
-#                                        1 Hz, whole run, all engines); and each
+#                                        10 Hz, whole run, all engines); and each
 #                                        cell's J, J/request, J/output token and,
-#                                        scored, J per right answer (cell_energy.py)
+#                                        scored, J per right answer; each request's
+#                                        J, and where requests ran one at a time
+#                                        its prefill and decode J (cell_energy.py)
 #   prompt x answer x users grid       scr bench serve (1, 2, 4 users;
 #     (heat maps, every curve)           128 to 8192 in;
 #                                        64 out, --full adds 512 and 2048 at 1)
@@ -971,7 +973,7 @@ fi
 caffeinate -dims -w $$ &
 # --resume appends: the cells it keeps have their energy in the log the earlier run wrote.
 (( RESUME )) || : >"${POWER_LOG}"
-"${ROOT}/target/release/scratchy-power-sampler" --interval-ms 1000 \
+"${ROOT}/target/release/scratchy-power-sampler" --interval-ms 100 \
     >>"${POWER_LOG}" 2>"${RAW}/power-sampler.log" &
 POWER_PID=$!
 sleep 1
@@ -2172,6 +2174,10 @@ def tasks(engine):
             # a correct answer by prompt length.
             if (joules := cell_energy.per_request(j, power_rows)) is not None:
                 cell["task_joules"] = joules
+            # Where its requests ran one at a time, each one's joules before and after its first
+            # token: prefill and decode energy, measured (cell_energy.per_phase).
+            if (phases := cell_energy.per_phase(j, power_rows)) is not None:
+                cell["task_prefill_joules"], cell["task_decode_joules"] = phases
         cells.append(cell)
     return cells or None
 def spec_decode():

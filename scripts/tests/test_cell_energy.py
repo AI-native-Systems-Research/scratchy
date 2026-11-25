@@ -49,6 +49,49 @@ class PerRequest(unittest.TestCase):
         self.assertIsNone(cell_energy.per_request(self.cell([0.0], [1000.0]), rows((1, 0, 0), start=500.0)))
 
 
+class PerPhase(unittest.TestCase):
+    def cell(self, starts, ttfts_ms, e2els_ms):
+        return {"started_unix_s": 100.0, "ended_unix_s": 104.0, "start_times": starts,
+                "ttfts_ms": ttfts_ms, "e2els_ms": e2els_ms}
+
+    def test_one_request_at_a_time_splits_at_the_first_token(self):
+        # Request 1: prefill second 1 (2 J), decode second 2 (4 J). Request 2: prefill the first
+        # half of second 3 (3 of 6 J), decode the rest of it and second 4 (3 + 8 J).
+        log = rows((1, 1, 0), (2, 2, 0), (3, 3, 0), (4, 4, 0))
+        cell = self.cell([0.0, 2.0], [1000.0, 500.0], [2000.0, 2000.0])
+        prefill, decode = cell_energy.per_phase(cell, log)
+        self.assertEqual(prefill, [2.0, 3.0])
+        self.assertEqual(decode, [4.0, 11.0])
+        whole = cell_energy.per_request(cell, log)
+        self.assertEqual([p + d for p, d in zip(prefill, decode)], whole, "the request's joules")
+
+    def test_requests_in_flight_together_have_no_split(self):
+        # A step of two requests holds one's prompt tokens beside the other's decode tokens: no
+        # counter splits it, so no phase figure, rather than a share by time.
+        log = rows((2, 0, 0), (2, 0, 0), (2, 0, 0), (2, 0, 0))
+        cell = self.cell([0.0, 2.0], [500.0, 500.0], [4000.0, 2000.0])
+        self.assertIsNone(cell_energy.per_phase(cell, log))
+
+    def test_a_failed_request_has_no_phases(self):
+        log = rows((1, 0, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0))
+        cell = self.cell([0.0, 2.0], [1000.0, None], [2000.0, None])
+        prefill, decode = cell_energy.per_phase(cell, log)
+        self.assertEqual((prefill, decode), ([1.0, None], [1.0, None]))
+
+    def test_a_cell_file_gets_its_phases(self):
+        import json
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            path, log = Path(d, "cell.json"), Path(d, "power.csv")
+            path.write_text(json.dumps({**self.cell([0.0], [1000.0], [2000.0]), "completed": 1,
+                                        "total_output_tokens": 10}))
+            log.write_text("".join(f"{100 + i + 1},1.0,1,1,0\n" for i in range(4)))
+            cell_energy.fold(str(path), str(log))
+            cell = json.loads(path.read_text())
+            self.assertEqual(cell["task_prefill_joules"], [2.0])
+            self.assertEqual(cell["task_decode_joules"], [2.0])
+
+
 class Window(unittest.TestCase):
     def test_a_window_takes_the_seconds_inside_it_whole(self):
         log = rows((1, 2, 0), (3, 4, 0), (5, 6, 1), (7, 8, 0))

@@ -9,7 +9,9 @@ ran (bench serve's started_unix_s to ended_unix_s), folded into the cell's JSON 
 The power log is scratchy-power-sampler's: a row a sample, unix_s, interval_s, cpu_j, gpu_j,
 ane_j, the joules of the interval that ended at unix_s. A sample the window covers part of counts
 by the share it covers. The counters are CPU, GPU and ANE only, not DRAM, and include the Mac's
-idle floor; at one sample a second, a cell of under about 20 s is coarse.
+idle floor. The matrix samples every 100 ms: fine enough to split a request's energy at its first
+token where requests run one at a time ([`per_phase`]); a 10 ms sample often reads zero on an idle
+GPU (a counter step is about 2 mJ), 100 ms never does.
 """
 
 import csv
@@ -82,18 +84,11 @@ def per(cell, e):
     return out
 
 
-def per_request(cell, rows):
-    """Each request's joules, in the order sent (`task_joules`): each power sample's joules inside
-    the cell's window shared among the requests in flight over its interval, by the time each was
-    in flight in it, so the requests' joules sum to the cell's. A request runs from the cell's
-    started_unix_s plus its start_times entry, for its e2els_ms. None for a request that failed;
-    None for a cell that kept no request times, or none of whose requests the log covers."""
-    start, end = cell.get("started_unix_s"), cell.get("ended_unix_s")
-    starts, e2els = cell.get("start_times"), cell.get("e2els_ms")
-    if start is None or end is None or not starts or not e2els or len(starts) != len(e2els):
-        return None
-    spans = [(start + s, start + s + d / 1000.0) if s is not None and d is not None else None
-             for s, d in zip(starts, e2els)]
+def shares(rows, start, end, spans):
+    """Each span's joules: each power sample's joules inside start to end shared among the spans
+    open over its interval, by the time each was open in it, so the spans' joules sum to the
+    window's busy joules. A span is (from, to) in Unix seconds, or None (no joules); None for all
+    where the log covers none of them. The one rule every per-request figure shares."""
     joules = [0.0 if span else None for span in spans]
     met = False
     for t, dt, c, g, a in rows:
@@ -115,6 +110,59 @@ def per_request(cell, rows):
     return [round(j, 3) if j is not None else None for j in joules] if met else None
 
 
+def request_spans(cell):
+    """Each request's (sent, first token, last token) in Unix seconds, in the order sent: the
+    cell's started_unix_s plus its start_times entry, then its ttfts_ms and e2els_ms after it. None
+    for a request that failed; None for a cell that kept no request times."""
+    start = cell.get("started_unix_s")
+    starts, e2els = cell.get("start_times"), cell.get("e2els_ms")
+    if start is None or not starts or not e2els or len(starts) != len(e2els):
+        return None
+    ttfts = cell.get("ttfts_ms") or [None] * len(starts)
+    if len(ttfts) != len(starts):
+        return None
+    return [(start + s, start + s + f / 1000.0 if f is not None else None, start + s + d / 1000.0)
+            if s is not None and d is not None else None
+            for s, f, d in zip(starts, ttfts, e2els)]
+
+
+def per_request(cell, rows):
+    """Each request's joules, in the order sent (`task_joules`): each power sample's joules inside
+    the cell's window shared among the requests in flight over its interval, by the time each was
+    in flight in it ([`shares`]), so the requests' joules sum to the cell's. A request runs from
+    its send to its last token. None for a request that failed; None for a cell that kept no
+    request times, or none of whose requests the log covers."""
+    start, end, spans = cell.get("started_unix_s"), cell.get("ended_unix_s"), request_spans(cell)
+    if start is None or end is None or spans is None:
+        return None
+    return shares(rows, start, end, [(span[0], span[2]) if span else None for span in spans])
+
+
+def per_phase(cell, rows):
+    """Each request's prefill and decode joules, in the order sent (`task_prefill_joules`,
+    `task_decode_joules`): its joules up to its first token, and after it ([`shares`] over the two
+    phases as spans). A MEASUREMENT only where no two requests were in flight at once — then every
+    joule a sample holds is one request's one phase. Where requests overlap, a step's energy is its
+    batch's whole (one request's prompt tokens beside another's decode tokens), which no counter
+    splits: None, never a share by tokens or time. None for a request that failed or has no first
+    token; None for a cell that kept no request times, or that the log does not cover."""
+    start, end, spans = cell.get("started_unix_s"), cell.get("ended_unix_s"), request_spans(cell)
+    if start is None or end is None or spans is None:
+        return None
+    open_ = sorted((s, e) for span in spans if span for s, _, e in [span])
+    if any(b[0] < a[1] for a, b in zip(open_, open_[1:])):
+        return None
+    phases = []
+    for span in spans:
+        s, f, e = span or (None, None, None)
+        ok = span is not None and f is not None and s <= f <= e
+        phases += [(s, f), (f, e)] if ok else [None, None]
+    j = shares(rows, start, end, phases)
+    if j is None:
+        return None
+    return j[0::2], j[1::2]
+
+
 def fold(cell_json, power_csv):
     """Fold a cell's energy into its JSON, where it says when its requests ran and the log
     covers it; else leave it as it is."""
@@ -131,6 +179,8 @@ def fold(cell_json, power_csv):
     joules = per_request(cell, log)
     if joules is not None:
         cell["task_joules"] = joules
+    if (phases := per_phase(cell, log)) is not None:
+        cell["task_prefill_joules"], cell["task_decode_joules"] = phases
     with open(cell_json, "w") as f:
         json.dump(cell, f, indent=2)
 
