@@ -390,6 +390,7 @@ pub(crate) fn run_card_launch(
         steps: &fsteps,
         inputs: &inputs,
         staged: None,
+        tables: Vec::new(),
         acts: Vec::with_capacity(fsteps.len()),
         acts_i32: Vec::new(),
         seeds: Vec::new(),
@@ -410,6 +411,7 @@ pub(crate) fn run_card_launch(
     for id in &launcher.card_owned_sticks {
         pf.hand_to_card(*id);
     }
+    let tables = launcher.tables;
     let acts = launcher.acts;
     let mut acts_i32 = launcher.acts_i32;
     let seeds = launcher.seeds;
@@ -473,14 +475,24 @@ pub(crate) fn run_card_launch(
     if flags().phase_time {
         let elems: usize = acts.iter().map(|(_, v)| v.len()).sum();
         eprintln!(
-            "[sdsc-host] card_stage={:.2} ms  ({} acts, {} f32 built, {} int32 binds)",
+            "[sdsc-host] card_stage={:.2} ms  ({} tables, {} acts, {} f32 built, {} int32 binds)",
             _t_stage.elapsed().as_secs_f64() * 1e3,
+            tables.len(),
             acts.len(),
             elems,
             acts_i32.len(),
         );
     }
     log_binds(&format!("launch mq={mq} at={seq_pos}"), b.wiring, &acts);
+    // ⭐ EVERY CHANNEL OF THE STEP, ONCE — every card binds them into its own shadow on its own
+    // thread, then every card rings its doorbell (`SuperDscSession::submit_bound` / `run_bound`).
+    let binds = scratchy_target_spyre_card::sdsc_runner::StepBinds {
+        tables: &tables,
+        f32: &acts,
+        f16: &[],
+        i32: &acts_i32,
+        seeds: &seeds,
+    };
     // ⭐ THE SEAT IS THE PICK'S OWN MATCH — every suffix arm takes the
     // launch's own (seat, width) pair as the match's binding, never a second
     // Option and never an unwrap over a guard established lines earlier: a
@@ -499,17 +511,10 @@ pub(crate) fn run_card_launch(
                 .expect("the overlap probe's own lock")
                 .as_ref()
                 .is_some_and(|s| !s.fired());
-            let t_bind = std::time::Instant::now();
-            pf.stage_step_acts_seeded(&acts, &[], &acts_i32, &seeds)
-                .map_err(|e| {
-                    werr(format!(
-                        "superdsc decode stage (mq={mq}, at={seq_pos}): {e}"
-                    ))
-                })?;
             let t_submit = std::time::Instant::now();
-            pf.submit_step(mq, seq_pos).map_err(|e| {
+            let bind = pf.submit_bound(&binds, mq, seq_pos).map_err(|e| {
                 werr(format!(
-                    "superdsc decode submit (mq={mq}, at={seq_pos}): {e}"
+                    "superdsc decode bind+submit (mq={mq}, at={seq_pos}): {e}"
                 ))
             })?;
             let depth = OUTSTANDING.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
@@ -531,11 +536,13 @@ pub(crate) fn run_card_launch(
             *PRIOR_READ.lock().expect("the overlap probe's own lock") = Some(read.signal());
             scratchy_serving_worker::step_segs::record_submit(
                 scratchy_serving_worker::step_segs::SubmitSegs {
-                    bind: t_submit.duration_since(t_bind),
-                    submit: t_defer.duration_since(t_submit),
+                    // The cards' binds run inside `submit_bound`, ahead of its doorbells: the
+                    // slowest card's is the bind row, and the rest of the span is the submit.
+                    bind,
+                    submit: t_defer.duration_since(t_submit).saturating_sub(bind),
                     defer: t_stage.duration_since(t_defer),
                     stage: None,
-                    total: t_bind.elapsed(),
+                    total: t_submit.elapsed(),
                     depth,
                     busy: card_busy_at_submit,
                 },
@@ -577,8 +584,7 @@ pub(crate) fn run_card_launch(
         }
         // A middle prompt chunk: no suffix runs and nothing is read back.
         (LogitsWanted::None, _) => {
-            pf.stage_step_acts_seeded(&acts, &[], &acts_i32, &seeds)
-                .and_then(|()| pf.run_staged_step(mq, seq_pos, StepLogits::Discarded))
+            pf.run_bound(&binds, mq, seq_pos, StepLogits::Discarded)
                 .map_err(|e| {
                     werr(format!(
                         "superdsc prefill run_step (mq={mq}, at={seq_pos}): {e}"
@@ -590,8 +596,7 @@ pub(crate) fn run_card_launch(
         // sampler: the suffix runs, the sampler consumes the folded lm-head row there, and the idx
         // stick comes back raw, exactly like a decode's.
         (LogitsWanted::LastRow, Some((seat, seat_width))) => {
-            pf.stage_step_acts_seeded(&acts, &[], &acts_i32, &seeds)
-                .and_then(|()| pf.run_staged_step(mq, seq_pos, StepLogits::LeftOnDevice))
+            pf.run_bound(&binds, mq, seq_pos, StepLogits::LeftOnDevice)
                 .map_err(|e| {
                     werr(format!(
                         "superdsc prefill run_step (mq={mq}, at={seq_pos}): {e}"
@@ -672,7 +677,13 @@ pub(crate) struct ForwardLauncher<'a> {
     pub(crate) inputs: &'a scratchy_target_spyre::forward_tape::ForwardInputs<'a>,
     pub(crate) staged: Option<(
         scratchy_target_spyre::bundle_code::PlaceId,
-        scratchy_target_spyre::forward_tape::Staged,
+        scratchy_target_spyre::forward_tape::Staged<'a>,
+    )>,
+    /// ⭐ THE HOST KERNELS' TABLES — each in the card's own fp16, which every card writes into its
+    /// own shadow on its own thread ([`scratchy_target_spyre_card::sdsc_runner::StepBinds::tables`]).
+    pub(crate) tables: Vec<(
+        scratchy_target_spyre::bundle_code::PlaceId,
+        Box<dyn scratchy_target_spyre::forward_tape::CardTable + 'a>,
     )>,
     pub(crate) acts: Vec<scratchy_target_spyre::wiring::Bind>,
     /// ⭐ RAW LE 32-bit binds — the paged step's index tables and the chain's seed words. Kept apart
@@ -781,6 +792,7 @@ impl scratchy_subtile::host_tape::Launcher for ForwardLauncher<'_> {
         };
         // The KERNEL decided the format; the transfer just honours it.
         match staged {
+            scratchy_target_spyre::forward_tape::Staged::Table(t) => self.tables.push((tensor, t)),
             scratchy_target_spyre::forward_tape::Staged::F32(v) => {
                 // `Staged::F32` already carries the borrow/own distinction — a computed kernel
                 // output is Owned, a constant table is Borrowed — so it passes straight through.

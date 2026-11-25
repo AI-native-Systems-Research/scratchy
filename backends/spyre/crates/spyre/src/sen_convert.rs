@@ -20,8 +20,9 @@
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct IeeeF16(pub u16);
 
-/// One SEN169/DLF16 value (the device-native fp16), as its raw bits.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+/// One SEN169/DLF16 value (the device-native fp16), as its raw bits. `Default` is `+0.0`, the all-zero
+/// bits (`ieee_to_sen` maps IEEE `+0.0` to them).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct SenF16(pub u16);
 
 /// IEEE fp16 → SEN169. Verbatim `Ieeef16BinToFp16bin` (sen_data_convert.cpp):
@@ -225,7 +226,31 @@ pub fn f32_to_f16_le(vals: &[f32]) -> Vec<u8> {
 pub fn f32_to_sen_bytes(src: &[f32], dst: &mut [u8]) {
     assert_eq!(dst.len(), src.len() * 2);
     for (d, &v) in dst.as_chunks_mut::<2>().0.iter_mut().zip(src) {
-        *d = SEN_TABLE[half::f16::from_f32(v).to_bits() as usize].to_le_bytes();
+        *d = f32_to_sen(v).0.to_le_bytes();
+    }
+}
+
+/// ⭐ ONE f32 → ONE SEN169 VALUE — the narrowing every f32 the card reads takes: `half`'s
+/// round-to-nearest-even f16, then the compile-time IEEE→SEN table. [`f32_to_sen_bytes`] is this,
+/// element by element; a host kernel that writes its table in the card's own format
+/// ([`crate::forward_tape::CardTable`]) narrows through it too, so the two cannot differ.
+pub fn f32_to_sen(v: f32) -> SenF16 {
+    SenF16(SEN_TABLE[half::f16::from_f32(v).to_bits() as usize])
+}
+
+/// [`f32_to_sen`] over a whole slice — `half`'s slice narrowing (its own vectorized form of the
+/// same round-to-nearest-even `f16::from_f32`, hardware F16C where the CPU has it), then the same
+/// table, element by element. A host kernel narrowing a table's rows (an embedding row is
+/// `hidden` values) takes this; [`tests::the_slice_narrowing_is_the_scalar_one`] pins the two equal.
+///
+/// `dst` must hold exactly `src.len()` values.
+pub fn f32_to_sen_slice(src: &[f32], dst: &mut [SenF16]) {
+    use half::slice::HalfFloatSliceExt;
+    assert_eq!(dst.len(), src.len());
+    let mut ieee = vec![half::f16::ZERO; src.len()];
+    ieee.convert_from_f32_slice(src);
+    for (d, v) in dst.iter_mut().zip(&ieee) {
+        *d = SenF16(SEN_TABLE[v.to_bits() as usize]);
     }
 }
 
@@ -352,6 +377,32 @@ mod tests {
                 &two[2 * i..2 * i + 2],
             );
         }
+        the_slice_narrowing_is_the_scalar_one_over(&vals);
+    }
+
+    /// ⭐ THE SLICE NARROWING IS THE SCALAR ONE — over every f16 value, every rounding midpoint and
+    /// its neighbours, the saturation edge, subnormals and a million random f32s: `half`'s
+    /// vectorized slice conversion and its scalar `from_f32` round alike, so [`f32_to_sen_slice`]
+    /// and [`f32_to_sen`] write the same SEN169 bits.
+    fn the_slice_narrowing_is_the_scalar_one_over(vals: &[f32]) {
+        let mut slice = vec![SenF16::default(); vals.len()];
+        f32_to_sen_slice(vals, &mut slice);
+        if let Some(i) = (0..vals.len()).find(|&i| slice[i] != f32_to_sen(vals[i])) {
+            panic!(
+                "element {i} (f32 bits {:#010x}): slice {:?} != scalar {:?}",
+                vals[i].to_bits(),
+                slice[i],
+                f32_to_sen(vals[i]),
+            );
+        }
+    }
+
+    #[test]
+    fn the_slice_narrowing_is_the_scalar_one() {
+        let vals: Vec<f32> = (0u32..1 << 18)
+            .map(|i| f32::from_bits(i.wrapping_mul(0x9E37_79B9)))
+            .collect();
+        the_slice_narrowing_is_the_scalar_one_over(&vals);
     }
 
     /// The compile-time tables ARE the scalar functions (they were built from them; this pins the
