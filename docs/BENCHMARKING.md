@@ -146,7 +146,10 @@ nothing is self-reported.
   joules: measured, since every joule a sample holds is one request's one phase.
   Where requests overlap, a step's energy is its whole batch's (one request's
   prompt tokens beside another's decode tokens), which no counter splits, so
-  there is no phase split, rather than a share by tokens or time. On macOS 27 it reads
+  there is no phase split, rather than a share by tokens or time.
+- **`decode_tokens`** — each request's tokens after its first: what its TPOT
+  divides its decode time by (`bench serve`'s one `task_decode`), so its decode
+  joules read per token over the same tokens. On macOS 27 it reads
   the CLPC counters (cumulative nJ, per-chip-driver ids), because there the
   "Energy Model" group's `CPU Energy` channel reads 0 under load; on every
   other release it reads the "Energy Model" group's `CPU Energy`, `GPU Energy`
