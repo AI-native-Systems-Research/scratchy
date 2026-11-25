@@ -23,6 +23,142 @@ use scratchy_target_spyre::manifest::bytes_to_f32;
 use ktir_superdsc::collective::PerRank;
 use scratchy_target_spyre::sen_convert::f32_to_f16_le;
 
+/// ⭐ ONE STEP'S HOST INPUTS — every channel a launch writes into each card's shadow, borrowed for
+/// the step:
+/// * `tables` — the host kernels' tables (embedding rows, rotary tables, the mask stack), each in
+///   the card's own fp16 ([`scratchy_target_spyre::forward_tape::CardTable`]), written by each card
+///   straight into its own slot;
+/// * `f32` — the constants, narrowed to SEN169 at the bind;
+/// * `f16` — already-IEEE-f16 bytes, as-is;
+/// * `i32` — the index tables, RAW LE words through `bind_input_raw`;
+/// * `seeds` — the chained head's seeds, the one input NOT the same on every card: rank `r` binds
+///   the words of ITS OWN vocabulary block ([`scratchy_target_spyre::forward_tape::ChainSeed::words`]).
+pub struct StepBinds<'s, 't> {
+    pub tables: &'s [(
+        scratchy_target_spyre::bundle_code::PlaceId,
+        Box<dyn scratchy_target_spyre::forward_tape::CardTable + 't>,
+    )],
+    pub f32: &'s [scratchy_target_spyre::wiring::Bind],
+    pub f16: &'s [(scratchy_target_spyre::bundle_code::PlaceId, Vec<u8>)],
+    pub i32: &'s [(scratchy_target_spyre::bundle_code::PlaceId, Vec<u8>)],
+    pub seeds: &'s [(
+        scratchy_target_spyre::bundle_code::PlaceId,
+        scratchy_target_spyre::forward_tape::ChainSeed,
+    )],
+}
+
+impl StepBinds<'static, 'static> {
+    /// A step that binds nothing — its shadow already holds every input.
+    pub const NONE: StepBinds<'static, 'static> = StepBinds {
+        tables: &[],
+        f32: &[],
+        f16: &[],
+        i32: &[],
+        seeds: &[],
+    };
+}
+
+/// The meeting [`bind_then_meet`] holds: one party per rank of the world, the world's own count
+/// (`World::RANKS`) — a world of one, whose parallel section runs on the caller, meets alone.
+fn world_meeting<T: ktir_superdsc::collective::Tp>() -> std::sync::Barrier {
+    std::sync::Barrier::new(<T as ktir_superdsc::collective::World>::RANKS as usize)
+}
+
+/// ⭐ ONE CARD'S BINDS, THEN THE WORLD MEETS — every card of a step binds into its own shadow on its
+/// own thread ([`bind_rank`]), then waits at `together` for every other card, so the doorbells that
+/// follow go out together, as they did when the host bound card after card before one submit
+/// section. Each card's doorbell trailing its own bind skewed the cards into the step's first
+/// collective: the decode steps' all-reduce waits grew 1.305 → 1.411 M cycles a step and ITL
+/// 34.6 → 34.75 ms (granite-3.1-8b tp/4); a second parallel section for the binds cost as much in
+/// host time a token. Every card reaches the barrier, its bind failed or not — a failed card's
+/// error returns after the meeting, so no other card waits on a card that left.
+fn bind_then_meet<T: ktir_superdsc::collective::Tp>(
+    e: &mut Executor<'_, '_, T>,
+    b: &StepBinds<'_, '_>,
+    together: &std::sync::Barrier,
+) -> Result<()> {
+    let bound = bind_rank(e, b);
+    together.wait();
+    bound
+}
+
+/// ⭐ ONE CARD'S BINDS OF A STEP, INTO ITS OWN SHADOW — the one bind body every door runs, on the
+/// card's own thread inside the step's parallel section. One body, so a new channel or a new guard
+/// cannot land on one step shape and skip the other.
+fn bind_rank<T: ktir_superdsc::collective::Tp>(
+    e: &mut Executor<'_, '_, T>,
+    b: &StepBinds<'_, '_>,
+) -> Result<()> {
+    // BIND-LOOP TIMING (SCRATCHY_SDSC_PHASE_TIME, the executor's phase-breakdown flag): the binds
+    // run BEFORE predict, so the preamble_h2d/compute/logits_d2h split cannot see them.
+    let t_bind = std::time::Instant::now();
+    // ⭐ A HOST KERNEL'S TABLE IS WRITTEN IN THE CARD'S OWN FORMAT, at its own slot — no f32 table,
+    // no clone of it, no per-card convert of one.
+    for (id, t) in b.tables {
+        e.bind_input_table(*id, &**t)?;
+    }
+    // ⭐ ONE PASS, STRAIGHT INTO THE SHADOW: f32 → SEN169 at the activation's own slot.
+    for (id, vals) in b.f32 {
+        e.bind_input_f32(*id, vals)?;
+    }
+    for (id, bytes) in b.f16 {
+        e.bind_input(*id, bytes.clone());
+    }
+    // ⛔ `bind_input_raw`, NOT `bind_input`. See `Executor::raw_ids`: the shadow write applies
+    // `ieee_to_sen_bytes` to every ordinary bind, which reads each 4-byte index entry as two fp16
+    // values and rewrites both — turning block 37 into a different, valid, arbitrary block.
+    // ⛔ AND THE PAYLOAD ARRIVES PAIRED WITH ITS PLACEMENT. `place_raw` is the only constructor of
+    // the value `bind_input_raw` takes, so the three ways a raw bind used to go wrong — a byte
+    // count that is not whole int32 entries, a payload longer than its own placement, and a name
+    // this bundle never placed (silently SKIPPED, and a skipped index reads as entry 0, a real
+    // address) — are one refusal at one door.
+    for (id, bytes) in b.i32 {
+        let bind = e.place_raw(*id, bytes.clone()).ok_or_else(|| {
+            anyhow!(
+                "bind: raw tensor '{id}' ({} B) has no placement in this bundle, does not fit the \
+                 one it has, or is not a whole number of int32 entries — a partial trailing entry \
+                 is a truncated address, an over-long bind overwrites the next tensor, and an \
+                 unplaced one would be skipped in silence (entry 0 is page 0's first block, a REAL \
+                 address)",
+                bytes.len()
+            )
+        })?;
+        e.bind_input_raw(bind);
+    }
+    for (id, seed) in b.seeds {
+        let bytes: Vec<u8> = seed
+            .words(e.tp_identity())
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
+        let n = bytes.len();
+        let bind = e.place_raw(*id, bytes).ok_or_else(|| {
+            anyhow!(
+                "bind: the chain seed '{id}' ({n} B) has no placement in this bundle or does not \
+                 fit the one it has — an unstaged stick gathers the wrong row"
+            )
+        })?;
+        e.bind_input_raw(bind);
+    }
+    if std::env::var_os("SCRATCHY_SDSC_PHASE_TIME").is_some() {
+        let elems: usize = b
+            .tables
+            .iter()
+            .map(|(_, t)| scratchy_target_spyre::forward_tape::card_elems(t.layout()))
+            .sum();
+        eprintln!(
+            "[sdsc-host] bind_loop={:.2} ms  rank {:?}  ({} tables, {elems} sen written; {} f32 \
+             acts, {} f16 acts)",
+            t_bind.elapsed().as_secs_f64() * 1e3,
+            e.tp_identity().map(|r| r.get()),
+            b.tables.len(),
+            b.f32.len(),
+            b.f16.len(),
+        );
+    }
+    Ok(())
+}
+
 /// What a step's caller does with its logits — the session-level spelling of [`Logits`], minus the
 /// buffer the session owns. See [`Logits`] for why this is three states and not a `bool`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -786,10 +922,26 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> SuperDscSession<'a, 'c, T> {
     /// door exists to not run. Call `stage_step_acts` first: this door submits
     /// whatever the shadow holds.
     pub fn submit_step(&mut self, n_new: usize, seq_pos: usize) -> Result<()> {
+        self.submit_bound(&StepBinds::NONE, n_new, seq_pos)
+    }
+
+    /// ⭐ BIND AND SUBMIT ONE PIPELINED STEP — every card writes `b` into its own shadow on its own
+    /// thread, the cards meet, then every card rings its doorbell together ([`bind_then_meet`]),
+    /// one parallel section. Bound card after card, the last card's bind loop started a whole
+    /// world's bind loops late (28 ms a 512-row prompt chunk at tp/4 against 11 at tp/1). Waits on
+    /// nothing, as [`Self::submit_step`].
+    pub fn submit_bound(
+        &mut self,
+        b: &StepBinds<'_, '_>,
+        n_new: usize,
+        seq_pos: usize,
+    ) -> Result<()> {
         // ⭐ EVERY CARD'S DOORBELL BEFORE ANY WAIT — this door waits on nothing, so the ranks' steps
         // are all in flight together and their collectives meet on the cards.
         let t0 = std::time::Instant::now();
+        let together = world_meeting::<T>();
         let at = self.each_parallel("Submit", |e| {
+            bind_then_meet(e, b, &together)?;
             e.submit_step(NewTokens(n_new as i64), SeqPos(seq_pos as i64))?;
             Ok(t0.elapsed().as_secs_f64() * 1e3)
         })?;
@@ -890,113 +1042,23 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> SuperDscSession<'a, 'c, T> {
         }
     }
 
-    /// ⭐ #32 (A) — THE BIND LOOP EVERY STEP RUNS BEFORE ITS FORWARD, PUB FOR THE
-    /// PIPELINED LOOP, which stages half a step at a time: it calls this with
-    /// step `j+1`'s acts while the device still executes step `j` (the
-    /// position-pure half, pre-fence), then stages the ONE token-dependent bind
-    /// after the fence. `submit_step` is the other half — its refill uploads
-    /// whatever the shadow holds, so the split between the two calls is where
-    /// the pipelining lives. The one-shot `run_step_inner` path composes this
-    /// same body, never a second spelling of it. The three channels are its
-    /// own: f32 narrowed to f16 at the boundary, already-f16 bytes as-is, and
-    /// RAW LE int32 through `bind_input_raw`. One body, so a new channel or a
-    /// new guard cannot land on one step shape and skip the other.
+    /// ⭐ #32 (A) — THE BIND LOOP A STEP RUNS BEFORE ITS FORWARD, every card writing its own
+    /// shadow on its own thread ([`bind_rank`], the one bind body every door runs). The one-shot
+    /// `run_step_inner` path stages through it; a launch binds and submits in one section
+    /// ([`Self::submit_bound`], [`Self::run_bound`]).
     pub fn stage_step_acts(
         &mut self,
         activations: &[scratchy_target_spyre::wiring::Bind],
         activations_f16: &[(scratchy_target_spyre::bundle_code::PlaceId, Vec<u8>)],
         activations_i32: &[(scratchy_target_spyre::bundle_code::PlaceId, Vec<u8>)],
     ) -> Result<()> {
-        self.stage_step_acts_seeded(activations, activations_f16, activations_i32, &[])
-    }
-
-    /// [`Self::stage_step_acts`] plus the chained head's seeds — the one host input that is NOT
-    /// the same on every card: rank `r` binds the words of ITS OWN vocabulary block
-    /// ([`scratchy_target_spyre::forward_tape::ChainSeed::words`]), the block its staged tables were built for,
-    /// by the rank its executor plays as. Raw LE u32 words, through the same verbatim channel
-    /// the index tables ride.
-    pub fn stage_step_acts_seeded(
-        &mut self,
-        activations: &[scratchy_target_spyre::wiring::Bind],
-        activations_f16: &[(scratchy_target_spyre::bundle_code::PlaceId, Vec<u8>)],
-        activations_i32: &[(scratchy_target_spyre::bundle_code::PlaceId, Vec<u8>)],
-        seeds: &[(
-            scratchy_target_spyre::bundle_code::PlaceId,
-            scratchy_target_spyre::forward_tape::ChainSeed,
-        )],
-    ) -> Result<()> {
-        // BIND-LOOP TIMING (SCRATCHY_SDSC_PHASE_TIME, the same flag as the executor's phase
-        // breakdown): this loop runs BEFORE predict, so it is invisible to the
-        // preamble_h2d/compute/logits_d2h split. For batched prefill it converts ~300k f32
-        // (embedding 63k + cos/sin 159k + cmask 63k + consts) — a real per-forward cost the TTFT
-        // budget never accounted for.
-        let t_bind = std::time::Instant::now();
-        let mut bind_elems = 0usize;
-        // ⭐ ONE PASS, STRAIGHT INTO THE SHADOW: f32 → SEN169 at the activation's own slot, the bytes
-        // `f32_to_f16_le` then the refill's `ieee_to_sen_bytes` made between them — with no IEEE-f16
-        // `Vec` per bind per step in between and no second convert pass at the refill.
-        for (id, vals) in activations {
-            bind_elems += vals.len();
-            self.each(|e| e.bind_input_f32(*id, vals))?;
-        }
-        let mut bind_f16_bytes = 0usize;
-        for (id, bytes) in activations_f16 {
-            bind_f16_bytes += bytes.len();
-            for e in self.ranks.values_mut() {
-                e.bind_input(*id, bytes.clone());
-            }
-        }
-        // ⛔ `bind_input_raw`, NOT `bind_input`. See `Executor::raw_ids`: the shadow write applies
-        // `ieee_to_sen_bytes` to every ordinary bind, which reads each 4-byte index entry as two fp16
-        // values and rewrites both — turning block 37 into a different, valid, arbitrary block.
-        // ⛔ AND THE PAYLOAD ARRIVES PAIRED WITH ITS PLACEMENT. `place_raw` is the only constructor of
-        // the value `bind_input_raw` takes, so the three ways a raw bind used to go wrong — a byte
-        // count that is not whole int32 entries, a payload longer than its own placement, and a name
-        // this bundle never placed (silently SKIPPED, and a skipped index reads as entry 0, a real
-        // address) — are one refusal at one door instead of a check here, a `bail!` in the refill loop
-        // and a `continue` nobody could see.
-        for (id, bytes) in activations_i32 {
-            for e in self.ranks.values_mut() {
-                let bind = e.place_raw(*id, bytes.clone()).ok_or_else(|| {
-                anyhow!(
-                    "bind: raw tensor '{id}' ({} B) has no placement in this bundle, does not fit \
-                     the one it has, or is not a whole number of int32 entries — a partial trailing \
-                     entry is a truncated address, an over-long bind overwrites the next tensor, and \
-                     an unplaced one would be skipped in silence (entry 0 is page 0's first block, a \
-                     REAL address)",
-                    bytes.len()
-                )
-            })?;
-                e.bind_input_raw(bind);
-            }
-        }
-        for (id, seed) in seeds {
-            for e in self.ranks.values_mut() {
-                let bytes: Vec<u8> = seed
-                    .words(e.tp_identity())
-                    .iter()
-                    .flat_map(|w| w.to_le_bytes())
-                    .collect();
-                let n = bytes.len();
-                let bind = e.place_raw(*id, bytes).ok_or_else(|| {
-                    anyhow!(
-                        "bind: the chain seed '{id}' ({n} B) has no placement in this bundle or \
-                         does not fit the one it has — an unstaged stick gathers the wrong row"
-                    )
-                })?;
-                e.bind_input_raw(bind);
-            }
-        }
-        if std::env::var_os("SCRATCHY_SDSC_PHASE_TIME").is_some() {
-            eprintln!(
-                "[sdsc-host] bind_loop={:.2} ms  ({} acts, {bind_elems} f32->sen, {} f16 acts, \
-                 {bind_f16_bytes} f16 bytes as-is)",
-                t_bind.elapsed().as_secs_f64() * 1e3,
-                activations.len(),
-                activations_f16.len(),
-            );
-        }
-        Ok(())
+        let b = StepBinds {
+            f32: activations,
+            f16: activations_f16,
+            i32: activations_i32,
+            ..StepBinds::NONE
+        };
+        self.each_parallel("Bind", |e| bind_rank(e, &b)).map(drop)
     }
 
     fn run_step_inner(
@@ -1016,9 +1078,24 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> SuperDscSession<'a, 'c, T> {
     }
 
     /// Run the step whatever the shadow holds — every input already staged
-    /// ([`Self::stage_step_acts`] / [`Self::stage_step_acts_seeded`]).
+    /// ([`Self::stage_step_acts`]).
     pub fn run_staged_step(
         &mut self,
+        n_new: usize,
+        seq_pos: usize,
+        logits: StepLogits,
+    ) -> Result<Option<Vec<f32>>> {
+        self.run_bound(&StepBinds::NONE, n_new, seq_pos, logits)
+    }
+
+    /// ⭐ BIND AND RUN ONE STEP — every card writes `b` into its own shadow on its own thread (a
+    /// prompt chunk's tables are millions of values a card,
+    /// [`scratchy_target_spyre::forward_tape::CardTable`]), the cards meet and submit together
+    /// ([`bind_then_meet`]), then every card's forward is finished, rank 0 reading the row back when
+    /// the step asks for it.
+    pub fn run_bound(
+        &mut self,
+        b: &StepBinds<'_, '_>,
         n_new: usize,
         seq_pos: usize,
         logits: StepLogits,
@@ -1031,7 +1108,11 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> SuperDscSession<'a, 'c, T> {
         };
         // ⭐ EVERY CARD SUBMITS BEFORE ANY CARD IS WAITED ON — a rank's collective waits on its
         // peers' sends, so the forward is in flight on all of them before the host drains one.
-        let submitted = self.each_parallel("Submit", |e| e.predict_submit(n_new, seq_pos, want))?;
+        let together = world_meeting::<T>();
+        let submitted = self.each_parallel("Submit", |e| {
+            bind_then_meet(e, b, &together)?;
+            e.predict_submit(n_new, seq_pos, want)
+        })?;
         let mut row = vec![0u8; self.vocab * 2];
         for ((r, e), s) in self.ranks.iter_mut().zip(submitted) {
             // Rank 0 reads the row back; every other rank's forward is drained, its read the same

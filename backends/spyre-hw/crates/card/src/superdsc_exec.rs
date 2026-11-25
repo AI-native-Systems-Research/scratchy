@@ -2140,14 +2140,41 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
     /// `bind_input(f32_to_f16_le(vals))` and the refill's `ieee_to_sen_bytes` produce between them,
     /// without the IEEE-f16 buffer in between or the refill's second convert pass. Re-bound every
     /// step, and the refill sends its range every step, exactly like [`Self::bind_input`]: only
-    /// WHERE the conversion happens moves.
-    ///
-    /// The placement checks the refill makes for a `bound` activation are made here instead, where
-    /// the write happens: a name this bundle never placed is skipped (as the refill skips it), and a
-    /// bind longer than its own placement, or past its segment's shadow, is refused.
+    /// WHERE the conversion happens moves. The write is [`Self::write_activation`]'s.
     pub fn bind_input_f32(&mut self, id: bundle::PlaceId, vals: &[f32]) -> Result<()> {
+        self.write_activation(id, vals.len() as u64 * 2, |dst| {
+            sen_convert::f32_to_sen_bytes(vals, dst)
+        })
+    }
+
+    /// ⭐ Bind a HOST KERNEL'S TABLE IN THE CARD'S OWN FORMAT — the table writes its SEN169 bytes at
+    /// its card layout straight into the activation's own slot of THIS card's shadow
+    /// ([`scratchy_target_spyre::forward_tape::fill_card`]): no f32 buffer, no per-card convert of
+    /// one. The same door as [`Self::bind_input_f32`] — one placement law for both.
+    pub fn bind_input_table(
+        &mut self,
+        id: bundle::PlaceId,
+        table: &dyn scratchy_target_spyre::forward_tape::CardTable,
+    ) -> Result<()> {
+        let elems = scratchy_target_spyre::forward_tape::card_elems(table.layout());
+        self.write_activation(id, elems as u64 * 2, |dst| {
+            scratchy_target_spyre::forward_tape::fill_card(table, dst)
+        })
+    }
+
+    /// THE ONE SHADOW WRITE OF A PER-STEP fp16 ACTIVATION — `len` SEN169 bytes `write` lays at the
+    /// activation's own slot, re-sent by every step's refill. The placement checks the refill makes
+    /// for a `bound` activation are made here, where the write happens: a name this bundle never
+    /// placed is skipped (as the refill skips it), and a bind longer than its own placement, or past
+    /// its segment's shadow, is refused.
+    fn write_activation(
+        &mut self,
+        id: bundle::PlaceId,
+        len: u64,
+        write: impl FnOnce(&mut [u8]),
+    ) -> Result<()> {
         if !self.prepared {
-            bail!("bind_input_f32('{id}') before prepare — the shadow is sized at prepare");
+            bail!("bind '{id}' before prepare — the shadow is sized at prepare");
         }
         // A RESIDENT WEIGHT is never re-sent by a step (the refill skips it), so a per-step bind of
         // one writes nothing — as before, where the refill skipped its `bound` entry.
@@ -2160,7 +2187,6 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
         let Some(seg) = SegIdx::checked(p.segment as i64) else {
             return Ok(());
         };
-        let len = vals.len() as u64 * 2;
         if len > p.size {
             bail!(
                 "bind: activation '{id}' binds {len} B into a {} B placement (seg{} off {}) — \
@@ -2186,7 +2212,7 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
             })?
             .get_mut(off as usize..(off + len) as usize)
             .ok_or_else(|| anyhow!("bind: activation '{id}' overflows seg{}", segi))?;
-        sen_convert::f32_to_sen_bytes(vals, dst);
+        write(dst);
         self.raw_ids.remove(&id);
         self.keyed.remove(&id);
         self.bound.remove(&id);
