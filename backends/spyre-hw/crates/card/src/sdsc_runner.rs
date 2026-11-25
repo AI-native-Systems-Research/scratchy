@@ -180,11 +180,11 @@ impl<T: ktir_superdsc::collective::Tp> Drop for BindSeat<'_, T> {
 
 /// ⭐ ONE CARD'S BINDS, THEN THE WORLD MEETS — every card of a step binds into its own shadow on its
 /// own thread ([`bind_rank`]), then meets the world at its [`BindSeat`], so the doorbells that
-/// follow go out together, as they did when the host bound card after card before one submit
-/// section, and only if every card bound. Each card's doorbell trailing its own bind skewed the
-/// cards into the step's first collective: the decode steps' all-reduce waits grew 1.305 → 1.411 M
-/// cycles a step and ITL 34.6 → 34.75 ms (granite-3.1-8b tp/4); a second parallel section for the
-/// binds cost as much in host time a token. Returns how long this card's own bind took.
+/// follow go out together, and only if every card bound. The meeting is what keeps the cards
+/// aligned into the step's first collective: a doorbell that rang as soon as its own card bound
+/// grew the decode steps' all-reduce waits 1.305 → 1.411 M cycles a step and ITL 34.6 → 34.75 ms
+/// (granite-3.1-8b tp/4), and binding in a parallel section of its own cost as much in host time a
+/// token. Returns how long this card's own bind took.
 fn bind_then_meet<T: ktir_superdsc::collective::Tp>(
     e: &mut Executor<'_, '_, T>,
     b: &StepBinds<'_, '_>,
@@ -1084,10 +1084,11 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> SuperDscSession<'a, 'c, T> {
 
     /// ⭐ BIND AND SUBMIT ONE PIPELINED STEP — every card writes `b` into its own shadow on its own
     /// thread, the cards meet, then — only if every card bound — every card rings its doorbell
-    /// together ([`bind_then_meet`]), one parallel section. Bound card after card, the last card's bind loop started a whole
-    /// world's bind loops late (28 ms a 512-row prompt chunk at tp/4 against 11 at tp/1). Waits on
-    /// nothing, as [`Self::submit_step`]. Returns the slowest card's bind — the bind's share of the
-    /// submit span, since every doorbell waits for it.
+    /// together ([`bind_then_meet`]), one parallel section: the step's bind costs the slowest
+    /// card's bind, not the sum of the cards' (a serial bind of the cards cost 28 ms a 512-row
+    /// prompt chunk at tp/4 against 11 at tp/1). Waits on nothing, as [`Self::submit_step`].
+    /// Returns the slowest card's bind — the bind's share of the submit span, since every doorbell
+    /// waits for it.
     pub fn submit_bound(
         &mut self,
         b: &StepBinds<'_, '_>,
