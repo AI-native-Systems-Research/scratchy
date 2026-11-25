@@ -3249,7 +3249,7 @@ mod tests {
         assert!(!html.contains("vs oMLX</strong>"), "no square has a ratio");
     }
 
-    /// The summary map's 2u and 4u rows are E2E × J/right: in a bucket, the median end-to-end
+    /// The summary map's 2u and 4u rows are E2E × J: in a bucket, the median end-to-end
     /// time of its requests times the joules they took over how many were right, scratchy against
     /// its rival. A cell whose answers were forced was not scored, so has none; a run that kept
     /// no joules a request reads each cell's whole, and says so.
@@ -3287,7 +3287,7 @@ mod tests {
         };
         let mut runs = fixtures(&[REQUESTS_FIXTURE]);
         let html = shape(&mut runs, false, true);
-        assert!(html.contains("E2E × J/right"));
+        assert!(html.contains("E2E × J"));
         // The Raw Performance map beside it: the same squares, the time alone, 1000 ms against 500, x0.50.
         assert!(
             html.contains("End-to-end Latency · "),
@@ -3309,11 +3309,12 @@ mod tests {
         // Forced answers: not scored, no ratio.
         let html = shape(&mut runs, true, true);
         assert!(html.contains("answers forced to a length, so not scored"));
-        // No joules a request: each cell's whole, 36 J x 500 ms against 20 x 1000, x0.90, and
-        // said so.
+        // No joules a request: nothing to multiply each request's time by, so no
+        // Energy-Delay Product square, and it says so (the Raw Performance map still compares
+        // the times).
         let html = shape(&mut runs, false, false);
-        assert!(html.contains("each cell&#39;s whole: a side kept no joules a request"));
-        assert!(html.contains("×0.90 vs oMLX"));
+        assert!(html.contains("a side kept no joules a request"));
+        assert!(!html.contains("×0.90 vs oMLX"));
         // A cell the power log missed part of has no energy: no ratio, and its squares say why,
         // not that its run kept no joules a request.
         shape(&mut runs, false, true);
@@ -3324,7 +3325,7 @@ mod tests {
         let machines = super::index(&runs);
         let html = render(super::datasets::section("rag", &machines, &machines));
         assert!(html.contains("no energy on one side"));
-        assert!(!html.contains("each cell&#39;s whole"));
+        assert!(!html.contains("a side kept no joules a request"));
         // A cell's answers cut off at the length limit, every one, are still its answers: its
         // accuracy, and so its joules a correct answer, stand.
         shape(&mut runs, false, true);
@@ -3334,6 +3335,61 @@ mod tests {
         let machines = super::index(&runs);
         let html = render(super::datasets::section("rag", &machines, &machines));
         assert!(html.contains("×0.90 vs oMLX"), "cut off, and still scored");
+    }
+
+    /// The decode square is one decoded token's energy-delay product: TPOT × each request's DECODE
+    /// joules per decoded token, so neither the prefill's energy nor the answer's length moves it.
+    /// The prefill square pairs TTFT with PREFILL joules. Without phase joules (a run from before
+    /// they were measured), those squares say so.
+    #[test]
+    fn a_decode_square_is_one_decoded_tokens_energy_delay_product() {
+        // scratchy decodes at 10 ms a token, 1 J over 20 tokens; oMLX at 20 ms, 2 J over 10:
+        // 10 × 0.05 against 20 × 0.2, x8.00. Per request instead of per token it would read 10
+        // against 40, x4.00 (the longer answer penalized); with the whole request's joules (a 50 J
+        // prefill against 5 J) 10×51 against 20×7, x0.27.
+        let shape = |runs: &mut [Run], phases: bool| {
+            let m = &mut runs[0].models[0];
+            for (cells, tpot, prefill, decode, tokens) in [
+                (m.tasks.as_mut(), 10.0, 50.0, 1.0, 20),
+                (m.tasks_omlx.as_mut(), 20.0, 5.0, 2.0, 10),
+            ] {
+                for c in cells.into_iter().flatten().filter(|c| c.workload == "rag") {
+                    scored(c);
+                    let n = c.ttfts_ms.as_ref().map_or(0, Vec::len);
+                    c.prompt_tokens = Some(vec![Some(2700); n]);
+                    c.tpots_ms = Some(vec![Some(tpot); n]);
+                    c.task_joules = Some(vec![Some(prefill + decode); n]);
+                    c.task_prefill_joules = phases.then(|| vec![Some(prefill); n]);
+                    c.task_decode_joules = phases.then(|| vec![Some(decode); n]);
+                    c.decode_tokens = phases.then(|| vec![Some(tokens); n]);
+                }
+            }
+            let machines = super::index(runs);
+            render(super::datasets::section("rag", &machines, &machines))
+        };
+        let mut runs = fixtures(&[REQUESTS_FIXTURE]);
+        let html = shape(&mut runs, true);
+        let pe = &html[..html
+            .find("id=\"rag-summary-energy-delay-product-scale\"")
+            .expect("the Energy-Delay Product map")];
+        assert!(
+            pe.contains("×8.00 vs oMLX"),
+            "TPOT × decode joules a token, 0.5 against 4"
+        );
+        assert!(
+            !pe.contains("×4.00 vs oMLX"),
+            "not per request: the answer's length is out"
+        );
+        assert!(
+            !pe.contains("×0.27 vs oMLX"),
+            "not the whole request's joules"
+        );
+        let html = shape(&mut runs, false);
+        assert!(
+            html.contains("a side kept no decode joules"),
+            "no phase joules, said so"
+        );
+        assert!(html.contains("a side kept no prefill joules"));
     }
 
     /// A section reads each model's newest run that measured its dataset, the runs a newer one
@@ -3395,7 +3451,7 @@ mod tests {
         let machines = super::index(&runs);
         let html = render(super::datasets::section("rag", &machines, &machines));
         let map = &html[..html
-            .find("id=\"rag-summary-performance-efficiency-scale\"")
+            .find("id=\"rag-summary-energy-delay-product-scale\"")
             .expect("the summary map")];
         assert!(map.contains(">Sliding window<"), "the class, as a column");
         assert!(!map.contains(">granite-4.2-3b<"), "not a column of its own");
@@ -3430,9 +3486,9 @@ mod tests {
         }
         let machines = super::index(&runs);
         let html = render(super::datasets::section("rag", &machines, &machines));
-        // The summary's first map, Performance-Efficiency: one model's squares, 4 rows by 4 buckets.
+        // The summary's first map, Energy-Delay Product: one model's squares, 4 rows by 4 buckets.
         let map = &html[..html
-            .find("id=\"rag-summary-performance-efficiency-scale\"")
+            .find("id=\"rag-summary-energy-delay-product-scale\"")
             .expect("the summary map")];
         assert_eq!(
             map.matches("width: 2.25rem; height: 2.25rem").count(),
@@ -4142,8 +4198,8 @@ mod tests {
         }
         let machines = super::index(&runs);
         let html = render(super::datasets::section("rag", &machines, &machines));
-        // A map a scale, Performance-Efficiency and Raw Performance, a tab each, each its own ratio scale.
-        for scale in ["performance-efficiency", "raw-performance"] {
+        // A map a scale, Energy-Delay Product and Raw Performance, a tab each, each its own ratio scale.
+        for scale in ["energy-delay-product", "raw-performance"] {
             assert!(
                 html.contains(&format!("id=\"rag-summary-{scale}-scale\"")),
                 "its own ratio scale: {scale}"

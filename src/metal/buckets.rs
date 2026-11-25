@@ -66,26 +66,30 @@ pub fn bucketed(c: &TaskCell) -> bool {
         .is_some_and(|p| p.iter().any(Option::is_some))
 }
 
-/// A cell's joules a correct answer in bucket `at` of `buckets`: the joules its requests there
-/// took over how many of them were right, a wrong one's joules counted too. A failed request has
-/// no joules of its own: its seconds went to the requests in flight beside it
-/// (`cell_energy.per_request`). None where the cell kept no joules a request, no prompt counts or
-/// no scores, or none there was right.
-pub fn joules_per_right_in(c: &TaskCell, buckets: Buckets, at: usize) -> Option<f64> {
-    let (prompts, joules, right) = (
+/// What a right answer typically cost in bucket `at` of `buckets`, for `timing`: the median, over
+/// the bucket's correctly answered requests, of each one's own time times its own energy over that
+/// time's span ([`joules`]: prefill joules for TTFT, decode joules for TPOT, the whole request's
+/// for end-to-end). Every number is one request's: no sum, no count of right answers divided into
+/// a total. A request missing its time or its energy (a one-token answer has no TPOT) is not
+/// counted. None where the cell kept no such energy, no prompt counts or no scores, or no request
+/// there was right.
+pub fn time_joules_per_right_in(
+    c: &TaskCell,
+    buckets: Buckets,
+    timing: RequestTiming,
+    at: usize,
+) -> Option<f64> {
+    let energy = joules(c, timing)?;
+    let (prompts, right, times) = (
         c.prompt_tokens.as_deref()?,
-        c.task_joules.as_deref()?,
         c.task_right.as_deref()?,
+        values(c, timing)?,
     );
-    let (spent, rights) = (prompts.iter().zip(joules).zip(right))
-        .filter(|((p, _), _)| p.is_some_and(|p| bucket(buckets, p) == at))
-        .fold((0.0, 0u32), |(spent, rights), ((_, j), r)| {
-            (
-                spent + j.unwrap_or(0.0),
-                rights + u32::from(*r == Some(true)),
-            )
-        });
-    (rights > 0).then(|| spent / f64::from(rights))
+    let costs: Vec<f64> = (prompts.iter().zip(&energy).zip(right).zip(times))
+        .filter(|(((p, _), r), _)| p.is_some_and(|p| bucket(buckets, p) == at) && **r == Some(true))
+        .filter_map(|(((_, j), _), t)| Some((*t)? * (*j)?))
+        .collect();
+    median(costs)
 }
 
 /// How many of a cell's requests in bucket `at` of `buckets` were right: what its joules a
@@ -107,36 +111,65 @@ fn values(c: &TaskCell, timing: RequestTiming) -> Option<&[Option<f64>]> {
     }
 }
 
+/// Each request's energy in the unit `timing` times it in, in the order sent: its prefill joules
+/// for TTFT (up to its first token), its decode joules per decoded token for TPOT (TPOT is a time
+/// per token, so its energy is per token too, over the same `decode_tokens`), its whole joules
+/// for end-to-end. The one pairing of a time with its energy every figure reads.
+pub fn joules(c: &TaskCell, timing: RequestTiming) -> Option<Vec<Option<f64>>> {
+    match timing {
+        RequestTiming::Ttft => c.task_prefill_joules.clone(),
+        RequestTiming::Tpot => {
+            let (j, n) = (
+                c.task_decode_joules.as_deref()?,
+                c.decode_tokens.as_deref()?,
+            );
+            Some(
+                (j.iter().zip(n))
+                    .map(|(j, n)| Some((*j)? / (*n).filter(|&n| n > 0)? as f64))
+                    .collect(),
+            )
+        }
+        RequestTiming::E2el => c.task_joules.clone(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// A bucket's joules a correct answer: its requests' joules, a wrong or failed one's too, over
-    /// how many were right; none where none was right, or the cell kept no joules a request.
+    /// What a right answer typically cost in a bucket: the median, over its correctly answered
+    /// requests, of each one's own time times its own joules — a wrong answer's not counted, nor a
+    /// right one missing its time; none where none was right, or the cell kept no joules a request.
     #[test]
-    fn a_buckets_joules_per_correct_answer_counts_every_request_it_paid_for() {
+    fn a_buckets_cost_of_a_right_answer_is_the_median_of_each_ones_own_product() {
         let mut c: TaskCell = serde_json::from_value(serde_json::json!({
             "workload": "rag", "conc": 2,
-            "prompt_tokens": [2000, 2000, 2000, 3000, 3000],
-            "task_right": [true, false, true, false, false],
-            "task_joules": [4.0, 6.0, 2.0, 5.0, null],
+            "prompt_tokens": [2000, 2000, 2000, 2000, 2000, 3000],
+            "task_right": [true, false, true, true, true, false],
+            "task_joules": [4.0, 6.0, 2.0, 5.0, 1.0, 3.0],
+            "e2els_ms": [100.0, 300.0, 1000.0, null, 5000.0, 200.0],
         }))
         .unwrap();
+        // The right answers with a time: 4×100, 2×1000, 1×5000 — the median is 2,000. The wrong
+        // one's 6×300 and the untimed right one are not counted.
         assert_eq!(
-            joules_per_right_in(&c, MUSIQUE, 0),
-            Some(6.0),
-            "12 J over 2 right"
+            time_joules_per_right_in(&c, MUSIQUE, RequestTiming::E2el, 0),
+            Some(2000.0),
+            "each right answer's own product, the median of them"
         );
-        assert_eq!(rights_in(&c, MUSIQUE, 0), 2);
-        assert_eq!(joules_per_right_in(&c, MUSIQUE, 3), None, "none right");
         assert_eq!(
-            joules_per_right_in(&c, MUSIQUE, 1),
+            time_joules_per_right_in(&c, MUSIQUE, RequestTiming::E2el, 3),
+            None,
+            "none right"
+        );
+        assert_eq!(
+            time_joules_per_right_in(&c, MUSIQUE, RequestTiming::E2el, 1),
             None,
             "no request there"
         );
         c.task_joules = None;
         assert_eq!(
-            joules_per_right_in(&c, MUSIQUE, 0),
+            time_joules_per_right_in(&c, MUSIQUE, RequestTiming::E2el, 0),
             None,
             "no joules a request"
         );
