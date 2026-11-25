@@ -322,20 +322,25 @@ fn dataset_summary(
         .collect();
     rsx! {
         Stack { gap: 4,
-            p { style: "contain: inline-size",
-                "Per machine, its rows: prefill (P) and decode (D) with 1 user, then joules per \
-                 correct answer with each users count above it (2u, 4u). A column per model, under \
-                 its family; the same tasks to every engine. Colour is how many times better scratchy \
-                 is than the engine it is set against: on P and D its median time over the cell's \
-                 requests against the rival's, on 2u and 4u the joules its requests took over how many \
-                 were right against the rival's. Blue better, red worse, grey within noise. A striped \
-                 square has no ratio: one engine did not run it, most of its requests failed, its \
-                 answers were forced to a length, so not scored, one side's were mostly cut off or \
-                 in reasoning where the other's were not, as the accuracy table says, or one side \
-                 had no energy reading or no right answer there. Hover or focus a square for its \
-                 ratio, the engine, and a borrowed rival's run."
+            // Secondary (line) tabs right under the primary one, as the latency distributions'
+            // are: a map a scale, the first shown.
+            div {
+                Tabs { selected: format!("{id}-summary-{}", slug(Scale::ALL[0].title())), id: "{id}-summary-scales",
+                    for scale in Scale::ALL {
+                        TabItem { value: format!("{id}-summary-{}", slug(scale.title())), target: Some(format!("{id}-summary-{}", slug(scale.title()))), selected: scale == Scale::ALL[0], "{scale.title()}" }
+                    }
+                }
+                div { style: "padding-top: var(--cds-spacing-05)",
+                    for scale in Scale::ALL {
+                        ContentPanel { id: format!("{id}-summary-{}", slug(scale.title())), shown: scale == Scale::ALL[0],
+                            Stack { gap: 4,
+                                p { style: "contain: inline-size", "{scale.legend()}" }
+                                {summary_map(dataset, id, ran, machines, &summary_columns, scale)}
+                            }
+                        }
+                    }
+                }
             }
-            {summary_map(dataset, id, ran, machines, &summary_columns)}
             {tasks::accuracy_table(dataset, &scored_pairs)}
         }
     }
@@ -626,10 +631,15 @@ fn tabbed(
                             TabItem { value: panel(t), target: Some(panel(t)), selected: n == 0, "{t}" }
                         }
                     }
-                    div { style: "padding-top: var(--cds-spacing-05)",
+                    // Summary and Latency distributions open on their own secondary tabs, right
+                    // under these; Over time, which has none, keeps the space a panel's content
+                    // takes under its tabs.
+                    div {
                         ContentPanel { id: panel(TABS[0]), shown: true, {summary} }
                         ContentPanel { id: panel(TABS[1]), shown: false, {chosen("latency", &latency)} }
-                        ContentPanel { id: panel(TABS[2]), shown: false, {over_time} }
+                        ContentPanel { id: panel(TABS[2]), shown: false,
+                            div { style: "padding-top: var(--cds-spacing-05)", {over_time} }
+                        }
                     }
                 }
             }
@@ -951,6 +961,7 @@ fn summary_map(
     ran: &[(&str, Vec<&str>)],
     machines: &BTreeMap<&str, MachineRuns>,
     grid: &SummaryGrid,
+    scale: Scale,
 ) -> Element {
     // Each pair's scratchy and rival cells of this dataset, by users count.
     let pair = |chip: &str, column: &str| -> Option<Pair> {
@@ -992,19 +1003,28 @@ fn summary_map(
         users.dedup();
         let mut rows = Vec::new();
         if users.contains(&1) {
-            rows.push(Row { label: "P".into(), name: "Prefill", users: 1, measure: Measure::Timing(RequestTiming::Ttft),
-                about: "Time to first token with 1 user: how long the prompt takes before the answer starts." });
-            rows.push(Row { label: "D".into(), name: "Decode", users: 1, measure: Measure::Timing(RequestTiming::Tpot),
-                about: "Time per output token with 1 user: how fast the answer streams once it has started." });
+            rows.push(Row {
+                label: "P".into(),
+                name: scale.row_name(RequestTiming::Ttft),
+                users: 1,
+                measure: Measure(RequestTiming::Ttft),
+                about: scale.row_about(RequestTiming::Ttft),
+            });
+            rows.push(Row {
+                label: "D".into(),
+                name: scale.row_name(RequestTiming::Tpot),
+                users: 1,
+                measure: Measure(RequestTiming::Tpot),
+                about: scale.row_about(RequestTiming::Tpot),
+            });
         }
         for &u in users.iter().filter(|&&u| u > 1) {
             rows.push(Row {
                 label: format!("{u}u"),
-                name: "Joules per Correct Answer",
+                name: scale.row_name(RequestTiming::E2el),
                 users: u,
-                measure: Measure::JoulesPerRight,
-                about: "The energy a right answer took with that many users at once: the joules the \
-                    requests took over how many of them were right. Fewer is better.",
+                measure: Measure(RequestTiming::E2el),
+                about: scale.row_about(RequestTiming::E2el),
             });
         }
         rows
@@ -1021,12 +1041,19 @@ fn summary_map(
         if tasks::mostly_failed(ours) || tasks::mostly_failed(theirs) {
             return Err("most requests failed".into());
         }
-        let (a, t) = match row.measure {
-            Measure::Timing(timing) => (
-                buckets::median_in(ours, bs, timing, b),
-                buckets::median_in(theirs, bs, timing, b),
-            ),
-            Measure::JoulesPerRight => {
+        let Measure(timing) = row.measure;
+        // The row's time: its median over the bucket's requests, the side it is missing on named.
+        let (ta, tt) = (
+            buckets::median_in(ours, bs, timing, b),
+            buckets::median_in(theirs, bs, timing, b),
+        );
+        if ta.is_none() || tt.is_none() {
+            let sides = [("scratchy", *ours, ta), (rival.label(), *theirs, tt)];
+            return Err(no_ratio_why(sides, bs, timing, b));
+        }
+        let r = match scale {
+            Scale::Performance => tasks::times(ta, tt, true).ok_or("no time on one side")?,
+            Scale::PerformanceEfficiency => {
                 if ours.timed_answers || theirs.timed_answers {
                     return Err("answers forced to a length, so not scored".into());
                 }
@@ -1040,24 +1067,21 @@ fn summary_map(
                 if ours.energy.is_none() || theirs.energy.is_none() {
                     return Err("no energy on one side".into());
                 }
-                match (ours.task_joules.as_ref(), theirs.task_joules.as_ref()) {
+                // The one normalization every row shares: joules a correct answer (each request's
+                // joules integrated over its own send-to-last-token window), in the bucket where
+                // the run kept joules a request, else over each cell's whole.
+                let (ja, jt) = match (ours.task_joules.as_ref(), theirs.task_joules.as_ref()) {
                     (Some(_), Some(_)) => (
                         buckets::joules_per_right_in(ours, bs, b),
                         buckets::joules_per_right_in(theirs, bs, b),
                     ),
-                    // A run that kept no joules a request: each cell's whole, every bucket alike.
                     _ => (tasks::per_right(ours), tasks::per_right(theirs)),
-                }
+                };
+                let times_j = |t: Option<f64>, j: Option<f64>| t.zip(j).map(|(t, j)| t * j);
+                let (a, t) = (times_j(ta, ja), times_j(tt, jt));
+                tasks::times(a, t, true).ok_or("no right answer on one side")?
             }
         };
-        let r = tasks::times(a, t, true).ok_or_else(|| match row.measure {
-            // The side the timing is missing on, by name ([`no_ratio_why`]).
-            Measure::Timing(timing) => {
-                let sides = [("scratchy", *ours, a), (rival.label(), *theirs, t)];
-                no_ratio_why(sides, bs, timing, b)
-            }
-            Measure::JoulesPerRight => "no right answer on one side".to_string(),
-        })?;
         let from = (theirs.borrowed_from.as_ref())
             .map_or(String::new(), |w| format!(" (from {})", w.month_day()));
         Ok((r, format!("{}{from}", rival.label())))
@@ -1077,36 +1101,27 @@ fn summary_map(
                     // having no joules a request, says that.
                     let over = p.as_ref().and_then(|p| {
                         let (ours, theirs) = (p.ours.get(&row.users), p.theirs.get(&row.users));
-                        match row.measure {
-                            Measure::Timing(timing) => {
+                        let Measure(timing) = row.measure;
+                        let timed = |c: Option<&&TaskCell>| {
+                            c.map_or(0, |c| buckets::in_bucket(c, bs, timing, b).len())
+                        };
+                        let kept =
+                            |c: Option<&&TaskCell>| c.is_some_and(|c| c.task_joules.is_some());
+                        let joules = match (scale, kept(ours) && kept(theirs)) {
+                            (Scale::Performance, _) => String::new(),
+                            (Scale::PerformanceEfficiency, true) => {
                                 let n = |c: Option<&&TaskCell>| {
-                                    c.map_or(0, |c| buckets::in_bucket(c, bs, timing, b).len())
+                                    c.map_or(0, |c| buckets::rights_in(c, bs, b))
                                 };
-                                let (a, t) = (n(ours), n(theirs));
-                                (a + t > 0).then(|| format!("over {a} and {t} requests"))
+                                format!("; {} and {} right answers", n(ours), n(theirs))
                             }
-                            Measure::JoulesPerRight => {
-                                let kept = |c: Option<&&TaskCell>| {
-                                    c.is_some_and(|c| c.task_joules.is_some())
-                                };
-                                match kept(ours) && kept(theirs) {
-                                    true => {
-                                        let n = |c: Option<&&TaskCell>| {
-                                            c.map_or(0, |c| buckets::rights_in(c, bs, b))
-                                        };
-                                        Some(format!(
-                                            "over {} and {} right answers",
-                                            n(ours),
-                                            n(theirs)
-                                        ))
-                                    }
-                                    false => got.is_ok().then(|| {
-                                        "each cell's whole: a side kept no joules a request"
-                                            .to_string()
-                                    }),
-                                }
+                            (Scale::PerformanceEfficiency, false) => {
+                                "; each cell's whole: a side kept no joules a request".into()
                             }
-                        }
+                        };
+                        let (a, t) = (timed(ours), timed(theirs));
+                        (a + t > 0 && got.is_ok())
+                            .then(|| format!("over {a} and {t} requests{joules}"))
                     });
                     let stem = p.as_ref().map_or("", |p| p.stem);
                     // scratchy's guesses kept over the whole cell: its helper's, not a bucket's.
@@ -1170,7 +1185,7 @@ fn summary_map(
         .values()
         .flat_map(|block| ratio_labels(block, BLOCK_LABELS))
         .collect();
-    map.render(&format!("{id}-summary-scale"))
+    map.render(&format!("{id}-summary-{}-scale", slug(scale.title())))
 }
 
 /// Why a summary square has no ratio, naming the side it is missing: the engine that sent no
@@ -1217,13 +1232,85 @@ struct Row {
     about: &'static str,
 }
 
-/// What a summary map row compares, scratchy against its rival: a request timing's median over a
-/// bucket's requests (P and D), or joules a correct answer, the joules a bucket's requests took
-/// over how many were right (2u, 4u). Fewer is better for both.
+/// What a summary map row times, scratchy against its rival: a request time's median over a
+/// bucket's requests (TTFT for P, TPOT for D, end-to-end for 2u and 4u). The map's [`Scale`] says
+/// whether it is compared alone or times the one normalization every row shares.
 #[derive(Clone, Copy, PartialEq)]
-enum Measure {
-    Timing(RequestTiming),
-    JoulesPerRight,
+struct Measure(RequestTiming);
+
+/// How a summary map compares its rows' times: each times the joules a correct answer took, the
+/// one normalization every row shares (Performance-Efficiency, the first tab), or alone (Raw
+/// Performance). Smaller is better on both.
+#[derive(Clone, Copy, PartialEq)]
+enum Scale {
+    PerformanceEfficiency,
+    Performance,
+}
+
+impl Scale {
+    /// The tabs' order: the first is shown.
+    const ALL: [Scale; 2] = [Scale::PerformanceEfficiency, Scale::Performance];
+
+    /// Its tab label, which also names its panel.
+    fn title(self) -> &'static str {
+        match self {
+            Scale::PerformanceEfficiency => "Performance-Efficiency",
+            Scale::Performance => "Raw Performance",
+        }
+    }
+
+    /// Its tab's legend: what the rows and the squares mean under it.
+    fn legend(self) -> &'static str {
+        match self {
+            Scale::PerformanceEfficiency => {
+                "This heat map takes into account raw performance, energy consumption, and \
+                 accuracy. It compares scratchy relative to oMLX using that combined metric."
+            }
+            Scale::Performance => {
+                "This heat map takes into account raw performance, measured by Prefill (i.e. TTFT) \
+                 and Decode (i.e. TPOT) for single-user workloads, and by end-to-end latency (E2EL) \
+                 for multi-user workloads (2u, 4u)."
+            }
+        }
+    }
+
+    /// A row's name under this scale, from the time it compares.
+    fn row_name(self, t: RequestTiming) -> &'static str {
+        match (self, t) {
+            (Scale::Performance, RequestTiming::Ttft) => "Prefill",
+            (Scale::Performance, RequestTiming::Tpot) => "Decode",
+            (Scale::Performance, RequestTiming::E2el) => "End-to-end Latency",
+            (Scale::PerformanceEfficiency, RequestTiming::Ttft) => "TTFT × J/right",
+            (Scale::PerformanceEfficiency, RequestTiming::Tpot) => "TPOT × J/right",
+            (Scale::PerformanceEfficiency, RequestTiming::E2el) => "E2E × J/right",
+        }
+    }
+
+    /// What a row measures under this scale.
+    fn row_about(self, t: RequestTiming) -> &'static str {
+        match (self, t) {
+            (Scale::Performance, RequestTiming::Ttft) => {
+                "Time to first token with 1 user: how long the prompt takes before the answer starts."
+            }
+            (Scale::Performance, RequestTiming::Tpot) => {
+                "Time per output token with 1 user: how fast the answer streams once it has started."
+            }
+            (Scale::Performance, RequestTiming::E2el) => {
+                "End-to-end time with that many users at once: send to last token."
+            }
+            (Scale::PerformanceEfficiency, RequestTiming::Ttft) => {
+                "Time to first token times joules per correct answer, with 1 user. Smaller is better."
+            }
+            (Scale::PerformanceEfficiency, RequestTiming::Tpot) => {
+                "Time per output token times joules per correct answer, with 1 user. Smaller is \
+                 better."
+            }
+            (Scale::PerformanceEfficiency, RequestTiming::E2el) => {
+                "End-to-end time (send to last token) times joules per correct answer, with that \
+                 many users at once. Smaller is better."
+            }
+        }
+    }
 }
 
 /// The engines a pair of `dataset` is drawn for, scratchy then its rival, and every users count

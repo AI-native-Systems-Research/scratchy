@@ -3199,6 +3199,24 @@ mod tests {
         assert!(html.contains("helper kept 23% of 1,229 guessed tokens<"));
     }
 
+    /// Score a RAG cell from a fixture that predates scoring: every answer right, 5 J a request, so
+    /// the summary map's one normalization (joules a correct answer) exists on every row.
+    fn scored(c: &mut super::data::TaskCell) {
+        let n = c.ttfts_ms.as_ref().map_or(0, Vec::len);
+        c.timed_answers = false;
+        c.capped_answers = Some(0);
+        c.accuracy = Some(1.0);
+        c.task_right = Some(vec![Some(true); n]);
+        c.task_joules = Some(vec![Some(5.0); n]);
+        c.energy = Some(super::data::Energy {
+            soc_j: 5.0 * n as f64,
+            window_s: 60.0,
+            j_per_request: Some(5.0),
+            j_per_output_token: None,
+            j_per_right_answer: Some(5.0),
+        });
+    }
+
     /// A summary square against a cell most of whose requests failed has no ratio: it says why.
     #[test]
     fn a_summary_square_against_a_mostly_failed_cell_has_no_ratio() {
@@ -3212,6 +3230,7 @@ mod tests {
             for c in cells.iter_mut().filter(|c| c.workload == "rag") {
                 let n = c.ttfts_ms.as_ref().map_or(0, Vec::len);
                 c.prompt_tokens = Some(vec![Some(3200); n]);
+                scored(c);
             }
         }
         let machines = super::index(&runs);
@@ -3230,19 +3249,24 @@ mod tests {
         assert!(!html.contains("vs oMLX</strong>"), "no square has a ratio");
     }
 
-    /// The summary map's 2u and 4u rows are joules per correct answer: in a bucket, the joules its
-    /// requests took over how many were right, scratchy against its rival. A cell whose answers
-    /// were forced was not scored, so has none; a run that kept no joules a request reads each
-    /// cell's whole, and says so.
+    /// The summary map's 2u and 4u rows are E2E × J/right: in a bucket, the median end-to-end
+    /// time of its requests times the joules they took over how many were right, scratchy against
+    /// its rival. A cell whose answers were forced was not scored, so has none; a run that kept
+    /// no joules a request reads each cell's whole, and says so.
     #[test]
-    fn a_users_square_is_joules_per_correct_answer() {
-        // Every prompt in one bucket; every other answer right; scratchy's requests 5 J each,
-        // oMLX's 9: 10 J a right answer against 18, x1.80.
+    fn a_users_square_is_e2e_times_joules_per_correct_answer() {
+        // Every prompt in one bucket; every other answer right; scratchy's requests 5 J each over
+        // 1000 ms, oMLX's 9 J over 500 ms: 10 J a right answer x 1000 ms against 18 x 500, x0.90.
         let shape = |runs: &mut [Run], forced: bool, joules: bool| {
             let m = &mut runs[0].models[0];
-            for (cells, j) in [(m.tasks.as_mut(), 5.0), (m.tasks_omlx.as_mut(), 9.0)] {
+            for (cells, j, e2el) in [
+                (m.tasks.as_mut(), 5.0, 1000.0),
+                (m.tasks_omlx.as_mut(), 9.0, 500.0),
+            ] {
                 for c in cells.into_iter().flatten().filter(|c| c.workload == "rag") {
                     let n = c.ttfts_ms.as_ref().map_or(0, Vec::len);
+                    c.e2els_ms = Some(vec![Some(e2el); n]);
+                    c.median_e2el_ms = Some(e2el);
                     c.prompt_tokens = Some(vec![Some(3200); n]);
                     c.timed_answers = forced;
                     c.capped_answers = Some(0);
@@ -3263,30 +3287,33 @@ mod tests {
         };
         let mut runs = fixtures(&[REQUESTS_FIXTURE]);
         let html = shape(&mut runs, false, true);
-        assert!(html.contains("Joules per Correct Answer"));
+        assert!(html.contains("E2E × J/right"));
+        // The Raw Performance map beside it: the same squares, the time alone, 1000 ms against 500, x0.50.
         assert!(
-            !html.contains("End-to-end Latency · "),
-            "no end-to-end square in the map"
+            html.contains("End-to-end Latency · "),
+            "the Time map's end-to-end squares"
+        );
+        assert!(html.contains("×0.50 vs oMLX"), "1000 ms against 500");
+        assert!(
+            html.contains("×0.90 vs oMLX"),
+            "18 J a right answer x 500 ms against 10 x 1000"
         );
         assert!(
-            html.contains("×1.80 vs oMLX"),
-            "18 J a right answer against 10"
-        );
-        assert!(
-            html.contains("over 4 and 4 right answers"),
+            html.contains("; 4 and 4 right answers"),
             "2 users, 8 requests a side"
         );
         assert!(
-            html.contains("over 8 and 8 right answers"),
+            html.contains("; 8 and 8 right answers"),
             "4 users, 16 a side"
         );
         // Forced answers: not scored, no ratio.
         let html = shape(&mut runs, true, true);
         assert!(html.contains("answers forced to a length, so not scored"));
-        // No joules a request: each cell's whole, 36 J against 20, x1.80, and said so.
+        // No joules a request: each cell's whole, 36 J x 500 ms against 20 x 1000, x0.90, and
+        // said so.
         let html = shape(&mut runs, false, false);
         assert!(html.contains("each cell&#39;s whole: a side kept no joules a request"));
-        assert!(html.contains("×1.80 vs oMLX"));
+        assert!(html.contains("×0.90 vs oMLX"));
         // A cell the power log missed part of has no energy: no ratio, and its squares say why,
         // not that its run kept no joules a request.
         shape(&mut runs, false, true);
@@ -3306,7 +3333,7 @@ mod tests {
         }
         let machines = super::index(&runs);
         let html = render(super::datasets::section("rag", &machines, &machines));
-        assert!(html.contains("×1.80 vs oMLX"), "cut off, and still scored");
+        assert!(html.contains("×0.90 vs oMLX"), "cut off, and still scored");
     }
 
     /// A section reads each model's newest run that measured its dataset, the runs a newer one
@@ -3358,9 +3385,9 @@ mod tests {
         }
         let machines = super::index(&runs);
         let html = render(super::datasets::section("rag", &machines, &machines));
-        // The summary map: one model's squares, 4 rows by 4 buckets.
+        // The summary's first map, Performance-Efficiency: one model's squares, 4 rows by 4 buckets.
         let map = &html[..html
-            .find("id=\"rag-summary-scale\"")
+            .find("id=\"rag-summary-performance-efficiency-scale\"")
             .expect("the summary map")];
         assert_eq!(
             map.matches("width: 2.25rem; height: 2.25rem").count(),
@@ -3952,6 +3979,7 @@ mod tests {
                 for c in cells.iter_mut().filter(|c| c.workload == "rag") {
                     let n = c.ttfts_ms.as_ref().map_or(0, Vec::len);
                     c.prompt_tokens = Some(vec![Some(3200); n]);
+                    scored(c);
                 }
             }
         }
@@ -4064,14 +4092,22 @@ mod tests {
                         .collect(),
                 );
                 c.tpots_ms = Some(vec![Some(20.0); n]);
+                scored(c);
             }
         }
         let machines = super::index(&runs);
         let html = render(super::datasets::section("rag", &machines, &machines));
-        assert!(
-            html.contains("id=\"rag-summary-scale\""),
-            "its own ratio scale"
-        );
+        // A map a scale, Performance-Efficiency and Raw Performance, a tab each, each its own ratio scale.
+        for scale in ["performance-efficiency", "raw-performance"] {
+            assert!(
+                html.contains(&format!("id=\"rag-summary-{scale}-scale\"")),
+                "its own ratio scale: {scale}"
+            );
+            assert!(
+                html.contains(&format!("target=\"rag-summary-{scale}\"")),
+                "a switch to {scale}"
+            );
+        }
         // The rows the random-token map has, for this machine's users counts.
         for row in [">P<", ">D<", ">2u<", ">4u<"] {
             assert!(html.contains(row), "no {row} row");
@@ -4087,9 +4123,9 @@ mod tests {
             let label = b.0.replace('<', "&#60;");
             assert!(html.contains(&format!(">{label}<")), "no {} column", b.0);
         }
-        // Squares of the grid's size: 4 rows by 4 buckets for its one model.
+        // Squares of the grid's size: 4 rows by 4 buckets for its one model, in each of the two maps.
         let squares = html.matches("width: 2.25rem; height: 2.25rem").count();
-        assert_eq!(squares, 4 * 4);
+        assert_eq!(squares, 2 * 4 * 4);
         assert!(
             html.contains("vs oMLX</strong>"),
             "a ratio against its rival"
@@ -4120,6 +4156,7 @@ mod tests {
                 let n = c.ttfts_ms.as_ref().map_or(0, Vec::len);
                 c.prompt_tokens = Some(vec![Some(len); n]);
                 c.tpots_ms = Some(vec![Some(20.0); n]);
+                scored(c);
             }
         }
         let machines = super::index(&runs);
@@ -4136,6 +4173,7 @@ mod tests {
             if c.workload == "rag" {
                 c.prompt_tokens = Some(vec![Some(3200); n]);
                 c.tpots_ms = Some(vec![Some(20.0); n]);
+                scored(c);
             }
         }
         let omlx = m.tasks_omlx.iter_mut().flatten();
