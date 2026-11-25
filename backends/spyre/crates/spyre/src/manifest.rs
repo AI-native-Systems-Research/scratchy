@@ -405,35 +405,56 @@ pub fn attn_causal_mask_fill(mq: usize) -> Vec<f32> {
 /// form both classes take here; a proportional class whose rotated lanes paired
 /// at `rotated/2` would disagree with the body and rotate wrong lanes.
 pub fn rope_cos_sin_kind(pos: u32, kind: crate::wiring::RotaryKind) -> (Vec<f32>, Vec<f32>) {
-    let (hd, theta) = (kind.head_dim() as usize, kind.theta());
-    let half = hd / 2;
-    let mut cos = vec![0.0f32; hd];
-    let mut sin = vec![0.0f32; hd];
-    let rotated_pairs = match kind {
-        crate::wiring::RotaryKind::Default { .. } => half,
-        crate::wiring::RotaryKind::Proportional { rotated, .. } => (rotated / 2) as usize,
-    };
-    for i in 0..half {
-        if i < rotated_pairs {
-            // The exponent's denominator is the FULL hd — the Default class's
-            // own law at rotated == hd, and ProportionalRoPE's defining
-            // difference from ordinary partial rope.
-            let inv_freq = theta.powf(-(2.0 * i as f32) / hd as f32);
-            let ang = pos as f32 * inv_freq;
-            let (s, c) = ang.sin_cos();
+    RopeFreqs::of(kind).cos_sin(pos)
+}
+
+/// ⭐ A ROTARY CLASS'S FREQUENCIES, COMPUTED ONCE — `inv_freq[i] = θ^(-2i / head_dim)` for each of
+/// the class's rotated pairs ([`rope_cos_sin_kind`]'s law, which is `RopeFreqs::of(kind).cos_sin`):
+/// a host kernel laying a chunk's hundreds of rows pays the class's `powf`s once, then a `sin_cos`
+/// a pair a row — the same operations in the same order, so the same bits.
+pub struct RopeFreqs {
+    hd: usize,
+    /// One per ROTATED pair, ascending; pairs past it pass through.
+    inv_freq: Vec<f32>,
+}
+
+impl RopeFreqs {
+    pub fn of(kind: crate::wiring::RotaryKind) -> RopeFreqs {
+        let (hd, theta) = (kind.head_dim() as usize, kind.theta());
+        let half = hd / 2;
+        let rotated_pairs = match kind {
+            crate::wiring::RotaryKind::Default { .. } => half,
+            crate::wiring::RotaryKind::Proportional { rotated, .. } => (rotated / 2) as usize,
+        };
+        // The exponent's denominator is the FULL hd — the Default class's own law at rotated ==
+        // hd, and ProportionalRoPE's defining difference from ordinary partial rope.
+        let inv_freq = (0..rotated_pairs.min(half))
+            .map(|i| theta.powf(-(2.0 * i as f32) / hd as f32))
+            .collect();
+        RopeFreqs { hd, inv_freq }
+    }
+
+    /// The class's `(cos, sin)` rows at `pos` — each pair `(i, i + half)` holding one angle's.
+    pub fn cos_sin(&self, pos: u32) -> (Vec<f32>, Vec<f32>) {
+        let half = self.hd / 2;
+        let mut cos = vec![0.0f32; self.hd];
+        let mut sin = vec![0.0f32; self.hd];
+        for i in 0..half {
+            let (c, s) = match self.inv_freq.get(i) {
+                Some(&inv_freq) => {
+                    let (s, c) = (pos as f32 * inv_freq).sin_cos();
+                    (c, s)
+                }
+                // Pass-through: freq ∞ ⇒ angle 0 ⇒ identity.
+                None => (1.0, 0.0),
+            };
             cos[i] = c;
             sin[i] = s;
             cos[i + half] = c;
             sin[i + half] = s;
-        } else {
-            // Pass-through: freq ∞ ⇒ angle 0 ⇒ identity.
-            cos[i] = 1.0;
-            sin[i] = 0.0;
-            cos[i + half] = 1.0;
-            sin[i + half] = 0.0;
         }
+        (cos, sin)
     }
-    (cos, sin)
 }
 
 // ⛔ THE HOST ARGMAX IS DELETED, AND ITS DOC IS KEPT AS THE LAW IT PINNED: the
