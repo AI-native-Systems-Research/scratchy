@@ -1247,12 +1247,28 @@ pub fn assemble_expand_blocks<T: crate::collective::Tp>(
             }
         }
         ExpandSrcForm::PerStickColumn { record } => {
-            // ⛔ THE TRANSPOSING PER-STICK SCATTER — every address is the RECORD's own `dev_off`
-            // (source) or the contraction kernel frame's (destination), never a re-derived
-            // stride. Block `b`'s stick column `j` is `rows` sticks at
-            // `record.dev_off(b·rows + r, j·lanes)` — consecutive rows are consecutive sticks;
-            // the destination's block `b·group + g` is row-major, so its column-`j` sticks sit
-            // `cols/lanes` apart. One run a stick, at most one run a core.
+            // ⛔ THE PER-STICK SCATTER LANDS EACH BLOCK IN THE BYTES THE CONTRACTION READS — the
+            // block's own stick-major `[rows, cols]` (`StickLayout::row_blocked(rows, cols)`), the
+            // layout of a KV pool page (`PagedKvPool::addr`: a head's block is sticked on `hd`) and
+            // therefore exactly the bytes the CONTIGUOUS form hands the contraction verbatim. That
+            // form is the one proven on the card (granite, gemma-4's sliding class, every decode),
+            // so the contraction's kernel read is stick-major blocks.
+            //
+            // MEASURED (gemma-4-12b on the card): this scatter used to write a ROW-MAJOR block
+            // (`for_view_df(['x', in, out])`'s flat frame). Only gemma-4's GLOBAL class reaches this
+            // form (ONE kv head, so its page landing is one stick-blocked block), and only in the
+            // continuation-chunk program. Every global layer's Kᵀ and V reached the contraction
+            // transposed: a prompt past one page answered wrong, worse with every chunk.
+            //
+            // Block `b`'s stick column `j` is `rows` consecutive source sticks at
+            // `record.dev_off(b·rows + r, j·lanes)`, and destination block `b·group + g` holds the
+            // same column as `rows` consecutive sticks at `dst_block.dev_off(r, j·lanes)` past the
+            // block's base. Both pitches are one stick. One run a stick, at most one run a core.
+            let dst_block = crate::sdsc_abstract::StickLayout::row_blocked(
+                rows as usize,
+                cols as usize,
+            );
+            let block_elems = rows as usize * cols as usize;
             let columns = cols as usize / stick;
             let chunks = stick_runs_chunks(rows);
             ops.reserve(columns * group as usize * batch as usize * chunks.len());
@@ -1273,15 +1289,12 @@ pub fn assemble_expand_blocks<T: crate::collective::Tp>(
                                         runs: count,
                                         run_sticks: 1,
                                         src_pitch: 1,
-                                        dst_pitch: columns as u32,
+                                        dst_pitch: 1,
                                         src_elems: record
                                             .dev_off((b * rows + first) as usize, j * stick)
                                             as u32,
-                                        dst_elems: dst_kernel
-                                            .dev_off(
-                                                (b * group + g) as usize,
-                                                first as usize * cols as usize + j * stick,
-                                            )
+                                        dst_elems: ((b * group + g) as usize * block_elems
+                                            + dst_block.dev_off(first as usize, j * stick))
                                             as u32,
                                         df,
                                     },
@@ -3447,10 +3460,13 @@ mod expand_blocks_tests {
     /// sources): the producer declared the source `RowBlocked [512, 128]` — 8 kv heads'
     /// `[64, 128]` blocks, stick-column-major — and the expansion lays it for 2 query heads a
     /// group BY THE RECORD'S OWN `dev_off`: block `b`'s stick column `j` is 64 consecutive
-    /// source sticks at `dev_off(b·64 + r, j·64)`, written to the row-major destination block
-    /// `b·2 + g` at `(first + r)·2 + j` sticks in — the transposing per-stick scatter, every
-    /// address the record's own (source) or the contraction kernel frame's (destination,
-    /// `for_view_df` over `['x','in','out']`), never a re-derived stride.
+    /// source sticks at `dev_off(b·64 + r, j·64)`, written to destination block `b·2 + g` as 64
+    /// consecutive sticks in the block's own stick-major `[64, 128]` — the bytes the contraction
+    /// reads (a KV page's layout, what the contiguous form copies verbatim).
+    ///
+    /// ⛔ THIS TEST USED TO PIN A ROW-MAJOR DESTINATION, and that was the gemma-4-12b card defect
+    /// (every global layer's Kᵀ/V transposed into the contraction): the expectation is corrected
+    /// to the bytes the card reads, not weakened.
     #[test]
     fn a_stick_blocked_source_copies_by_the_arrangements_own_dev_off() {
         use crate::sdsc_abstract::StickLayout;
@@ -3459,9 +3475,8 @@ mod expand_blocks_tests {
         let record = StickLayout::row_blocked(512, 128);
         l.declare_arrangement(&src, record)
             .expect("the producer's stick-major [512, 128]");
-        // The contraction's own kernel frame — the same classifier its kernel arg goes through.
-        let dst_kernel =
-            StickLayout::for_view_df(&[16, 64, 128], 2, Df::Fp16);
+        // Each destination block's own stick-major frame.
+        let dst_block = StickLayout::row_blocked(64, 128);
         let mut sym = 0i64;
         let ops = assemble_expand_blocks::<crate::collective::TpWorld<1>>(
             "expand_o2",
@@ -3498,8 +3513,9 @@ mod expand_blocks_tests {
                 );
                 assert_eq!(
                     output[r],
-                    (r * 256) as u64,
-                    "core {r} writes run {r} at the destination's column stride (2 sticks)"
+                    (r * 128) as u64,
+                    "core {r} writes run {r}'s stick — consecutive rows of the destination \
+                     block's stick column are consecutive sticks"
                 );
             }
             assert_eq!(
@@ -3510,10 +3526,58 @@ mod expand_blocks_tests {
             );
             assert_eq!(
                 out_base - out0,
-                (dst_kernel.dev_off(b * 2 + g, first * 128 + j * 64) * 2) as u64,
+                (((b * 2 + g) * 64 * 128 + dst_block.dev_off(first, j * 64)) * 2) as u64,
                 "query head {}'s block, row chunk {k}, column {j}: the destination base IS \
-                 the contraction kernel frame's own dev_off",
+                 the block's own stick-major dev_off",
                 b * 2 + g
+            );
+        }
+    }
+
+    /// ⭐⭐⭐ GEMMA-4-12B's GLOBAL CLASS — ONE kv head of hd 512, a 16-query group: the page landing
+    /// is one stick-blocked `[128, 512]` block, so the expansion takes the per-stick form, and every
+    /// query head's block must be the KV page's bytes VERBATIM (what the contiguous form hands the
+    /// contraction for every other geometry, the bytes the card's contraction reads). Each copy
+    /// moves a source stick to the SAME offset inside query head `g`'s block. A row-major
+    /// destination (the card defect: prompts past one page answering wrong) breaks it at every
+    /// stick column past the first.
+    #[test]
+    fn one_kv_heads_block_is_copied_verbatim_into_every_query_heads_block() {
+        use crate::sdsc_abstract::StickLayout;
+        let (rows, cols, group) = (128u32, 512u32, 16u32);
+        let l = declared(rows, cols, rows * group, cols);
+        let (src, dst) = (crate::place::act_name(1), crate::place::act_name(2));
+        l.declare_arrangement(
+            &src,
+            StickLayout::row_blocked(rows as usize, cols as usize),
+        )
+        .expect("the one-block page landing, stick-major [128, 512]");
+        let mut sym = 0i64;
+        let ops = assemble_expand_blocks::<crate::collective::TpWorld<1>>(
+            "expand_o2",
+            &src,
+            &dst,
+            ExpandedBlocks::of(1, group, rows, cols, rows, cols).expect("the expansion builds"),
+            &mut sym,
+            Some(&l),
+        )
+        .expect("the one-block source copies");
+        let block_bytes = u64::from(rows * cols) * 2;
+        let ((_, in0), (_, out0)) = op_starts(&ops[0]);
+        for (idx, op) in ops.iter().enumerate() {
+            let g = idx as u64 / (ops.len() as u64 / u64::from(group));
+            let ((input, in_base), (output, out_base)) = op_starts(op);
+            assert_eq!(
+                input, output,
+                "{}: every core's run lands at its own offset — a one-stick-pitch copy",
+                op.op_name
+            );
+            assert_eq!(
+                out_base - out0 - g * block_bytes,
+                in_base - in0,
+                "{}: the source stick lands at the same offset inside query head {g}'s block — \
+                 the verbatim copy",
+                op.op_name
             );
         }
     }
