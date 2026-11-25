@@ -121,6 +121,10 @@ struct Untiled {
     /// wall for both producers. `None` for the dense contraction (store drains the matmul
     /// directly), which keeps every dense program byte-identical to what this pass emitted
     /// before the field existed.
+    ///
+    /// The SSA held is the LOADED `[1, n]` scale row the mulf's scale side comes from (through any
+    /// collapse/broadcast) — what a tiled ROW (`m > 1`, one row per program) scales its own
+    /// `[1, n]` product by.
     scale: Option<Ssa>,
     /// The matmul's own result SSA — the operand the surviving scaled epilogue's
     /// mulf must be re-pointed from, onto the nest's result.
@@ -168,7 +172,9 @@ fn recognize(func: &IRFunction<'_>) -> Vec<Untiled> {
     // result's shape) before the mulf sees it. Unwrap both — MEASURED on
     // granite-3.1-2b-fp8's `matmul_s*` functions, where the chain is
     // `mulf ← broadcast ← collapse ← load(access_tile(view))`.
-    let through_scale = |v: Ssa| -> Option<Vec<i64>> {
+    // Yields the loaded `[1, n]` row's own SSA beside its tile's dims — the per-row epilogue of a
+    // tiled `m > 1` contraction scales by that row directly (see `Untiled::scale_row`).
+    let through_scale = |v: Ssa| -> Option<(Ssa, Vec<i64>)> {
         let mut v = v;
         for _ in 0..4 {
             let (_, op) = def.get(&v)?;
@@ -181,7 +187,7 @@ fn recognize(func: &IRFunction<'_>) -> Vec<Untiled> {
                     if acc.op_type != OpKind::KtdpConstructAccessTile {
                         return None;
                     }
-                    return shape_of(acc);
+                    return Some((v, shape_of(acc)?));
                 }
                 _ => return None,
             }
@@ -250,7 +256,7 @@ fn recognize(func: &IRFunction<'_>) -> Vec<Untiled> {
                     // every fp8 producer's wscale read states (the builder's
                     // `tile(scale_view, 0, 0, 1, n)`; the ladder's ws descriptor `[1, N]`),
                     // possibly through collapse/broadcast (see `through_scale`).
-                    let Some(s_dims) = through_scale(other) else {
+                    let Some((_, s_dims)) = through_scale(other) else {
                         continue;
                     };
                     // Rank 2, one row, whose width must equal the contraction's n
@@ -299,16 +305,13 @@ fn recognize(func: &IRFunction<'_>) -> Vec<Untiled> {
         // `[1, n]` row against the `[m, n]` result, so a loaded `[1, x]` row with
         // x != n is a DIFFERENT epilogue — it disqualifies the node rather than
         // misbroadcasting.
-        if let Some(scale_ssa) = scale {
-            let s_dims = through_scale(scale_ssa);
-            if s_dims
-                .as_deref()
-                .map(|d| d.len() != 2 || d[0] != 1 || d[1] != n)
-                != Some(false)
-            {
-                continue;
-            }
-        }
+        let scale = match scale {
+            None => None,
+            Some(scale_ssa) => match through_scale(scale_ssa) {
+                Some((row, d)) if d.len() == 2 && d[0] == 1 && d[1] == n => Some(row),
+                _ => continue,
+            },
+        };
         let elem = op.result_type.and_then(|t| t.elem()).unwrap_or(DType::F16);
         // ⛔ THE SCALED FORM NEEDS ONE N-BLOCK. The rewrite replaces only the matmul
         // with the K-loop nest and leaves the surviving `arith.mulf(result, scale)`
@@ -578,7 +581,61 @@ fn tile_func<'a>(a: &'a Arena, func: &mut IRFunction<'a>) -> usize {
         // `[m, n]` contraction the mulf scales). The wscale load chain therefore
         // keeps its consumer through `dce`, which is what keeps the wscale
         // tensor's shape derivable downstream.
-        if let Some(_scale) = p.scale {
+        if let Some(scale_row) = p.scale
+            && p.m > 1
+        {
+            // ⛔ AT `m > 1` THE NEST IS ONE ROW PER PROGRAM, so the untiled epilogue cannot
+            // survive. The grid is `(m, 1, 1)` and each program contracts the ONE row at
+            // `row_idx`: its result is `[1, n]`, not the whole `[m, n]`. Re-pointing the
+            // original `mulf(matmul, broadcast(scale)) → store([m, n] at (0, 0))` at that
+            // result writes every program's single row across ALL m rows, and the last program
+            // wins. MEASURED on the gemma-4-12b fp8 gate (m=31): every o_proj output row was row
+            // 30's product at row 30's e4m3 scale. So the epilogue is rebuilt per row, the dense
+            // form's own law (its store tile is `(row_idx, n_off)`): a `[1, n]` mulf of this row's
+            // product by the loaded `[1, n]` scale row, stored at `(row_idx, 0)`. The original
+            // mulf, its broadcast and its whole-tile store are dropped, and `dce` takes their
+            // dead feeders.
+            let nest_result = nest_result.expect("the scaled form takes one N-block");
+            let out_elem = ops
+                .iter()
+                .find(|o| o.op_type == OpKind::ArithMulf && o.operands.contains(&p.matmul_res))
+                .and_then(|o| o.result_type)
+                .and_then(|t| t.elem())
+                .unwrap_or(elem);
+            let row_dims = vec![1, p.n];
+            let (zero, st_acc, scaled) = (g.mint(), g.mint(), g.mint());
+            let mut ts = Operation::new(
+                a,
+                Some(st_acc),
+                OpKind::KtdpConstructAccessTile,
+                &[p.out_view, row_idx, zero],
+            )
+            .with_attr(a, AttrKey::Shape, Attr::IntList(a.ints(row_dims.clone())));
+            ts.result_type = Some(IrType::AccessTile {
+                dims: a.ints(row_dims.clone()),
+            });
+            let mut mulf = Operation::new(
+                a,
+                Some(scaled),
+                OpKind::ArithMulf,
+                &[nest_result, scale_row],
+            )
+            .with_attr(a, AttrKey::Shape, Attr::IntList(a.ints(row_dims.clone())));
+            mulf.result_type = Some(IrType::Tensor {
+                dims: a.ints(row_dims),
+                elem: out_elem,
+            });
+            let row_epilogue = vec![
+                const_index(a, zero, 0),
+                ts,
+                mulf,
+                Operation::new(a, None, OpKind::KtdpStore, &[scaled, st_acc]),
+            ];
+            // The store sits after the matmul (it drains the mulf the matmul feeds), so it is
+            // replaced first and the matmul's index stays valid for the nest's splice.
+            ops.splice(store_at..=store_at, row_epilogue);
+            ops.splice(at..=at, pre);
+        } else if p.scale.is_some() {
             let matmul_res = p.matmul_res;
             let nest_result = nest_result.expect("the scaled form takes one N-block");
             let mulf_at = ops
@@ -864,6 +921,62 @@ mod tests {
                 "the fp8 store must drain the scaled value"
             );
         }
+    }
+
+    /// ⛔⛔ AT `m > 1` THE SCALED FORM STORES ITS OWN ROW, NEVER THE WHOLE `[m, n]` WINDOW. The
+    /// grid is one row per program, so each program's product is `[1, n]`. The surviving
+    /// whole-window store wrote every program's row across all m rows, and the last program won:
+    /// the gemma-4-12b fp8 gate (m=31) saw every o_proj output row equal to row 30's. Pinned here:
+    /// - exactly one store, of a `[1, n]` tile whose row corner IS the program's compute-tile id;
+    /// - that store drains a `[1, n]` mulf of the nest's own result by the loaded `[1, n]` scale
+    ///   row;
+    /// - no `[m, n]` store or mulf survives.
+    #[test]
+    fn a_scaled_contraction_past_one_row_stores_each_programs_own_row() {
+        let (m, n) = (31, 96);
+        let mut f = contraction(m, n, 128, true, n);
+        assert_eq!(tile_func(Arena::global(), &mut f), 1);
+        assert_eq!(f.grid, (m as usize, 1, 1), "m rows across the grid");
+        let def = |s: Ssa| f.operations.iter().find(|o| o.result == Some(s));
+        let row_dims = Attr::IntList(Arena::global().ints(vec![1, n]));
+        let pid = f
+            .operations
+            .iter()
+            .find(|o| o.op_type == OpKind::KtdpGetComputeTileId)
+            .and_then(|o| o.result)
+            .expect("the m > 1 form reads its row off the compute-tile id");
+        let stores: Vec<_> = f
+            .operations
+            .iter()
+            .filter(|o| o.op_type == OpKind::KtdpStore)
+            .collect();
+        assert_eq!(stores.len(), 1, "one store: this program's own row");
+        let (val, tile) = (stores[0].operands[0], stores[0].operands[1]);
+        let tile = def(tile).expect("the store's tile is constructed here");
+        assert_eq!(tile.op_type, OpKind::KtdpConstructAccessTile);
+        assert_eq!(tile.attr(AttrKey::Shape), Some(&row_dims), "a [1, n] store tile");
+        assert_eq!(tile.operands[1], pid, "its row corner is the program's own row");
+        let mulf = def(val).expect("the store drains a value defined here");
+        assert_eq!(mulf.op_type, OpKind::ArithMulf, "the store drains the dequant");
+        assert_eq!(mulf.attr(AttrKey::Shape), Some(&row_dims), "a [1, n] dequant");
+        let [prod, scale] = [mulf.operands[0], mulf.operands[1]];
+        assert!(
+            def(prod).is_some_and(|o| o.op_type == OpKind::ScfFor),
+            "the dequant scales the nest's own result"
+        );
+        assert!(
+            def(scale).is_some_and(|o| o.op_type == OpKind::KtdpLoad
+                && o.attr(AttrKey::Shape) == Some(&row_dims)),
+            "by the loaded [1, n] scale row"
+        );
+        let whole = Attr::IntList(Arena::global().ints(vec![m, n]));
+        assert!(
+            !f.operations.iter().any(|o| matches!(
+                o.op_type,
+                OpKind::ArithMulf | OpKind::KtdpStore
+            ) && o.attr(AttrKey::Shape) == Some(&whole)),
+            "no whole-window [m, n] mulf survives"
+        );
     }
 
     /// ⛔ The N-block budget is a BYTE budget. The gemma-4-12b fp8 prefill (m=31, n=15360)
