@@ -1090,6 +1090,11 @@ fn summary_map(
         for (r, row) in rows.iter().enumerate() {
             for (k, &column) in grid.columns.iter().enumerate() {
                 let p = pair(chip, column);
+                // A column this Mac shows no model in has no square, as on the random-token map:
+                // not a "not run" square for a class whose lineup model it never ran.
+                if p.is_none() {
+                    continue;
+                }
                 for (b, &(bucket, _)) in bs.iter().enumerate() {
                     let got = ratio(p.as_ref(), row, b);
                     // How many requests each side's median is over, or right answers its joules a

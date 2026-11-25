@@ -3361,6 +3361,51 @@ mod tests {
         assert!(rag.contains("gpt-oss-20b on Apple M3 Pro"));
     }
 
+    /// A Mac whose newest run's model is outside the newest lineup leaves the summary map's columns
+    /// the lineup's classes: that model is not shown, and no square stands for it. (Before, one
+    /// such model — the M4 Max's granite-4.2-3b once the lineup's Dense model became qwen2.5-3b —
+    /// turned every column into a model's name.)
+    #[test]
+    fn a_model_outside_the_newest_lineup_keeps_the_summary_columns_classes() {
+        let mut runs = fixtures(&[REQUESTS_FIXTURE, REQUESTS_FIXTURE]);
+        // The older Mac also ran the Dense model of its own lineup, granite-4.2-3b.
+        let mut granite = fixtures(&[REQUESTS_FIXTURE]).remove(0).models.remove(0);
+        granite.stem = "granite-4.2-3b".into();
+        runs[0].models.push(granite);
+        // A newer run on another Mac, whose lineup's Dense model is another one.
+        runs[1].generated_utc =
+            serde_json::from_value(serde_json::json!("2026-11-20T00:00:00Z")).unwrap();
+        runs[1].machine.chip = serde_json::from_value(serde_json::json!("Apple M5 Max")).unwrap();
+        for c in runs[1].config.classes.iter_mut().flatten() {
+            if c.class == "Dense" {
+                c.small = "qwen2.5-3b".into();
+            }
+        }
+        for m in runs.iter_mut().flat_map(|r| r.models.iter_mut()) {
+            for cells in [m.tasks.as_mut(), m.tasks_omlx.as_mut()]
+                .into_iter()
+                .flatten()
+            {
+                for c in cells.iter_mut().filter(|c| c.workload == "rag") {
+                    let n = c.ttfts_ms.as_ref().map_or(0, Vec::len);
+                    c.prompt_tokens = Some(vec![Some(2700); n]);
+                }
+            }
+        }
+        let machines = super::index(&runs);
+        let html = render(super::datasets::section("rag", &machines, &machines));
+        let map = &html[..html
+            .find("id=\"rag-summary-performance-efficiency-scale\"")
+            .expect("the summary map")];
+        assert!(map.contains(">Sliding window<"), "the class, as a column");
+        assert!(!map.contains(">granite-4.2-3b<"), "not a column of its own");
+        assert!(!map.contains("granite-4.2-3b on "), "and no square for it");
+        assert!(
+            !map.contains(">Dense<"),
+            "no Mac ran the lineup's Dense model: no column"
+        );
+    }
+
     /// A Mac that ran both sets shows its class's one model on the summary map, the small set's
     /// as the random-token map does, and the class names only that model: not the large one
     /// it also ran, whose numbers are in its own tab.
