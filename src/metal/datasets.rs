@@ -346,8 +346,8 @@ fn dataset_summary(
     }
 }
 
-/// The summary map's columns: the lineup's classes, each machine's model in a class its tile, when
-/// the runs record a lineup and it covers every model shown; else one column a model shown.
+/// The summary map's columns: the lineup's classes, each machine's model in a class its tile, as
+/// the random-token map has them, when the runs record a lineup; else one column a model shown.
 struct SummaryGrid<'a> {
     columns: Vec<&'a str>,
     cells: Vec<(&'a str, &'a str, &'a str)>,
@@ -377,41 +377,38 @@ fn summary_grid<'a>(
     ran: &[(&'a str, Vec<&'a str>)],
     machines: &'a BTreeMap<&str, MachineRuns<'a>>,
 ) -> SummaryGrid<'a> {
-    let lineup = lineup(machines);
-    let classes = lineup.as_ref().map(|l| l.classes).unwrap_or_default();
-    let class_of = |stem: &str| {
-        (classes.iter())
-            .find(|c| c.small == stem || c.large == stem)
-            .map(|c| c.class.as_str())
-    };
-    // The model a Mac shows in a class, as the random-token map has it ([`Lineup::model`]): one,
-    // the small set's where every Mac runs it, though a Mac that ran both sets measured both.
-    let shows = |chip: &str, stem: &str| {
-        let memory = machines[chip].runs[machines[chip].runs.len() - 1]
-            .machine
-            .memory_gb;
-        match (lineup.as_ref(), class_of(stem)) {
-            (Some(l), Some(class)) => l.model(class, memory) == Some(stem),
-            _ => true,
-        }
-    };
-    let all_classed = ran
-        .iter()
-        .all(|(_, stems)| stems.iter().all(|s| class_of(s).is_some()));
-    let mut columns: Vec<&str> = Vec::new();
+    // With a lineup, the columns are its classes, as the random-token map's are, and each Mac shows
+    // the model the lineup gives it in a class ([`Lineup::model`]): a Mac that did not run that
+    // model has no square there, and a model outside the lineup is not shown. Without one, a
+    // column a model shown.
     let mut cells = Vec::new();
-    for (chip, stems) in ran {
-        for &stem in stems.iter().filter(|s| !all_classed || shows(chip, s)) {
-            let column = match all_classed {
-                true => class_of(stem).unwrap_or(stem),
-                false => stem,
-            };
-            if !columns.contains(&column) {
-                columns.push(column);
+    let Some(l) = lineup(machines) else {
+        let mut columns: Vec<&str> = Vec::new();
+        for (chip, stems) in ran {
+            for &stem in stems {
+                if !columns.contains(&stem) {
+                    columns.push(stem);
+                }
+                cells.push((*chip, stem, stem));
             }
-            cells.push((*chip, column, stem));
+        }
+        return SummaryGrid { columns, cells };
+    };
+    let classes: Vec<&'a str> = (l.classes.iter()).map(|c| c.class.as_str()).collect();
+    for (chip, stems) in ran {
+        let runs = &machines[chip].runs;
+        let memory = runs[runs.len() - 1].machine.memory_gb;
+        for &class in &classes {
+            let shown = l.model(class, memory);
+            if let Some(&stem) = stems.iter().find(|&&s| Some(s) == shown) {
+                cells.push((*chip, class, stem));
+            }
         }
     }
+    // A class no Mac shows on this dataset has no column.
+    let columns = (classes.into_iter())
+        .filter(|class| cells.iter().any(|&(_, k, _)| k == *class))
+        .collect();
     SummaryGrid { columns, cells }
 }
 
@@ -1093,6 +1090,11 @@ fn summary_map(
         for (r, row) in rows.iter().enumerate() {
             for (k, &column) in grid.columns.iter().enumerate() {
                 let p = pair(chip, column);
+                // A column this Mac shows no model in has no square, as on the random-token map:
+                // not a "not run" square for a class whose lineup model it never ran.
+                if p.is_none() {
+                    continue;
+                }
                 for (b, &(bucket, _)) in bs.iter().enumerate() {
                     let got = ratio(p.as_ref(), row, b);
                     // How many requests each side's median is over, or right answers its joules a
