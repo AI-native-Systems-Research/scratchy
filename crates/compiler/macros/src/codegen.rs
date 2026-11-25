@@ -9778,6 +9778,74 @@ mod fingerprint_tests {
     use super::*;
     use crate::fixtures::{arch_configs, config_of, dsl_of, fuf_of, fuf_of_ast, variant_of};
 
+    /// The shared lowering states an expert bank in the format the checkpoint stores it, with no
+    /// target's answer in it: a bf16 bank (Qwen3.6's `moe_block`, Gemma 4's SwitchGLU) lowers to
+    /// dense expert matmuls reading rows, pairs and the weight alone; an fp8 bank to fp8 ones and
+    /// an MLX-affine bank to affine ones, each binding its scale as operand 3. Read as anything
+    /// else, a bank's bytes would be taken for another format's.
+    #[test]
+    fn an_expert_bank_lowers_in_the_format_its_checkpoint_stores() {
+        use crate::to_wavefront::{KvPool, PrefixCapacity, lower_decode_to_wavefront};
+        use scratchy_subtile::lower::{ExpertQuant, ExpertWeight};
+        use scratchy_subtile::subtile_ir::SubOp;
+        let prefix = KvPool::at_context(PrefixCapacity::new(
+            std::num::NonZeroU32::new(8192).unwrap(),
+        ));
+        let affine = ExpertWeight::Affine(ExpertQuant::declared(64, 4));
+        for (arch, stem, mlx) in [
+            ("qwen3-5-moe", "qwen3.6-35b-a3b", "mlx-affine-b4-g64-qembed"),
+            ("gemma4-moe", "gemma-4-26b-a4b-it", "mlx-affine-b4-g64"),
+        ] {
+            let variant = |preset| {
+                variant_of(arch, stem, preset)
+                    .unwrap_or_else(|| panic!("{stem}: the declared {preset} preset was refused"))
+            };
+            for (model, want) in [
+                (config_of(arch, stem), (ExpertWeight::Dense, 3)),
+                (
+                    variant("fp8-dynamic-per-channel"),
+                    (ExpertWeight::Fp8Dynamic, 4),
+                ),
+                (variant(mlx), (affine, 4)),
+            ] {
+                let ast = crate::draft_capture::insert(&dsl_of(arch));
+                let (_, fuf, inferred) = crate::fixtures::inferred_fuf_of_ast(arch, &model, &ast);
+                let wp = crate::workload::WorkloadPoint {
+                    num_tokens: 1,
+                    sk_bucket: 256,
+                };
+                let bounds = bounds_for_wp(&model, wp, 1);
+                let facts = fill_canonical_params(
+                    &model,
+                    1,
+                    None,
+                    None,
+                    &KvCacheLayers::of(&fuf),
+                    None,
+                    crate::target::KvStore::Dense,
+                )
+                .0;
+                let bridge = crate::to_wavefront::BridgeModel {
+                    params: &model,
+                    facts: &facts,
+                };
+                let lowered =
+                    lower_decode_to_wavefront(&fuf, &inferred, &bounds, &bridge, prefix, 1)
+                        .unwrap_or_else(|e| panic!("{}: {e}", model.source_stem));
+                let banks: Vec<_> = (lowered.input.ops.iter())
+                    .filter_map(|o| match o.op {
+                        SubOp::ExpertMatmul { weight, .. } => Some((weight, o.inputs.len())),
+                        _ => None,
+                    })
+                    .collect();
+                assert!(!banks.is_empty(), "{}: no expert matmul", model.source_stem);
+                for bank in banks {
+                    assert_eq!(bank, want, "{}", model.source_stem);
+                }
+            }
+        }
+    }
+
     /// A shim's `load` delegates to its canonical's body — the affine
     /// bit-widths are baked into THAT body, and the shim's own accessor
     /// set is empty (a shim lowers no tape). So a rowless shim

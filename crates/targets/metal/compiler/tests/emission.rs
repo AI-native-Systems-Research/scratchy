@@ -99,3 +99,40 @@ fn metal_lowers_the_mlx_affine_and_nvfp4_presets_only() {
         assert_eq!(got, want, "{arch}: every base × every preset metal lowers");
     }
 }
+
+/// A MoE whose expert banks are the checkpoint's own bf16 tensors has no metal kernel: metal's
+/// expert kernels are affine-only. Each bucket is skipped — its tape bakes NO variants, so the
+/// pool refuses the model at load — rather than failing the build, whether the shared lowering
+/// refuses the bank or lowers it as dense and metal's own step lowering refuses it.
+#[test]
+fn a_dense_expert_bank_bakes_no_metal_variants() {
+    let root = root();
+    for (arch, stem) in [
+        ("gemma4-moe", "gemma-4-26b-a4b-it-parity-tiny"),
+        ("qwen3-5-moe", "qwen3.5-35b-a3b-parity-tiny"),
+    ] {
+        let dsl = root.join(format!("crates/models/arch/dsl/{arch}.py"));
+        let carrier = scratchy_forward_compiler_macro::parse_python_file(
+            &std::fs::read_to_string(dsl).unwrap(),
+        )
+        .expect("python parse");
+        let tokens = scratchy_forward_compiler_macro::compile_carrier(
+            carrier,
+            &root.join("crates/models/arch/configs").join(arch),
+            None,
+            &Scope::stems(&[(arch, stem)]).with_quants(Vec::<String>::new()),
+            &Metal,
+        )
+        .unwrap_or_else(|e| panic!("{stem}: {e}"));
+        let mut rendered = String::with_capacity(1 << 20);
+        scratchy_forward_compiler_macro::render_tokens(tokens, &mut rendered);
+        let tapes: Vec<&str> = (rendered.split("static METAL_TAPES_M").skip(1))
+            .map(|s| s.split(';').next().unwrap())
+            .collect();
+        assert!(!tapes.is_empty(), "{stem}: no bucket tape");
+        for tape in tapes {
+            let bare: String = tape.split_whitespace().collect();
+            assert!(bare.ends_with("=&[]"), "{stem}: a baked variant: {tape}");
+        }
+    }
+}

@@ -842,8 +842,16 @@ pub(crate) fn emit(cx: &ModelCx<'_>) -> ModelEmission {
                 BackboneLayout::Encoder => scratchy_subtile::sample_rows::ResultRows::Every,
             },
         };
-        let lowered = mc3::lower_canonical_classed(&l, &facts, mc, at, &mut metal_sources)
-            .unwrap_or_else(|e| panic!("[m2-flip] {stem} m={m}: {e}"));
+        // A bank metal's expert kernels do not take skips the canonical as the shared tape's
+        // `NoKernel` does above: the step records refuse before any source is interned.
+        let lowered = match mc3::lower_canonical_classed(&l, &facts, mc, at, &mut metal_sources) {
+            Ok(lowered) => lowered,
+            Err(e) if e.is_no_kernel() => {
+                eprintln!("[m2-eq] {stem} m={m} steps REFUSED: {e}");
+                continue;
+            }
+            Err(e) => panic!("[m2-flip] {stem} m={m}: {e}"),
+        };
         // The narrow band's shared bucket facts — the classed lowering proved the wide band
         // keeps every one of them (only the step tapes may differ).
         *ns_field = lowered.narrow.colours.get();

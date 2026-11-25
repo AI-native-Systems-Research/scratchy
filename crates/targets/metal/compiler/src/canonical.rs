@@ -416,6 +416,13 @@ pub enum CanonicalRefusal {
     },
 }
 
+impl CanonicalRefusal {
+    /// Whether metal has no kernel for the model ([`StepRefusal::is_no_kernel`]).
+    pub fn is_no_kernel(&self) -> bool {
+        matches!(self, Self::Steps(e) if e.is_no_kernel())
+    }
+}
+
 impl std::fmt::Display for CanonicalRefusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {

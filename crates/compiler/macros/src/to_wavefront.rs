@@ -38,7 +38,7 @@ use std::collections::{BTreeMap, HashMap};
 use scratchy_ir::model_facts::ModelFacts;
 use scratchy_subtile::handoff::{BundleTensor, Expansion, ExpansionId};
 use scratchy_subtile::lower::{
-    AffineInt4, ArchOp, ExpertQuant, GemmWeight, InputRef, LoweringInput, OpDesc,
+    AffineInt4, ArchOp, ExpertQuant, ExpertWeight, GemmWeight, InputRef, LoweringInput, OpDesc,
 };
 use scratchy_subtile::subtile_ir::{
     AttnMask, DraftConvStage, EwKind, ExpertBody, ExpertBundle, ExpertProj, GainConvention,
@@ -277,7 +277,7 @@ struct Experts {
     k: TopK,
     inter: u32,
     hidden: u32,
-    quant: ExpertQuant,
+    weight: ExpertWeight,
     bundle: ExpertBundle,
     body: ExpertBody,
     shared: SharedExpertBound,
@@ -318,7 +318,8 @@ impl<'a> Builder<'a> {
     /// summed by `scores`. Closes the expansion; returns the sum.
     ///
     /// `bank` resolves one projection's WEIGHT and SCALE sources — the two are separate
-    /// launch tensors (a bundle holds both), so the matmul binds them as operands 2 and 3.
+    /// launch tensors (a bundle holds both), so an affine or fp8 bank's matmul binds them as
+    /// operands 2 and 3. A dense bank has no scale: its matmul binds the weight alone, as operand 2.
     fn experts(
         &mut self,
         x: InputRef,
@@ -327,12 +328,12 @@ impl<'a> Builder<'a> {
         bank: &dyn Fn(ExpertProj) -> (InputRef, InputRef),
         e: Experts,
     ) -> usize {
-        let (k, quant, bundle) = (e.k, e.quant, e.bundle);
+        let (k, weight, bundle) = (e.k, e.weight, e.bundle);
         let matmul = |proj, n| SubOp::ExpertMatmul {
             proj,
             n,
             k,
-            quant,
+            weight,
             bundle,
         };
         let sort = SubOp::ExpertSort {
@@ -341,8 +342,12 @@ impl<'a> Builder<'a> {
             bundle,
         };
         let pairs = self.push_op(sort, vec![x, InputRef::Op(indices)]);
-        let rows =
-            |r: usize, w: InputRef, s: InputRef| vec![InputRef::Op(r), InputRef::Op(pairs), w, s];
+        let rows = |r: usize, w: InputRef, s: InputRef| match weight {
+            ExpertWeight::Affine(_) | ExpertWeight::Fp8Dynamic => {
+                vec![InputRef::Op(r), InputRef::Op(pairs), w, s]
+            }
+            ExpertWeight::Dense => vec![InputRef::Op(r), InputRef::Op(pairs), w],
+        };
         let act = match e.body {
             ExpertBody::Gated(act) => {
                 let (gw, gs) = bank(ExpertProj::Gate);
@@ -1563,15 +1568,23 @@ pub fn lower_decode_to_wavefront(
                     .get("routed_scaling_factor")
                     .map(|&f| f as f32)
                     .filter(|&f| f != 1.0);
-                let (group_size, bits) = match crate::weight_vocab::weight_storage_of(node) {
+                // The bank lowers in the format the checkpoint stores it; each target decides in
+                // its own lowering whether it has a kernel for that format.
+                let weight = match crate::weight_vocab::weight_storage_of(node) {
                     Some(crate::quantization::StorageFormat::Affine { group_size, bits }) => {
-                        (*group_size, *bits)
+                        ExpertWeight::Affine(ExpertQuant::declared(*group_size, *bits))
                     }
-                    _ => {
+                    Some(crate::quantization::StorageFormat::Fp8 { .. }) => {
+                        ExpertWeight::Fp8Dynamic
+                    }
+                    None | Some(crate::quantization::StorageFormat::Dense) => ExpertWeight::Dense,
+                    // A packed format with no expert lowering: read as dense, its bytes would be
+                    // taken for bf16.
+                    Some(_) => {
                         return Err(BridgeError::NoKernel {
                             tile,
-                            detail: "MoE without affine expert storage has no kernel \
-                                     (no expert kernel takes dense expert storage)",
+                            detail: "MoE expert storage is a packed format no expert \
+                                     lowering takes",
                         });
                     }
                 };
@@ -1621,14 +1634,14 @@ pub fn lower_decode_to_wavefront(
                     k,
                     inter: moe_inter,
                     hidden,
-                    quant: ExpertQuant::declared(group_size, bits),
+                    weight,
                     bundle,
                     body,
                     shared: SharedExpertBound(shared),
                 };
-                // The fused MoE bundle is ONE source (its affine scales resolve by tensor
-                // role at the target, not as separate operands), so both of a projection's
-                // weight operands bind it.
+                // The fused MoE bundle is ONE source (its affine or fp8 scales resolve by
+                // tensor role at the target, not as separate operands), so both of a
+                // projection's weight operands bind it.
                 let bank = &|_proj: ExpertProj| (w, w);
                 let idx = bx.experts(expert_x, indices, scores, bank, experts);
                 bx.produced.insert((tile.0, 0), Producer::Op(idx));
@@ -1857,13 +1870,16 @@ pub fn lower_decode_to_wavefront(
                     })? as u32;
                 // The EXPERT bundle's storage — the SECOND weight edge in
                 // DSL order (router first, switch_glu second); mixed-bit
-                // presets quantize the router differently. Falls back to
-                // (64, 4).
-                let (group_size, bits) = match ew.2 {
+                // presets quantize the router differently. The bank lowers in
+                // the format the checkpoint stores it; any other packed format
+                // keeps the (64, 4) affine fallback.
+                let weight = match ew.2 {
                     crate::quantization::StorageFormat::Affine { group_size, bits } => {
-                        (group_size, bits)
+                        ExpertWeight::Affine(ExpertQuant::declared(group_size, bits))
                     }
-                    _ => (64, 4),
+                    crate::quantization::StorageFormat::Fp8 { .. } => ExpertWeight::Fp8Dynamic,
+                    crate::quantization::StorageFormat::Dense => ExpertWeight::Dense,
+                    _ => ExpertWeight::Affine(ExpertQuant::declared(64, 4)),
                 };
                 // Routes off its own pre-norm of `router_in`: logits → top-k → scores at a
                 // `hidden^-0.5` temperature → softmax → × per-expert scale. GeGLU experts over
@@ -1883,15 +1899,20 @@ pub fn lower_decode_to_wavefront(
                 let w_src = |bx: &mut Builder, t: BundleTensor, out: u32, inp: u32| {
                     expert_src(bx, t, e_rows * out, inp)
                 };
-                let s_src = |bx: &mut Builder, t: BundleTensor, out: u32| {
-                    expert_src(bx, t, e_rows * out, 1)
+                // A dense bank binds no scale: its "scale" is its weight `w`, which a dense
+                // `ExpertMatmul` never reads as an operand.
+                let s_src = |bx: &mut Builder, t: BundleTensor, w: usize, out: u32| match weight {
+                    ExpertWeight::Dense => w,
+                    ExpertWeight::Affine(_) | ExpertWeight::Fp8Dynamic => {
+                        expert_src(bx, t, e_rows * out, 1)
+                    }
                 };
                 let gate_w = w_src(&mut bx, BundleTensor::ExpertGateW, moe_inter, hidden);
-                let gate_s = s_src(&mut bx, BundleTensor::ExpertGateS, moe_inter);
+                let gate_s = s_src(&mut bx, BundleTensor::ExpertGateS, gate_w, moe_inter);
                 let up_w = w_src(&mut bx, BundleTensor::ExpertUpW, moe_inter, hidden);
-                let up_s = s_src(&mut bx, BundleTensor::ExpertUpS, moe_inter);
+                let up_s = s_src(&mut bx, BundleTensor::ExpertUpS, up_w, moe_inter);
                 let down_w = w_src(&mut bx, BundleTensor::ExpertDownW, hidden, moe_inter);
-                let down_s = s_src(&mut bx, BundleTensor::ExpertDownS, hidden);
+                let down_s = s_src(&mut bx, BundleTensor::ExpertDownS, down_w, hidden);
                 bx.expand();
                 let norm = SubOp::RouterNorm { eps, router: gemma };
                 let xr = bx.push_op(norm, vec![router_in, InputRef::Ext(r_scale)]);
@@ -1913,7 +1934,7 @@ pub fn lower_decode_to_wavefront(
                     k,
                     inter: moe_inter,
                     hidden,
-                    quant: ExpertQuant::declared(group_size, bits),
+                    weight,
                     bundle: ExpertBundle::SwitchGlu,
                     body: ExpertBody::Gated(GatedAct::Gelu),
                     shared: SharedExpertBound(None),
@@ -2021,7 +2042,7 @@ pub fn lower_decode_to_wavefront(
                     k,
                     inter: moe_inter,
                     hidden,
-                    quant: ExpertQuant::declared(group_size, bits),
+                    weight: ExpertWeight::Affine(ExpertQuant::declared(group_size, bits)),
                     bundle: ExpertBundle::GptOss,
                     body: ExpertBody::Gated(GatedAct::SwigluOai),
                     shared: SharedExpertBound(None),
