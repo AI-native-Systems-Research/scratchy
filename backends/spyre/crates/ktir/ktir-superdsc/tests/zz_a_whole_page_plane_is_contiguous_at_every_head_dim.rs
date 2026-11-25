@@ -54,11 +54,12 @@ use std::num::NonZeroU32;
 /// `PagePlaneExtent::blocks` is `nkvh * POOL_PAGE_SLOTS / POOL_STICK` — 32 at nkvh=8, which is ALSO
 /// `CopyDims::ENTRIES_PER_OP` and ALSO `PageScratch::ENTRIES_PER_PASS_MAX`. Three unrelated quantities
 /// with one value, never separated by a test, and the one that moves is this axis.
-const NKVH_SWEEP: [usize; 4] = [4, 8, 16, 32];
+/// `1` is a shipped geometry: gemma-4's global attention class keeps ONE kv head.
+const NKVH_SWEEP: [usize; 5] = [1, 4, 8, 16, 32];
 
 /// And the head-dim sweep, which must include a dim where `hd != POOL_STICK` (the pin) and one where
-/// `nslab > 2` (the fold's slab loops).
-const HD_SWEEP: [usize; 3] = [64, 128, 256];
+/// `nslab > 2` (the fold's slab loops). `512` is a shipped geometry: gemma-4's global head.
+const HD_SWEEP: [usize; 4] = [64, 128, 256, 512];
 
 /// The test pool: head count and width as the raw fixture numbers, minted through the pool's
 /// own typed doors (nonzero, whole sticks) — the refusals live in the types, not the fixture.
@@ -94,9 +95,13 @@ fn plane_addrs(pool: &PagedKvPool, plane: KvPlane) -> Vec<u32> {
 /// CLAIM 1 + 2: all three planes tile `[0, nkvh*hd*POOL_PAGE_SLOTS)` exactly, at both head dims.
 #[test]
 fn a_whole_page_plane_is_a_hole_free_bijection_for_every_plane_at_both_head_dims() {
-    for hd in [64usize, 128] {
-        let pool = pool(8, hd);
-        let want = 8u64 * hd as u64 * PagedKvPool::POOL_PAGE_SLOTS.get() as u64;
+    for (nkvh, hd) in HD_SWEEP
+        .iter()
+        .map(|&hd| (8usize, hd))
+        .chain([(1usize, 512usize), (8, 256)])
+    {
+        let pool = pool(nkvh, hd);
+        let want = nkvh as u64 * hd as u64 * PagedKvPool::POOL_PAGE_SLOTS.get() as u64;
 
         let extent = PagePlaneExtent::of_pool(pool);
         assert_eq!(
