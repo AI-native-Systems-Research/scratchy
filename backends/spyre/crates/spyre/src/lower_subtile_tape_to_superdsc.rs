@@ -811,6 +811,17 @@ pub fn compute_bundle_layout<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     // never re-derived from graph rows (see [`bundle_registry`]'s own parameter note).
     query_rows: scratchy_triton_splice::GraphExtent,
 ) -> Result<BundleLayout, SuperDscError> {
+    // ⭐ THE GRAPH'S OWN TIDS SIT BELOW THE RESERVED HALF — the one place real tensors are placed
+    // beside the reserved regions, so the partition `reserved_tids::RESERVED_ID_HALF` states is
+    // proven here for the graph being baked.
+    if !ktir_superdsc::reserved_tids::real_tids_fit(ir.tensors.len()) {
+        return Err(SuperDscError(format!(
+            "the graph states {} tensors — its ids reach the reserved half of the tid space \
+             (RESERVED_ID_HALF = {}), where every reserved region lives",
+            ir.tensors.len(),
+            ktir_superdsc::reserved_tids::RESERVED_ID_HALF
+        )));
+    }
     // fp8 W8A8 weights (SEN143_FP8: 1-byte / 128-elem stick) are the graph's fp8 payloads
     // (`SubtileIR::fp8_weight_payloads`). Their device footprint is HALF the fp16 weight — this is
     // the unfakeable 1-byte-read proxy: it is what shrinks `seg_bytes[1]` (the weight segment). A
@@ -9451,27 +9462,11 @@ fn ktir_groups_via_superdsc<T: ktir_superdsc::collective::Tp>(
                 };
                 let in_act = l.placements.get(&tid).is_some_and(|p| p.segment == act);
                 // The sources a trip walks: one class's page table and mask stack — or a
-                // PACKED rung's, one per window of the class's family
-                // (`paged_window_of_class`; window 0 IS the class's own step tables, so the
-                // family states the solo case too) — or a decode batch's chunk page ids and
-                // chunk masks. Enumerated over the whole reserved class space: the guard is a
-                // fact of the reserved families, never of which classes one model states.
-                let mut walked = Vec::new();
-                for class in 0..ktir_superdsc::reserved_tids::PAGED_MAX_STEP_CLASSES as usize {
-                    let tids = scratchy_triton_splice::PagedStepTids::of_class(class);
-                    walked.extend([tids.chunk_pages, tids.chunk_masks]);
-                    for r in 0..ktir_superdsc::reserved_tids::PAGED_MAX_WINDOWS {
-                        for table in [
-                            scratchy_triton_splice::WindowTable::PageTable,
-                            scratchy_triton_splice::WindowTable::Mask,
-                        ] {
-                            walked.push(scratchy_triton_splice::paged_window_of_class(
-                                class, r, table,
-                            ));
-                        }
-                    }
-                }
-                if in_act && !walked.contains(&tid) {
+                // PACKED rung's, one per window of the class's family — or a decode batch's chunk
+                // page ids and chunk masks (`PagedStepTids::walked_sources`). The class is the
+                // tid's own, decoded from it, so the guard is a fact of the reserved families at
+                // every class a model can state, never of a class count.
+                if in_act && !scratchy_triton_splice::PagedStepTids::is_walked_source(tid) {
                     return Err(SuperDscError(format!(
                         "[spyre-superdsc] walk body op '{}' reads t{tid} from the activation \
                          segment, which its relaunch shifts one step per trip — only the step's \

@@ -633,13 +633,12 @@ pub const RESERVED_REGIONS: [TidRegion; Region::COUNT] = [
     // ⭐ THE PAGED STEP's CLASS REGION — the class-dependent tables of every attention class past
     // the first (class 0 keeps the `paged_step` sentinels; see [`PAGED_STEP_CLASS_BASE`]): the
     // seven step tables plus the per-window tables of every packed-prefill window past the first
-    // ([`paged_step_class_window_tid`]). 63 slots: four classes is twice the gemma-4 shape, and a
-    // model with more DISTINCT attention step geometries than that is a config error the region's
-    // own overflow assert turns into a bake refusal.
+    // ([`paged_step_class_window_tid`]). The LOWEST region, so it holds every whole class stride
+    // down to [`RESERVED_ID_HALF`]: the model's own class count, with no cap.
     TidRegion {
         name: Region::PagedStepClass,
         base: PAGED_STEP_CLASS_BASE,
-        slots: PAGED_STEP_CLASS_STRIDE * (PAGED_MAX_STEP_CLASSES - 1),
+        slots: PAGED_STEP_CLASS_STRIDE * PAGED_STEP_CLASS_STRIDES,
     },
 ];
 
@@ -810,10 +809,37 @@ pub const PAGED_STEP_CLASS_WINDOW_TABLES: u32 = 2;
 pub const PAGED_STEP_CLASS_STRIDE: u32 =
     PAGED_STEP_CLASS_TABLES + PAGED_STEP_CLASS_WINDOW_TABLES * (PAGED_MAX_WINDOWS - 1);
 
-/// The widest attention-class count the tids are reserved for. Four classes is twice the gemma-4
-/// shape, and a model with more DISTINCT attention step geometries than that is a config error the
-/// region's own overflow assert turns into a bake refusal, never a wrap onto another region's tids.
-pub const PAGED_MAX_STEP_CLASSES: u32 = 4;
+/// ⭐ THE RESERVED HALF OF THE TID SPACE — every reserved region lives at or above it, and a graph's
+/// own tensors index the space below it ([`real_tids_fit`]). This is a partition of the `u32` id
+/// space, not a count of any model's tensors or attention classes: the regions are proven inside
+/// the upper half at compile time ([`RESERVED_REGIONS_ARE_DISJOINT`]), and a bake proves its
+/// graph's tensor count below it, so a reserved tid and a real one can never coincide.
+pub const RESERVED_ID_HALF: u32 = 1 << 31;
+
+/// The class region's whole class strides — as many as fit from [`PAGED_STEP_CLASS_BASE`] down to
+/// [`RESERVED_ID_HALF`]. Every attention class a model states takes one stride, so the region holds
+/// the model's own class count, whatever it is: there is no class cap to size to any checkpoint.
+const PAGED_STEP_CLASS_STRIDES: u32 =
+    (PAGED_STEP_CLASS_BASE - RESERVED_ID_HALF + 1) / PAGED_STEP_CLASS_STRIDE;
+
+/// Does a graph of `tensors` real tensors fit below [`RESERVED_ID_HALF`]? Its ids are `0..tensors`,
+/// so it fits exactly while the count does. The bake asks this where it places the graph's tensors,
+/// so a real tid can never land on a reserved one.
+pub const fn real_tids_fit(tensors: usize) -> bool {
+    tensors <= RESERVED_ID_HALF as usize
+}
+
+/// The attention class (`>= 1`) whose slot `tid` is in the class region, or `None` for a tid outside
+/// it — [`paged_step_class_tid`]'s arithmetic, inverted: class `c`'s slots are
+/// `(c - 1)·STRIDE .. c·STRIDE`. A reader asking "is this tid one of some class's tables?" decodes
+/// the class here and asks that class, so it never enumerates classes it cannot bound.
+pub const fn paged_step_class_of(tid: u32) -> Option<u32> {
+    let r = Region::PagedStepClass.tids();
+    if tid > r.base || tid < r.floor() {
+        return None;
+    }
+    Some((r.base - tid) / PAGED_STEP_CLASS_STRIDE + 1)
+}
 
 /// Reserved tid for slot `idx` of the paged-step class region — the class-dependent step tables of
 /// the classes past the first (see [`PAGED_STEP_CLASS_BASE`] for the class law and the seven-table
@@ -830,11 +856,6 @@ pub const fn paged_step_class_tid(idx: u32) -> u32 {
 /// so the splice and the wiring's mask-family check read ONE law.
 pub const fn paged_step_class_window_tid(class: u32, window: u32, table: ClassWindowTable) -> u32 {
     assert!(class >= 1, "class 0's windows are the paged_window family");
-    assert!(
-        class < PAGED_MAX_STEP_CLASSES,
-        "an attention class past PAGED_MAX_STEP_CLASSES — the tape states more DISTINCT \
-         attention step geometries than the reserved tid space holds"
-    );
     assert!(window >= 1, "window 0 is the class's own step tables");
     assert!(window < PAGED_MAX_WINDOWS, "a packed rung asked for a window past PAGED_MAX_WINDOWS");
     paged_step_class_tid(
@@ -908,22 +929,20 @@ pub const PAGED_WINDOW_0_IS_THE_SENTINELS: () = {
     );
 };
 
-/// ⭐ THE CLASS REGION HOLDS ITS OWN WIDEST USE — the law the class family's overflow safety
-/// stands on. The last class's last window table is the region's floor, and nothing the tid mint
-/// admits lands below it, so a class or window past the constants' bounds is a call-site assert
-/// (a bake refusal by name), never a wrap onto another region's tids.
+/// ⭐ ONE CLASS'S TABLES FILL EXACTLY ITS OWN STRIDE — the law the class family's disjointness
+/// stands on. A class's last window table (the widest window's mask stack) is the last slot of its
+/// stride, so classes never overlap one another; the region holds whole strides down to
+/// [`RESERVED_ID_HALF`], and [`paged_step_class_of`] inverts the same arithmetic.
 pub const PAGED_STEP_CLASS_FAMILY_IS_BOUNDED: () = {
-    let r = Region::PagedStepClass.tids();
     assert!(
-        paged_step_class_window_tid(
-            PAGED_MAX_STEP_CLASSES - 1,
-            PAGED_MAX_WINDOWS - 1,
-            // The family's LAST table (the mask stack) — the highest slot the tid mint admits
-            // for a class window.
-            ClassWindowTable::Mask
-        ) == r.floor(),
-        "the last class's last window table is not the paged_step_class region's floor — the \
-         region does not hold every class window the tid mint admits"
+        paged_step_class_window_tid(1, PAGED_MAX_WINDOWS - 1, ClassWindowTable::Mask)
+            == paged_step_class_tid(PAGED_STEP_CLASS_STRIDE - 1),
+        "class 1's last window table is not the last slot of its stride — the class tables do not \
+         fill exactly one stride"
+    );
+    assert!(
+        PAGED_STEP_CLASS_STRIDES >= 1,
+        "the class region holds no class stride above the reserved half"
     );
 };
 
@@ -954,10 +973,14 @@ pub const RESERVED_REGIONS_ARE_DISJOINT: () = {
             );
             j += 1;
         }
-        // Regions descend, and none may run below the last one's floor into REAL tensor ids.
+        // Regions descend, and none may run below the reserved half into REAL tensor ids.
         assert!(
             RESERVED_REGIONS[i].floor() < RESERVED_REGIONS[i].base + 1,
             "a reserved region wrapped past zero",
+        );
+        assert!(
+            RESERVED_REGIONS[i].floor() >= RESERVED_ID_HALF,
+            "a reserved region runs below RESERVED_ID_HALF, into the graph's own tensor ids",
         );
         i += 1;
     }
