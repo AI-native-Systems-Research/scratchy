@@ -24,9 +24,10 @@ use scratchy_serving_worker::error::ExecutorResult;
 /// reads. One enum (not a bare `Vec<Vec<f32>>`) because the shape is a fact of the
 /// step the caller must not be able to confuse with the model's other outs.
 pub(crate) enum ChunkOut {
-    /// A prompt-only forward: no launch in it picked, nothing to sample. The first
-    /// generated token is picked by the DECODE launch that runs the prompt's last
-    /// token — never by a host readback.
+    /// A prompt-only forward: no launch in it picked, nothing to sample — a card's
+    /// middle prompt chunk, whose suffix never runs (`card::forward::Middle`). The
+    /// emulator's every chunk draws, so it has none.
+    #[cfg(feature = "spyre-hw")]
     Prompt,
     /// TOKENS THE DEVICE PICKED, one per launch this chunk ran that drew, in step
     /// order. The minted sampler's idx stick, read back raw — the only pick that
@@ -45,6 +46,7 @@ impl ChunkOut {
     pub(crate) fn minted_pick(&self) -> Option<&[u32]> {
         match self {
             ChunkOut::Tokens(ts) => Some(ts),
+            #[cfg(feature = "spyre-hw")]
             ChunkOut::Prompt => None,
         }
     }
@@ -124,13 +126,6 @@ pub(crate) struct Chunk<'a> {
 /// Pick the smallest decode rung that reaches `need` positions ([`BundleMeta::reach`]).
 /// `buckets` is ascending by reach and non-empty; if `need` exceeds every rung, return the
 /// largest so the caller's `forward_chunk` raises the precise over-capacity error.
-pub(crate) fn select_decode(buckets: &[BundleMeta], need: usize) -> &BundleMeta {
-    buckets
-        .iter()
-        .find(|b| b.reach() >= need)
-        .unwrap_or_else(|| buckets.last().expect("at least one decode bucket"))
-}
-
 /// Forward `n` positions from `start`, then greedily sample iff this completes
 /// the prompt or is a decode step. n==1 (generation) uses the cheap m=1 DECODE
 /// bundle; n>1 (prompt) uses the batched m=M PREFILL bundle (chunked by m_cap),
@@ -171,11 +166,11 @@ pub(crate) fn run_request_step(
     // chunks on the prefill rungs (each chunk on the smallest that reaches it, below); `b` is the
     // chunk width's source and the card's fixed meta.
     let b: &BundleMeta = if n == 1 {
-        select_decode(&model.decode, start + n)
+        model.decode.for_reach(start + n)
     } else if let Some(p) = model.prefill.first() {
         p
     } else {
-        select_decode(&model.decode, start + n)
+        model.decode.for_reach(start + n)
     };
     // ⭐ THE CARD'S PROMPT CHUNK LOOP CHUNKS FOR ITSELF, over its two ladders
     // (`superdsc_forward_chunk`), so a step's tokens go in one call.
@@ -218,12 +213,11 @@ pub(crate) fn run_request_step(
         #[cfg(not(feature = "spyre-hw"))]
         if b.m_cap > 1 && rung.is_none() {
             for one in chunk.chunks(1) {
-                let db = select_decode(&model.decode, pos + 1);
+                let db = model.decode.for_reach(pos + 1);
                 if let Some(ts) = forward_chunk(
                     &sh,
                     &mut model.session,
                     db,
-                    model.batched_prefill.as_ref(),
                     Chunk {
                         state: req,
                         id,
@@ -246,7 +240,6 @@ pub(crate) fn run_request_step(
             &sh,
             &mut model.session,
             b,
-            model.batched_prefill.as_ref(),
             Chunk {
                 state: req,
                 id,
@@ -275,12 +268,11 @@ pub(crate) fn run_request_step(
         // THE PICK — on the card, through the decode bundle's sampler. No host
         // logits, no host argmax, anywhere: the idx stick is the only answer that
         // comes back.
-        let db = select_decode(&model.decode, start + n);
+        let db = model.decode.for_reach(start + n);
         match forward_chunk(
             &sh,
             &mut model.session,
             db,
-            model.batched_prefill.as_ref(),
             Chunk {
                 state: req,
                 id,

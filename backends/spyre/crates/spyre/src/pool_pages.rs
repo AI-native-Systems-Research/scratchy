@@ -258,17 +258,18 @@ pub fn pools_page_bytes(pools: &[crate::wiring::KvPool]) -> PerPageBytes {
 ///   weight tail sits in its own non-resident segment, so it is its own.
 ///
 /// The per-page bytes are the pool's page ([`pools_page_bytes`]), paid by the owner alone because
-/// every borrower aliases its pool, plus this session's own row pool page
-/// ([`crate::wiring::KV_ROW_POOL_PAGE_BYTES`]) when its step reads one. That row pool's bytes sit
-/// inside its segment's extent and leave the fixed total to ride per page, charged one host page of
-/// cover past its bytes ([`crate::bundle_code::HOST_PAGE_BYTES`]). Two sessions' residencies add
-/// ([`impl Add`]) to what they cost together.
+/// every borrower aliases its pool, plus one row pool page
+/// ([`crate::wiring::KV_ROW_POOL_PAGE_BYTES`]) for EVERY attention class whose step reads one —
+/// each class's step has its own row pool. A row pool's bytes sit inside its segment's extent and
+/// leave the fixed total to ride per page, charged one host page of cover past its bytes
+/// ([`crate::bundle_code::HOST_PAGE_BYTES`]). Two sessions' residencies add ([`impl Add`]) to what
+/// they cost together.
 pub fn session_residency<'a>(
     role: SessionRole,
     ceiling: &BundleLayout,
     rungs: impl IntoIterator<Item = &'a BundleLayout>,
     pools: &[crate::wiring::KvPool],
-    step: Option<crate::wiring::PagedStep>,
+    steps: &[crate::wiring::PagedStep],
 ) -> Residency {
     let kv_seg = SegRole::Kv.segment();
     let extents = crate::lower_subtile_tape_to_superdsc::session_segment_bytes(
@@ -294,9 +295,7 @@ pub fn session_residency<'a>(
         SegmentHold::Allocated => pools_page_bytes(pools).get(),
         SegmentHold::Borrowed => 0,
     };
-    if let Some(step) = step
-        && step.reads_kv_row_pool()
-    {
+    for step in steps.iter().filter(|s| s.reads_kv_row_pool()) {
         // The row pool sits inside its segment's extent; charge its run per page instead, and its
         // region one host page past the run — the most its page cover can add as the run grows.
         fixed = fixed - step.card_kv_row_pool_bytes() + crate::bundle_code::HOST_PAGE_BYTES;
@@ -332,31 +331,25 @@ mod tests {
         .expect("the fixture's rows fit a u32")
     }
 
-    /// A step of `pages` pages at `rows` query rows — the reserved sentinels every real
-    /// wiring's step carries, one sequence's rows.
+    /// A step of `pages` pages at `rows` query rows — class 0, so the reserved sentinels every
+    /// real wiring's first class carries, one sequence's rows.
     fn step(pages: u32, rows: u32) -> crate::wiring::PagedStep {
-        let tids = scratchy_triton_splice::PagedStepTids::RESERVED;
         crate::wiring::PagedStep {
-            mask: tids.mask,
-            page_table: tids.page_table,
-            write_rows: tids.write_rows,
-            query_rows: tids.query_rows,
-            kv_row_pool: tids.kv_row_pool,
-            rep_rows: tids.rep_rows,
-            chunk_pages: tids.chunk_pages,
-            chunk_masks: tids.chunk_masks,
-            int32_zero: tids.int32_zero,
-            pages,
+            view: crate::wiring::ContextPages::new(nz32(pages)),
+            pages: PoolPages::of_nonzero(nz32(pages)),
             page_slots: SchedulerBlockTokens::REFERENCE.get(),
-            rows,
-            nkvh: 8,
-            q_width: 32 * 64,
-            head_size: 64,
-            walk: pages,
+            heads: crate::wiring::HeadGeometry::new(
+                crate::wiring::QueryHeads::new(32),
+                crate::wiring::KvHeads::new(8),
+                crate::wiring::HeadDim::new(64),
+                crate::wiring::RotDim::new(64),
+                crate::wiring::BlockSize::new(16),
+            ),
+            walk: crate::paged_step::WalkBlocks::new(nz32(pages)),
             paged_rows: crate::paged_step::PagedRows::Sequence,
             extent: pair(rows, 1),
             window: None,
-            class: 0,
+            class: crate::wiring::AttnClass::FIRST,
         }
     }
 
@@ -506,7 +499,7 @@ mod tests {
             &layout,
             [],
             &[fp16(512), fp16(512)],
-            Some(step(2, 1)),
+            &[step(2, 1)],
         );
         let unread = a(8192) + a(200) + a(400) + 3 * a(0);
         assert_eq!(reading.fixed().get(), unread - 2 * run + grow);
@@ -516,7 +509,7 @@ mod tests {
             &layout,
             [],
             &[fp16(512), fp16(512)],
-            Some(step(2, 2)),
+            &[step(2, 2)],
         );
         assert_eq!(not_reading.fixed().get(), unread);
         assert_eq!(not_reading.page().get(), 2 * fp16(512).page_bytes());
@@ -525,7 +518,7 @@ mod tests {
             &layout,
             [],
             &[fp16(512), fp16(512)],
-            None,
+            &[],
         );
         assert_eq!(no_step.fixed(), not_reading.fixed());
         assert_eq!(no_step.page(), not_reading.page());
@@ -541,14 +534,14 @@ mod tests {
             ..BundleLayout::default()
         };
         assert_eq!(
-            session_residency(SessionRole::Owner, &layout, [], &[fp16(512)], None)
+            session_residency(SessionRole::Owner, &layout, [], &[fp16(512)], &[])
                 .fixed()
                 .get(),
             a(8192) + a(200) + a(400) + 3 * a(0)
         );
         layout.synth(ktir_superdsc::place::SynthId::Act(900), &[4, 64]);
         assert_eq!(layout.segment_extents(), [8704, 200, 3072, 400, 0, 0, 0]);
-        let reading = session_residency(SessionRole::Owner, &layout, [], &[fp16(512)], None);
+        let reading = session_residency(SessionRole::Owner, &layout, [], &[fp16(512)], &[]);
         assert_eq!(reading.fixed().get(), a(8704) + a(200) + a(400) + 3 * a(0));
         assert_eq!(reading.page().get(), fp16(512).page_bytes());
     }
@@ -565,7 +558,7 @@ mod tests {
             segment_bytes: [12288, 200, 3072, 300, 0, 0, 4096],
             ..BundleLayout::default()
         };
-        let r = session_residency(SessionRole::Owner, &ceiling, [&rung], &[fp16(512)], None);
+        let r = session_residency(SessionRole::Owner, &ceiling, [&rung], &[fp16(512)], &[]);
         assert_eq!(
             r.fixed().get(),
             a(12288) + a(200) + a(400) + a(0) + a(0) + a(4096)
@@ -592,9 +585,9 @@ mod tests {
         };
         let (owner, reader, batch) = (layout(8192, 0), layout(16384, 4096), layout(12288, 0));
         let cols = [fp16(512), fp16(512)];
-        let o = session_residency(SessionRole::Owner, &owner, [], &cols, Some(step(2, 1)));
-        let r = session_residency(SessionRole::Borrower, &reader, [], &cols, Some(step(2, 1)));
-        let b = session_residency(SessionRole::Borrower, &batch, [], &cols, Some(step(2, 2)));
+        let o = session_residency(SessionRole::Owner, &owner, [], &cols, &[step(2, 1)]);
+        let r = session_residency(SessionRole::Borrower, &reader, [], &cols, &[step(2, 1)]);
+        let b = session_residency(SessionRole::Borrower, &batch, [], &cols, &[step(2, 2)]);
         assert_eq!(
             o.fixed().get(),
             a(8192) + a(weights) + a(400) + a(256) + a(256) + a(0) + a(bank) - 2 * run + grow
@@ -642,7 +635,7 @@ mod tests {
             &layout,
             [],
             &[fp16(512), fp16(512)],
-            None,
+            &[],
         );
         let pool = of_bake(residency, context);
         if cfg!(feature = "spyre-lower") {
@@ -664,7 +657,7 @@ mod tests {
             &layout,
             [],
             &[fp16(512), fp16(512)],
-            None,
+            &[],
         );
         assert_eq!(of_bake(no_page, context).get(), context.get());
         let page = PageBytes::new(nz64(1024));
@@ -695,7 +688,7 @@ mod tests {
             &layout,
             [],
             &[fp8(1024), fp8(1024)],
-            None,
+            &[],
         );
         assert_eq!(r.page().get(), 2 * fp8(1024).page_bytes());
     }

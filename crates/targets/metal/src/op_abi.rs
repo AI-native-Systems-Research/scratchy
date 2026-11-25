@@ -120,7 +120,9 @@ pub fn metal_colour_rule<F: RopeForm, S: OpStage>(op: &SubOp<F, S>) -> ColourRul
             FRESH.output(A::PeeledWhenNormed(OperandIx(0)))
         }
         // The un-rotated writer only reads K and V; its K output IS its K operand.
-        L::KvAppend { .. } => FRESH.output(A::Operand(OperandIx(0))),
+        L::KvAppend { .. } => FRESH.output(A::Operand(OperandIx(
+            scratchy_subtile::subtile_ir::KvWriterLayout::KV_APPEND.k() as u8,
+        ))),
         L::MatmulTile { .. } | L::VarlenAttention { .. } | L::EncoderAttn { .. } => {
             FRESH.reads_across()
         }

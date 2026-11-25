@@ -41,7 +41,7 @@ use scratchy_subtile::lower::{
     AffineInt4, ArchOp, ExpertQuant, GemmWeight, InputRef, LoweringInput, OpDesc,
 };
 use scratchy_subtile::subtile_ir::{
-    AttnMask, DraftConvStage, EwKind, ExpertBody, ExpertBundle, ExpertProj, GainConvention,
+    AttnLayout, AttnMask, DraftConvStage, EwKind, ExpertBody, ExpertBundle, ExpertProj, GainConvention,
     GatedAct, NumExperts, RopeFormTag, RouterBundle, RowScale, SharedExpertBound, SourceShape,
     SubOp, TopK,
 };
@@ -1270,11 +1270,23 @@ pub fn lower_decode_to_wavefront(
                         *attn = AttnMask::SlidingWindow { window };
                     }
                 }
-                let mut attn_inputs = vec![q, InputRef::Ext(pk), InputRef::Ext(pv), k, v];
-                if let Some(s) = sinks {
-                    attn_inputs.push(s);
-                }
-                let idx = bx.push_op(SubOp::attn_decode(attention, valid_len, mask), attn_inputs);
+                // The query, the resident prefix, and the step's own new rows (the writer's K,
+                // the projected V), with the sinks weight when the model carries one — laid out
+                // by the one assembly, which mints the op's layout with them.
+                let (operands, attn_inputs) = AttnLayout::assemble(
+                    q,
+                    [(InputRef::Ext(pk), InputRef::Ext(pv)), (k, v)],
+                    sinks,
+                )
+                .ok_or(BridgeError::MalformedOp {
+                    tile,
+                    op: node.op,
+                    detail: "the attention's operands are no attention layout",
+                })?;
+                let idx = bx.push_op(
+                    SubOp::attn_decode(attention, valid_len, mask, operands),
+                    attn_inputs,
+                );
                 bx.produced.insert((tile.0, 0), Producer::Op(idx));
                 result = Some(idx);
             }
@@ -1330,9 +1342,18 @@ pub fn lower_decode_to_wavefront(
                 // model's sliding and global layers have different kv widths,
                 // and the cache this attention reads is its own class's.
                 let (pk, pv) = bx.prefix_for(layer, geom.kv_width());
+                // The query and its target's resident cache alone — one segment, by the one
+                // assembly.
+                let (operands, attn_inputs) =
+                    AttnLayout::assemble(q, [(InputRef::Ext(pk), InputRef::Ext(pv))], None)
+                        .ok_or(BridgeError::MalformedOp {
+                            tile,
+                            op: node.op,
+                            detail: "the shared attention's operands are no attention layout",
+                        })?;
                 let idx = bx.push_op(
-                    SubOp::attn_decode(attention, bx.prefix_len, mask),
-                    vec![q, InputRef::Ext(pk), InputRef::Ext(pv)],
+                    SubOp::attn_decode(attention, bx.prefix_len, mask, operands),
+                    attn_inputs,
                 );
                 bx.produced.insert((tile.0, 0), Producer::Op(idx));
                 result = Some(idx);

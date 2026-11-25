@@ -451,8 +451,6 @@ impl<'a> BundleLayout<'a> {
 /// collective's consume.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct KvShifts<T: ktir_superdsc::collective::Tp> {
-    /// This is a walk's body group: the runtime relaunches it [`Walk::trips`] times.
-    pub page_fold: bool,
     /// ⭐ This group reads the pool through the GATHER — each page came from the index the host stages
     /// rather than from a segment shift. Two consequences the runtime must know: the group's KV shift
     /// must be ZERO (an absolute entry plus a page base composes two bases and lands inside neither),
@@ -482,6 +480,12 @@ pub struct Walk {
 }
 
 impl<T: ktir_superdsc::collective::Tp> KvShifts<T> {
+    /// ⭐ THIS IS A WALK'S BODY GROUP — the runtime relaunches it [`Walk::trips`] times. Read off
+    /// [`Self::walk`], the one statement: a group is a page fold exactly when it carries a walk.
+    pub const fn page_fold(&self) -> bool {
+        self.walk.is_some()
+    }
+
     /// ⭐ WHERE THIS LAUNCH'S WEIGHT SLOT RESOLVES — `(byte shift, bank)` from the layer's own
     /// `(layer_shift, layer_bank)`.
     ///
@@ -799,12 +803,29 @@ impl From<String> for SiblingFp<'static> {
 pub struct LadderRung<'a> {
     /// The columns one fold pass of this rung's body sweeps.
     pub active_cap: SweptCols,
-    /// This rung's body per class, in the meta's `bodies` order.
-    pub bodies: Cow<'a, [SiblingFp<'a>]>,
-    /// The same bodies with the per-page fold fused in — one fewer launch per layer, run whenever the
-    /// context fits ONE page. [`SiblingFp::none`] entries simply mean that class always uses the
-    /// split body: correct, one launch per layer dearer.
-    pub bodies_fused: Cow<'a, [SiblingFp<'a>]>,
+    /// This rung's body per class, in the meta's `bodies` order — each class's program, its fused
+    /// twin and the walk the host stages for it, as one record, so a class cannot have one without
+    /// the others.
+    pub bodies: Cow<'a, [RungBody<'a>]>,
+}
+
+/// ⭐ ONE CLASS'S BODY AT A RUNG — the program, its fused twin, and the walk its step is staged at.
+///
+/// The walk is the BAKE's: the pages the class's step walks at this rung's sweep
+/// (`scratchy_target_spyre::wiring::PagedStep::staged_walk`, the one walk law, evaluated at
+/// the bake for the session's own step). The host stages the body at this walk and never
+/// re-derives it from the sweep, so the walk the host lays its tables out for is the one the
+/// bake proved against the emitted body's relaunches.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RungBody<'a> {
+    /// The class's body at this rung.
+    pub body: SiblingFp<'a>,
+    /// The same body with the per-page fold fused in — one fewer launch per layer, run whenever the
+    /// context fits ONE page. [`SiblingFp::none`] means the class always uses the split body:
+    /// correct, one launch per layer dearer.
+    pub fused: SiblingFp<'a>,
+    /// The pages the class's step walks at this rung.
+    pub walk: ktir_superdsc::sdsc_abstract::WalkBlocks,
 }
 
 /// ⭐ ONE LAYER LAUNCH, IN TRUE LAYER ORDER — the whole of the executor's per-layer arithmetic.
@@ -852,13 +873,9 @@ pub struct RerollMeta<'a> {
     pub bodies: Cow<'a, [SiblingFp<'a>]>,
     /// Each body's fold-fused twin, in the SAME order as [`Self::bodies`].
     pub bodies_fused: Cow<'a, [SiblingFp<'a>]>,
-    /// The sk_bucket ladder, ASCENDING by `active_cap`; each rung carries one body per class.
-    pub rungs: Cow<'a, [LadderRung<'a>]>,
-    /// ⛔ THE RUNG A CONTEXT PAST EVERY RUNG'S SWEEP RUNS — an index into [`Self::rungs`], decided and
-    /// PROVEN at bake (`fold_plan::the_fallback_serves_any_length`: never a split-KV chunk, which
-    /// attends only its own pages). The runtime reads it rather than choosing, so it cannot run a rung
-    /// the bake did not prove serves any length.
-    pub fallback_rung: u32,
+    /// The sk_bucket ladder, ASCENDING by `active_cap` — never empty, its fallback one of its rungs,
+    /// by type ([`BakedLadder`]); each rung carries one body per class.
+    pub ladder: BakedLadder<'a>,
     /// One entry per layer, IN TRUE LAYER ORDER — see [`LayerLaunch`]. The executor runs exactly
     /// this sequence; there is no per-layer arithmetic left at runtime.
     pub launches: Cow<'a, [LayerLaunch]>,
@@ -873,12 +890,12 @@ pub struct RerollMeta<'a> {
 
 /// ⭐ A ROLLED BODY'S LADDER — its rungs, never empty, and the rung a context past every sweep runs.
 ///
-/// The ONE reading of [`RerollMeta::rungs`] and the one selection over it ([`Ladder::rung_for`]): the
-/// card executor binds its bodies from it and asks it which body serves a step, and the bake proves,
-/// through the same two calls, that every position each paged bundle admits stages a walk
-/// (`scratchy_target_spyre::wiring::prove_ladder_walks`). So a reading of the ladder the bake did not
-/// prove cannot run — MEASURED as the miss this closes: the executor read a ladder only past one
-/// rung, a prompt chunk's bundle bakes exactly one, and the card's first forward was refused.
+/// The ONE reading of [`RerollMeta::ladder`] and the one selection over it ([`Ladder::rung_for`]): the
+/// card executor binds its bodies from it and asks it which body serves a step. The selection
+/// answers every position with a rung, and every rung's every class carries the walk its step is
+/// staged at ([`RungBody::walk`]), so every position a paged bundle admits stages a walk by type —
+/// MEASURED as the miss this closes: the executor read a ladder only past one rung, a prompt chunk's
+/// bundle bakes exactly one, and the card's first forward was refused.
 #[derive(Clone, Copy, Debug)]
 pub struct Ladder<'m, 'a> {
     rungs: &'m [LadderRung<'a>],
@@ -902,20 +919,124 @@ impl<'m, 'a> Ladder<'m, 'a> {
     }
 }
 
-impl<'a> RerollMeta<'a> {
-    /// This body's [`Ladder`]. `Err` when it bakes no rung, or a fallback that is none of them — the
-    /// bake emits neither, so such a bundle is not one it emitted.
-    pub fn ladder(&self) -> Result<Ladder<'_, 'a>, String> {
-        let rungs: &[LadderRung<'a>] = &self.rungs;
-        let fallback = self.fallback_rung as usize;
-        if fallback >= rungs.len() {
-            return Err(format!(
-                "a rolled body's ladder of {} rung(s) names rung {fallback} as its fallback — a ladder \
-                 has at least one rung, and its fallback is one of them",
-                rungs.len()
-            ));
+/// ⭐ A BAKED LADDER — at least one rung, its rungs strictly ascending by sweep, and a fallback
+/// that is one of them, BY TYPE. The order is what [`Ladder::rung_for`]'s "first covering rung is
+/// the narrowest" reads, so no reader sorts a ladder.
+///
+/// ⛔ THE FALLBACK IS AN INDEX INTO THE RUNGS — decided and PROVEN at bake
+/// (`fold_plan::the_fallback_serves_any_length`: never a split-KV chunk, which attends only its own
+/// pages). The runtime reads it rather than choosing, so it cannot run a rung the bake did not
+/// prove serves any length.
+///
+/// The fields are private: [`Self::of_static`] (the baked static's own const, a build failure on
+/// a ladder that is none) and [`Self::of_owned`] (the bake) are the only mints, both over the one
+/// law [`Self::admits`]. So nothing that holds a `BakedLadder` re-checks it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BakedLadder<'a> {
+    rungs: Cow<'a, [LadderRung<'a>]>,
+    fallback: u32,
+}
+
+impl<'a> BakedLadder<'a> {
+    /// THE LAW — the rungs strictly ascend by sweep, and `fallback` names one of them (so there is
+    /// at least one).
+    const fn admits(rungs: &[LadderRung<'_>], fallback: u32) -> bool {
+        let mut i = 1;
+        while i < rungs.len() {
+            if rungs[i - 1].active_cap.get() >= rungs[i].active_cap.get() {
+                return false;
+            }
+            i += 1;
         }
-        Ok(Ladder { rungs, fallback })
+        (fallback as usize) < rungs.len()
+    }
+
+    /// The baked static's ladder. A const panic — a build failure — on a ladder the law refuses.
+    pub const fn of_static(rungs: &'a [LadderRung<'a>], fallback: u32) -> Self {
+        assert!(
+            Self::admits(rungs, fallback),
+            "a baked ladder has at least one rung, its rungs strictly ascend by sweep, and its \
+             fallback is one of them"
+        );
+        Self {
+            rungs: Cow::Borrowed(rungs),
+            fallback,
+        }
+    }
+
+    /// The bake's ladder, `None` where the law refuses it (the bake names it and panics).
+    pub fn of_owned(rungs: Vec<LadderRung<'a>>, fallback: u32) -> Option<Self> {
+        Self::admits(&rungs, fallback).then_some(Self {
+            rungs: Cow::Owned(rungs),
+            fallback,
+        })
+    }
+
+    /// The rungs, ascending by sweep — at least one.
+    pub fn rungs(&self) -> &[LadderRung<'a>] {
+        &self.rungs
+    }
+
+    /// The fallback rung's index.
+    pub const fn fallback(&self) -> u32 {
+        self.fallback
+    }
+}
+
+impl<'a> RerollMeta<'a> {
+    /// This body's [`Ladder`] — total: the ladder is never empty and its fallback is one of its
+    /// rungs by type ([`BakedLadder`]).
+    pub fn ladder(&self) -> Ladder<'_, 'a> {
+        Ladder {
+            rungs: self.ladder.rungs(),
+            fallback: self.ladder.fallback() as usize,
+        }
+    }
+
+    /// ⭐ THE LAUNCH TABLE ADDRESSES ONLY WHAT THIS META AND ITS BUNDLE CARRY — at least one layer;
+    /// every layer's body one of [`Self::bodies`]; every weight bank (each layer's, the prefix's,
+    /// the suffix's) one of the bundle's `banks` regions (its base region and its layout's extra
+    /// banks, `BundleLayout::weight_bank_bytes`). A bank past them would read another bank's base —
+    /// a whole program on the wrong weights. The bake's proof, panicked on where the meta is minted
+    /// beside its bundle's layout, so the executor plays the table without re-checking it.
+    pub fn launch_table_within(&self, banks: usize) -> Result<(), String> {
+        if self.launches.is_empty() {
+            return Err(
+                "the launch table is empty — the layer sequence is the one thing the \
+                        executor cannot re-derive"
+                    .to_string(),
+            );
+        }
+        for (what, b) in [
+            ("prefix", self.prefix_weight_bank),
+            ("suffix", self.suffix_weight_bank),
+        ] {
+            if b as usize >= banks {
+                return Err(format!(
+                    "the {what}'s weights sit in bank {b}, and the bundle holds {banks} weight \
+                     bank(s)"
+                ));
+            }
+        }
+        for l in self.launches.iter() {
+            if l.body as usize >= self.bodies.len() {
+                return Err(format!(
+                    "layer (body {}, iter {}) names body {}, and the meta carries {} body(ies)",
+                    l.body,
+                    l.iter,
+                    l.body,
+                    self.bodies.len()
+                ));
+            }
+            if l.w_bank as usize >= banks {
+                return Err(format!(
+                    "layer (body {}, iter {}) sits in weight bank {}, and the bundle holds {banks} \
+                     weight bank(s)",
+                    l.body, l.iter, l.w_bank
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Every sibling fingerprint this meta names, whatever kind it is — one walk over the fields, so a
@@ -926,9 +1047,10 @@ impl<'a> RerollMeta<'a> {
             .chain(self.bodies.iter())
             .chain(self.bodies_fused.iter())
             .chain(
-                self.rungs
+                self.ladder
+                    .rungs()
                     .iter()
-                    .flat_map(|r| r.bodies.iter().chain(r.bodies_fused.iter())),
+                    .flat_map(|r| r.bodies.iter().flat_map(|b| [&b.body, &b.fused])),
             )
             .filter(|s| !s.is_none())
             .map(|s| s.as_str())
@@ -1023,6 +1145,12 @@ pub fn registered_fps<T: collective::Tp>() -> Vec<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn walk(pages: u32) -> ktir_superdsc::sdsc_abstract::WalkBlocks {
+        ktir_superdsc::sdsc_abstract::WalkBlocks::new(
+            std::num::NonZeroU32::new(pages).expect("a fixture walks at least one page"),
+        )
+    }
 
     #[test]
     fn a_borrower_holds_the_resident_segments_as_placeholders() {
@@ -1169,38 +1297,101 @@ mod tests {
     fn a_ladder_runs_its_narrowest_covering_rung() {
         let rung = |cap: u32| LadderRung {
             active_cap: SweptCols::new(cap),
-            bodies: Cow::Owned(vec![SiblingFp::from(format!("{cap:016x}"))]),
-            bodies_fused: Cow::Owned(vec![SiblingFp::none()]),
+            bodies: Cow::Owned(vec![RungBody {
+                body: SiblingFp::from(format!("{cap:016x}")),
+                fused: SiblingFp::none(),
+                walk: walk(cap / 64),
+            }]),
         };
-        let meta = |rungs: Vec<LadderRung<'static>>, fallback_rung: u32| RerollMeta {
+        let meta = |rungs: Vec<LadderRung<'static>>, fallback: u32| RerollMeta {
             prefix: SiblingFp::none(),
             suffix: SiblingFp::none(),
             bodies: Cow::Owned(vec![SiblingFp::none()]),
             bodies_fused: Cow::Owned(vec![SiblingFp::none()]),
-            rungs: Cow::Owned(rungs),
-            fallback_rung,
+            ladder: BakedLadder::of_owned(rungs, fallback).expect("a lawful fixture ladder"),
             launches: Cow::Owned(Vec::new()),
             prefix_weight_bank: 0,
             suffix_weight_bank: 0,
         };
         // One rung: a prompt chunk's own pages.
         let one = meta(vec![rung(128)], 0);
-        let l = one.ladder().expect("one rung is a ladder");
+        let l = one.ladder();
         for p in [1, 64, 128] {
             assert_eq!(l.rung_for(p).0, 0, "position {p}");
         }
         // Three: the narrowest covering, and the fallback past them all.
         let three = meta(vec![rung(64), rung(128), rung(256)], 2);
-        let l = three.ladder().expect("a ladder");
+        let l = three.ladder();
         assert_eq!(l.rung_for(1).0, 0);
         assert_eq!(l.rung_for(64).0, 0);
         assert_eq!(l.rung_for(65).0, 1);
         assert_eq!(l.rung_for(256).0, 2);
         assert_eq!(l.rung_for(257).0, 2, "past every sweep: the fallback");
-        assert!(meta(Vec::new(), 0).ladder().is_err(), "no rung");
+        // No rung, or a fallback that is none of them, is no ladder — it cannot be minted.
+        assert!(BakedLadder::of_owned(Vec::new(), 0).is_none(), "no rung");
         assert!(
-            meta(vec![rung(64)], 1).ladder().is_err(),
+            BakedLadder::of_owned(vec![rung(64)], 1).is_none(),
             "a fallback past the rungs"
+        );
+        assert!(
+            BakedLadder::of_owned(vec![rung(128), rung(64)], 1).is_none(),
+            "rungs out of order — `rung_for` would run the wider one first"
+        );
+        assert!(
+            BakedLadder::of_owned(vec![rung(64), rung(64)], 1).is_none(),
+            "two rungs of one sweep"
+        );
+    }
+
+    /// ⭐ A LAUNCH TABLE ADDRESSES ONLY ITS META'S BODIES AND ITS BUNDLE'S BANKS — and each way out
+    /// of them is named: no layer, a layer's body past the bodies, a layer's bank or a seam's bank
+    /// past the bundle's.
+    #[test]
+    fn a_launch_table_addresses_only_its_bodies_and_banks() {
+        let launch = |body: u8, w_bank: u8| LayerLaunch {
+            body,
+            iter: 0,
+            w_bank,
+            w_off: 0,
+            kv_bank: KvBank::BASE,
+        };
+        let meta = |launches: Vec<LayerLaunch>, prefix_weight_bank: u32| RerollMeta {
+            prefix: SiblingFp::none(),
+            suffix: SiblingFp::none(),
+            bodies: Cow::Owned(vec![SiblingFp::none(), SiblingFp::none()]),
+            bodies_fused: Cow::Owned(vec![SiblingFp::none(), SiblingFp::none()]),
+            ladder: BakedLadder::of_owned(
+                vec![LadderRung {
+                    active_cap: SweptCols::new(64),
+                    bodies: Cow::Owned(Vec::new()),
+                }],
+                0,
+            )
+            .expect("a lawful fixture ladder"),
+            launches: Cow::Owned(launches),
+            prefix_weight_bank,
+            suffix_weight_bank: 0,
+        };
+        // Two bodies, two banks: every layer and seam inside them.
+        assert_eq!(
+            meta(vec![launch(0, 0), launch(1, 1)], 1).launch_table_within(2),
+            Ok(())
+        );
+        assert!(
+            meta(Vec::new(), 0).launch_table_within(2).is_err(),
+            "no layer"
+        );
+        assert!(
+            meta(vec![launch(2, 0)], 0).launch_table_within(2).is_err(),
+            "a body past the bodies"
+        );
+        assert!(
+            meta(vec![launch(0, 2)], 0).launch_table_within(2).is_err(),
+            "a layer's bank past the bundle's"
+        );
+        assert!(
+            meta(vec![launch(0, 0)], 2).launch_table_within(2).is_err(),
+            "the prefix's bank past the bundle's"
         );
     }
 
@@ -1214,21 +1405,28 @@ mod tests {
             suffix: SiblingFp::from("de8ab8a9205d4b1e".to_string()),
             bodies: Cow::Owned(vec![SiblingFp::from("443aebd9890d269af".to_string())]),
             bodies_fused: Cow::Owned(vec![SiblingFp::from("443aebd9890d269af".to_string())]),
-            rungs: Cow::Owned(vec![
-                LadderRung {
-                    active_cap: SweptCols::new(64),
-                    bodies: Cow::Owned(vec![SiblingFp::from("2f65540feaf0b24b".to_string())]),
-                    bodies_fused: Cow::Owned(vec![SiblingFp::from(
-                        "2f65540feaf0b24bf".to_string(),
-                    )]),
-                },
-                LadderRung {
-                    active_cap: SweptCols::new(256),
-                    bodies: Cow::Owned(vec![SiblingFp::from("443aebd9890d269a".to_string())]),
-                    bodies_fused: Cow::Owned(vec![SiblingFp::none()]),
-                },
-            ]),
-            fallback_rung: 1,
+            ladder: BakedLadder::of_owned(
+                vec![
+                    LadderRung {
+                        active_cap: SweptCols::new(64),
+                        bodies: Cow::Owned(vec![RungBody {
+                            body: SiblingFp::from("2f65540feaf0b24b".to_string()),
+                            fused: SiblingFp::from("2f65540feaf0b24bf".to_string()),
+                            walk: walk(1),
+                        }]),
+                    },
+                    LadderRung {
+                        active_cap: SweptCols::new(256),
+                        bodies: Cow::Owned(vec![RungBody {
+                            body: SiblingFp::from("443aebd9890d269a".to_string()),
+                            fused: SiblingFp::none(),
+                            walk: walk(4),
+                        }]),
+                    },
+                ],
+                1,
+            )
+            .expect("a lawful fixture ladder"),
             launches: Cow::Owned(vec![LayerLaunch {
                 body: 0,
                 iter: 0,

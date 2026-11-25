@@ -837,6 +837,25 @@ pub enum KvOperand {
 /// mis-roll — the failure mode this exists to end is invisible at the tape and only shows up as
 /// wrong tokens on the device.
 impl<F: RopeForm, S: OpStage> SubOp<F, S> {
+    /// ⭐ THIS OP'S KV-WRITER LAYOUT — which of its inputs is its K, its V and its caches —
+    /// when it is a cache writer; `None` for every other op.
+    pub const fn kv_writer(&self) -> Option<KvWriterLayout> {
+        match self {
+            SubOp::RopeAppend { .. } => Some(KvWriterLayout::ROPE_APPEND),
+            SubOp::KvAppend { .. } => Some(KvWriterLayout::KV_APPEND),
+            _ => None,
+        }
+    }
+
+    /// ⭐ THIS OP'S MATMUL LAYOUT — which of its inputs is its activation, its weight and its
+    /// weight scale — when it is a [`SubOp::MatmulTile`]; `None` for every other op.
+    pub const fn matmul(&self) -> Option<MatmulLayout> {
+        match self {
+            SubOp::MatmulTile { weight, .. } => Some(MatmulLayout::of(*weight)),
+            _ => None,
+        }
+    }
+
     /// The layer this node belongs to, when it carries one.
     ///
     /// Only the KV-cache writer names its layer on the tape; everything else in a layer is
@@ -1217,8 +1236,14 @@ impl<F: RopeForm> SubOp<F, Arch> {
     /// `AttnDecode`: its cache, that cache's producer and its softmax accumulator are bound by
     /// [`lower_region`]. The op carries its CLASS (`mask`) and the model's attention facts
     /// (`attention`), minted at the bridge — every consumer reads
-    /// `attention.class(mask.class())` off the op itself.
-    pub const fn attn_decode(attention: Attention, valid_len: u32, mask: AttnMask) -> Self {
+    /// `attention.class(mask.class())` off the op itself. `operands` is the layout
+    /// [`AttnLayout::assemble`] minted with the op's inputs.
+    pub const fn attn_decode(
+        attention: Attention,
+        valid_len: u32,
+        mask: AttnMask,
+        operands: AttnLayout,
+    ) -> Self {
         SubOp::AttnDecode {
             valid_len,
             layout: Unbound,
@@ -1226,6 +1251,7 @@ impl<F: RopeForm> SubOp<F, Arch> {
             softmax_state: Unbound,
             mask,
             attention,
+            operands,
         }
     }
 }
@@ -1413,6 +1439,9 @@ pub enum SubOp<F: RopeForm = NeoX, S: OpStage = Tiled> {
         /// The model's attention facts, minted once at the bridge — the class's
         /// geometry and the softmax scale read off `attention.class(mask.class())`.
         attention: Attention,
+        /// ⭐ WHICH INPUT IS WHICH — minted with the inputs by [`AttnLayout::assemble`];
+        /// every reader takes its slots from here, never from an index of its own.
+        operands: AttnLayout,
     },
 
     // ── The rest of the arch vocabulary ────────────────────────────
@@ -1785,12 +1814,18 @@ pub enum SubOp<F: RopeForm = NeoX, S: OpStage = Tiled> {
 /// must be a power of two) AND the sentinel law's (a power-of-two vocab still
 /// needs pad lanes to land its all-NaN one-hot on, so a vocab that is already
 /// a power of two rounds to the NEXT one up: gemma-4's 262144 pads to
-/// 524288). ONE derivation, read by the host reference, the splice's
-/// constexpr flow, and the load-time table staging, so no two of them can
-/// disagree.
+/// 524288) — and NEVER NARROWER THAN ONE PICK GROUP
+/// (`SAMPLE_BLOCK · SAMPLE_GROUP_BLOCKS`), the chain's own law
+/// ([`mint_embed_chain`]: the sentinel is the last row only when the pad is a
+/// whole number of groups). A power of two at least one group wide is a whole
+/// number of groups, so every vocab — a parity fixture's 512 as much as a
+/// checkpoint's 262144 — gets a pad both laws hold for. ONE derivation, read
+/// by the host reference, the splice's constexpr flow, and the load-time table
+/// staging, so no two of them can disagree.
 pub fn sample_pad_vocab(vocab: u32) -> u32 {
     let pad = vocab.max(1).next_power_of_two();
-    if pad == vocab { pad * 2 } else { pad }
+    let strictly_above = if pad == vocab { pad * 2 } else { pad };
+    strictly_above.max(SAMPLE_BLOCK * SAMPLE_GROUP_BLOCKS)
 }
 
 /// The token draw's stick width — the idx stick's own lane count and the
@@ -1836,6 +1871,221 @@ pub fn sample_groups(pad_vocab: u32) -> u32 {
 /// never equal its own solo text. The key is request-owned alone — the
 /// seed and the request's own step count.)
 pub const SAMPLE_SEED_WORDS: u32 = 4;
+
+/// The [`SubOp::Sample`] input that is the logits block it draws from — the first; every other
+/// input is the draw's seat and staged tables.
+pub const SAMPLE_LOGITS_INPUT: usize = 0;
+
+/// ⭐ AN ATTENTION'S OPERAND LAYOUT — the ONE statement of which input of a
+/// [`SubOp::AttnDecode`] is which: `[Q, (K, V)…, sinks?]` — the query, its
+/// `(K, V)` segments in sequence order (a resident prefix first, the step's
+/// own new rows last), and, for a gpt-oss attention, the per-head
+/// `[num_heads]` sinks weight as the one trailing input of the six-input form.
+/// Minted with the inputs themselves by [`Self::assemble`] (the one place an
+/// attention's inputs are laid out) and carried on the op
+/// ([`SubOp::AttnDecode::operands`]), so every reader asks this type for a slot
+/// and none indexes the inputs by a number of its own. [`Self::of_arity`] is
+/// the same law read from a count — the op registry's arity check (`ops.rs`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct AttnLayout {
+    segments: usize,
+    sinks: bool,
+}
+
+impl AttnLayout {
+    /// ⭐ THE ONE ASSEMBLY — an attention's inputs in its layout's order, and the
+    /// layout they make: the query, its `(K, V)` segments in sequence order (the
+    /// resident prefix first, the step's new rows last), and the sinks weight.
+    /// `None` for an arrangement no attention has (no segment, or sinks beside
+    /// anything but the two-segment form).
+    pub fn assemble<T>(
+        q: T,
+        segments: impl IntoIterator<Item = (T, T)>,
+        sinks: Option<T>,
+    ) -> Option<(Self, Vec<T>)> {
+        let mut inputs = vec![q];
+        for (k, v) in segments {
+            inputs.push(k);
+            inputs.push(v);
+        }
+        let has_sinks = sinks.is_some();
+        inputs.extend(sinks);
+        let layout = Self::of_arity(inputs.len())?;
+        (layout.sinks == has_sinks).then_some((layout, inputs))
+    }
+
+    /// The layout of an attention with `n` inputs: an odd count is the query
+    /// and `(n − 1) / 2` segments; exactly six is the two-segment form plus the
+    /// trailing sinks. `None` for any other count — no attention has it.
+    pub const fn of_arity(n: usize) -> Option<Self> {
+        if n >= 3 && n % 2 == 1 {
+            Some(Self {
+                segments: (n - 1) / 2,
+                sinks: false,
+            })
+        } else if n == 6 {
+            Some(Self {
+                segments: 2,
+                sinks: true,
+            })
+        } else {
+            None
+        }
+    }
+
+    /// The query's input.
+    pub const fn q(self) -> usize {
+        0
+    }
+
+    /// How many `(K, V)` segments the attention reads.
+    pub const fn segments(self) -> usize {
+        self.segments
+    }
+
+    /// Segment `s`'s K input.
+    pub const fn k(self, s: usize) -> usize {
+        1 + 2 * s
+    }
+
+    /// Segment `s`'s V input.
+    pub const fn v(self, s: usize) -> usize {
+        2 + 2 * s
+    }
+
+    /// The step's own new rows — the LAST segment, the one its KV writer
+    /// stores, when the attention has one past its resident prefix; `None` for
+    /// an attention that reads a resident cache alone (a drafter over its
+    /// target's KV: the one segment is the prefix).
+    pub const fn step_segment(self) -> Option<usize> {
+        if self.segments > 1 {
+            Some(self.segments - 1)
+        } else {
+            None
+        }
+    }
+
+    /// The trailing sinks weight's input, if the attention carries one.
+    pub const fn sinks(self) -> Option<usize> {
+        if self.sinks {
+            Some(1 + 2 * self.segments)
+        } else {
+            None
+        }
+    }
+
+    /// The inputs the `(K, V)` segments span — every input past the query and
+    /// before the sinks.
+    pub const fn segment_inputs(self) -> core::ops::Range<usize> {
+        1..1 + 2 * self.segments
+    }
+}
+
+/// ⭐ A MATMUL'S OPERAND LAYOUT — the ONE statement of which input of a
+/// [`SubOp::MatmulTile`] is which, as a function of its weight scheme: every scheme reads
+/// `[act, weight]`, and the fp8 W8A8 scheme ([`crate::lower::GemmWeight::Fp8Dynamic`]) adds its
+/// per-channel `weight_scale` third (`[act, weight_fp8, weight_scale]`). Read off the op
+/// ([`SubOp::matmul`]) and stated as the registry's arity, so no reader tells an fp8 matmul by its
+/// operand count or names its payload or scale by a number of its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MatmulLayout {
+    /// Whether the weight carries a per-channel scale operand (fp8 W8A8).
+    scaled: bool,
+}
+
+impl MatmulLayout {
+    /// The layout a matmul of weight scheme `weight` states.
+    pub const fn of(weight: crate::lower::GemmWeight) -> Self {
+        Self {
+            scaled: matches!(weight, crate::lower::GemmWeight::Fp8Dynamic),
+        }
+    }
+
+    /// The operand count.
+    pub const fn arity(self) -> usize {
+        if self.scaled { 3 } else { 2 }
+    }
+
+    /// The activation's input.
+    pub const fn act(self) -> usize {
+        0
+    }
+
+    /// The weight's input — the fp8 payload when the matmul is [`Self::scale`]d.
+    pub const fn weight(self) -> usize {
+        1
+    }
+
+    /// The weight's per-channel scale input, when the scheme carries one (fp8 W8A8).
+    pub const fn scale(self) -> Option<usize> {
+        if self.scaled { Some(2) } else { None }
+    }
+
+    /// The weight's input when it is an fp8 PAYLOAD (a scaled scheme's weight), else `None`.
+    pub const fn fp8_payload(self) -> Option<usize> {
+        if self.scaled {
+            Some(self.weight())
+        } else {
+            None
+        }
+    }
+}
+
+/// ⭐ A KV WRITER'S OPERAND LAYOUT — the ONE statement of which input of a
+/// cache writer is which: a [`SubOp::RopeAppend`]'s
+/// `[K, cos, sin, V, K_cache, V_cache]` (it rotates K first) and a
+/// [`SubOp::KvAppend`]'s `[K, V, K_cache, V_cache]`. Read off the op
+/// ([`SubOp::kv_writer`]) and stated as the registry's arity, so no reader
+/// names a writer's V or caches by a number of its own — the V a writer stores
+/// is the V an attention's step segment must read (`kv_codec`'s float8 law).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KvWriterLayout {
+    rotary: bool,
+}
+
+impl KvWriterLayout {
+    /// `RopeAppend`'s: K, its rotation's cos and sin, V, the two caches.
+    pub const ROPE_APPEND: Self = Self { rotary: true };
+    /// `KvAppend`'s: K, V, the two caches.
+    pub const KV_APPEND: Self = Self { rotary: false };
+
+    /// The writer's input count.
+    pub const fn arity(self) -> usize {
+        if self.rotary { 6 } else { 4 }
+    }
+
+    /// The K it writes (rotated first by a `RopeAppend`).
+    pub const fn k(self) -> usize {
+        0
+    }
+
+    /// A `RopeAppend`'s rotation rows, `(cos, sin)`.
+    pub const ROPE_ROTATION: (usize, usize) = (1, 2);
+
+    /// The rotation's `(cos, sin)` rows — a `RopeAppend`'s only.
+    pub const fn rotation(self) -> Option<(usize, usize)> {
+        if self.rotary {
+            Some(Self::ROPE_ROTATION)
+        } else {
+            None
+        }
+    }
+
+    /// The V it writes.
+    pub const fn v(self) -> usize {
+        if self.rotary { 3 } else { 1 }
+    }
+
+    /// The K cache it writes into.
+    pub const fn k_cache(self) -> usize {
+        if self.rotary { 4 } else { 2 }
+    }
+
+    /// The V cache it writes into.
+    pub const fn v_cache(self) -> usize {
+        if self.rotary { 5 } else { 3 }
+    }
+}
 
 // ── Nodes & graph ──────────────────────────────────────────────────
 
@@ -1893,6 +2143,17 @@ impl<F: RopeForm> SubtileIR<F> {
     /// construction (the const generic guarantees it).
     pub const fn rope_form(&self) -> RopeFormTag {
         F::TAG
+    }
+
+    /// ⭐ EVERY fp8 WEIGHT PAYLOAD THE GRAPH'S MATMULS READ — the tensors at each matmul's
+    /// [`MatmulLayout::fp8_payload`] input. The one statement of "which weights are fp8" every
+    /// reader (the placement's 1-byte footprint, the re-tile descriptor, the weight folds that must
+    /// not rescale a quantized payload) takes.
+    pub fn fp8_weight_payloads(&self) -> std::collections::BTreeSet<TensorId> {
+        self.nodes
+            .iter()
+            .filter_map(|n| Some(n.inputs[n.op.matmul()?.fp8_payload()?].tensor))
+            .collect()
     }
 }
 
@@ -3872,7 +4133,7 @@ pub fn eval_node<F: RopeForm>(
         }
         // KvAppend writes K as projected: the identity on K; its V input +
         // the paged-cache write are GPU-only.
-        SubOp::KvAppend { .. } => gather(&node.inputs[0], graph, bufs).0,
+        SubOp::KvAppend { .. } => gather(&node.inputs[KvWriterLayout::KV_APPEND.k()], graph, bufs).0,
         // RopeAppend's host eval is rotation only (identical to RopeRotate);
         // its V input + the paged-cache write are GPU-only.
         SubOp::RopeRotate { head_dim, .. } => rope_eval(node, graph, bufs, head_dim.get()),
@@ -4108,16 +4369,37 @@ pub fn eval_node<F: RopeForm>(
                 dyn_width as usize,
             )
         }
-        expansion_ops!() | SubOp::KvQuantize { .. } => panic!(
+        // ⭐ THE FLOAT8 KV QUANTIZE IS ELEMENTWISE OVER ITS OPERAND (its own doc: ONE pass over
+        // the writer's whole value, BEFORE the writer), so it HAS a host reference — the value
+        // the pools hold and every reader of them sees: the operand's rows through the e4m3
+        // grid's SATURATING round trip (`scratchy_tensors::fp8` — the tree's one statement of
+        // that law; the kernel's own clamp ±448 rides inside it, `quantize_kv.py`). The scales
+        // are matched WITHOUT a wildcard: `Unscaled` alone exists today, and a checkpoint that
+        // states a `kv_cache_scheme` adds a variant — which must land HERE as its divide (the
+        // writer) and multiply (the reader) or this reference does not compile, never silently
+        // ignores the scale.
+        SubOp::KvQuantize { scales, .. } => {
+            let (x, _, _) = gather(&node.inputs[0], graph, bufs);
+            match scales {
+                scratchy_ir::KvCacheScales::Unscaled => x
+                    .iter()
+                    .map(|&v| scratchy_tensors::fp8::e4m3_saturating_round_trip(v))
+                    .collect(),
+            }
+        }
+        expansion_ops!() => panic!(
             "{} has no host reference: the router and expert weights arrive as opaque \
-             bundle sources, a KV codec's packed stores as runtime buffers, a float8 KV \
-             cache's rows as the device quantizer's bytes, and the sampled rows at the \
-             runtime's sequence boundaries, none of which `gather` can read as a tensor region",
+             bundle sources, a KV codec's packed stores as runtime buffers, and the sampled rows \
+             at the runtime's sequence boundaries, none of which `gather` can read as a tensor \
+             region",
             node.op.name()
         ),
 
         SubOp::AttnDecode {
-            mask, attention, ..
+            mask,
+            attention,
+            operands: layout,
+            ..
         } => {
             // ⭐ THE WINDOW IS ON THE TAPE, so a sliding-window layer HAS a host
             // reference: the window bound is `window` positions back from the
@@ -4140,7 +4422,8 @@ pub fn eval_node<F: RopeForm>(
             let scale = scale_site.scale(attention);
             let hd = geom.head_dim().get() as usize;
             let gqa = geom.gqa().get() as usize;
-            let (q, qr, qc) = gather(&node.inputs[0], graph, bufs);
+            // The op's operands by name — its own layout.
+            let (q, qr, qc) = gather(&node.inputs[layout.q()], graph, bufs);
             let mq = qr as usize;
             let qh_count = qc as usize / hd; // q-heads in this block
             let qh_start = node.output.region.cols.start as usize / hd; // global first q-head
@@ -4149,41 +4432,24 @@ pub fn eval_node<F: RopeForm>(
                 qh_count * hd,
                 "attn Q width is a head multiple"
             );
-            debug_assert!(node.inputs.len() >= 3, "attn needs Q + >=1 (K,V) segment");
-            // The gpt-oss trailing sinks weight: the registry's arity
-            // closure admits `Q + (K,V) pairs` (odd count) or exactly 6
-            // = the 5-input decode form plus ONE trailing weight-source
-            // input. An even count therefore marks the LAST input as
-            // the per-head `[num_heads]` sinks — read it here and stop
-            // the (K,V) walk before it (the pair loop below would
-            // otherwise gather past the end).
-            let sinks: Option<Vec<f32>> = if node.inputs.len().is_multiple_of(2) {
-                Some(gather(&node.inputs[node.inputs.len() - 1], graph, bufs).0)
-            } else {
-                None
-            };
-            let attn_len = node.inputs.len() - sinks.is_some() as usize;
-            debug_assert_eq!(
-                attn_len % 2,
-                1,
-                "attn inputs = Q + (K,V) pairs (+ optional trailing sinks)"
-            );
+            // The gpt-oss trailing per-head `[num_heads]` sinks weight, when the op carries one.
+            let sinks: Option<Vec<f32>> = layout
+                .sinks()
+                .map(|i| gather(&node.inputs[i], graph, bufs).0);
             // kv-head offset of this block (from the first K segment's column slice).
-            let kvh_start = node.inputs[1].region.cols.start as usize / hd;
+            let kvh_start = node.inputs[layout.k(0)].region.cols.start as usize / hd;
             // Concatenate K/V segments along sequence; each segment spans this
             // block's kv-heads (kv_count * hd wide).
             let mut k_all: Vec<f32> = Vec::new();
             let mut v_all: Vec<f32> = Vec::new();
             let mut kv_count = 0usize;
-            let mut i = 1;
-            while i < attn_len {
-                let (k, kr, kc) = gather(&node.inputs[i], graph, bufs);
-                let (v, vr, vc) = gather(&node.inputs[i + 1], graph, bufs);
+            for s in 0..layout.segments() {
+                let (k, kr, kc) = gather(&node.inputs[layout.k(s)], graph, bufs);
+                let (v, vr, vc) = gather(&node.inputs[layout.v(s)], graph, bufs);
                 debug_assert_eq!((vr, vc), (kr, kc), "attn V seg shape");
                 kv_count = kc as usize / hd;
                 k_all.extend_from_slice(&k);
                 v_all.extend_from_slice(&v);
-                i += 2;
             }
             debug_assert!(kv_count >= 1, "attn K seg has at least one kv-head");
             let seg_w = kv_count * hd;
@@ -4630,30 +4896,13 @@ pub fn lower_region(
                 _form,
                 ..
             } => {
-                // K-cache TensorId comes from desc.inputs[4]
-                // (the validate arity-6 contract); for legacy
-                // 4-input fixtures (K, cos, sin, V only) fall
-                // back to the K input's own tensor — the layout
-                // witness is consulted only when the producer/
-                // consumer pair is end-to-end (RopeAppend +
-                // AttnDecode), so the sentinel never escapes.
-                let k_cache_t = if desc.inputs.len() > 4 {
-                    resolve(desc.inputs[4], &op_tensor, &op_cols, &tensors).0
-                } else {
-                    in0_named("RopeAppend").0
-                };
-                // V-cache TensorId from desc.inputs[5] (arity-6
-                // contract). Without it the layout aliases V=K
-                // (`for_cache_tensor`) and the V-cache StoreAsync lands
-                // in the K cache — clobbering the rotated K, leaving the
-                // real V cache unwritten (caught by the full-tape interp
-                // diff). Legacy 4-input fixtures fall back to the K
-                // cache (sentinel; never escapes end-to-end).
-                let v_cache_t = if desc.inputs.len() > 5 {
-                    resolve(desc.inputs[5], &op_tensor, &op_cols, &tensors).0
-                } else {
-                    k_cache_t
-                };
+                // The writer's two caches, by its own layout. They are DISTINCT tensors: a
+                // layout aliasing V=K (`for_cache_tensor`) lands the V-cache StoreAsync in the K
+                // cache — clobbering the rotated K, leaving the real V cache unwritten (caught by
+                // the full-tape interp diff).
+                let w = KvWriterLayout::ROPE_APPEND;
+                let k_cache_t = resolve(desc.inputs[w.k_cache()], &op_tensor, &op_cols, &tensors).0;
+                let v_cache_t = resolve(desc.inputs[w.v_cache()], &op_tensor, &op_cols, &tensors).0;
                 // The per-model dims (num_kv_heads / head_dim) live
                 // on the op itself — stamped from `model.bounds`
                 // upstream — and flow into the byte-offset math via the
@@ -4677,9 +4926,10 @@ pub fn lower_region(
                 attn,
                 ..
             } => {
-                // `[K, V, K_cache, V_cache]` — the arity-4 contract.
-                let k_cache_t = resolve(desc.inputs[2], &op_tensor, &op_cols, &tensors).0;
-                let v_cache_t = resolve(desc.inputs[3], &op_tensor, &op_cols, &tensors).0;
+                // The writer's two caches, by its own layout.
+                let w = KvWriterLayout::KV_APPEND;
+                let k_cache_t = resolve(desc.inputs[w.k_cache()], &op_tensor, &op_cols, &tensors).0;
+                let v_cache_t = resolve(desc.inputs[w.v_cache()], &op_tensor, &op_cols, &tensors).0;
                 let layout = KvCacheLayout::for_cache_tensors(k_cache_t, v_cache_t);
                 k_cache_producer_node.insert(k_cache_t, nodes.len() as u32);
                 SubOp::KvAppend {
@@ -4694,16 +4944,17 @@ pub fn lower_region(
                 valid_len,
                 mask,
                 attention,
+                operands,
                 ..
             } => {
-                let (prefix_k_t, _, _) = resolve(desc.inputs[1], &op_tensor, &op_cols, &tensors);
-                // prefix_v (inputs[2]) is a DISTINCT cache tensor from
-                // prefix_k (inputs[1]). `for_cache_tensor(t)` aliases
-                // V=K — using it here made the lowering's V load read
-                // the K cache (attn output == K, caught by the
-                // full-tape interp diff). Inputs = [q, prefix_k,
-                // prefix_v, new_k, new_v].
-                let (prefix_v_t, _, _) = resolve(desc.inputs[2], &op_tensor, &op_cols, &tensors);
+                // The resident prefix is the FIRST segment ([`AttnLayout`]): its K and its V are
+                // DISTINCT cache tensors. `for_cache_tensor(t)` aliases V=K — using it here made
+                // the lowering's V load read the K cache (attn output == K, caught by the
+                // full-tape interp diff).
+                let (prefix_k_t, _, _) =
+                    resolve(desc.inputs[operands.k(0)], &op_tensor, &op_cols, &tensors);
+                let (prefix_v_t, _, _) =
+                    resolve(desc.inputs[operands.v(0)], &op_tensor, &op_cols, &tensors);
                 // The layout witness is the cache-tensor identity pair; the head
                 // geometry is the op's own attention (minted at the bridge).
                 let layout = KvCacheLayout::for_cache_tensors(prefix_k_t, prefix_v_t);
@@ -4720,6 +4971,7 @@ pub fn lower_region(
                     softmax_state,
                     mask,
                     attention,
+                    operands,
                 }
             }
             SubOp::TanhSoftCap { cap } => SubOp::TanhSoftCap { cap },
@@ -4849,11 +5101,13 @@ pub fn lower_region(
                     },
                 },
             ];
-            if matches!(weight, crate::lower::GemmWeight::Fp8Dynamic) {
-                // fp8 W8A8: carry the PER-CHANNEL weight_scale (desc.inputs[2], shape [N,1]) as the
-                // MatmulTile's THIRD input, so `lower_matmul_node` sees arity-3 == fp8 and dequants via
-                // `Fp8W8A8Dequant` (w_scale[n]). Dense matmul stays arity-2 [act, W] (byte-identical).
-                let (ws_t, ws_r, ws_c) = resolve(desc.inputs[2], &op_tensor, &op_cols, &tensors);
+            // fp8 W8A8: carry the PER-CHANNEL weight_scale (shape [N,1]) at the scale input the
+            // scheme's layout states ([`MatmulLayout`]), the descriptor's own and the tile's alike,
+            // so the lowering dequants via `Fp8W8A8Dequant` (w_scale[n]). Every other scheme states
+            // no scale input and stays `[act, W]` (byte-identical).
+            if let Some(scale) = MatmulLayout::of(weight).scale() {
+                let (ws_t, ws_r, ws_c) =
+                    resolve(desc.inputs[scale], &op_tensor, &op_cols, &tensors);
                 mm_inputs.push(TensorRegion {
                     tensor: ws_t,
                     region: Region {
@@ -5114,6 +5368,7 @@ pub fn decompose_rmsnorm<F: RopeForm>(
                 softmax_state,
                 mask,
                 attention,
+                operands,
             } => {
                 // Remap the KvCacheProducer's stored producer node id
                 // so an upstream RopeAppend's new SubtileId stays
@@ -5135,6 +5390,7 @@ pub fn decompose_rmsnorm<F: RopeForm>(
                         producer: new_producer,
                         softmax_state,
                         attention,
+                        operands,
                     },
                     inputs: node.inputs.clone(),
                     output: node.output,
@@ -5258,15 +5514,15 @@ pub fn head_tile_rope<F: RopeForm>(graph: &SubtileIR<F>, nb: std::num::NonZeroU3
                 layout,
                 _form: _,
             } => {
-                // Arity 6: [K, cos, sin, V, K_cache, V_cache]. K and V
-                // are head-tiled; cos/sin and the cache handles stay
-                // whole.
-                let k_in = node.inputs[0];
-                let cos_in = node.inputs[1];
-                let sin_in = node.inputs[2];
-                let v_in = node.inputs[3];
-                let kcache_in = node.inputs[4];
-                let vcache_in = node.inputs[5];
+                // The writer's operands by its own layout. K and V are head-tiled; cos/sin and
+                // the cache handles stay whole.
+                let (w, (cos, sin)) = (KvWriterLayout::ROPE_APPEND, KvWriterLayout::ROPE_ROTATION);
+                let k_in = node.inputs[w.k()];
+                let cos_in = node.inputs[cos];
+                let sin_in = node.inputs[sin];
+                let v_in = node.inputs[w.v()];
+                let kcache_in = node.inputs[w.k_cache()];
+                let vcache_in = node.inputs[w.v_cache()];
                 let total_cols = node.output.region.cols.len;
                 let head_dim_nz = rope.head_dim(attention).nonzero();
                 let k_col_start = k_in.region.cols.start;
@@ -5321,6 +5577,7 @@ pub fn head_tile_rope<F: RopeForm>(graph: &SubtileIR<F>, nb: std::num::NonZeroU3
                 softmax_state,
                 mask,
                 attention,
+                operands,
             } => {
                 // AttnDecode stays whole — head tiling for it rides on
                 // a KvCachePageShape redesign that has not landed.
@@ -5344,6 +5601,7 @@ pub fn head_tile_rope<F: RopeForm>(graph: &SubtileIR<F>, nb: std::num::NonZeroU3
                         producer: new_producer,
                         softmax_state,
                         attention,
+                        operands,
                     },
                     inputs: node.inputs.clone(),
                     output: node.output,
@@ -5376,6 +5634,11 @@ pub fn head_tile_rope<F: RopeForm>(graph: &SubtileIR<F>, nb: std::num::NonZeroU3
 mod tests {
     use super::*;
     use crate::fixtures::attention_at;
+
+    /// The decode attention's layout: the query, the resident prefix and the step's new rows.
+    fn two_segments() -> AttnLayout {
+        AttnLayout::of_arity(5).expect("a two-segment layout")
+    }
 
     /// The LOGICAL half of Reshape's contract: it preserves the element
     /// sequence and changes only the extents. `eval_dag` is the oracle the
@@ -5905,7 +6168,7 @@ mod tests {
                 },
                 OpDesc {
                     // l prefix rows (fully valid) ++ 1 new = l+1 valid positions.
-                    op: SubOp::attn_decode(attention, l + 1, AttnMask::Causal),
+                    op: SubOp::attn_decode(attention, l + 1, AttnMask::Causal, two_segments()),
                     m,
                     inputs: vec![
                         InputRef::Ext(0),
@@ -5978,7 +6241,7 @@ mod tests {
                     ],
                 },
                 OpDesc {
-                    op: SubOp::attn_decode(attention, l + 1, AttnMask::Causal),
+                    op: SubOp::attn_decode(attention, l + 1, AttnMask::Causal, two_segments()),
                     m,
                     inputs: vec![
                         InputRef::Ext(0),
@@ -6910,8 +7173,8 @@ mod tests {
             std::hash::Hasher::finish(&h)
         };
         let a = hybrid();
-        let sliding = SubOp::attn_decode(a, 33, window());
-        let global = SubOp::attn_decode(a, 33, AttnMask::Causal);
+        let sliding = SubOp::attn_decode(a, 33, window(), two_segments());
+        let global = SubOp::attn_decode(a, 33, AttnMask::Causal, two_segments());
         // The two classes of one hybrid model hash apart...
         assert_ne!(
             key(&sliding),
@@ -6920,7 +7183,7 @@ mod tests {
         );
         // ...and two layers of one class hash equal (`valid_len` is the model's one
         // prefix capacity, shared by every layer — not per-layer identity).
-        let sliding_b = SubOp::attn_decode(a, 33, window());
+        let sliding_b = SubOp::attn_decode(a, 33, window(), two_segments());
         assert_eq!(
             key(&sliding),
             key(&sliding_b),
@@ -6929,8 +7192,8 @@ mod tests {
         // The same ops over a UNIFORM model (both classes the global geometry) also hash
         // apart by mask — the window is class, not per-layer identity.
         let uniform = attention_at(4, 1, 64, 0.125);
-        let sliding_u = SubOp::attn_decode(uniform, 33, window());
-        let global_u = SubOp::attn_decode(uniform, 33, AttnMask::Causal);
+        let sliding_u = SubOp::attn_decode(uniform, 33, window(), two_segments());
+        let global_u = SubOp::attn_decode(uniform, 33, AttnMask::Causal, two_segments());
         assert_ne!(key(&sliding_u), key(&global_u));
     }
 

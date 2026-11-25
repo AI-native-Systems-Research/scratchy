@@ -24,9 +24,9 @@ use scratchy_target_spyre::manifest::SengraphBundle;
 use scratchy_target_spyre::runner::SpyreSession;
 use scratchy_tensors::DType as SDType;
 use tracing::info;
-// `debug`/`warn` are only reached from the card blocks below.
+// `debug` is only reached from the card blocks below.
 #[cfg(feature = "spyre-hw")]
-use tracing::{debug, warn};
+use tracing::debug;
 
 /// A weight staged for binding: its tensor id, bytes, dtype and shape.
 ///
@@ -36,6 +36,37 @@ use tracing::{debug, warn};
 /// whose bytes are REWRITTEN before binding (a pad, a fold, a TP rank's cut) arrives
 /// `Owned`, the product of that rewrite.
 pub(crate) type StagedWeight = (usize, HostBytes, SDType, Vec<usize>);
+
+/// One rung of a bundle's walk ladder, as the emulator loads it: its body's program and each
+/// class's baked body record (`RungBody::walk` is the walk that class's step is staged at). A
+/// bundle with no ladder is its own one rung, at the walk its wiring states — no records.
+#[cfg(not(feature = "spyre-hw"))]
+struct EmuRung {
+    fp: &'static str,
+    bodies: Option<&'static [scratchy_target_spyre::bundle_code::RungBody<'static>]>,
+}
+
+/// ⭐ A SOLO PROMPT-CHUNK RUNG'S OWN WIRING CELL — the cell of `width` in its `family`
+/// (`Wirings::first_chunk` or `Wirings::continuation_chunk`): the one its session's constants are
+/// built from and its meta is read off, so no rung runs under another rung's bindings. A rung the
+/// bake shipped with no cell of its own is a binary that does not match its bake, named at load.
+#[cfg(feature = "spyre-hw")]
+fn chunk_cell(
+    family: &'static [(u32, scratchy_target_spyre::wiring::Wiring)],
+    width: usize,
+    what: &str,
+) -> &'static scratchy_target_spyre::wiring::Wiring {
+    family
+        .iter()
+        .find(|(w, _)| *w as usize == width)
+        .map(|(_, wiring)| wiring)
+        .unwrap_or_else(|| {
+            panic!(
+                "the bake shipped the {what} prompt-chunk rung of {width} rows with no wiring cell \
+                 of its own"
+            )
+        })
+}
 
 /// ⭐⭐ THE KV POOL'S TABLES A **PREFILL** SESSION MUST STAGE FOR ITSELF — `kv_row_pool` and the int32
 /// zero beside it, from the PREFILL bundle's own paged step.
@@ -211,10 +242,6 @@ pub(crate) struct Parsed {
 pub(crate) fn wiring_to_parsed(
     w: &'static scratchy_target_spyre::wiring::Wiring,
 ) -> ExecutorResult<Parsed> {
-    // (The kernel-table check moved to where the LAYOUT is in hand: `BakeFacts::of` is followed by
-    // `Wiring::verify_class_placements(&code.layout)` once per baked bundle, which cross-checks the
-    // class sets against the placements — the fact that actually failed on gemma-4, where a fresh
-    // re-staging at the same base head dim agreed with a wrong table.)
     let capacity = w
         .capacity()
         .ok_or_else(|| werr("wiring has no attn_mask (re-bake with the length mask)"))?;
@@ -1302,31 +1329,34 @@ impl SpyreWorker {
                 Ok(&code.groups)
             };
             // ⭐ THE WALK RUNGS — every body a bundle's ladder names (`RerollMeta::rungs`), with the
-            // positions its page walk reaches: one graph walked over fewer or more pages, so the
-            // rungs share the weights and the pools by tensor id. Ascending by reach. A bundle with
-            // no ladder is its own one rung, at the walk its wiring states (`None`).
-            let rungs = |fp: &'static str| -> ExecutorResult<Vec<(Option<usize>, &'static str)>> {
+            // positions its page walk reaches and each class's baked walk (`RungBody::walk`): one
+            // graph walked over fewer or more pages, so the rungs share the weights and the pools by
+            // tensor id. Ascending by reach. A bundle with no ladder is its own one rung, at the walk
+            // its wiring states (`None`).
+            let rungs = |fp: &'static str| -> ExecutorResult<Vec<EmuRung>> {
                 let code = scratchy_target_spyre::bundle_code::bundle::<
                     scratchy_target_spyre::bundle_code::collective::TpWorld<1>,
                 >(fp)
                 .ok_or_else(|| werr(format!("no KTIR bundle registered for fp={fp}")))?;
-                let mut v: Vec<(Option<usize>, &'static str)> = match &code.reroll {
-                    Some(meta) if !meta.rungs.is_empty() => meta
-                        .rungs
+                // Ascending by reach: the ladder's rungs strictly ascend by type (`BakedLadder`).
+                let v: Vec<EmuRung> = match &code.reroll {
+                    Some(meta) => meta
+                        .ladder()
+                        .rungs()
                         .iter()
                         .map(|r| match r.bodies.first() {
-                            Some(b) if !b.is_none() => {
-                                Ok((Some(r.active_cap.get() as usize), b.as_str()))
-                            }
+                            Some(b) if !b.body.is_none() => Ok(EmuRung {
+                                fp: b.body.as_str(),
+                                bodies: Some(&r.bodies[..]),
+                            }),
                             _ => Err(werr(format!(
                                 "bundle {fp}: a ladder rung of {} slots names no body",
                                 r.active_cap.get()
                             ))),
                         })
                         .collect::<ExecutorResult<_>>()?,
-                    _ => vec![(None, fp)],
+                    None => vec![EmuRung { fp, bodies: None }],
                 };
-                v.sort_by_key(|&(reach, _)| reach);
                 Ok(v)
             };
             let prefill_rungs = match (pparsed.as_ref(), bundle.prefill.as_ref()) {
@@ -1342,16 +1372,16 @@ impl SpyreWorker {
                 Vec<u64>,
             )> = Vec::new();
             if let Some(pp) = pparsed.as_ref() {
-                for &(_, fp) in &prefill_rungs {
+                for r in &prefill_rungs {
                     programs.push((
-                        groups(fp)?,
+                        groups(r.fp)?,
                         pp.output_ids.iter().map(|i| *i as u64).collect(),
                     ));
                 }
             }
-            for &(_, fp) in &decode_rungs {
+            for r in &decode_rungs {
                 programs.push((
-                    groups(fp)?,
+                    groups(r.fp)?,
                     dparsed.output_ids.iter().map(|i| *i as u64).collect(),
                 ));
             }
@@ -1493,7 +1523,7 @@ impl SpyreWorker {
                 let step = wirings.decode.paged.first().ok_or_else(|| {
                     werr("this bundle states no paged step — its attention has no pools")
                 })?;
-                let num_blocks = step.pages as usize;
+                let num_blocks = step.pages.get() as usize;
                 let pool_need_bytes = code.layout.kv_pool_bytes();
                 // ⭐ THE CONTEXT THIS RUN SERVES — the declared `--max-model-len`, which the pool must
                 // hold: a declaration past it is REFUSED, never clamped. An unset flag serves the
@@ -1504,7 +1534,8 @@ impl SpyreWorker {
                         return Err(werr(format!(
                             "--max-model-len {d} is past the {capacity} positions the bake's KV pool \
                              holds ({} page(s) of {} slots) — serve a shorter context",
-                            step.pages, step.page_slots
+                            step.pages.get(),
+                            step.page_slots
                         )));
                     }
                     Some(d) => d.max(1),
@@ -1545,11 +1576,7 @@ impl SpyreWorker {
                 // `top_prefill` remains exactly what it was gated to be: the anchor ONLY when the
                 // ladder has no multi-token rung at all, so its width is the prefill wiring's own
                 // `m_cap` in that case and never disagrees with the bundle it runs.
-                let narrowest_rung = g0
-                    .prefill_rungs
-                    .iter()
-                    .filter(|(rm, _)| *rm > 1)
-                    .min_by_key(|(rm, _)| *rm);
+                let narrowest_rung = g0.anchor_rung();
                 let prefill_code = match (top_prefill, narrowest_rung) {
                     (Some(_tp), Some((rm, sent))) => Some(sent
                         .strip_prefix(SUPERDSC_SENTINEL)
@@ -1753,16 +1780,8 @@ impl SpyreWorker {
                             .map(|(_, b)| *b)
                             .sum::<u64>()
                     };
-                let anchor_rung_m = g0
-                    .prefill_rungs
-                    .iter()
-                    .filter(|(rm, _)| *rm > 1)
-                    .min_by_key(|(rm, _)| *rm)
-                    .map(|(rm, _)| *rm);
                 let ladder_rung_bytes: u64 = g0
-                    .prefill_rungs
-                    .iter()
-                    .filter(|(rm, _)| *rm > 1 && Some(*rm) != anchor_rung_m)
+                    .ladder_rungs()
                     .filter_map(|(_, sent)| sent.strip_prefix(SUPERDSC_SENTINEL))
                     .filter_map(scratchy_target_spyre::bundle_code::bundle::<World>)
                     .map(|rc| non_resident(&rc.layout))
@@ -1832,7 +1851,7 @@ impl SpyreWorker {
                     "superdsc paged: KV pool {} page(s) of {} slot(s) = {capacity} positions ({} MB), \
                      as the bake placed it; serving {served_context_v} — {} block(s) offered to the \
                      scheduler, page 0 kept for padded rows' writes",
-                    step.pages,
+                    step.pages.get(),
                     step.page_slots,
                     pool_need_bytes / (1024 * 1024),
                     step.host_blocks(),
@@ -1840,17 +1859,6 @@ impl SpyreWorker {
                 // What the DECODE bake placed — one call, and its own refusal.
                 let df = scratchy_target_spyre::wiring::BakeFacts::of(&code.layout);
                 df.require_identity(&code.fp).map_err(werr)?;
-                // ⭐ THE CLASS SETS vs THE PLACEMENTS — the load-time cross-check that closes the
-                // "emu green, card garbage" gap for the kernel-table class: the emulator executes
-                // the KTIR dialect ops and never reads these tids, so nothing on its path can see
-                // a wiring/layout desync. Here, every rope-P and identity class tid must be placed
-                // at exactly its `hd²·2` footprint, and every placed class tid must be in the
-                // wiring's set — the gemma-4 defect (a base-hd table in a max-hd placement) is
-                // unrepresentable once this runs.
-                wirings
-                    .decode
-                    .verify_class_placements(&code.layout)
-                    .map_err(werr)?;
                 // ⭐ AND THE TAPE IS CHECKED AGAINST THE ARTIFACT, ONCE, HERE. Every tensor the
                 // forward would bind must be one this bundle placed. They come from the same bake
                 // and so agree "by construction" — which is exactly what was also true of the
@@ -1922,13 +1930,12 @@ impl SpyreWorker {
                         // The mismeasured width went straight into the prefill LADDER as the
                         // anchor rung's label: on the tiny fixture the 7-row bundle registered as
                         // "28", sorted above the 11/15/… rungs, and an 8-token prompt — the
-                        // fixture's own request — selected it by `prefill_rung_for`'s
+                        // fixture's own request — selected it by the chunk ladder's
                         // smallest-m≥real rule, then ran its attention ops past placements sized
                         // for 7 rows. The manifest's `prefill_rungs` rows already state each
                         // bundle's width at the bake (the same list this anchor was selected
                         // FROM), so the label is read back off the entry the anchor came from —
                         // no second derivation to disagree with the first.
-                        let pl = &pcode.layout;
                         // The anchor is `top_prefill`-gated: either the manifest's NARROWEST rung
                         // (the normal path — its width is that entry's own `rm`, the same value
                         // the selection just keyed on) or the top prefill bundle itself (no
@@ -1936,10 +1943,7 @@ impl SpyreWorker {
                         // embed activation was staged at, from the wiring and not from the
                         // placement bytes).
                         let prefill_m = g0
-                            .prefill_rungs
-                            .iter()
-                            .filter(|(rm, _)| *rm > 1)
-                            .min_by_key(|(rm, _)| *rm)
+                            .anchor_rung()
                             .map_or_else(
                                 || {
                                     wirings.prefill.as_ref().map_or(0, |p| {
@@ -1948,14 +1952,6 @@ impl SpyreWorker {
                                 },
                                 |(rm, _)| *rm as usize,
                             );
-                        // The prefill bake's class sets against ITS placements — the same
-                        // cross-check the decode bake just passed, for the same reason.
-                        wirings
-                            .prefill
-                            .as_ref()
-                            .unwrap_or(&wirings.decode)
-                            .verify_class_placements(pl)
-                            .map_err(werr)?;
                         // OWNS ITS WEIGHTS ON PURPOSE — do NOT switch this to `new_borrowing`.
                         // This session is allocated BEFORE the decode session, so its 2.6 GB seg1
                         // reservation is what places decode's own weight region. Making it borrow (a
@@ -1994,12 +1990,10 @@ impl SpyreWorker {
                         // ⭐ THE PREFILL WIRING'S OWN STAGED CONSTANTS — the general mint puts
                         // the sampler's nine tables in every prefill rung, and they sit in each
                         // session's own seg3 (never aliased), so every prefill session stages
-                        // its own copy through the same load-time channel the decode rungs use.
-                        let prefill_consts = wirings
-                            .prefill
-                            .as_ref()
-                            .unwrap_or(&wirings.decode)
-                            .load_consts;
+                        // its own copy through the same load-time channel the decode rungs use —
+                        // the anchor's from ITS OWN cell.
+                        let prefill_consts =
+                            chunk_cell(wirings.first_chunk, prefill_m, "first-chunk").load_consts;
                         // The pool's own tables, staged per prefill session — see
                         // [`prefill_pool_statics`] for why they cannot be aliased.
                         let anchor_pool = prefill_pool_statics(wirings)?;
@@ -2070,17 +2064,20 @@ impl SpyreWorker {
                     usize,
                     &'static scratchy_target_spyre::bundle_code::BundleCode<'static, World>,
                 )> = g0
-                    .prefill_rungs
-                    .iter()
-                    .filter_map(|(rung_m, sentinel)| {
-                        let rm = *rung_m as usize;
-                        if rm == prefill_m || rm <= 1 {
-                            return None;
-                        }
-                        sentinel
+                    .ladder_rungs()
+                    .map(|&(rung_m, sentinel)| {
+                        // A rung the bake shipped whose sentinel names no bundle in this binary
+                        // is a binary that does not match its bake — named here, never dropped.
+                        let code = sentinel
                             .strip_prefix(SUPERDSC_SENTINEL)
                             .and_then(scratchy_target_spyre::bundle_code::bundle::<World>)
-                            .map(|c| (rm, c))
+                            .unwrap_or_else(|| {
+                                panic!(
+                                    "prompt-chunk ladder rung m={rung_m}: sentinel did not \
+                                     resolve — every rung the bake shipped must load"
+                                )
+                            });
+                        (rung_m as usize, code)
                     })
                     .collect();
                 // ⛔ THE LADDER'S HOST HALF SPAWNS HERE, BEFORE THE OWNER — ITS DEVICE HALF DOES
@@ -2108,13 +2105,6 @@ impl SpyreWorker {
                 // Capped at the smaller of the rung count and the core count, so a short ladder does
                 // not spawn threads it cannot use.
                 let ladder_join = {
-                    // The prefill wiring's staged constants, staged by every rung through its own
-                    // seg3 (the general mint's nine tables — see the anchor's own `prefill_consts`).
-                    let prefill_consts = wirings
-                        .prefill
-                        .as_ref()
-                        .unwrap_or(&wirings.decode)
-                        .load_consts;
                     let nthreads = std::thread::available_parallelism()
                         .map(|n| n.get())
                         .unwrap_or(4)
@@ -2143,11 +2133,19 @@ impl SpyreWorker {
                             .into_iter()
                             .map(|part| {
                                 let rung_spill = ladder_spill.clone();
-                                let rung_consts = prefill_consts;
                                 let rung_pool = ladder_pool.clone();
                                 std::thread::spawn(move || {
                                     part.into_iter()
                                         .map(|(rm, rcode)| {
+                                            // ⭐ THE RUNG'S OWN CELL'S STAGED CONSTANTS — the
+                                            // general mint's nine tables, staged through the
+                                            // rung's own seg3, from the wiring it was baked under.
+                                            let rung_consts = chunk_cell(
+                                                wirings.first_chunk,
+                                                rm,
+                                                "first-chunk",
+                                            )
+                                            .load_consts;
                                             let r = SuperDscSession::build_borrowing_with_consts(
                                                 cards,
                                                 rcode,
@@ -2226,7 +2224,7 @@ impl SpyreWorker {
                             )
                         });
                     let wiring = if seqs == 1 {
-                        wirings.prefill.as_ref().unwrap_or(&wirings.decode)
+                        chunk_cell(wirings.continuation_chunk, pmq as usize, "continuation")
                     } else {
                         wirings
                             .packed_prefill
@@ -2374,20 +2372,13 @@ impl SpyreWorker {
                     // this rung's `seqs`, so both differ per rung. A rung whose placement does not
                     // describe `rn` whole rows is a LOAD ERROR — a gathered-from guess would read
                     // rows nobody wrote.
-                    // ⭐ THE LOGITS TID IS THE SEAT'S `row` WHEN THE BAKE MINTED A DRAW. The
-                    // token-draw mint re-points the rung's RESULT to the idx stick, so
-                    // `dparsed.result_id` names the `[rows, BLOCK]` pick — the placement exists
-                    // but is not `seqs` rows of vocab, and reading it as logits refused every
-                    // rung at load. The wiring's `SampleSeat.row` is the Sample node's
-                    // inputs[0] — the logits row the mint deliberately keeps placed and
-                    // readable by tid — the same fact the solo launch reads the pick through.
-                    // A bake without a draw keeps the result AS the logits (the host-argmax
-                    // readback this front replaces), so `result_id` stays the fallback.
-                    let logits_tid = wirings
-                        .decode
-                        .sample_seat
-                        .map(|seat| seat.row)
-                        .unwrap_or(dparsed.result_id as u32);
+                    // ⭐ THE LOGITS TID IS THE SEAT'S `row`. The token-draw mint re-points every
+                    // rung's RESULT to the idx stick, so `dparsed.result_id` names the
+                    // `[rows, BLOCK]` pick — the placement exists but is not `seqs` rows of vocab.
+                    // The wiring's `SampleSeat.row` is the Sample node's inputs[0] — the logits
+                    // row the mint deliberately keeps placed and readable by tid — the same fact
+                    // the solo launch reads the pick through.
+                    let logits_tid = wirings.decode.sample_seat.row;
                     let logits = rcode
                         .layout
                         .place_of_tid(logits_tid)
@@ -2902,39 +2893,80 @@ impl SpyreWorker {
                             })
                             .collect()
                     });
+                // ⭐ A PROMPT-CHUNK RUNG, minted once: its manifest width as the rung's own
+                // `RungWidth`, its session, and the meta of the wiring cell the session was built
+                // from. Every manifest row reaching here is a prompt-chunk rung
+                // (`SengraphBundleGroup::prompt_chunk_rungs`).
+                let chunk_rung = |m: usize,
+                                  wiring: &'static scratchy_target_spyre::wiring::Wiring,
+                                  sess: SuperDscSession|
+                 -> ExecutorResult<ChunkRung> {
+                    let width = u32::try_from(m)
+                        .ok()
+                        .and_then(ktir_superdsc::sdsc_abstract::RungWidth::of_baked_rows)
+                        .unwrap_or_else(|| {
+                            panic!("the manifest states a prompt-chunk rung of {m} rows")
+                        });
+                    Ok(ChunkRung {
+                        width,
+                        meta: mk_meta(wiring_to_parsed(wiring)?, 0, wiring),
+                        sess,
+                    })
+                };
+                let mut continuation: Vec<ChunkRung> = Vec::new();
                 let mut prefix_built: Vec<PrefixRungBuilt> = Vec::new();
                 for (job, adopted) in prefix_adopted {
                     let ps = adopted.unwrap_or_else(|m| panic!("{m}"));
-                    // ⭐ THE RUNG'S OWN META, minted from the same wiring cell its consts
-                    // staged — the wave front's launch reads it, never a representative's.
-                    let meta = mk_meta(wiring_to_parsed(job.wiring)?, 0, job.wiring);
                     info!(
                         "[spyre-worker] sendnn: prefix-capable prefill session ready (w={}, s={}, \
-                         bundle {}) — a start>0 chunk runs on the smallest solo rung that holds \
-                         it, a wave of tails on the smallest packed product that holds them",
+                         bundle {}) — a lone continuation chunk runs on the smallest solo rung \
+                         that holds it, a wave of tails on the smallest packed product that holds \
+                         them",
                         job.pmq, job.seqs, job.rcode.fp
                     );
-                    prefix_built.push(PrefixRungBuilt {
-                        width: job.pmq as usize,
-                        seqs: job.seqs as usize,
-                        meta,
-                        sess: ps,
-                    });
+                    if job.seqs == 1 {
+                        continuation.push(chunk_rung(job.pmq as usize, job.wiring, ps)?);
+                    } else {
+                        // ⭐ THE RUNG'S OWN META, minted from the same wiring cell its consts
+                        // staged — the wave front's launch reads it, never a representative's.
+                        prefix_built.push(PrefixRungBuilt {
+                            width: job.pmq as usize,
+                            seqs: job.seqs as usize,
+                            meta: mk_meta(wiring_to_parsed(job.wiring)?, 0, job.wiring),
+                            sess: ps,
+                        });
+                    }
                 }
-                let prefill_prefix = PrefixLadder::of_built(prefix_built);
-                if prefill_prefix.is_empty() {
-                    warn!(
-                        "[spyre-worker] sendnn: no prefix-capable prefill session built — continuation \
-                         chunks will be REFUSED"
-                    );
-                } else {
-                    info!(
-                        "[spyre-worker] sendnn: PREFIX ladder = {:?} (a continuation chunk runs on the \
-                         smallest solo rung that holds the rows it has left; a wave of k tails on \
-                         the smallest packed product holding its widest tail and k)",
-                        prefill_prefix.pairs(),
-                    );
-                }
+                let packed = PrefixLadder::of_built(prefix_built);
+                let first = prefill_ladder
+                    .into_iter()
+                    .map(|(m, sess)| {
+                        chunk_rung(m, chunk_cell(wirings.first_chunk, m, "first-chunk"), sess)
+                    })
+                    .collect::<ExecutorResult<Vec<ChunkRung>>>()?;
+                // ⭐ BOTH FAMILIES, NEVER EMPTY — a bake ships the prompt's first-chunk rungs and
+                // its prefix-capable rungs together, so a binary missing either does not match its
+                // bake: named here, at load, never as a refused chunk mid-request.
+                let chunks = ChunkLadder {
+                    first: ChunkFamily::of_built(first).unwrap_or_else(|| {
+                        panic!("the bake shipped no prompt-chunk rung for a prompt's first chunk")
+                    }),
+                    continuation: ChunkFamily::of_built(continuation).unwrap_or_else(|| {
+                        panic!(
+                            "the bake shipped no prefix-capable prompt-chunk rung — a prompt past \
+                             its first chunk has nothing to run on"
+                        )
+                    }),
+                };
+                info!(
+                    "[spyre-worker] sendnn: CHUNK ladder — first {:?}, continuation {:?}, packed {:?} \
+                     (a chunk runs on the smallest rung of its reach that holds the rows it has \
+                     left; a wave of k tails on the smallest packed product holding its widest \
+                     tail and k)",
+                    chunks.first.widths(),
+                    chunks.continuation.widths(),
+                    packed.pairs(),
+                );
                 // ── DECODE BATCH LADDER: one session per baked request count ──
                 // Same construction as the prefill ladder: each rung aliases the decode session's
                 // weights and page pool, so a rung costs its programs and its activations, never
@@ -3020,8 +3052,8 @@ impl SpyreWorker {
                 let sb = SuperDscBundle {
                     decode: ss,
                     decode_rungs: decode_ladder,
-                    prefill_rungs: prefill_ladder,
-                    prefill_prefix,
+                    chunks,
+                    packed,
                 };
                 SendnnSession::SuperDsc(sb)
             } else {
@@ -3039,7 +3071,7 @@ impl SpyreWorker {
         // KTIR program routing (prefill=0, decode=1). sendnn routes per group inside
         // forward; keep these for the BundleMeta (decode/prefill phase index).
         #[cfg(feature = "spyre-hw")]
-        let (decode_prog_base, prefill_prog) = (1usize, Some(0usize));
+        let decode_prog_base = 1usize;
 
         // Model-level dims (identical across cap buckets) from the first decode parse.
         let hidden = dparsed.hidden;
@@ -3067,24 +3099,15 @@ impl SpyreWorker {
 
         #[cfg(feature = "spyre-hw")]
         let (decode, prefill) = {
-            let mut decode: Vec<BundleMeta> = dparsed_all
+            let decode: Vec<BundleMeta> = dparsed_all
                 .into_iter()
                 .enumerate()
                 .map(|(i, p)| mk_meta(p, decode_prog_base + i, &wirings.decode))
                 .collect();
-            // Ascending by reach so `select_decode`'s first-fit picks the smallest.
-            decode.sort_by_key(|b| b.reach());
-            let prefill: Vec<BundleMeta> = pparsed
-                .map(|p| {
-                    mk_meta(
-                        p,
-                        prefill_prog.unwrap(),
-                        wirings.prefill.as_ref().unwrap_or(&wirings.decode),
-                    )
-                })
-                .into_iter()
-                .collect();
-            (decode, prefill)
+            // ⭐ ON A CARD EVERY PROMPT-CHUNK META LIVES ON ITS CHUNK RUNG, beside the session it
+            // was built for ([`ChunkLadder`]); the per-forward prompt list is the emulator's.
+            drop(pparsed);
+            (decode, Vec::<BundleMeta>::new())
         };
         // ⭐ ONE META PER RUNG, each at its rung's own walk: the wiring is the graph's (every rung
         // binds the same tensors), and the walk is the rung's (`PagedStep::walk`, which sizes the
@@ -3093,26 +3116,14 @@ impl SpyreWorker {
         let (decode, prefill) = {
             drop(dparsed_all);
             drop(pparsed);
-            let page_slots =
-                scratchy_target_spyre::paged_step::SchedulerBlockTokens::REFERENCE.as_usize();
-            let at_walk = |mut meta: BundleMeta, reach: Option<usize>| {
-                // ⭐ EACH CLASS'S OWN WALK AT THE RUNG'S REACH — the rung's causal
-                // sweep, capped by a windowed class's own bound (the same
-                // `window_walk_blocks` law `PagedStep::on_body` states for a launch).
-                if let Some(r) = reach {
-                    for p in meta.paged.iter_mut() {
-                        let swept = (r / page_slots) as u32;
-                        p.walk = match p.window {
-                            Some(w) => swept.min(
-                                scratchy_target_spyre::paged_step::window_walk_blocks(
-                                    p.pages,
-                                    w,
-                                    p.extent.per_request().get(),
-                                    p.page_slots,
-                                ),
-                            ),
-                            None => swept,
-                        };
+            let at_walk = |mut meta: BundleMeta, rung: &EmuRung| {
+                // ⭐ EACH CLASS AT ITS RUNG'S BAKED WALK — `RungBody::walk`, the walk the bake
+                // minted for the class's step (`PagedStep::staged_walk`), one record per class in
+                // the wiring's class order (`rung_bodies` states the order and the count at the
+                // bake). Nothing here derives a walk.
+                if let Some(bodies) = rung.bodies {
+                    for (p, b) in meta.paged.iter_mut().zip(bodies) {
+                        *p = p.at_walk(b.walk);
                     }
                 }
                 meta
@@ -3120,14 +3131,14 @@ impl SpyreWorker {
             let decode = decode_rungs
                 .iter()
                 .enumerate()
-                .map(|(j, &(reach, _))| {
+                .map(|(j, rung)| {
                     Ok(at_walk(
                         mk_meta(
                             wiring_to_parsed(&wirings.decode)?,
                             prefill_rungs.len() + j,
                             &wirings.decode,
                         ),
-                        reach,
+                        rung,
                     ))
                 })
                 .collect::<ExecutorResult<Vec<BundleMeta>>>()?;
@@ -3135,43 +3146,30 @@ impl SpyreWorker {
                 Some(pw) => prefill_rungs
                     .iter()
                     .enumerate()
-                    .map(|(i, &(reach, _))| {
-                        Ok(at_walk(mk_meta(wiring_to_parsed(pw)?, i, pw), reach))
-                    })
+                    .map(|(i, rung)| Ok(at_walk(mk_meta(wiring_to_parsed(pw)?, i, pw), rung)))
                     .collect::<ExecutorResult<Vec<BundleMeta>>>()?,
                 None => Vec::new(),
             };
             (decode, prefill)
         };
-        // ⛔ DEFAULT-MODE: the single static-SDPA graph IS the decode graph (prefill slot holds the same
-        // graph). Its PrimaryInput ids (`t0`/`t5..t8`/prefix-KV) come from the DECODE manifest. The
-        // separately-emitted m=prefill prefill manifest has DIFFERENT tensor ids, so using its BundleMeta for
-        // the PER-FORWARD binding would bind the wrong names to the default graph (silent wrong output). So
-        // `model.prefill` is nulled for Default/Paged/SuperDsc (every forward drives the decode meta). BUT
-        // the batched-prefill path binds the prefill meta to the DISTINCT prefill SESSION (via
-        // run_card_launch), where the ids DO match — so preserve it in `batched_prefill` (SuperDsc only).
-        #[cfg(feature = "spyre-hw")]
-        let (prefill, batched_prefill) = if matches!(session, SendnnSession::SuperDsc(_)) {
-            (Vec::new(), prefill.into_iter().next())
-        } else {
-            (prefill, None)
+        // ⭐ THE DECODE BUCKETS, NEVER EMPTY — every bake ships a decode bundle, so a binary with
+        // none does not match its bake, named here at load.
+        let decode = DecodeBuckets::of(decode)
+            .unwrap_or_else(|| panic!("{arch}: the bake shipped no decode bundle"));
+        let reaches = |metas: &mut dyn Iterator<Item = &BundleMeta>| -> Vec<usize> {
+            metas.map(|b| b.reach()).collect()
         };
-        #[cfg(not(feature = "spyre-hw"))]
-        let batched_prefill: Option<BundleMeta> = None;
-
-        let reaches =
-            |metas: &[BundleMeta]| -> Vec<usize> { metas.iter().map(|b| b.reach()).collect() };
         info!(
             "[spyre-worker] arch {arch} via try_load (decode m={}) prefill={} | {} layers, \
              hidden {hidden}, head_dim {head_dim}, kv_dim {kv_dim}, vocab {vocab}, \
              decode reaches {:?}, prefill reaches {:?}, theta {rope_theta}",
-            decode[0].m_cap,
+            decode.narrowest().m_cap,
             prefill
                 .first()
                 .map_or_else(|| "none".to_string(), |p| format!("m={}", p.m_cap)),
-            decode[0].layers.len(),
-            reaches(&decode),
-            reaches(&prefill),
+            decode.narrowest().layers.len(),
+            reaches(&mut decode.iter()),
+            reaches(&mut prefill.iter()),
         );
 
         Ok(Loaded {
@@ -3183,7 +3181,6 @@ impl SpyreWorker {
             session,
             decode,
             prefill,
-            batched_prefill,
             pool: wirings.pool,
             served_context: served_context_v,
             #[cfg(feature = "spyre-hw")]

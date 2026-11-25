@@ -33,6 +33,52 @@ pub(crate) struct LayerWiring {
     pub(crate) prefix_v_src: usize,
 }
 
+/// ⭐ THE DECODE BUCKETS, NEVER EMPTY — the widest, and the narrower ones ascending by reach
+/// ([`BundleMeta::reach`]). Holding the widest apart makes every selection total: a step reaching
+/// past every narrower bucket runs the widest, which serves the whole context the run declares.
+pub(crate) struct DecodeBuckets {
+    narrower: Vec<BundleMeta>,
+    widest: BundleMeta,
+}
+
+impl DecodeBuckets {
+    /// The buckets the loader minted, or `None` when it minted none — a binary with no decode
+    /// bundle, the loader's to name.
+    pub(crate) fn of(mut buckets: Vec<BundleMeta>) -> Option<Self> {
+        buckets.sort_by_key(BundleMeta::reach);
+        let widest = buckets.pop()?;
+        Some(Self {
+            narrower: buckets,
+            widest,
+        })
+    }
+
+    /// ⭐ THE BUCKET A STEP REACHING `need` POSITIONS RUNS — the narrowest that reaches them, else
+    /// the widest. THE ONE decode selection.
+    pub(crate) fn for_reach(&self, need: usize) -> &BundleMeta {
+        self.narrower
+            .iter()
+            .find(|b| b.reach() >= need)
+            .unwrap_or(&self.widest)
+    }
+
+    /// The narrowest bucket.
+    pub(crate) fn narrowest(&self) -> &BundleMeta {
+        self.narrower.first().unwrap_or(&self.widest)
+    }
+
+    /// The widest bucket — the wiring a decode batch rung runs under (the card's decode front).
+    #[cfg(feature = "spyre-hw")]
+    pub(crate) fn widest(&self) -> &BundleMeta {
+        &self.widest
+    }
+
+    /// Every bucket, ascending by reach.
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &BundleMeta> {
+        self.narrower.iter().chain(std::iter::once(&self.widest))
+    }
+}
+
 /// Per-phase metadata for one program (decode m=1 or prefill m=M) inside the
 /// shared [`SpyreSession`]. Decode and prefill share weight tensor ids (same
 /// graph, different m), so the weights live ONCE in the session; this carries
@@ -99,13 +145,13 @@ pub(crate) struct BundleMeta {
     #[cfg(not(feature = "spyre-hw"))]
     pub(crate) phase: scratchy_target_spyre::forward_tape::ForwardPhase,
     /// ⭐ THE MINTED SAMPLER'S SEAT — the wiring's own (`Wiring::sample_seat`), projected at load
-    /// like `phase` above (never a second derivation). `Some` on every rung the bake minted the
-    /// draw into: the emulator forward stages this seat's law every step and reads the pick back
-    /// through the re-pointed result. Emulator-only: the card path reads it straight off its own
-    /// `wiring` field.
+    /// like `phase` above (never a second derivation) — every rung's, since every rung mints the
+    /// draw: the emulator forward stages this seat's law every step and reads the pick back through
+    /// the re-pointed result. Emulator-only: the card path reads it straight off its own `wiring`
+    /// field.
     #[cfg(not(feature = "spyre-hw"))]
-    pub(crate) sample_seat: Option<scratchy_target_spyre::wiring::SampleSeat>,
-    /// ⭐ THE GENERATED scratchy_target_spyre::wiring::IRING THIS BUNDLE scratchy_target_spyre::wiring::AS BAKED scratchy_target_spyre::wiring::ITH. Everything above it is a copy taken
+    pub(crate) sample_seat: scratchy_target_spyre::wiring::SampleSeat,
+    /// ⭐ THE GENERATED WIRING THIS BUNDLE WAS BAKED WITH. Everything above it is a copy taken
     /// out of this static on the way through `Parsed`; the forward tape is read straight off it
     /// (`Wiring::forward_shape`) so the shape a forward plays cannot be a second opinion about
     /// what the bake decided.
@@ -173,20 +219,16 @@ pub(crate) struct Loaded {
     /// layer-group split — selected from the baked bundle shape.
     #[cfg(feature = "spyre-hw")]
     pub(crate) session: SendnnSession,
-    /// m=1 decode program metas, one per rung, ASCENDING by reach ([`BundleMeta::reach`]). The
-    /// generation loop runs the smallest rung that reaches the current position — on the emulator the
-    /// page walk's rungs, so a step walks the fewest pages its context fills; never empty. The
-    /// sendnn path bakes a single bucket, so its ladder is the full-cap entry.
-    pub(crate) decode: Vec<BundleMeta>,
-    /// m=M prompt-chunk program metas, ASCENDING by reach — on the emulator the page walk's rungs,
-    /// each chunk run on the smallest that reaches its context. Empty when none is baked (prefill then
-    /// walks the decode program, one token per forward).
+    /// m=1 decode program metas, one per rung ([`DecodeBuckets`]): the generation loop runs the
+    /// smallest that reaches the current position — on the emulator the page walk's rungs, so a step
+    /// walks the fewest pages its context fills. The sendnn path bakes a single bucket, so its ladder
+    /// is the full-cap entry.
+    pub(crate) decode: DecodeBuckets,
+    /// m=M prompt-chunk program metas, ASCENDING by reach — the emulator's page walk's rungs, each
+    /// chunk run on the smallest that reaches its context. Empty on a card, where every prompt-chunk
+    /// meta lives on its chunk rung beside its session (`ChunkLadder`), and on an emulator build that
+    /// bakes none (prefill then walks the decode program, one token per forward).
     pub(crate) prefill: Vec<BundleMeta>,
-    /// The prefill program meta PRESERVED for the batched-prefill path. `model.prefill` is nulled for
-    /// SuperDsc so the PER-FORWARD binding uses the decode graph (the prefill manifest has different
-    /// tensor ids); but `run_card_launch` binds this meta to the DISTINCT prefill SESSION (where the ids
-    /// match), so it is kept here. Some only for SuperDsc with a baked prefill bundle; None otherwise.
-    pub(crate) batched_prefill: Option<BundleMeta>,
     /// ⭐ THE KV POOL THE BAKE PLACED — its pages and one page ([`scratchy_target_spyre::wiring::Wirings::pool`]): the ENGINE's final KV budget ([`Worker::determine_available_memory`]) and block ([`Worker::kv_block_bytes`]) read it, so the scheduler's block count is the pool's page count.
     pub(crate) pool: scratchy_target_spyre::pool_pages::BakedPool,
     /// ⭐ THE CONTEXT THIS RUN SERVES, in tokens — the `--max-model-len` declared (else the model's

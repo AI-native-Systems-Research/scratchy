@@ -248,11 +248,9 @@ impl<T: ktir_superdsc::collective::Tp> scratchy_subtile::model_geometry::OnHeadD
     }
 }
 
-/// ⭐ THE DOOR. main's `lower_rope_node` read `mq`/`total` off a `TileOp` built from the node and its
-/// operand names off `ds_name`. `total` is the node's declared output width and `mq` its row count —
-/// both carried on [`KtirNode::out_shape`], because the program states only their product with
-/// `heads` (see that field). The head dim is the `x` view's own column extent, and it becomes the
-/// const generic through the SAME door main crossed.
+/// ⭐ THE DOOR. The rope's plane — its head dim `hd`, row count `mq` and width `total` — is read
+/// off the program's own `x` view and access tile ([`RopePlane`], one reading per form below), and
+/// the head dim becomes the const generic through `with_config_head_dim`.
 fn rope<T: ktir_superdsc::collective::Tp>(
     name: &str,
     r: &[Region],

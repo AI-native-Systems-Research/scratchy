@@ -22,7 +22,6 @@ pub(crate) fn forward_chunk(
     sh: &Shared<'_>,
     session: &mut SpyreSession,
     b: &BundleMeta,
-    prefill_meta: Option<&BundleMeta>,
     Chunk {
         state: req,
         id,
@@ -31,7 +30,6 @@ pub(crate) fn forward_chunk(
         toks,
     }: Chunk<'_>,
 ) -> ExecutorResult<ChunkOut> {
-    let _ = prefill_meta; // the batched-prefill session pair is a sendnn-only shape
     let n = toks.len();
     if start + n > b.capacity {
         return Err(werr(format!(
@@ -48,15 +46,10 @@ pub(crate) fn forward_chunk(
     // in. Its pages already hold the keys of positions `0..start` (this request's earlier steps, or
     // the request whose prefix a cache hit shares), and this forward's write scatters positions
     // `start..start + n` into them; the paged step below checks the grant reaches that far.
-    // Block `b` is pool page `b + 1`: page 0 is the null page a padded row writes
-    // (`paged_step::page_of_block`).
-    let blocks: Vec<u32> = tokens
+    // The block table as pool pages — the one mapping (`paged_step::request_pages`).
+    let blocks = tokens
         .block_table(id)
-        .map(|t| {
-            t.iter()
-                .map(|&b| scratchy_target_spyre::paged_step::page_of_block(b as u32))
-                .collect()
-        })
+        .map(scratchy_target_spyre::paged_step::request_pages)
         .unwrap_or_default();
     // The number of activation ROWS the bound buffers carry: the baked `m_cap`. Each forward fills
     // n <= m_cap real rows; the remaining pad rows REPLICATE the last real token (see the staging
@@ -220,7 +213,6 @@ pub(crate) fn forward_chunk(
         }
         dynamic
     };
-    let vocab = sh.vocab;
 
     // ⭐ THE PAGED STEPS — the page table, the mask stack and the write rows of EVERY attention
     // class, staged from the request's blocks by `scratchy_target_spyre::paged_step` (the law the
@@ -248,9 +240,12 @@ pub(crate) fn forward_chunk(
                     ));
                 }
             }
-            let (mask_tid, mask, mask_shape) = srcs.mask;
-            if !dynamic.iter().any(|(t, ..)| *t == u64::from(mask_tid)) {
-                dynamic.push((u64::from(mask_tid), mask, mask_shape));
+            // Every mask the step stages — one per window on a packed rung (the request's own
+            // at window 0, the empty-slot laws past it), exactly one on every solo step.
+            for (mask_tid, mask, mask_shape) in srcs.masks {
+                if !dynamic.iter().any(|(t, ..)| *t == u64::from(mask_tid)) {
+                    dynamic.push((u64::from(mask_tid), mask, mask_shape));
+                }
             }
         }
         session
@@ -261,9 +256,9 @@ pub(crate) fn forward_chunk(
         // one-row decode step had its outputs decoded at the prefill's `m`. The result is the one
         // readback — `vocab` of the logits row, or, for a rung that draws (its result re-pointed at
         // the idx stick, `[rows, W]` at the seat's minted width), the whole stick (`0`).
-        let result_elems = if b.sample_seat.is_some() { 0 } else { vocab };
+        // Every rung draws, so its result is the idx stick, read whole (`0`).
         let wanted: std::collections::HashMap<u64, usize> =
-            std::iter::once((b.result_id as u64, result_elems)).collect();
+            std::iter::once((b.result_id as u64, 0)).collect();
         let outputs: Vec<(u64, usize)> = b
             .output_ids
             .iter()
@@ -278,7 +273,8 @@ pub(crate) fn forward_chunk(
         // law both tiers lay out — packed `[rows, 1]` at the views' own dtypes (i32 words, f32
         // inv_t), the memref-faithful layout the bake's numeric gate stages them in; the f16
         // channel `run_step` takes would encode them into half the bytes their views span.
-        if let Some(seat) = b.sample_seat {
+        let seat = b.sample_seat;
+        {
             let rows = seat.rows as usize;
             let draw = req.draw;
             let words: Vec<([i32; 4], f32)> = (0..rows)
@@ -341,29 +337,24 @@ pub(crate) fn forward_chunk(
         // emulator's readback is memref-faithful, row `r`'s lane 0 is element `r·width`, and each
         // word passes the same token law the card's decode applies (`token_of_idx_word`). The
         // caller consumes the LAST row's pick, the folded tail's: the last real token's forward.
-        match b.sample_seat {
-            Some(seat) => {
-                let idx = out.get(&(b.result_id as u64)).ok_or_else(|| {
-                    werr(format!(
-                        "the minted draw's idx stick t{} came back unread",
-                        b.result_id
-                    ))
-                })?;
-                let rows = seat.rows as usize;
-                let width = idx.len() / rows.max(1);
-                tracing::debug!(
-                    "EMU_PICK t{} rows={rows} width={width} words={:?} seat={:?}",
-                    b.result_id,
-                    &idx[..idx.len().min(8)],
-                    seat
-                );
-                let picks = (0..rows)
-                    .map(|r| token_of_idx_word(r, idx[r * width] as i32, seat.vocab as usize))
-                    .collect::<ExecutorResult<Vec<u32>>>()?;
-                Ok(ChunkOut::Tokens(picks))
-            }
-            None => Ok(ChunkOut::Prompt),
-        }
+        let idx = out.get(&(b.result_id as u64)).ok_or_else(|| {
+            werr(format!(
+                "the minted draw's idx stick t{} came back unread",
+                b.result_id
+            ))
+        })?;
+        let rows = seat.rows as usize;
+        let width = idx.len() / rows.max(1);
+        tracing::debug!(
+            "EMU_PICK t{} rows={rows} width={width} words={:?} seat={:?}",
+            b.result_id,
+            &idx[..idx.len().min(8)],
+            seat
+        );
+        let picks = (0..rows)
+            .map(|r| token_of_idx_word(r, idx[r * width] as i32, seat.vocab as usize))
+            .collect::<ExecutorResult<Vec<u32>>>()?;
+        Ok(ChunkOut::Tokens(picks))
     }
 }
 

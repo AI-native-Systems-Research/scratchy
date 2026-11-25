@@ -333,8 +333,20 @@ pub enum Program {
     /// number that keeps the gather's per-core LX charge under the vendor budget. Stated
     /// by the lowering that builds this payload — the one derivation's spelling, called
     /// once off this op's own `hidden` — and read here by the door, never re-derived.
+    ///
+    /// `hidden` — the gathered row's OWN width, the mint's one statement of it (the
+    /// `SubOp::EmbedRowGather` payload, the same single source the paired `ChainStage`'s
+    /// payload carries). ⛔ THE DOOR READS THE LOGICAL HIDDEN HERE, NEVER THE ROW OUT'S
+    /// STATED SHAPE: the resident's per-tid shape is the WIDEST view that addresses the
+    /// tid — an ALLOCATION law — and a pointwise consumer of the rows legitimately
+    /// restates them at its DEVICE width (`DeviceWidth::for_pointwise`'s unconditional
+    /// util-floor bump: 2 sticks become 8, a 128-wide row states 512), so the merged
+    /// view's cols are the allocation's padded width, not the mint's hidden. A door that
+    /// conflates the two refuses a graph the mint did make (measured: the parity fixture's
+    /// chained head, first execution under the lower path).
     EmbedRowGather {
         k: u32,
+        hidden: u32,
     },
     /// The chained head's pick decompose (#603) — the pick, staged into the persistent s/l
     /// placements through TWO STAGED TABLES, as THREE one-entry u32 table gathers the door

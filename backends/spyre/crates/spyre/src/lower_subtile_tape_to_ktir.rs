@@ -18,7 +18,6 @@
 use crate::lower_subtile_tape_to_superdsc::*;
 use ktir_superdsc::emit::EmittedOp;
 use ktir_superdsc::ktir_node::ActiveCap;
-use ktir_superdsc::sdsc_abstract::QueryExtent;
 use ktir_superdsc::superdsc_opspec::{DataFormat, DeviceTileLayout};
 use scratchy_subtile::subtile_ir::chain_slab_entries;
 use scratchy_subtile::subtile_ir::{RopeForm, SubOp, SubtileIR, SubtileId, SubtileNode, TensorId};
@@ -139,6 +138,7 @@ pub(crate) fn scalar_mul_weight_folds<F: RopeForm>(
 ) -> Vec<(SubtileId, u32, f32)> {
     let _pc = crate::pc::Pc::start("foldscan");
     crate::pc::count("foldscan", ir.nodes.len() as u64);
+    let fp8_payloads = ir.fp8_weight_payloads();
     let mut folds = Vec::new();
     for node in &ir.nodes {
         let SubOp::ScalarMul { scale } = &node.op else {
@@ -157,25 +157,19 @@ pub(crate) fn scalar_mul_weight_folds<F: RopeForm>(
         else {
             continue;
         };
-        if !matches!(producer.op, SubOp::MatmulTile { .. }) || producer.inputs.len() < 2 {
+        // The matmul's weight is its LAST operand, and a matmul has at least two.
+        let (SubOp::MatmulTile { .. }, [_, .., target]) = (&producer.op, producer.inputs.as_slice())
+        else {
             continue;
-        }
-        let target = producer.inputs.last().expect("len checked above");
+        };
         // ⛔ AN fp8 WEIGHT CANNOT ABSORB A SCALE — multiplying its mantissa bytes elementwise is
         // a REQUANTIZE (the product has to re-encode into fp8's own exponent range), not the
         // exact algebra this fold is. The `ws` dequant row is the fp8 fold's target precisely
-        // because it sits OUTSIDE the quantized payload. The fp8-weight test is the emitter's
-        // own (`input[1]` of an arity-3 `MatmulTile`, `compute_bundle_layout::fp8_weight_tids`),
-        // restated here so a matmul whose input order puts the quantized payload last is refused
-        // at RECOGNITION — a build-time fact, not a load-time dtype check.
-        let is_fp8_weight = |t: TensorId| {
-            ir.nodes.iter().any(|n| {
-                matches!(n.op, SubOp::MatmulTile { .. })
-                    && n.inputs.len() == 3
-                    && n.inputs[1].tensor == t
-            })
-        };
-        if is_fp8_weight(target.tensor) {
+        // because it sits OUTSIDE the quantized payload. The fp8-weight test is the graph's own
+        // (`SubtileIR::fp8_weight_payloads`, the set the placement sizes by), so a matmul whose
+        // last input is a quantized payload is refused at RECOGNITION — a build-time fact, not a
+        // load-time dtype check.
+        if fp8_payloads.contains(&target.tensor) {
             continue;
         }
         let shared = |tid: TensorId, skip: SubtileId| {
@@ -220,8 +214,9 @@ pub(crate) fn scalar_mul_weight_folds<F: RopeForm>(
 /// node's arm skipped.
 ///
 /// The producer walk, and ⛔ EVERY REFUSAL IS A CORRECTNESS FACT:
-///   * `inputs[0]` (Q) must be a rope's WHOLE output — its producer is the `RopeRotate` — and
-///     `inputs[3]` (new K) the `RopeAppend`'s; a pre-populated cache region or any other
+///   * the query (`AttnLayout::q`) must be a rope's WHOLE output — its producer is the
+///     `RopeRotate` — and the step segment's K the `RopeAppend`'s; a pre-populated cache region
+///     or any other
 ///     producer shape refuses (the walk is granite's chain, stated as a shape and not guessed
 ///     at: `matmul → rope → attention`);
 ///   * the rope's first input must be a MATMUL's whole output, whose LAST input is the fold
@@ -251,7 +246,7 @@ pub(crate) fn attn_scale_weight_folds<F: RopeForm>(
         ir: &SubtileIR<F>,
         attn_input: &scratchy_subtile::subtile_ir::TensorRegion,
         attn_id: SubtileId,
-        is_fp8_weight: &impl Fn(TensorId) -> bool,
+        fp8_payloads: &std::collections::BTreeSet<TensorId>,
         shared: &impl Fn(TensorId, SubtileId) -> bool,
     ) -> Option<TensorId> {
         let rope = ir
@@ -267,13 +262,14 @@ pub(crate) fn attn_scale_weight_folds<F: RopeForm>(
             .nodes
             .iter()
             .find(|p| p.id != rope.id && p.output == rope.inputs[0])?;
-        if !matches!(matmul.op, SubOp::MatmulTile { .. }) || matmul.inputs.len() < 2 {
+        // The matmul's weight is its LAST operand, and a matmul has at least two.
+        let (SubOp::MatmulTile { .. }, [_, .., target]) = (&matmul.op, matmul.inputs.as_slice())
+        else {
             return None;
-        }
-        let target = matmul.inputs.last().expect("len checked above");
+        };
         // The fp8-payload and shared-weight refusals, same laws as the ScalarMul fold's —
         // see that function's doc for why each is a correctness fact and not timidity.
-        if is_fp8_weight(target.tensor) {
+        if fp8_payloads.contains(&target.tensor) {
             return None;
         }
         if shared(target.tensor, matmul.id) {
@@ -287,13 +283,7 @@ pub(crate) fn attn_scale_weight_folds<F: RopeForm>(
         }
         Some(target.tensor)
     }
-    let is_fp8_weight = |t: TensorId| {
-        ir.nodes.iter().any(|n| {
-            matches!(n.op, SubOp::MatmulTile { .. })
-                && n.inputs.len() == 3
-                && n.inputs[1].tensor == t
-        })
-    };
+    let fp8_payloads = ir.fp8_weight_payloads();
     let shared = |tid: TensorId, skip: SubtileId| {
         ir.nodes
             .iter()
@@ -301,22 +291,30 @@ pub(crate) fn attn_scale_weight_folds<F: RopeForm>(
     };
     let mut folds = Vec::new();
     for node in &ir.nodes {
-        let SubOp::AttnDecode { attention, .. } = &node.op else {
+        let SubOp::AttnDecode {
+            attention,
+            operands,
+            ..
+        } = &node.op
+        else {
             continue;
         };
-        // inputs = [q, prefix_k, prefix_v, new_k, new_v] — the walk is the two live sides.
-        let [q, _prefix_k, _prefix_v, new_k, _new_v] = node.inputs.as_slice() else {
+        // The walk is the two live sides — the query and the step's new K, by the op's own
+        // layout. A sinks attention keeps its in-kernel scale (the fold's walk is stated for the
+        // sinks-free form only), and an attention over a resident cache alone has no new K.
+        let (Some(step), None) = (operands.step_segment(), operands.sinks()) else {
             continue;
         };
+        let (q, new_k) = (&node.inputs[operands.q()], &node.inputs[operands.k(step)]);
         // The model's scale at this node's class, off the facts.
         let scale = attention.scale().get();
         if scale == 1.0 {
             continue;
         }
-        let Some(w_q) = projection_weight(ir, q, node.id, &is_fp8_weight, &shared) else {
+        let Some(w_q) = projection_weight(ir, q, node.id, &fp8_payloads, &shared) else {
             continue;
         };
-        let Some(w_k) = projection_weight(ir, new_k, node.id, &is_fp8_weight, &shared) else {
+        let Some(w_k) = projection_weight(ir, new_k, node.id, &fp8_payloads, &shared) else {
             continue;
         };
         // ⛔ THE F16 FLOOR GATE, pair-wise: the score algebra needs BOTH sides folded
@@ -509,11 +507,16 @@ fn chain_skeleton<F: RopeForm>(
     })
 }
 
-/// The gathered row's program — `Program::EmbedRowGather { k }`, `[s_stick, l_stick, weight]`
-/// in and the `[1, hidden]` row out, hand-minted over the node's own regions. `k` is the
-/// ONE SPELLING'S spyre-side call: this node carries no k of its own (the ChainStage's
-/// payload does), so the emitter asks [`chain_slab_entries`] at THIS node's own `hidden`
-/// — the same pure fn the mint stated, called on the same hidden, the ruled third site.
+/// The gathered row's program — `Program::EmbedRowGather { k, hidden }`, `[s_stick,
+/// l_stick, weight]` in and the `[1, hidden]` row out, hand-minted over the node's own
+/// regions. `k` is the ONE SPELLING'S spyre-side call: this node carries no k of its own
+/// (the ChainStage's payload does), so the emitter asks [`chain_slab_entries`] at THIS
+/// node's own `hidden` — the same pure fn the mint stated, called on the same hidden,
+/// the ruled third site. `hidden` is the node's OWN payload statement carried verbatim —
+/// the mint's one hidden, the same single source the paired `ChainStage`'s payload
+/// reads — so the door reads the LOGICAL hidden from the payload and never from the row
+/// out's stated shape, whose cols are the widest ALLOCATION view (a pointwise consumer's
+/// device-width restatement, legitimately past the logical hidden).
 fn embed_row_gather_emitted<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     node: &SubtileNode<F>,
     ir: &SubtileIR<F>,
@@ -535,7 +538,10 @@ fn embed_row_gather_emitted<T: ktir_superdsc::collective::Tp, F: RopeForm>(
         "embed_row_gather",
         node,
         ir,
-        ktir_superdsc::ktir_node::Program::EmbedRowGather { k: entries },
+        ktir_superdsc::ktir_node::Program::EmbedRowGather {
+            k: entries,
+            hidden,
+        },
     )?;
     Ok(ktir_only(k))
 }
@@ -889,9 +895,11 @@ pub(crate) fn lower_one_node<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     // See main's `lower_attn_node`: whether this bundle's rows are separate requests.
     rows_are_requests: bool,
     // ⭐ THE QUERY'S EXTENT PAIR — the rung's own `(per-request width, requests)`, minted once at
-    // the bake ([`QueryExtent::of_baked_rung`]) and threaded down to the attention splice beside
-    // `active_cap`. Only `AttnDecode` spends it; every other op reads the graph's rows.
-    query_rows: QueryExtent,
+    // the bake (`QueryExtent::of_baked_rung`), proven against this graph
+    // ([`scratchy_triton_splice::GraphExtent`]) and threaded down to the splice beside
+    // `active_cap`. Only `AttnDecode` and the lm-head tail spend it; every other op reads the
+    // graph's rows.
+    query_rows: scratchy_triton_splice::GraphExtent,
 ) -> NodeLowering<T> {
     use NodeLowering::{HostRouted, Ops, Unhandled};
     // ⭐⭐⭐ A FOLDED SCALARMUL'S READERS BIND THE PRODUCER'S OUTPUT. The fold takes the node
@@ -1241,7 +1249,7 @@ pub fn lower_graph_to_ktir<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     // See main's `lower_attn_node`. Prefill callers pass false.
     rows_are_requests: bool,
     // The rung's query extent pair — threaded to the attention splice ([`lower_one_node`]).
-    query_rows: QueryExtent,
+    query_rows: scratchy_triton_splice::GraphExtent,
 ) -> Result<(Vec<EmittedOp<T>>, BundleLayout), SuperDscError> {
     // GLOBAL ≤7-segment memory layout (task #55) computed ONCE for the whole bundle.
     // Every op resolves each tensor's HBM address from this (by `t{id}` name) so a
@@ -1317,7 +1325,7 @@ pub fn lower_graph_to_superdsc<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     weight_ids: &std::collections::HashSet<u32>,
     active_cap: ActiveCap,
     rows_are_requests: bool,
-    query_rows: QueryExtent,
+    query_rows: scratchy_triton_splice::GraphExtent,
 ) -> Result<(Vec<EmittedOp<T>>, BundleLayout), SuperDscError> {
     let (programs, mut bundle_layout) =
         lower_graph_to_ktir(ir, weight_ids, active_cap, rows_are_requests, query_rows)?;
@@ -1433,8 +1441,7 @@ pub struct BundleWiring {
     /// above, applied to the class sets. The rope's lowering resolves its table off the
     /// LAYOUT's list (`BundleLayout::rope_class_hds`, the registry mechanism
     /// `scalarmul_scales` established), so the worker's load-time table binds must be THAT list
-    /// and not a second derivation free to disagree — the runtime's
-    /// `Wiring::verify_class_placements` cross-checks exactly this against the baked placements.
+    /// and not a second derivation free to disagree — both are one `KernelTableClasses` value.
     /// Index `i` ↔ `rope_p_class_tid(i)` / `identity_class_tid(i)`; class 0 is the widest and
     /// keeps the pre-class sentinel tid, so a uniform model's binds are byte-identical.
     /// `attn_class_hds` is EMPTY on this ladder — `AttnDecode` is refused by name and the door
@@ -1611,14 +1618,14 @@ pub(crate) fn tensor_shapes_of_ir<F: RopeForm>(
 /// the splice's own law) is the one fact of the step that depends on it. `paged_rows` says whether
 /// the rows are a decode batch, whose chunking of that walk the batched kernel reads.
 /// `query_rows` is the rung's minted extent pair — the ONE mint (the bake's codegen, off the rung
-/// itself, never a division of the graph's rows), checked here against the graph it describes: the
-/// pair's held product must equal the attention's `mq` rows, and a pair that does not is refused by
-/// name — a bake bug, never a silently-wrong per-request width the layout would size by.
+/// itself, never a division of the graph's rows), proven against the graph it describes by its
+/// witness ([`scratchy_triton_splice::GraphExtent::of`]): the pair's held product IS the
+/// attention's `mq` rows.
 pub fn paged_step_of_ir<F: RopeForm>(
     ir: &SubtileIR<F>,
     active_cap: ActiveCap,
     paged_rows: scratchy_triton_splice::PagedRows,
-    query_rows: ktir_superdsc::sdsc_abstract::QueryExtent,
+    query_rows: scratchy_triton_splice::GraphExtent,
 ) -> Result<Vec<crate::wiring::PagedStep>, SuperDscError> {
     let slots = scratchy_triton_splice::SchedulerBlockTokens::REFERENCE.get();
     // ⭐ ONE STEP PER ATTENTION CLASS — the graph's distinct step geometries, in
@@ -1633,47 +1640,43 @@ pub fn paged_step_of_ir<F: RopeForm>(
     let classes = scratchy_triton_splice::attn_step_classes(ir);
     let mut out: Vec<crate::wiring::PagedStep> = Vec::new();
     for (class, (window, nkvh)) in classes.iter().enumerate() {
-        let tids = scratchy_triton_splice::PagedStepTids::of_class(class);
         let mut step_of_class: Option<crate::wiring::PagedStep> = None;
         for n in &ir.nodes {
             let SubOp::AttnDecode {
-                mask, attention, ..
+                mask,
+                attention,
+                operands,
+                ..
             } = &n.op
             else {
                 continue;
             };
             let g = attention.class(mask.class());
-            if (mask.window().map(|w| w.get()).unwrap_or(0), g.kv_heads().get())
-                != (*window, *nkvh)
+            if (
+                mask.window().map(|w| w.get()).unwrap_or(0),
+                g.kv_heads().get(),
+            ) != (*window, *nkvh)
             {
                 continue;
             }
-            let cache = n.inputs.get(1).ok_or_else(|| {
-                SuperDscError(format!(
-                    "AttnDecode t{} states no K cache input",
-                    n.output.tensor.index()
-                ))
-            })?;
+            // The K cache is the resident prefix's K — the layout's first segment.
+            let cache = &n.inputs[operands.k(0)];
             let rows = ir.tensors[cache.tensor.index()].rows;
-            if rows == 0 || !rows.is_multiple_of(slots) {
+            let Some(cache_slots) =
+                std::num::NonZeroU32::new(rows).filter(|r| r.get().is_multiple_of(slots))
+            else {
                 return Err(SuperDscError(format!(
                     "AttnDecode t{}: its K cache holds {rows} slots, not a whole number of \
                      {slots}-slot pages",
                     n.output.tensor.index()
                 )));
-            }
-            let (pages, mq) = (rows / slots, n.output.region.rows.len);
-            if query_rows.graph_rows().get() != mq {
-                return Err(SuperDscError(format!(
-                    "AttnDecode t{}: the graph runs {mq} query row(s) but the rung's minted extent \
-                     states {} ({} per request, {} request(s)) — the mint and the graph disagree, a \
-                     bake bug named here",
-                    n.output.tensor.index(),
-                    query_rows.graph_rows().get(),
-                    query_rows.per_request().get(),
-                    query_rows.requests().get(),
-                )));
-            }
+            };
+            // The kernel's view of the pools — the cache's whole pages — and, until the step is
+            // placed over the bake's pool, the pool it holds (the pool law off the card).
+            let view = ktir_superdsc::sdsc_abstract::ContextPages::of_slots(cache_slots);
+            let pages = crate::pool_pages::PoolPages::of_nonzero(view.nonzero());
+            // The attention's query rows ARE the pair's product — its witness proved it.
+            let mq = query_rows.graph_rows().get();
             if let Some(prev) = &out.first()
                 && (prev.pages, prev.page_slots) != (pages, slots)
             {
@@ -1681,37 +1684,38 @@ pub fn paged_step_of_ir<F: RopeForm>(
                     "the graph's attention classes disagree about the pool (class 0 holds {} \
                      page(s) of {} slot(s), this class {} of {}) — one block table serves every \
                      layer",
-                    prev.pages, prev.page_slots, pages, slots
+                    prev.pages.get(),
+                    prev.page_slots,
+                    pages.get(),
+                    slots
                 )));
             }
-            let walk = scratchy_triton_splice::walk_pages(
-                pages,
+            let walk = std::num::NonZeroU32::new(scratchy_triton_splice::walk_pages(
+                view.get(),
                 mq,
                 query_rows.per_request().get(),
                 active_cap,
                 mask.window(),
-            );
+            ))
+            .map(scratchy_triton_splice::WalkBlocks::new)
+            .ok_or_else(|| {
+                SuperDscError(format!(
+                    "AttnDecode t{}: its rung walks no page of its {}-page view",
+                    n.output.tensor.index(),
+                    view.get()
+                ))
+            })?;
+            // The step's tids are its class's (`PagedStep::tids`): the class is stated once.
             let step = crate::wiring::PagedStep {
-                mask: tids.mask,
-                page_table: tids.page_table,
-                write_rows: tids.write_rows,
-                query_rows: tids.query_rows,
-                kv_row_pool: tids.kv_row_pool,
-                rep_rows: tids.rep_rows,
-                chunk_pages: tids.chunk_pages,
-                chunk_masks: tids.chunk_masks,
-                int32_zero: tids.int32_zero,
+                view,
                 pages,
                 page_slots: slots,
-                rows: mq,
-                nkvh: g.kv_heads().get(),
-                q_width: g.q_width(),
-                head_size: g.head_dim().get(),
+                heads: g,
                 walk,
                 paged_rows,
-                extent: query_rows,
+                extent: query_rows.extent(),
                 window: mask.window(),
-                class: class as u32,
+                class: crate::wiring::AttnClass::of_index(class),
             };
             match &step_of_class {
                 Some(prev) if prev != &step => {
@@ -1749,7 +1753,7 @@ pub fn graph_wiring<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     // The graph's query extents, minted by the bake — threaded to the registry and node walks
     // below, never re-derived from graph rows: a walk that minted its own pair would agree
     // with the graph yet state the wrong per-request width the day a packed prefill arrives.
-    query_rows: ktir_superdsc::sdsc_abstract::QueryExtent,
+    query_rows: scratchy_triton_splice::GraphExtent,
 ) -> Result<BundleWiring, SuperDscError> {
     // ⛔ A REGISTRY, NOT A PLACEMENT — the wiring reads ONE kind of thing off the layout: the
     // registries ([`WiringRegistries`]). The placement pass [`compute_bundle_layout`] computed
@@ -1762,6 +1766,7 @@ pub fn graph_wiring<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     // registry added later is a missing field at the literal, not a silent `Default` on the
     // card.
     let _ = weight_ids;
+    let classes = crate::lower_subtile_tape_to_superdsc::KernelTableClasses::of(ir);
     let registries = WiringRegistries {
         scalarmul_scales: crate::lower_subtile_tape_to_superdsc::bundle_registry::<T, F>(
             ir, paged_rows, query_rows,
@@ -1775,21 +1780,10 @@ pub fn graph_wiring<T: ktir_superdsc::collective::Tp, F: RopeForm>(
             .collect(),
         // ⭐ THE CLASS REGISTRIES, here too — the rope's lowering resolves its P table and the door
         // an attn program's identity class through these, and this pass lowers through the door.
-        // Same shared helper, same tape, so the wiring's answer and the placement pass's cannot
-        // disagree.
-        rope_class_hds: ktir_superdsc::reserved_tids::rope_p_table_class_hds(
-            ir.nodes
-                .iter()
-                .filter_map(|n| n.op.rope_head_dim().map(|d| d.get())),
-        ),
-        attn_class_hds: ktir_superdsc::reserved_tids::rope_p_class_hds(ir.nodes.iter().filter_map(
-            |n| match &n.op {
-                SubOp::AttnDecode {
-                    mask, attention, ..
-                } => Some(attention.class(mask.class()).head_dim().get()),
-                _ => None,
-            },
-        )),
+        // The placement pass's own value (`KernelTableClasses`), so the wiring's answer and the
+        // placements are one derivation.
+        rope_class_hds: classes.rope,
+        attn_class_hds: classes.attn,
     };
     // ⭐ EVERY NODE IS LOWERED ON ITS OWN, so they are lowered IN PARALLEL and folded IN ORDER. Each
     // node's arm is a pure function of the node and the graph (the kernel memos it reaches are
@@ -1942,17 +1936,15 @@ pub fn graph_wiring<T: ktir_superdsc::collective::Tp, F: RopeForm>(
             let mut expected: std::collections::BTreeSet<u32> = Default::default();
             for step in &paged {
                 if batch {
-                    expected.insert(step.chunk_masks);
+                    expected.insert(step.chunk_masks());
                 } else {
-                    expected.extend(
-                        (0..windows).map(|r| {
-                            scratchy_triton_splice::paged_window_of_class(
-                                step.class as usize,
-                                r,
-                                2,
-                            )
-                        }),
-                    );
+                    expected.extend((0..windows).map(|r| {
+                        scratchy_triton_splice::paged_window_of_class(
+                            step.class.index(),
+                            r,
+                            scratchy_triton_splice::WindowTable::Mask,
+                        )
+                    }));
                 }
             }
             let bound: std::collections::BTreeSet<u32> =
@@ -1984,7 +1976,7 @@ pub fn graph_wiring<T: ktir_superdsc::collective::Tp, F: RopeForm>(
             }
             // Class 0's window-0 mask, the family's first — proven bound above; the family past
             // window 0 is `paged_window_of_class`'s own law, stated once in the splice.
-            Some(if batch { p.chunk_masks } else { p.mask })
+            Some(if batch { p.chunk_masks() } else { p.mask() })
         }
         (None, []) => None,
         (masks, paged) => {
@@ -2282,7 +2274,7 @@ pub fn staggered_of_ir<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     ir: &SubtileIR<F>,
     // The graph's query extents, minted by the bake — threaded to the node walk, never
     // re-derived from graph rows (see [`graph_wiring`]'s own parameter note).
-    query_rows: ktir_superdsc::sdsc_abstract::QueryExtent,
+    query_rows: scratchy_triton_splice::GraphExtent,
 ) -> Result<
     std::collections::BTreeMap<u32, ktir_superdsc::element_arrangement::ElementArrangement>,
     SuperDscError,
@@ -2538,7 +2530,7 @@ pub fn lower_subtile_tape_to_ktir<T: ktir_superdsc::collective::Tp, F: RopeForm>
     // See main's `lower_attn_node`. Prefill callers pass false.
     rows_are_requests: bool,
     // The rung's query extent pair — threaded to the attention splice ([`lower_one_node`]).
-    query_rows: QueryExtent,
+    query_rows: scratchy_triton_splice::GraphExtent,
 ) -> Result<RolledSuperDsc<T>, SuperDscError> {
     use scratchy_subtile::subtile_tape::{ComputeInput, Instr, LoopBound};
     let _pc = crate::pc::Pc::start("producer");
@@ -2559,7 +2551,7 @@ pub fn lower_subtile_tape_to_ktir<T: ktir_superdsc::collective::Tp, F: RopeForm>
     // The one perf gate that outlived it here (a decode batch must not split `mb`) is gone as well: it
     // was scoped to this lowering, the descriptors are built later in `emit_bundle`, so it never reached
     // one, and the form it asked for measured slower on the card (`matmul/dims.rs`). The extent half
-    // landed as the pair: [`QueryExtent`] states the rung's `(per-request width, requests)`, minted once
+    // landed as the pair: `QueryExtent` states the rung's `(per-request width, requests)`, minted once
     // at the bake. The KIND stays the separate `rows_are_requests` bool above because the pair cannot
     // carry it alone: a decode batch mints `(1 row, m)` and a packed prefill rung will mint
     // `(w, S)` — both per-request width > 1 pairs in general, differing only in whether one launch
@@ -2830,22 +2822,20 @@ pub fn lower_subtile_tape_to_ktir<T: ktir_superdsc::collective::Tp, F: RopeForm>
                 // that hole: it refuses at BAKE, from the bake's own data, before any card or
                 // emulator runs.
                 //
-                // Collect matmul KERNEL weights for the device re-tile manifest: w =
-                // inputs[1] is [k,n]=[in,out] row-major; the PT array needs the device
-                // tile layout [out/64, in, 64]. in=A.cols (k), out=output.cols (n).
-                // Arity-3 fp8 W8A8 matmuls MUST be collected here too: their weight (inputs[1]; inputs[2] is
-                // w_scale) needs the 1-byte packed RetileDescriptor from the `fp8_weight_tids` branch below.
-                // in_k/out derive identically (inputs[0].cols=k, output.cols=n); the
-                // KSPLIT branch (out>16384) never fires for fp8 projs.
+                // Collect matmul KERNEL weights for the device re-tile manifest: the weight (the
+                // matmul layout's `weight()` input) is [k,n]=[in,out] row-major; the PT array needs
+                // the device tile layout [out/64, in, 64]. in=A.cols (k), out=output.cols (n).
+                // fp8 W8A8 matmuls MUST be collected here too: their weight is the fp8 payload
+                // (the layout's `scale()` input is w_scale) and needs the 1-byte packed
+                // RetileDescriptor from the `fp8_weight_tids` branch below. in_k/out derive
+                // identically (the activation's cols = k, output.cols = n); the KSPLIT branch
+                // (out>16384) never fires for fp8 projs.
                 match n.op.gemm_weight_input() {
-                    // kernel0-collected: the dense gemms — W = inputs[1].
-                    Some(1)
-                        if matches!(n.op, SubOp::MatmulTile { .. })
-                            && (n.inputs.len() == 2 || n.inputs.len() == 3) =>
-                    {
+                    // kernel0-collected: every matmul, through its own layout.
+                    Some(_) if let Some(l) = n.op.matmul() => {
                         kernel0.push((
-                            n.inputs[1].tensor.index() as u32,
-                            n.inputs[0].region.cols.len,
+                            n.inputs[l.weight()].tensor.index() as u32,
+                            n.inputs[l.act()].region.cols.len,
                             // DEVICE out extent via the TYPE-SAFE `DeviceWidth` — the SAME rule as the
                             // worker's weight zero-pad and the slot reservation, so the RetileDescriptor
                             // device_size, the per-core address, and the staged buffer agree by
@@ -3130,14 +3120,14 @@ pub fn lower_subtile_tape_to_ktir<T: ktir_superdsc::collective::Tp, F: RopeForm>
     // copies → a RetileDescriptor built SOLELY from the DeviceTileLayout witness (the
     // SAME source per_core_addr uses for the stride), so the shim's host re-tile and the
     // on-card per-core address cannot diverge. KERNEL layout = [in,out] sticked on out.
-    // fp8 W8A8 weights (`input[1]` of an arity-3 MatmulTile) stage 1-byte / 128-elem stick (SEN143_FP8);
-    // dense weights stay fp16 2-byte / 64-stick. The shim reads `word_length` from this descriptor to
-    // size the H2D re-tile, so an fp8 weight MUST carry the fp8 descriptor or it is staged as 2-byte.
+    // fp8 W8A8 weights (the graph's fp8 payloads, `SubtileIR::fp8_weight_payloads`) stage 1-byte /
+    // 128-elem stick (SEN143_FP8); dense weights stay fp16 2-byte / 64-stick. The shim reads
+    // `word_length` from this descriptor to size the H2D re-tile, so an fp8 weight MUST carry the
+    // fp8 descriptor or it is staged as 2-byte.
     let fp8_weight_tids: std::collections::HashSet<u32> = ir
-        .nodes
-        .iter()
-        .filter(|n| matches!(n.op, SubOp::MatmulTile { .. }) && n.inputs.len() == 3)
-        .map(|n| n.inputs[1].tensor.index() as u32)
+        .fp8_weight_payloads()
+        .into_iter()
+        .map(|t| t.index() as u32)
         .collect();
     for (w_tid, in_k, out_n) in &kernel0 {
         let desc = if fp8_weight_tids.contains(w_tid) {
@@ -3991,6 +3981,8 @@ mod attn_scale_weight_fold_tests {
                     attention,
                     33,
                     scratchy_subtile::subtile_ir::AttnMask::Causal,
+                    scratchy_subtile::subtile_ir::AttnLayout::of_arity(5)
+                        .expect("a two-segment layout"),
                 ),
                 m: 1,
                 inputs: vec![
@@ -4136,6 +4128,8 @@ mod attn_scale_weight_fold_tests {
                         attention,
                         33,
                         scratchy_subtile::subtile_ir::AttnMask::Causal,
+                        scratchy_subtile::subtile_ir::AttnLayout::of_arity(5)
+                            .expect("a two-segment layout"),
                     ),
                     m: 1,
                     inputs: vec![

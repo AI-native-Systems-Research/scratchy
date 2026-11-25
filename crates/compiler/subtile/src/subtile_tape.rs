@@ -3095,6 +3095,8 @@ pub(crate) mod tests {
                 softmax_state: SoftmaxStateId::new(0),
                 mask: crate::subtile_ir::AttnMask::Causal,
                 attention: fixture_attention(),
+                // The query and one `(K, V)` segment.
+                operands: crate::subtile_ir::AttnLayout::of_arity(3).expect("a one-segment layout"),
             },
             inputs: vec![
                 TensorRegion {

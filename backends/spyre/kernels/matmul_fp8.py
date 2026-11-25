@@ -14,9 +14,12 @@ kernel):
   operand order (activation, fp8 weight, per-channel scale) then the output,
   arity 3. The registry row matches `GemmWeight::Fp8Dynamic`; the DENSE
   arity-2 form is `matmul.py`'s row.
-* CONSTEXPRS: `M`, `K`, `N`, `BLOCK_M`, `BLOCK_K`, `BLOCK_N` — stated by the
-  splice from the node's own regions, all blocks the whole extents (ONE tile;
-  `verify_canonical_fp8_matmul_kernel` refuses `BLOCK_K < K` and `BLOCK_N < N`).
+* CONSTEXPRS: `M`, `K`, `N`, `BLOCK_M`, `BLOCK_K`, `BLOCK_N`, `M_TOTAL`,
+  `N_TOTAL`, `C_START` — stated by the splice from the node's own regions, all
+  blocks the whole extents (ONE tile; `verify_canonical_fp8_matmul_kernel`
+  refuses `BLOCK_K < K` and `BLOCK_N < N`). `M_TOTAL`/`N_TOTAL`/`C_START` are
+  the dense arm's storage-window law (see `matmul.py`): the out descriptor
+  names the output TENSOR, the store names the region.
 * GRID: `[1]`.
 
 WHAT THE DEVICE COMPUTES vs WHAT THE PROGRAM COMPUTES: the program spells the
@@ -47,14 +50,15 @@ import triton.language as tl
 def matmul_fp8_fwd(desc_x, desc_w, desc_ws, desc_o,  #
                    M: tl.constexpr, K: tl.constexpr, N: tl.constexpr,  #
                    BLOCK_M: tl.constexpr, BLOCK_K: tl.constexpr, BLOCK_N: tl.constexpr,
-                   M_TOTAL: tl.constexpr):
+                   M_TOTAL: tl.constexpr, N_TOTAL: tl.constexpr, C_START: tl.constexpr):
     start_m = tl.program_id(0)
     # Descriptors, not pointer blocks (swiglu delta 3). The weight's descriptor
     # elem is fp8e4nv (delta 1); its shape is the checkpoint's `[out, in]`.
     # ⛔ THE DESCRIPTOR NAMES THE STORAGE, THE STORE NAMES THE WINDOW — see
-    # `matmul.py`'s `M_TOTAL` law: the out descriptor's shape is the output
-    # TENSOR's `[M_TOTAL, N]`, while the store takes the `[M, N]` tile at row 0
-    # (the prefill lm-head fold's m=1 tail over the LAST_HIDDEN staging).
+    # `matmul.py`'s `M_TOTAL`/`N_TOTAL`/`C_START` law: the out descriptor's shape
+    # is the output TENSOR's `[M_TOTAL, N_TOTAL]` with row stride `N_TOTAL`, while
+    # the store takes the `[M, N]` tile at `[0, C_START]` (the prefill lm-head
+    # fold's row window; a PAD_V logits tensor's or col-tile's column window).
     x_desc = tl.make_tensor_descriptor(desc_x, shape=[M, K],
                                        strides=[K, 1],
                                        block_shape=[BLOCK_M, BLOCK_K])
@@ -64,8 +68,8 @@ def matmul_fp8_fwd(desc_x, desc_w, desc_ws, desc_o,  #
     ws_desc = tl.make_tensor_descriptor(desc_ws, shape=[1, N],
                                         strides=[N, 1],
                                         block_shape=[1, BLOCK_N])
-    o_desc = tl.make_tensor_descriptor(desc_o, shape=[M_TOTAL, N],
-                                       strides=[N, 1],
+    o_desc = tl.make_tensor_descriptor(desc_o, shape=[M_TOTAL, N_TOTAL],
+                                       strides=[N_TOTAL, 1],
                                        block_shape=[BLOCK_M, BLOCK_N])
 
     offs_m = start_m * BLOCK_M
@@ -79,4 +83,4 @@ def matmul_fp8_fwd(desc_x, desc_w, desc_ws, desc_o,  #
 
     # delta 4: the per-channel scale, one row broadcast over m product rows.
     ws = ws_desc.load([0, 0])
-    o_desc.store([offs_m, 0], p * ws)
+    o_desc.store([offs_m, C_START], p * ws)

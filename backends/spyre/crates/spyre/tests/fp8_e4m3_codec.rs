@@ -166,6 +166,51 @@ fn rounds_to_the_nearest_representable() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────
+//  THE TREE'S ONE LAW vs THE VENDORED COPY — `scratchy_tensors::fp8` is this tree's single
+//  statement of the grid (the metal decode, the numeric gate's golden, and the subtile float8-KV
+//  host reference all read it). `ktir-core` is vendored from torch-spyre/ktir-cpu and
+//  dependency-free by its own RFC 0682, so it keeps upstream's copy — and this pins the two
+//  byte-for-byte equal, so the vendored crate cannot drift from the tree's law silently.
+//  Decode: all 256 patterns. Encode: a strided sweep of every finite magnitude below the format's
+//  top plus the specials (the full-dense encode sweep is `the_encoder_is_the_cards_qfp8ch` above,
+//  which the tree's law passes identically through its own oracle in `scratchy-tensors`).
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn the_trees_e4m3_law_is_the_vendored_codec() {
+    for b in 0u8..=255 {
+        let (tree, vendored) = (
+            scratchy_tensors::fp8::e4m3_to_f32(b),
+            ktir_core::codec::e4m3_to_f32(b),
+        );
+        assert!(
+            tree.to_bits() == vendored.to_bits() || (tree.is_nan() && vendored.is_nan()),
+            "decode drift at 0x{b:02x}: {tree} vs {vendored}"
+        );
+    }
+    let check = |v: f32| {
+        assert_eq!(
+            scratchy_tensors::fp8::f32_to_e4m3(v),
+            ktir_core::codec::f32_to_e4m3(v),
+            "encode drift at v = {v:e}"
+        );
+    };
+    let top = 448.0f32.to_bits();
+    let mut b = 0u32;
+    while b <= top {
+        check(f32::from_bits(b));
+        b += 97;
+    }
+    for v in [0.0, 448.0, 464.0, 1e9, f32::INFINITY, f32::NAN, -0.0] {
+        check(v);
+    }
+    assert_eq!(
+        scratchy_tensors::fp8::E4M3_FMAX,
+        ktir_core::codec::E4M3_FMAX
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────
 //  THE SLICE PATH — what a real fp8 store/load actually runs.
 //
 //  `ops_memory::store_data` encodes a tile with `encode(&tile_data, dtype)` and the load side

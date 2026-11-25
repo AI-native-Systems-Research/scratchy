@@ -510,10 +510,12 @@ impl<T: World> Weave<'_, T> {
         let SubOp::MatmulTile { n, weight } = desc.op else {
             return self.replicate(i);
         };
-        let (act, InputRef::Ext(we)) = (desc.inputs[0], desc.inputs[1]) else {
+        let layout = crate::subtile_ir::MatmulLayout::of(weight);
+        let (act, InputRef::Ext(we)) = (desc.inputs[layout.act()], desc.inputs[layout.weight()])
+        else {
             return self.replicate(i);
         };
-        let scale = desc.inputs.get(2).copied();
+        let scale = layout.scale().map(|s| desc.inputs[s]);
         let k = self.operand_shape(act).1;
         let act_place = self.place_of(act);
         // The per-channel scale follows N along whichever of its axes is N long.
@@ -801,6 +803,7 @@ impl<T: World> Weave<'_, T> {
                     attention,
                     valid_len,
                     mask,
+                    operands,
                     ..
                 } => {
                     let geom = attention.class(mask.class());
@@ -808,10 +811,9 @@ impl<T: World> Weave<'_, T> {
                     let Some(local) = attention.rank_local::<T>() else {
                         return self.replicate(i);
                     };
-                    // `[q, (k, v)…]`, or `[q, pk, pv, nk, nv, sinks]`.
-                    let n = desc.inputs.len();
-                    let sinks = if n == 6 {
-                        let InputRef::Ext(se) = desc.inputs[5] else {
+                    // The op's own layout: the sinks, when it carries them.
+                    let sinks = if let Some(si) = operands.sinks() {
+                        let InputRef::Ext(se) = desc.inputs[si] else {
                             return self.replicate(i);
                         };
                         let (sr, sc) = self.src_shape(se);
@@ -824,9 +826,10 @@ impl<T: World> Weave<'_, T> {
                     } else {
                         None
                     };
-                    let segs = if sinks.is_some() { 5 } else { n };
-                    let op = SubOp::attn_decode(local, valid_len, mask);
-                    ((0..segs).collect(), geom.head_dim().get(), op, sinks)
+                    // The query and every segment input split by head; the sinks shard apart.
+                    let split = 0..operands.segment_inputs().end;
+                    let op = SubOp::attn_decode(local, valid_len, mask, operands);
+                    (split.collect(), geom.head_dim().get(), op, sinks)
                 }
                 _ => return self.replicate(i),
             };

@@ -39,8 +39,6 @@ impl std::ops::Add for Bytes {
 /// The per-op launch-group facts the launch arithmetic reads, as the bake stated them.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct OpKv {
-    /// `kv_page_fold`: this group is a walk's body, relaunched [`Self::walk`]'s trip count.
-    pub page_fold: bool,
     /// ⭐ THIS GROUP READS THROUGH A **GATHERED** SCRATCH — each page came from the index the host
     /// stages, so the group takes NO KV segment shift: a gathered read computes
     /// `addr = idx * skip_addr + base`, and a page shift on top of an absolute entry composes two bases
@@ -56,6 +54,14 @@ pub struct OpKv {
     /// post-loop epilogue carry it because the seed must re-run between requests. Every group of
     /// every other bundle launches once, whatever the launch serves.
     pub per_request: bool,
+}
+
+impl OpKv {
+    /// This group is a walk's body, relaunched [`Self::walk`]'s trip count — read off the walk, the
+    /// one statement (`bundle::KvShifts::page_fold`'s own law).
+    pub const fn page_fold(&self) -> bool {
+        self.walk.is_some()
+    }
 }
 
 /// ⭐ THE LAUNCH'S REQUEST FACTS — how many requests one launch serves, and the pitch their tables
@@ -87,7 +93,7 @@ impl Default for Requests {
 /// 64-page chunk, and the worker refused the step ("the chunk ladder's top rung (64 pages) is below
 /// this context") where the per-page fold had served it. Every ladder without a chunk folds on every
 /// rung, so there this is the top, as before. Applied ONCE, at bake, by
-/// [`fallback_rung`]; the runtime reads the index it baked (`RerollMeta::fallback_rung`).
+/// [`fallback_rung`]; the runtime reads the index it baked (`BakedLadder::fallback`).
 pub fn past_every_sweep(folds: &[bool]) -> usize {
     folds
         .iter()
@@ -169,7 +175,7 @@ pub struct RungReach {
 }
 
 /// The bake's half of [`past_every_sweep`]: the rung a context past every sweep runs, `rungs`
-/// ascending exactly as the runtime holds them. Baked as `RerollMeta::fallback_rung`, which the
+/// ascending exactly as the runtime holds them. Baked as `BakedLadder::fallback`, which the
 /// runtime reads instead of choosing — so it cannot run another.
 pub fn fallback_rung(rungs: &[RungReach]) -> usize {
     let folds: Vec<bool> = rungs.iter().map(|r| r.folds).collect();
@@ -352,7 +358,6 @@ mod tests {
         // only ever hands it request 0, and the law holds by its own terms, not by the caller's.
         assert_eq!(seg_deltas(&once, 3, 2, 8192), SegDeltas::default());
         let walk = OpKv {
-            page_fold: true,
             gathered: true,
             walk: Some(scratchy_spyre_bundle::Walk {
                 trips: 7,
@@ -407,7 +412,6 @@ mod tests {
     fn a_walking_bundle_s_span_repeats_once_per_request_r_outer() {
         use super::{Launch, OpKv, launches};
         let walk = |trips| OpKv {
-            page_fold: true,
             gathered: true,
             per_request: true,
             walk: Some(scratchy_spyre_bundle::Walk {
@@ -503,7 +507,6 @@ mod tests {
     fn at_one_request_the_sequence_is_the_op_major_one() {
         use super::{OpKv, launches};
         let walk = OpKv {
-            page_fold: true,
             gathered: true,
             per_request: true,
             walk: Some(scratchy_spyre_bundle::Walk {

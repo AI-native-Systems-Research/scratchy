@@ -3549,6 +3549,31 @@ impl ContextPages {
     }
 }
 
+/// ⭐ THE PAGES A PER-SEQUENCE WALK READS — a paged attention's `NUM_BLOCKS` (the splice's
+/// `walk_pages`), nonzero by type. One type for the kernel's walk, the step the host stages, and the
+/// walk a baked ladder rung records for each class (`scratchy_spyre_bundle::LadderRung::walks`), so
+/// the three are one count. The constructor takes the nonzero a caller already holds and checks
+/// nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WalkBlocks(std::num::NonZeroU32);
+
+impl WalkBlocks {
+    /// The count.
+    pub const fn new(v: std::num::NonZeroU32) -> Self {
+        Self(v)
+    }
+
+    /// The count as a number.
+    pub const fn get(self) -> u32 {
+        self.0.get()
+    }
+
+    /// The count as its nonzero — handed over, never re-minted.
+    pub const fn nonzero(self) -> std::num::NonZeroU32 {
+        self.0
+    }
+}
+
 /// ⭐⭐⭐ THE PAGES THE RUN **DECLARED** IT NEEDS — `--max-model-len` × `--max-num-seqs`, in pages.
 ///
 /// 🛑 **THE POOL USED TO BE SIZED BY A CONSTANT, AND THAT MADE EVERY CAPACITY ARGUMENT CIRCULAR.**
@@ -3885,7 +3910,9 @@ impl RungCap {
 /// `spyre_attn.py`'s `_run_page_attn`/`_build_query_row_tables`). The two counts were one `mq`
 /// until S > 1, and the splice spent it as BOTH extents; this type is the pair that separates them.
 ///
-/// ⛔ MINTED ONCE, FROM THE RUNG — [`Self::of_baked_rung`] is the only mint, and the graph's row
+/// ⛔ MINTED ONCE, FROM THE RUNG — [`Self::of_baked_rung`] states a rung's pair, and
+/// [`Self::one_request`] / [`Self::one_row_each`] the two single-axis pairs a launch of a baked
+/// width is (one sequence's rows, or a decode batch's one token each); the graph's row
 /// count is the product HELD by the type, not a division any reader performs: nothing may recover
 /// the per-request width by dividing graph rows back (a width a later reader re-derived could
 /// disagree with the one the bake minted). The splice CHECKS the held product against the graph it
@@ -3923,6 +3950,25 @@ impl QueryExtent {
                 None => None,
             },
             None => None,
+        }
+    }
+
+    /// ONE REQUEST of `width` rows — a sequence launch's pair. Total: the product is `width`.
+    pub const fn one_request(width: RungWidth) -> Self {
+        Self {
+            per_request: width,
+            requests: RungCap::ONE,
+            rows: width,
+        }
+    }
+
+    /// `width` REQUESTS OF ONE ROW EACH — a decode batch's pair (every row a request's one token).
+    /// Total: the product is `width`.
+    pub const fn one_row_each(width: RungWidth) -> Self {
+        Self {
+            per_request: RungWidth::ONE,
+            requests: RungCap(width.rows()),
+            rows: width,
         }
     }
 

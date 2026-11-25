@@ -81,7 +81,7 @@ fn node() -> KtirNode {
             grid: (1, 1, 1),
             return_type: None,
         },
-        program: Program::EmbedRowGather { k: K },
+        program: Program::EmbedRowGather { k: K, hidden: HIDDEN },
         bindings: vec![
             BufferId::new(301),
             BufferId::new(302),

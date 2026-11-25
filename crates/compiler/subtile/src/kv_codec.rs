@@ -16,7 +16,7 @@ use std::collections::HashMap;
 
 use crate::handoff::{EmbedState, Expansion, ExpansionId, LoweredDecode};
 use crate::lower::{ArchOp, InputRef, LoweringInput, OpDesc, kv_operand_bias};
-use crate::subtile_ir::{KvOperand, RopeFormTag, SubOp};
+use crate::subtile_ir::{KvOperand, KvWriterLayout, RopeFormTag, SubOp};
 
 /// When a codec step runs: a runtime condition the target's worker evaluates.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -123,12 +123,15 @@ pub enum KvCodecError {
     MissingOperand {
         op: usize,
         name: &'static str,
-        operand: u8,
+        operand: usize,
     },
     /// A writer operand whose additive offset cannot be traced to its producer.
     Offset { op: usize, why: String },
     /// A coded op that another construct already expanded to.
     AlreadyExpanded { op: usize, name: &'static str },
+    /// A float8 attention whose new-token V is not the value its writer stored: it reads a V
+    /// the cache never held.
+    AttentionValueMismatch { op: usize, name: &'static str },
     /// A float8 KV writer whose checkpoint declares a rotation pairing the graph's form does not
     /// state: `RopeRotate` would drop it.
     InterleavedRotation { op: usize, name: &'static str },
@@ -156,6 +159,10 @@ impl std::fmt::Display for KvCodecError {
                 f,
                 "op {op} ({name}): a float8 KV writer rotates through `RopeRotate`, in the graph's \
                  NeoX pairing, and this writer's checkpoint declares the interleaved one"
+            ),
+            Self::AttentionValueMismatch { op, name } => write!(
+                f,
+                "op {op} ({name}): its new-token V is not the value its KV writer stored"
             ),
         }
     }
@@ -195,15 +202,19 @@ pub fn expand_kv_codec(
         next: first_id.unwrap_or(0),
     };
     for (i, od) in ops.iter().enumerate() {
+        // A cache writer is its own layout (`SubOp::kv_writer`), read off the op.
+        if let Some(writer) = od.op.kv_writer() {
+            x.writer(i, writer, facts)?;
+            continue;
+        }
         match od.op {
-            SubOp::RopeAppend { .. } | SubOp::KvAppend { .. } => x.writer(i, facts)?,
-            SubOp::AttnDecode { .. } => {
+            SubOp::AttnDecode { operands, .. } => {
                 let around = if od.m == 1 {
                     &facts.decode
                 } else {
                     &facts.prefill
                 };
-                x.attention(i, around)?
+                x.attention(i, operands, around)?
             }
             _ => {
                 let at = x.push_own(i, l.op_expansion[i]);
@@ -230,41 +241,6 @@ pub fn expand_kv_codec(
             .chain(x.unnamed_reads)
             .collect(),
     ))
-}
-
-/// Where a KV writer's operands sit: each operand's value and the cache half it fills, and a
-/// rotating writer's rotary row.
-struct WriterOperands {
-    k: (u8, u8),
-    v: (u8, u8),
-    rotary: Option<u8>,
-}
-
-impl WriterOperands {
-    fn of(op: &ArchOp) -> Self {
-        match op {
-            // `[K, V, K_cache, V_cache]`: written as projected.
-            SubOp::KvAppend { .. } => Self {
-                k: (0, 2),
-                v: (1, 3),
-                rotary: None,
-            },
-            // `[K, cos, sin, V, K_cache, V_cache]`.
-            _ => Self {
-                k: (0, 4),
-                v: (3, 5),
-                rotary: Some(1),
-            },
-        }
-    }
-
-    /// `operand`'s `(value, cache)` operand indices.
-    fn at(&self, operand: KvOperand) -> (u8, u8) {
-        match operand {
-            KvOperand::K => self.k,
-            KvOperand::V => self.v,
-        }
-    }
 }
 
 /// The expanded op list under construction.
@@ -298,8 +274,8 @@ impl Expander<'_> {
         }
     }
 
-    fn operand(&self, i: usize, k: u8) -> Result<InputRef, KvCodecError> {
-        let r = self.l.input.ops[i].inputs.get(k as usize).copied();
+    fn operand(&self, i: usize, k: usize) -> Result<InputRef, KvCodecError> {
+        let r = self.l.input.ops[i].inputs.get(k).copied();
         r.ok_or(KvCodecError::MissingOperand {
             op: i,
             name: self.name(i),
@@ -343,20 +319,29 @@ impl Expander<'_> {
     /// A coded KV writer, then its encodes: each the cache half it filled, its rotary row (a
     /// rotating writer's), and the projection whose bias the operand carries
     /// (`kv_operand_bias`).
-    fn writer(&mut self, i: usize, facts: &KvCodecFacts) -> Result<(), KvCodecError> {
+    fn writer(
+        &mut self,
+        i: usize,
+        layout: crate::subtile_ir::KvWriterLayout,
+        facts: &KvCodecFacts,
+    ) -> Result<(), KvCodecError> {
         let id = self.open(i)?;
         let own = Some(Expansion { id, guard: None });
         let at = self.push_own(i, own);
         self.read_as[i] = at;
         let ops = &self.l.input.ops;
         let m = ops[i].m;
-        let operands = WriterOperands::of(&ops[i].op);
         let mut packed = Vec::with_capacity(facts.after_writer.len());
         for g in facts.after_writer {
-            let (value, cache) = operands.at(g.step);
+            // The operand's value and the cache half it fills — the writer's own layout.
+            let (value, cache) = match g.step {
+                KvOperand::K => (layout.k(), layout.k_cache()),
+                KvOperand::V => (layout.v(), layout.v_cache()),
+            };
             let mut inputs = vec![self.operand(i, cache)?];
-            if let Some(rotary) = operands.rotary {
-                inputs.push(self.operand(i, rotary)?);
+            // A rotating writer's encode also reads its rotation's cos row.
+            if let Some((cos, _)) = layout.rotation() {
+                inputs.push(self.operand(i, cos)?);
             }
             if let InputRef::Op(producer) = self.operand(i, value)? {
                 let bias = kv_operand_bias(ops, producer);
@@ -379,19 +364,28 @@ impl Expander<'_> {
 
     /// A coded attention: the steps before it, itself under its guard, the steps after it. Its
     /// packed store is its new K's writer's (operand 3).
-    fn attention(&mut self, i: usize, around: &CodecAround) -> Result<(), KvCodecError> {
+    fn attention(
+        &mut self,
+        i: usize,
+        layout: crate::subtile_ir::AttnLayout,
+        around: &CodecAround,
+    ) -> Result<(), KvCodecError> {
         let name = self.name(i);
-        // An attention over a cache it appends nothing to (`q, prefix K, prefix V`: a drafter
-        // reading its target's KV) reads a packed store no writer of this forward encodes: its
-        // prefix sources stand for it.
-        let shared = self.l.input.ops[i].inputs.len() == 3;
-        let packed = match shared {
-            true => vec![
-                (KvOperand::K, self.input(self.operand(i, 1)?)),
-                (KvOperand::V, self.input(self.operand(i, 2)?)),
+        // The attention's slots by its own layout — minted with its inputs, so every slot it
+        // names is one of them.
+        let l = self.l;
+        let slot = |s: usize| l.input.ops[i].inputs[s];
+        // An attention over a cache it appends nothing to (its one segment the resident
+        // prefix: a drafter reading its target's KV) reads a packed store no writer of this
+        // forward encodes: its prefix sources stand for it. Otherwise its step segment's K is
+        // its writer's.
+        let packed = match layout.step_segment() {
+            None => vec![
+                (KvOperand::K, self.input(slot(layout.k(0)))),
+                (KvOperand::V, self.input(slot(layout.v(0)))),
             ],
-            false => {
-                let writer = match self.operand(i, 3)? {
+            Some(step) => {
+                let writer = match slot(layout.k(step)) {
                     InputRef::Op(w) if self.packed.contains_key(&w) => w,
                     _ => return Err(KvCodecError::NoWriter { op: i, name }),
                 };
@@ -411,7 +405,7 @@ impl Expander<'_> {
         let (pk, pv) = (packed_of(KvOperand::K)?, packed_of(KvOperand::V)?);
         let id = self.open(i)?;
         let m = self.l.input.ops[i].m;
-        let q = self.input(self.operand(i, 0)?);
+        let q = self.input(self.l.input.ops[i].inputs[layout.q()]);
         let mut staged = Vec::new();
         for g in around.before {
             let expansion = Some(Expansion {
@@ -430,7 +424,7 @@ impl Expander<'_> {
             guard: Some(around.anchor),
         });
         let at = self.push_own(i, anchor);
-        self.ops[at].inputs[0] = q;
+        self.ops[at].inputs[layout.q()] = q;
         self.unnamed_reads
             .extend(staged.into_iter().map(|s| (s, at)));
         let mut out = at;
@@ -441,14 +435,12 @@ impl Expander<'_> {
             });
             let (op, inputs) = match g.step {
                 After::PackedTwin => {
-                    // The twin IS the attention under the codec, so the attention's trailing
-                    // weight inputs (gpt-oss sinks — operand 5, past the cached form's
-                    // positional q/prefix_k/prefix_v/new_k/v prefix) ride along. Without them
-                    // the twin's weight row loses their sites and the lowered decode dispatch
+                    // The twin IS the attention under the codec, so the attention's sinks
+                    // weight (gpt-oss, the layout's trailing input) rides along. Without it
+                    // the twin's weight row loses its site and the lowered decode dispatch
                     // silently drops the sinks column its dense twin still carries.
                     let mut inputs = vec![q, InputRef::Op(out), pk, pv];
-                    let trailing = self.l.input.ops[i].inputs.iter().skip(5).copied();
-                    inputs.extend(trailing.map(|r| self.input(r)));
+                    inputs.extend(layout.sinks().map(|s| self.input(slot(s))));
                     (SubOp::AttnPackedKv, inputs)
                 }
             };
@@ -470,6 +462,14 @@ impl Expander<'_> {
 ///
 /// `scales` is the codec fact's (`KvCodec::Fp8E4m3(scales)`); every quantize carries it.
 ///
+/// ⭐ THE ATTENTION'S NEW-TOKEN V READS THE V THE WRITER STORED. Its new K reaches the
+/// quantized rows by riding the writer (`read_as` carries every reader of the writer to the
+/// `KvAppend`); its new V reaches the V projection directly — the rope's un-roped V slot is an
+/// ALIAS of the projection's output, so no reader-rewiring touches it. The re-point happens
+/// HERE, the one place the float8 law lives: an `AttnDecode` whose new K reads this expansion's
+/// writer reads, as its new V, the V quantize that writer stored. One whose new V is any other
+/// value reads a V the cache never held — refused by name, never silently half-rewired.
+///
 /// ⛔ NOT `KvEncode`. An encode runs AFTER its writer, under a runtime guard, packing the cache half
 /// the writer filled into a SEPARATE store the attention reads instead (int8). The float8
 /// cache IS the pool: its quantize runs BEFORE the writer, unguarded, over the writer's own value
@@ -489,9 +489,14 @@ pub fn expand_kv_quantize<E: EmbedState>(
     let (mut out, mut tiles, mut expansion) = (Vec::new(), Vec::new(), Vec::new());
     let mut at = vec![0; ops.len()];
     let mut read_as = vec![0; ops.len()];
+    // Per ORIGINAL writer op index: the value operand it stores (remapped) and the V quantize
+    // that operand became — the attention's new-token V reads the same quantized rows the
+    // writer stored into the pool.
+    let mut stored_v: std::collections::HashMap<usize, (InputRef, InputRef)> =
+        std::collections::HashMap::new();
     for (i, od) in ops.iter().enumerate() {
         let name = od.op.name();
-        let inputs: Vec<InputRef> = (od.inputs.iter())
+        let mut inputs: Vec<InputRef> = (od.inputs.iter())
             .map(|r| match *r {
                 InputRef::Op(j) => InputRef::Op(read_as[j]),
                 InputRef::Ext(e) => InputRef::Ext(e),
@@ -501,7 +506,7 @@ pub fn expand_kv_quantize<E: EmbedState>(
             inputs.get(k).copied().ok_or(KvCodecError::MissingOperand {
                 op: i,
                 name,
-                operand: k as u8,
+                operand: k,
             })
         };
         let (writer, [k, v, k_cache, v_cache], rotation) = match od.op {
@@ -518,11 +523,12 @@ pub fn expand_kv_quantize<E: EmbedState>(
                     return Err(KvCodecError::InterleavedRotation { op: i, name });
                 }
                 let head_dim = rope.head_dim(attention);
+                let (w, (cos, sin)) = (KvWriterLayout::ROPE_APPEND, KvWriterLayout::ROPE_ROTATION);
                 let rotated = out.len();
                 out.push(OpDesc {
                     op: SubOp::rope_rotate(head_dim),
                     m: od.m,
-                    inputs: vec![operand(0)?, operand(1)?, operand(2)?],
+                    inputs: vec![operand(w.k())?, operand(cos)?, operand(sin)?],
                 });
                 // The rotated K is the tile the writer's output realized.
                 tiles.push(l.op_tiles[i]);
@@ -534,14 +540,44 @@ pub fn expand_kv_quantize<E: EmbedState>(
                     attn,
                     layout,
                 };
-                let values = [InputRef::Op(rotated), operand(3)?, operand(4)?, operand(5)?];
+                // The rotated K, and the RopeAppend's own V and caches.
+                let values = [
+                    InputRef::Op(rotated),
+                    operand(w.v())?,
+                    operand(w.k_cache())?,
+                    operand(w.v_cache())?,
+                ];
                 (writer, values, Some(rotated))
             }
             SubOp::KvAppend { .. } => {
-                let values = [operand(0)?, operand(1)?, operand(2)?, operand(3)?];
+                let w = KvWriterLayout::KV_APPEND;
+                let values = [
+                    operand(w.k())?,
+                    operand(w.v())?,
+                    operand(w.k_cache())?,
+                    operand(w.v_cache())?,
+                ];
                 (od.op, values, None)
             }
             _ => {
+                // ⭐ THE NEW-TOKEN V READS THE WRITER'S STORED ROWS (the doc above states the
+                // law). The new K rides the writer through `read_as`; the new V reaches the V
+                // projection directly, so it is re-pointed here — the attention whose new K
+                // reads this expansion's writer reads, as its new V, the V quantize that
+                // writer stored. Any other V is one the cache never held: refused by name. The
+                // step segment is the attention's own layout's (an attention reading only a
+                // resident cache has none, and nothing to re-point).
+                if let SubOp::AttnDecode { operands, .. } = od.op
+                    && let Some(step) = operands.step_segment()
+                    && let InputRef::Op(w) = od.inputs[operands.k(step)]
+                    && let Some(&(stored, vq)) = stored_v.get(&w)
+                {
+                    if inputs[operands.v(step)] == stored {
+                        inputs[operands.v(step)] = vq;
+                    } else {
+                        return Err(KvCodecError::AttentionValueMismatch { op: i, name });
+                    }
+                }
                 out.push(OpDesc {
                     op: od.op,
                     m: od.m,
@@ -576,6 +612,7 @@ pub fn expand_kv_quantize<E: EmbedState>(
             InputRef::Op(out.len() - 1)
         };
         let (kq, vq) = (quantize(KvOperand::K, k), quantize(KvOperand::V, v));
+        stored_v.insert(i, (v, vq));
         out.push(OpDesc {
             op: writer,
             m: od.m,
@@ -739,7 +776,21 @@ mod tests {
         input.ops.iter_mut().for_each(|od| od.m = 1);
         let sinks = input.sources.len();
         input.sources.push(SourceShape { rows: 1, cols: 4 });
-        input.ops[6].inputs.push(InputRef::Ext(sinks));
+        // The attention re-laid with its sinks weight, by the one assembly — its layout and its
+        // inputs one statement.
+        let od = &mut input.ops[6];
+        let SubOp::AttnDecode { operands, .. } = &mut od.op else {
+            panic!("op 6 is the fixture's attention");
+        };
+        let slot = |s: usize| od.inputs[s];
+        let (laid, inputs) = crate::subtile_ir::AttnLayout::assemble(
+            slot(operands.q()),
+            (0..operands.segments()).map(|s| (slot(operands.k(s)), slot(operands.v(s)))),
+            Some(InputRef::Ext(sinks)),
+        )
+        .expect("the two-segment attention takes a sinks weight");
+        *operands = laid;
+        od.inputs = inputs;
         let x = expand_kv_codec(&lowered(input), &FACTS).expect("expands");
         use InputRef::{Ext, Op};
         // The dense anchor keeps all six of its inputs under `UnlessCodecDecode`…
@@ -948,6 +999,10 @@ mod tests {
         assert_eq!(ins(7), [writer.inputs[3]]);
         assert_eq!(ins(8), [Op(6), Op(7), writer.inputs[4], writer.inputs[5]]);
         assert_eq!(ins(9)[3], Op(8), "the attention reads the writer");
+        assert_eq!(
+            ins(9)[4], Op(7),
+            "the attention's new V reads the V quantize the writer stored"
+        );
         assert!(
             (6..=7).all(|i| matches!(
                 x.input.ops[i].op,
@@ -1001,6 +1056,25 @@ mod tests {
         assert_eq!((ins(5), ins(6)), (vec![Op(2)], vec![Op(3)]));
         assert_eq!(ins(7), [Op(5), Op(6), Ext(7), Ext(8)]);
         assert_eq!(ins(8)[3], Op(7));
+        assert_eq!(
+            ins(8)[4], Op(6),
+            "the attention's new V reads the V quantize the writer stored"
+        );
+    }
+
+    /// NEAR-MISS — a float8 attention whose new V is not its writer's value operand reads a V
+    /// the cache never held: the expansion refuses it by name rather than re-point it blindly.
+    #[test]
+    fn a_float8_cache_refuses_an_attention_reading_a_v_its_writer_never_stored() {
+        let mut l = layer(64, 1);
+        // The attention's new V is the writer's operand (op 3); point it at the Q rope instead.
+        l.input.ops[6].inputs[4] = InputRef::Op(4);
+        match expand_kv_quantize(&l, scratchy_ir::KvCacheScales::Unscaled) {
+            Err(KvCodecError::AttentionValueMismatch { op: 6, name }) => {
+                assert_eq!(name, "AttnDecode")
+            }
+            other => panic!("expected AttentionValueMismatch at op 6, got {other:?}"),
+        }
     }
 
     /// NEAR-MISS — a writer whose checkpoint declares the interleaved pairing: `RopeRotate` rotates

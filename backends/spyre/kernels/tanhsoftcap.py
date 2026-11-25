@@ -16,10 +16,13 @@ THE SPLICE'S OWN CONTRACT (what `scratchy-triton-splice` states about this kerne
 
 * PARAMETERS, IN ORDER: `desc_x`, `desc_o` — the node's one input, then the
   output.
-* CONSTEXPRS: `M`, `N`, `BLOCK_M`, `BLOCK_N`, `CAP`, `N_BLOCKS`, `TAIL_H` —
-  stated by the splice from the node's own region (`M =` rows, `N = BLOCK_N =`
-  the region's width) and its `SubOp::TanhSoftCap { cap }` payload (the producer
-  refuses `cap <= 0`).
+* CONSTEXPRS: `M`, `N`, `BLOCK_M`, `BLOCK_N`, `CAP`, `N_BLOCKS`, `TAIL_H`,
+  `N_TOTAL`, `C_START` — stated by the splice from the node's own region
+  (`M =` rows, `N = BLOCK_N =` the region's width) and its
+  `SubOp::TanhSoftCap { cap }` payload (the producer refuses `cap <= 0`).
+  `N_TOTAL`/`C_START` are the pointwise storage-window law (`window_of`, the
+  same constants `silumul.py` states): the descriptors name the output TENSOR's
+  column extent, the load/store corners name the region's.
 * GRID: `[1]`.
 
 THE DOOR'S OWN FACTS (`ktir_superdsc::tanhsoftcap`): `cols = out.c_len` — the
@@ -59,28 +62,43 @@ def tanhsoftcap_fwd(desc_x, desc_o,  #
                     CAP: tl.constexpr,  #
                     N_BLOCKS: tl.constexpr,  #
                     TAIL_H: tl.constexpr,  #
+                    N_TOTAL: tl.constexpr,  #
+                    C_START: tl.constexpr,  #
                     ):
-    x_desc = tl.make_tensor_descriptor(desc_x, shape=[M, N], strides=[N, 1],
+    # ⛔ THE DESCRIPTORS NAME THE STORAGE, THE LOADS/STORES NAME THE WINDOW —
+    # `silumul.py`'s own law: the descriptors are `[M, N_TOTAL]` at row stride
+    # `N_TOTAL` (the TENSOR the layout reserved), while every access names the
+    # region's column corner `C_START`. The softcap reads the lm_head's output —
+    # a PAD_V logits tensor minted wider than the projection that filled it (the
+    # sampler's argmax law) — so a descriptor pitched at the region's own `N`
+    # places every row past row 0 over the wrong bytes (MEASURED, gemma-4
+    # tiny-paged bundle ed46275: [32, 512] region of a [32, 4096] tensor). A
+    # whole-region node states `N_TOTAL = N`, `C_START = 0`.
+    x_desc = tl.make_tensor_descriptor(desc_x, shape=[M, N_TOTAL],
+                                        strides=[N_TOTAL, 1],
                                         block_shape=[BLOCK_M, BLOCK_N])
-    o_desc = tl.make_tensor_descriptor(desc_o, shape=[M, N], strides=[N, 1],
+    o_desc = tl.make_tensor_descriptor(desc_o, shape=[M, N_TOTAL],
+                                        strides=[N_TOTAL, 1],
                                         block_shape=[BLOCK_M, BLOCK_N])
     for blk in tl.range(0, N_BLOCKS, 1):
         offs_m = blk * BLOCK_M
-        x = x_desc.load([offs_m, 0])
+        x = x_desc.load([offs_m, C_START])
         # x / cap — the splatted cap as the divide's one constant operand.
         xc = tl.fdiv(x, CAP)
         # tanh, inside the f32 island the dtype check forces; LegalizeTypes
         # collapses it so the tanh's operand IS the divf.
         t = tl.tanh(xc.to(tl.float32)).to(tl.float16)
         # t * cap — the SAME splat, multiplied back up.
-        o_desc.store([offs_m, 0], t * CAP)
+        o_desc.store([offs_m, C_START], t * CAP)
     if TAIL_H > 0:
-        t_x = tl.make_tensor_descriptor(desc_x, shape=[M, N], strides=[N, 1],
+        t_x = tl.make_tensor_descriptor(desc_x, shape=[M, N_TOTAL],
+                                        strides=[N_TOTAL, 1],
                                         block_shape=[TAIL_H, BLOCK_N])
-        t_o = tl.make_tensor_descriptor(desc_o, shape=[M, N], strides=[N, 1],
+        t_o = tl.make_tensor_descriptor(desc_o, shape=[M, N_TOTAL],
+                                        strides=[N_TOTAL, 1],
                                         block_shape=[TAIL_H, BLOCK_N])
         offs_m = N_BLOCKS * BLOCK_M
-        x = t_x.load([offs_m, 0])
+        x = t_x.load([offs_m, C_START])
         xc = tl.fdiv(x, CAP)
         t = tl.tanh(xc.to(tl.float32)).to(tl.float16)
-        t_o.store([offs_m, 0], t * CAP)
+        t_o.store([offs_m, C_START], t * CAP)

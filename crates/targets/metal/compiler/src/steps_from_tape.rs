@@ -900,12 +900,16 @@ impl Recording<'_> {
             SourceBinding::PrefixK { layer } | SourceBinding::PrefixV { layer } => layer,
             _ => return Err(no()),
         };
-        let reads = |od: &scratchy_subtile::lower::OpDesc| {
-            od.inputs.len() == 3 && od.inputs[1..].contains(&InputRef::Ext(e))
-        };
+        // A one-segment attention (its layout states no step segment) whose resident K/V
+        // segment is this prefix source.
         let class = (self.l.input.ops.iter())
             .find_map(|od| match od.op {
-                SubOp::AttnDecode { mask, .. } if reads(od) => Some(mask),
+                SubOp::AttnDecode { mask, operands, .. }
+                    if operands.step_segment().is_none()
+                        && od.inputs[operands.segment_inputs()].contains(&InputRef::Ext(e)) =>
+                {
+                    Some(mask)
+                }
                 _ => None,
             })
             .ok_or_else(no)?;
@@ -1785,7 +1789,11 @@ impl Recording<'_> {
         // The attention reads the rotation directly.
         let reads = |q: Option<&InputRef>| matches!(q, Some(&InputRef::Op(j)) if j == i);
         ops.iter().enumerate().find_map(|(j, od)| match od.op {
-            SubOp::AttnDecode { mask, .. } if od.inputs.len() == 3 && reads(od.inputs.first()) => {
+            // A writer-less attention — its one segment the resident cache — whose query is
+            // this rotation (both by the op's own layout).
+            SubOp::AttnDecode { mask, operands, .. }
+                if operands.step_segment().is_none() && reads(od.inputs.get(operands.q())) =>
+            {
                 Some((self.prefix_layer(j)?, mask))
             }
             _ => None,
@@ -1808,7 +1816,9 @@ impl Recording<'_> {
     fn rope(&self, i: usize, rotate: usize) -> Result<Emission, StepRefusal> {
         let (layer, pairing, class) = self.rope_fields(i)?;
         let q = self.colour(self.step_arg(rotate, 0)?)?;
-        let (k_op, v_op) = (self.step_arg(i, 0)?, self.step_arg(i, 3)?);
+        // The writer's K and V, by its own layout.
+        let w = scratchy_subtile::subtile_ir::KvWriterLayout::ROPE_APPEND;
+        let (k_op, v_op) = (self.step_arg(i, w.k() as u8)?, self.step_arg(i, w.v() as u8)?);
         let (k, v) = (self.colour(k_op)?, self.colour(v_op)?);
         let (k_off, k_linear) = self.kv_offset(i, k_op, layer)?;
         let (v_off, v_linear) = self.kv_offset(i, v_op, layer)?;

@@ -930,6 +930,17 @@ fn an_unbatched_fp16_matmul_is_one_descriptor() {
     // LOWERED descriptor, and the bundle off the PROGRAMS.
     let ir = single_matmul_ir(64, 16384, 2048);
     let weight_ids: std::collections::HashSet<u32> = [1u32].into_iter().collect();
+    let graph = scratchy_triton_splice::GraphExtent::of(
+        &ir,
+        ktir_superdsc::sdsc_abstract::QueryExtent::of_baked_rung(
+            ktir_superdsc::sdsc_abstract::RungWidth::of_baked_rows(1).expect("one row is nonzero"),
+            ktir_superdsc::sdsc_abstract::RungCap::of_baked_seqs(64)
+                .expect("64 requests is nonzero"),
+        )
+        .expect("64 rows fit a u32"),
+        true,
+    )
+    .unwrap_or_else(|e| panic!("64 requests of one row describe the matmul: {e}"));
     let (programs, layout) =
         superdsc::lower_graph_to_ktir::<ktir_superdsc::collective::TpWorld<1>, _>(
             &ir,
@@ -937,13 +948,7 @@ fn an_unbatched_fp16_matmul_is_one_descriptor() {
             superdsc::ActiveCap::FULL,
             true,
             // The graph's own extent pair: 64 rows that are 64 requests — one row each.
-            ktir_superdsc::sdsc_abstract::QueryExtent::of_baked_rung(
-                ktir_superdsc::sdsc_abstract::RungWidth::of_baked_rows(1)
-                    .expect("one row is nonzero"),
-                ktir_superdsc::sdsc_abstract::RungCap::of_baked_seqs(64)
-                    .expect("64 requests is nonzero"),
-            )
-            .expect("64 rows fit a u32"),
+            graph,
         )
         .expect("KTIR for a 64x16384x2048 matmul");
     let (dscs, _) = superdsc::lower_graph_to_superdsc::<ktir_superdsc::collective::TpWorld<1>, _>(
@@ -952,12 +957,7 @@ fn an_unbatched_fp16_matmul_is_one_descriptor() {
         superdsc::ActiveCap::FULL,
         true,
         // Same pair as the KTIR half above: 64 requests of one row.
-        ktir_superdsc::sdsc_abstract::QueryExtent::of_baked_rung(
-            ktir_superdsc::sdsc_abstract::RungWidth::of_baked_rows(1).expect("one row is nonzero"),
-            ktir_superdsc::sdsc_abstract::RungCap::of_baked_seqs(64)
-                .expect("64 requests is nonzero"),
-        )
-        .expect("64 rows fit a u32"),
+        graph,
     )
     .expect("SuperDSC for a 64x16384x2048 matmul");
     let [e] = &dscs[..] else {

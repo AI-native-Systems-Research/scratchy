@@ -159,19 +159,31 @@ pub fn one_layer_input_shaped(h: u32, kv: u32, i: u32, hd: u32) -> LoweringInput
             },
             // 6: attn = AttnDecode(q', prefix_k, prefix_v, new_k, v)
             //    Llama-3.2-1B GQA: 32 q-heads, 8 kv-heads, head_dim=64.
-            OpDesc {
-                // Llama-3.2-1B GQA: 32 q-heads, 8 kv-heads. valid_len 2: decode_position=1 →
-                // 1 prefix row + 1 new = 2 valid positions. Decoupled from the cache TENSOR
-                // capacity (sources 7,8 may be sized larger).
-                op: SubOp::attn_decode(one_layer_attention(h, kv, hd), 2, AttnMask::Causal),
-                m: 1,
-                inputs: vec![
+            {
+                // The query, the resident prefix (sources 7, 8) and the step's new rows
+                // (the writer's rotated K, op 5; the projected V, op 3), by the one assembly.
+                let (operands, inputs) = crate::subtile_ir::AttnLayout::assemble(
                     InputRef::Op(4),
-                    InputRef::Ext(7),
-                    InputRef::Ext(8),
-                    InputRef::Op(5),
-                    InputRef::Op(3),
-                ],
+                    [
+                        (InputRef::Ext(7), InputRef::Ext(8)),
+                        (InputRef::Op(5), InputRef::Op(3)),
+                    ],
+                    None,
+                )
+                .expect("a two-segment attention is a layout");
+                OpDesc {
+                    // Llama-3.2-1B GQA: 32 q-heads, 8 kv-heads. valid_len 2: decode_position=1
+                    // → 1 prefix row + 1 new = 2 valid positions. Decoupled from the cache
+                    // TENSOR capacity (sources 7,8 may be sized larger).
+                    op: SubOp::attn_decode(
+                        one_layer_attention(h, kv, hd),
+                        2,
+                        AttnMask::Causal,
+                        operands,
+                    ),
+                    m: 1,
+                    inputs,
+                }
             },
             // 7: o = attn @ o_w
             OpDesc {

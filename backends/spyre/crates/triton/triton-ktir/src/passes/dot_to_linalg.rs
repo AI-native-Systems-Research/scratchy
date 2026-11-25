@@ -705,8 +705,13 @@ fn verify_canonical_matmul_kernel(
     }
     // The store's operands are [desc, indices..., src]; drop the trailing src.
     let s_idx = &s_idx[..s_idx.len().saturating_sub(1)];
-    if s_idx.len() != 2 || s_idx[0] != pid || s_idx[1] != pid {
-        return Err(refuse("C store offset is not the canonical [pid, pid]"));
+    // The store's column corner is a CONSTANT — the splice's `C_START`, the
+    // region's column corner over the storage C names (a whole-stick corner; the
+    // door's `rcol` law refuses a sub-stick one where the splice mints it). The
+    // old `[pid, pid]` spelling is this form at `C_START = 0`, grid [1]: pid is 0.
+    let is_col_corner = |v: Ssa| matches!(const_int_index(index, v), Some(c) if c >= 0);
+    if s_idx.len() != 2 || s_idx[0] != pid || !is_col_corner(s_idx[1]) {
+        return Err(refuse("C store offset is not the canonical [pid, C_START]"));
     }
 
     // No extra control flow: the ONLY loop may be the K-loop.
@@ -1003,12 +1008,15 @@ fn verify_canonical_fp8_matmul_kernel(
         ));
     }
 
-    // Canonical offsets: A[pid,0], W[0,0], ws[0,0], C[pid,0] -- the single-tile form of the
-    // f16 contract's [pid,k]/[k,pid] pair with the k index pinned at 0. The row offset is
-    // the IDIOMATIC `offs_m = pid * BLOCK_M` (`arith.muli`), admitted with its own guard:
-    // one operand must BE the pid and the other the constant BLOCK_M -- anything else
-    // scales the row by a value the emitter never reads and would silently misplace.
+    // Canonical offsets: A[pid,0], W[0,0], ws[0,0], C[pid,C_START] -- the single-tile form
+    // of the f16 contract's [pid,k]/[k,pid] pair with the k index pinned at 0. The row
+    // offset is the IDIOMATIC `offs_m = pid * BLOCK_M` (`arith.muli`), admitted with its
+    // own guard: one operand must BE the pid and the other the constant BLOCK_M --
+    // anything else scales the row by a value the emitter never reads and would silently
+    // misplace. The store's column corner is a CONSTANT -- the splice's `C_START` (the
+    // f16 contract's column-window law, see there).
     let is_zero_idx = |v: Ssa| const_int_index(index, v) == Some(0);
+    let is_col_corner = |v: Ssa| matches!(const_int_index(index, v), Some(c) if c >= 0);
     let is_row_idx = |v: Ssa| -> bool {
         if v == pid {
             return true;
@@ -1037,9 +1045,9 @@ fn verify_canonical_fp8_matmul_kernel(
     }
     // The store's operands are [desc, indices..., src]: skip the desc, drop the src.
     let s_idx = &store.operands[1..store.operands.len().saturating_sub(1)];
-    if s_idx.len() != 2 || !is_row_idx(s_idx[0]) || !is_zero_idx(s_idx[1]) {
+    if s_idx.len() != 2 || !is_row_idx(s_idx[0]) || !is_col_corner(s_idx[1]) {
         return Err(refuse(
-            "C store offset is not the canonical [pid*BLOCK_M, 0]",
+            "C store offset is not the canonical [pid*BLOCK_M, C_START]",
         ));
     }
 
@@ -1466,26 +1474,31 @@ fn check_desc(
     check_desc_common(index, d, nm, d1, b0, b1)
 }
 
-/// ⭐ C's OWN ADMISSION — the STORED-WINDOW form. The C descriptor may name the
-/// OUTPUT TENSOR'S STORAGE `[m_total, n]` while the store takes the `[m, n]` tile at
-/// row `pid`: the prefill lm-head fold re-lowers the vocab-wide tail at m=1 over the
-/// LAST_HIDDEN staging, and its output is row 0 of the `[mq, vocab]` logits storage
-/// the layout reserved. The store's canonical `[pid, pid]` corner (checked in the
-/// verifier body) keeps the window at row 0 of the storage at grid [1], and `s0 > d0`
-/// is exactly the window: the descriptor names the storage, the store names the
-/// window (`s0 < d0` would be a store that runs past its buffer, and is refused).
-/// Everything else about C is the strict form: contiguous row-major, the full `n`,
-/// the `[m, n]` block.
+/// ⭐ C's OWN ADMISSION — the STORED-WINDOW form, in BOTH axes. The C descriptor
+/// may name the OUTPUT TENSOR'S STORAGE while the store takes the `[m, n]` tile at
+/// a corner: `[m_total, n]` with the tile at row `pid` (the prefill lm-head fold
+/// re-lowers the vocab-wide tail at m=1 over the LAST_HIDDEN staging, and its
+/// output is row 0 of the `[mq, vocab]` logits storage the layout reserved), and
+/// `[m, n_total]` with the tile at column `C_START` (a PAD_V logits tensor minted
+/// wider than the projection that fills it — the sampler's argmax law — or a
+/// col-tiled output's region at a nonzero corner). `s0 > d0` / `s1 > ns` are
+/// exactly the window: the descriptor names the storage, the store names the
+/// window (`s0 < d0` or `s1 < ns` would be a store that runs past its buffer,
+/// and is refused). The strides are then the STORAGE'S OWN WIDTH `[s1, 1]` — not
+/// the tile's `ns` — or every row past row 0 lands over the wrong bytes
+/// (MEASURED, gemma-4 tiny-paged bundle ed46275: a [32, 512] tile pitched at 512
+/// inside a [32, 4096] tensor). Everything else about C is the strict form: the
+/// `[m, n]` block.
 fn check_desc_c(index: &DefIndex, d: &OpHead, m: i64, ns: i64, bm: i64, bn: i64) -> Result<()> {
     let (s0, s1) =
         desc_shape2(index, d).ok_or_else(|| refuse("C has non-constant shape/strides"))?;
-    if s0 < m || s1 != ns {
+    if s0 < m || s1 < ns {
         return Err(refuse(format!(
             "C shape [{s0},{s1}] does not hold the stored [{m},{ns}] tile — the output \
              descriptor must name either the tile or the storage that holds it"
         )));
     }
-    check_desc_common(index, d, "C", ns, bm, bn)
+    check_desc_common(index, d, "C", s1, bm, bn)
 }
 
 /// The strides/block half of [`check_desc`], shared by the strict and windowed forms.

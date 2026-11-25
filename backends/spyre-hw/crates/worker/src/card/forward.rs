@@ -47,14 +47,6 @@ pub(crate) struct SubmittedDecode {
     )>,
 }
 
-/// What `run_card_launch` hands back: a finished step's picks, or a
-/// submitted decode step whose read is deferred. A decode batch is ALWAYS the
-/// latter — one decode path — and a schedule that cannot defer collects it
-/// in-call through the same [`collect_decode_tokens`] door.
-pub(crate) enum BatchOut {
-    Done(Option<Vec<u32>>),
-    Deferred(SubmittedDecode),
-}
 
 /// ⭐ #32 (E) — THE OVERLAP PROBE'S PROCESS-WIDE STATE, in the same idiom
 /// `step_segs` states the reason for: the submit half's borrows (the session,
@@ -73,24 +65,135 @@ static OUTSTANDING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUs
 
 /// ⭐ WHAT ONE CARD LAUNCH'S ROWS ARE, for the paged step: one sequence's rows — a prompt chunk, or
 /// the one-request decode — or one token of each of a decode batch's sequences. Each names its KV
-/// blocks as pool pages (`paged_step::page_of_block` of the scheduler's block table), which the
+/// blocks as pool pages (`paged_step::request_pages` of the scheduler's block table), which the
 /// step's tables are built from and which nothing here can recompute: which page holds a block is
 /// the scheduler's grant, and it churns.
 pub(crate) enum LaunchRows<'a> {
-    /// One sequence: `rows.real` tokens from position `rows.start`, in the pages `blocks`.
-    Sequence { blocks: &'a [u32], rows: StepRows },
-    /// A decode batch: one token per live sequence, in slot order; the rung's rows past them are
-    /// padding, written at the null slot (`paged_step::batch_sources`).
-    Batch { seqs: &'a [BatchSeq<'a>] },
-    /// ⭐ A WAVE OF CONTINUATION TAILS on a packed rung — `steps` dense from window 0 (request
-    /// `r` rides window `r`), each request's window `width` rows wide: the rung's own
-    /// per-request width, the fact every row law below divides by. The windows past the live
-    /// requests are the rung's EMPTY slots (`paged_step::card_step_sources`'s empty-slot law:
-    /// their writes reach no request's cache and their answers are read by nobody).
+    /// One sequence: its real tokens `tokens` from position `rows.start`, in the pages `blocks` —
+    /// a prompt's rows are host facts, so the tokens ride the rows (minted together by
+    /// [`LaunchRows::sequence`], `rows.real` IS `tokens.len()`).
+    Sequence {
+        blocks: &'a [scratchy_target_spyre::paged_step::PoolPage],
+        rows: StepRows,
+        tokens: &'a [usize],
+        /// The request's draw: every baked row runs it — real row `i` at its own position, a pad
+        /// row at the last real position it clamps to (the pad row replicates the last real
+        /// token's forward, and the CONSUMED pick is the last baked row's, so the pad row carries
+        /// the draw the last real row would, or an unfilled rung would pick greedy for a sampled
+        /// request).
+        draw: Option<&'a SampledDraw>,
+    },
+    /// A decode batch: one [`DecodeRow`] per live sequence, in slot order; the rung's rows past them
+    /// are padding, written at the null slot (`paged_step::batch_sources`), and a padding slot runs
+    /// live 0's draw ([`pad_law_of`], the pad clamp) — its pick is never read. Its seeds are the one
+    /// launch kind's that may be the card's own ([`DecodeRows::Stable`]).
+    Batch(DecodeRows<'a>),
+    /// ⭐ A WAVE OF CONTINUATION TAILS on a packed rung — one [`PackedRequest`] per request, dense
+    /// from window 0 (request `r` rides window `r`), each request's window `width` rows wide: the
+    /// rung's own per-request width, the fact every row law below divides by. The windows past
+    /// the live requests are the rung's EMPTY slots (`paged_step::card_step_sources`'s empty-slot
+    /// law: their writes reach no request's cache and their answers are read by nobody).
     Packed {
-        steps: &'a [scratchy_target_spyre::paged_step::RequestStep<'a>],
+        reqs: &'a [PackedRequest<'a>],
         width: usize,
     },
+}
+
+/// ⭐ ONE REQUEST OF A WAVE — its step (pages and rows), its real tokens, and its draw, as one
+/// record: the rows are minted FROM the tokens ([`Self::new`]), so the two cannot disagree, and
+/// no list of draws or seeds can be another's length. Seat row `r` is request `r`'s folded answer
+/// row, so it runs request `r`'s draw at request `r`'s LAST position.
+pub(crate) struct PackedRequest<'a> {
+    step: scratchy_target_spyre::paged_step::RequestStep<'a>,
+    tokens: &'a [usize],
+    draw: Option<&'a SampledDraw>,
+}
+
+impl<'a> PackedRequest<'a> {
+    /// The request's `tokens` from `start`, in its `blocks`, in a `width`-row window. `None` for
+    /// no tokens or more than the window holds ([`StepRows::new`]'s own refusal).
+    pub(crate) fn new(
+        blocks: &'a [scratchy_target_spyre::paged_step::PoolPage],
+        width: usize,
+        start: usize,
+        tokens: &'a [usize],
+        draw: Option<&'a SampledDraw>,
+    ) -> Option<Self> {
+        Some(PackedRequest {
+            step: scratchy_target_spyre::paged_step::RequestStep {
+                blocks,
+                rows: StepRows::new(width, start, tokens.len())?,
+            },
+            tokens,
+            draw,
+        })
+    }
+}
+
+/// ⭐ ONE LIVE ROW OF A DECODE BATCH — its sequence's pages and the position of the one token it
+/// decodes, its request's draw at that position, and its seed `S`: the host's token on a churned
+/// seating (`usize`), nothing on a stable one (`()` — the card's own ChainStage writes are each
+/// seat's seed). One record per row, so the seeds, the draws and the sequences cannot be lists of
+/// different lengths.
+pub(crate) struct DecodeRow<'a, S> {
+    pub(crate) seq: BatchSeq<'a>,
+    pub(crate) draw: Option<&'a SampledDraw>,
+    pub(crate) seed: S,
+}
+
+/// ⭐ A DECODE BATCH'S LIVE ROWS, BY WHERE THEIR SEEDS COME FROM — every row's is the host's, or
+/// every row's is the card's own; never a mix, never a count to check.
+pub(crate) enum DecodeRows<'a> {
+    /// A churned seating: each row's seed is the host's token.
+    Churned(&'a [DecodeRow<'a, usize>]),
+    /// A stable seating: each seat's seed is the card's own write.
+    Stable(&'a [DecodeRow<'a, ()>]),
+}
+
+impl<'a> DecodeRows<'a> {
+    /// The live rows.
+    fn len(&self) -> usize {
+        match self {
+            DecodeRows::Churned(r) => r.len(),
+            DecodeRows::Stable(r) => r.len(),
+        }
+    }
+
+    /// Live row `i`'s sequence.
+    fn seq(&self, i: usize) -> BatchSeq<'a> {
+        match self {
+            DecodeRows::Churned(r) => r[i].seq,
+            DecodeRows::Stable(r) => r[i].seq,
+        }
+    }
+
+    /// Live row `i`'s draw.
+    fn draw(&self, i: usize) -> Option<&'a SampledDraw> {
+        match self {
+            DecodeRows::Churned(r) => r[i].draw,
+            DecodeRows::Stable(r) => r[i].draw,
+        }
+    }
+}
+
+impl<'a> LaunchRows<'a> {
+    /// ⭐ ONE SEQUENCE'S LAUNCH, its rows minted FROM its tokens — `tokens.len()` real rows from
+    /// `start` in a `width`-row chunk, so the rows and the seeds cannot disagree. `None` for a
+    /// chunk of no tokens or more tokens than the chunk holds ([`StepRows::new`]'s own refusal).
+    pub(crate) fn sequence(
+        blocks: &'a [scratchy_target_spyre::paged_step::PoolPage],
+        width: usize,
+        start: usize,
+        tokens: &'a [usize],
+        draw: Option<&'a SampledDraw>,
+    ) -> Option<Self> {
+        Some(LaunchRows::Sequence {
+            blocks,
+            rows: StepRows::new(width, start, tokens.len())?,
+            tokens,
+            draw,
+        })
+    }
 }
 
 impl LaunchRows<'_> {
@@ -99,67 +202,80 @@ impl LaunchRows<'_> {
     fn last_pos(&self) -> usize {
         match self {
             LaunchRows::Sequence { rows, .. } => rows.end() - 1,
-            LaunchRows::Batch { seqs } => seqs.iter().map(|q| q.pos).max().unwrap_or(0),
+            LaunchRows::Batch(rows) => (0..rows.len())
+                .map(|i| rows.seq(i).pos)
+                .max()
+                .unwrap_or(0),
             // The deepest position ANY request reaches — the body the session selects must
             // walk to every request's keys, not one of them.
-            LaunchRows::Packed { steps, .. } => {
-                steps.iter().map(|s| s.rows.end()).max().unwrap_or(1) - 1
+            LaunchRows::Packed { reqs, .. } => {
+                reqs.iter().map(|q| q.step.rows.end()).max().unwrap_or(1) - 1
             }
         }
     }
 
     /// The live rows — a sequence's real tokens, a batch's sequences, or a wave's every
-    /// request's real rows (the count its concatenated host seeds carry).
+    /// request's real rows.
     fn live(&self) -> usize {
         match self {
             LaunchRows::Sequence { rows, .. } => rows.real(),
-            LaunchRows::Batch { seqs } => seqs.len(),
-            LaunchRows::Packed { steps, .. } => steps.iter().map(|s| s.rows.real()).sum(),
+            LaunchRows::Batch(rows) => rows.len(),
+            LaunchRows::Packed { reqs, .. } => reqs.iter().map(|q| q.step.rows.real()).sum(),
         }
     }
 
-    /// Bound row `r`'s position. A pad row's is a live row's: a sequence's pad row repeats its last
-    /// real token (`StepRows::pos`), a batch's repeats live 0 (its write lands at the null slot, so
-    /// what it computes is never read). A wave's row `r` is window `r / width`'s row
-    /// `r % width` — its own request's position, a pad row clamped to its request's last real
-    /// one; an EMPTY window's rows take live 0's last real position, the same clamp the
-    /// decode's pad rows take.
+    /// Bound row `r`'s position — the position of the live row it is (the same row
+    /// [`Self::seed_of`] reads, never a second statement of the pad law): a sequence's pad row
+    /// repeats its last real token (`StepRows::pos`), a batch's pad row is live 0 (its write lands
+    /// at the null slot, so what it computes is never read), and a wave's row is its window's
+    /// request's row.
     fn pos(&self, r: usize) -> usize {
         match self {
             LaunchRows::Sequence { rows, .. } => rows.pos(r),
-            LaunchRows::Batch { seqs } => seqs.get(r).unwrap_or(&seqs[0]).pos,
-            LaunchRows::Packed { steps, width } => match steps.get(r / width) {
-                Some(req) => req.rows.pos(r % width),
-                None => steps[0].rows.pos(width - 1),
-            },
+            LaunchRows::Batch(rows) => rows.seq(batch_live(rows.len(), r)).pos,
+            LaunchRows::Packed { reqs, width } => {
+                let (req, row) = packed_row(reqs.len(), *width, r);
+                reqs[req].step.rows.pos(row)
+            }
         }
     }
 
-    /// The live row a bound row `r` takes its token from. A wave's row takes its own
-    /// window's, clamped to its request's last real row; an empty window's rows take live
-    /// 0's last real row, so the seed law's `t[live_of(r)]` always names a real token.
-    fn live_of(&self, r: usize) -> usize {
+    /// Bound row `r`'s host seed — the token of the live row it is: a sequence's by its pad law, a
+    /// batch's by [`batch_live`] off the row's own record, a wave's by [`packed_row`] off its
+    /// window's request's own tokens. `None` only for a stable decode seating, whose seeds are the
+    /// card's own.
+    fn seed_of(&self, r: usize) -> Option<usize> {
         match self {
-            LaunchRows::Sequence { rows, .. } => rows.live(r),
-            LaunchRows::Batch { seqs } => {
-                if r < seqs.len() {
-                    r
-                } else {
-                    0
-                }
+            LaunchRows::Sequence { rows, tokens, .. } => Some(tokens[rows.live(r)]),
+            LaunchRows::Batch(DecodeRows::Churned(rows)) => {
+                Some(rows[batch_live(rows.len(), r)].seed)
             }
-            LaunchRows::Packed { steps, width } => {
-                let q = r / width;
-                let mut base = 0;
-                for (i, req) in steps.iter().enumerate() {
-                    if i == q {
-                        return base + req.rows.live(r % width);
-                    }
-                    base += req.rows.real();
-                }
-                steps[0].rows.last_live()
+            LaunchRows::Batch(DecodeRows::Stable(_)) => None,
+            LaunchRows::Packed { reqs, width } => {
+                let (req, row) = packed_row(reqs.len(), *width, r);
+                Some(reqs[req].tokens[reqs[req].step.rows.live(row)])
             }
         }
+    }
+}
+
+/// ⭐ A DECODE BATCH'S PAD LAW, ONCE — bound row `r` of a batch of `live` sequences is sequence `r`,
+/// and a row past them is live 0 (its write lands at the null slot, so what it computes is never
+/// read). [`LaunchRows::pos`] and [`LaunchRows::seed_of`] both read it.
+fn batch_live(live: usize, r: usize) -> usize {
+    if r < live { r } else { 0 }
+}
+
+/// ⭐ A WAVE'S ROW LAW, ONCE — bound row `r` of a wave of `live` requests in windows `width` rows
+/// wide is window `r / width`'s row `r % width`; a row of an EMPTY window (past the live requests)
+/// is request 0's last row, which its pad law clamps to its last real one — the same clamp a
+/// decode's pad rows take. `(request, row in its window)`; [`LaunchRows::pos`] and
+/// [`LaunchRows::seed_of`] both read it.
+fn packed_row(live: usize, width: usize, r: usize) -> (usize, usize) {
+    if r / width < live {
+        (r / width, r % width)
+    } else {
+        (0, width - 1)
     }
 }
 
@@ -183,7 +299,7 @@ impl SeatWidth {
         mq: usize,
     ) -> Self {
         Self(match rows_in {
-            LaunchRows::Batch { .. } => mq,
+            LaunchRows::Batch(_) => mq,
             _ => seat.rows as usize,
         })
     }
@@ -193,48 +309,25 @@ impl SeatWidth {
     }
 }
 
-/// ⭐ THE SUFFIX'S MINTED SAMPLER, ONE BUNDLE: where the seeds come from, whether
-/// the lm-head tail runs, and the per-row seat laws — the three facts that
-/// describe the launch's sampling half rather than its forward body.
-pub(crate) struct SamplerLaws<'a> {
-    // ⛔ THE SEED LAW, NOT A TOKEN LIST. The device writes a decode step's seeds itself (each
-    // step's ChainStage decomposes its pick into the persistent sticks), so the host binds seeds
-    // ONLY where the card cannot have: a request's first step on a rung session, a churned seat, a
-    // rung switch. `SeedSource::OnCard` is that statement — a stable seating — and binds nothing.
-    // A prompt chunk's rows are the prompt's own tokens, always `Host`.
-    pub(crate) seeds: ktir_superdsc::sdsc_abstract::SeedSource<'a>,
-    pub(crate) want_logits: LogitsWanted,
-    // ⭐ THE SEAT LAWS THIS LAUNCH'S ROWS RUN UNDER — one law per row the suffix's sampler picks
-    // for, staged before anything runs. A middle prompt chunk's suffix never runs, so the value it
-    // passes is inert — but it is still that request's own.
-    pub(crate) laws: SeatLaws<'a>,
-}
-
 /// ⭐ ONE CARD LAUNCH ON THE PAGED STEP — the forward tape at the rung's `width` rows, the step's
 /// tables for the body that runs, and the minted sampler's seat; then the launch.
 ///
 /// ⭐ THE BODY IS ASKED FIRST. The session selects the narrowest walk that reaches the launch's last
-/// position (`SuperDscSession::step_body`), and the step the host stages is THAT body's
-/// (`PagedStep::on_body` at its sweep): the page table one block per trip, the mask stack one tile
-/// per trip. The launch is handed the same position, so the body staged for and the body launched
+/// position (`SuperDscSession::step_body`), and the step the host stages is THAT body's, at each
+/// class's walk its rung records (`StepBody::walks`): the page table one block per trip, the mask
+/// stack one tile per trip. The launch is handed the same position, so the body staged for and the body launched
 /// are one body by construction.
 ///
 /// `b` is the wiring the rung runs under — its own for a prompt chunk and the one-request decode,
 /// the one-request decode's for a decode batch rung (the same tape at `width` rows, addressed by
 /// fingerprint; `width` is the rung's own baked row count, which every extent here is sized by).
-pub(crate) fn run_card_launch(
+pub(crate) fn run_card_launch<E: LaunchEnd>(
     rows_in: LaunchRows<'_>,
     sh: &Shared<'_>,
     pf: &mut SuperDscSession,
     b: &BundleMeta,
     width: ktir_superdsc::sdsc_abstract::RungWidth,
-    sampler: SamplerLaws<'_>,
-) -> ExecutorResult<BatchOut> {
-    let SamplerLaws {
-        seeds,
-        want_logits,
-        laws: seat_laws,
-    } = sampler;
+) -> ExecutorResult<E::Out> {
     let (h, vocab) = (sh.hidden, sh.vocab);
     let mq = width.count();
     let live = rows_in.live();
@@ -251,15 +344,13 @@ pub(crate) fn run_card_launch(
             "card launch at {seq_pos}: the session could not say which body runs: {e}"
         ))
     })?;
-    let swept = body
-        .swept()
-        .ok_or_else(|| {
-            werr(format!(
-                "card launch at {seq_pos}: the session selected a body with no ladder rung — an \
-                 unrolled bundle, which states no walk to stage"
-            ))
-        })?
-        .get();
+    // ⭐ EACH CLASS'S WALK IS ITS RUNG'S BAKED RECORD (`RungBody::walk`), never re-derived here.
+    let walks = body.walks().ok_or_else(|| {
+        werr(format!(
+            "card launch at {seq_pos}: the session selected a body with no ladder rung — an \
+             unrolled bundle, which states no walk to stage"
+        ))
+    })?;
     // ⭐ EVERY CLASS'S STEP, at the body that runs — a hybrid model's attention geometries each
     // carry their own tables, staged side by side. The extent law is the launch's own kind: a
     // sequence launch re-derives its pair from its rows, a decode batch from its count, and a
@@ -270,87 +361,78 @@ pub(crate) fn run_card_launch(
             "this bundle states no paged step — its attention has no pools",
         ));
     }
-    let steps: Vec<scratchy_target_spyre::wiring::PagedStep> = b
+    // ⭐ EACH CLASS'S STEP, AS THE KIND ITS LAUNCH IS, STAGED BY THAT KIND'S STAGER — the step is
+    // minted for the launch at its class's baked walk (`on_sequence_body` / `on_batch_body` /
+    // `on_body_packed`, total), so no stager asks what its rows are. The records are the classes'
+    // in the wiring's order (the bake's `rung_bodies` states the order and the count).
+    let staging = |e: scratchy_target_spyre::paged_step::PagedStepError| {
+        werr(format!("card launch at {seq_pos}: paged step: {e}"))
+    };
+    // A decode batch's sequences and a wave's requests' steps, in slot / window order — the
+    // records' own, read once for every class.
+    let batch_seqs: Vec<BatchSeq<'_>> = match &rows_in {
+        LaunchRows::Batch(rows) => (0..rows.len()).map(|i| rows.seq(i)).collect(),
+        LaunchRows::Sequence { .. } | LaunchRows::Packed { .. } => Vec::new(),
+    };
+    let wave_steps: Vec<scratchy_target_spyre::paged_step::RequestStep<'_>> = match &rows_in {
+        LaunchRows::Packed { reqs, .. } => reqs.iter().map(|q| q.step).collect(),
+        LaunchRows::Sequence { .. } | LaunchRows::Batch(_) => Vec::new(),
+    };
+    let staged: Vec<(
+        scratchy_target_spyre::wiring::PagedStep,
+        scratchy_target_spyre::paged_step::CardSources,
+    )> = b
         .wiring
         .paged
         .iter()
-        .map(|&s| {
-            match &rows_in {
-                LaunchRows::Sequence { .. } => s.on_body(
-                    width.get(),
-                    scratchy_target_spyre::paged_step::PagedRows::Sequence,
-                    swept,
-                ),
-                LaunchRows::Batch { .. } => s.on_body(
-                    width.get(),
-                    scratchy_target_spyre::paged_step::PagedRows::Batch,
-                    swept,
-                ),
-                LaunchRows::Packed { .. } => s.on_body_packed(swept),
-            }
-            .ok_or_else(|| {
-                werr(format!(
-                    "card launch: the body sweeps {swept} slot(s), which is no walk of this \
-                     bundle's pool"
-                ))
-            })
-        })
-        .collect::<Result<_, _>>()?;
-    let card: Vec<scratchy_target_spyre::paged_step::CardSources> = steps
-        .iter()
-        .map(|step| {
-            match &rows_in {
-                LaunchRows::Sequence { blocks, rows } => {
-                    // One request's list: a sequence launch is one request today — the packing
-                    // that widens this list is the concurrent-prefill rung's own step, not this
-                    // front's.
-                    scratchy_target_spyre::paged_step::card_step_sources(
-                        step,
+        .zip(walks)
+        .map(|(&s, rung)| -> ExecutorResult<_> {
+            Ok(match &rows_in {
+                // One request's list: a sequence launch is one request today — the packing that
+                // widens this list is the concurrent-prefill rung's own step, not this front's.
+                LaunchRows::Sequence { blocks, rows, .. } => {
+                    let step = s.on_sequence_body(width, rung.walk);
+                    let card = scratchy_target_spyre::paged_step::card_step_sources(
+                        &step,
                         &[scratchy_target_spyre::paged_step::RequestStep {
                             blocks,
                             rows: *rows,
                         }],
                     )
+                    .map_err(staging)?;
+                    (*step, card)
                 }
-                LaunchRows::Batch { seqs } => {
-                    scratchy_target_spyre::paged_step::card_batch_sources(step, seqs)
+                LaunchRows::Batch(_) => {
+                    let step = s.on_batch_body(width, rung.walk);
+                    let card =
+                        scratchy_target_spyre::paged_step::card_batch_sources(&step, &batch_seqs)
+                            .map_err(staging)?;
+                    (*step, card)
                 }
                 // ⭐ THE WAVE'S OWN STEPS, one window per request — `card_step_sources` stages
-                // each request's three tables at its window's own tids and the empty slots
-                // past the live ones as no request's.
-                LaunchRows::Packed { steps, .. } => {
-                    scratchy_target_spyre::paged_step::card_step_sources(step, steps)
+                // each request's three tables at its window's own tids and the empty slots past
+                // the live ones as no request's.
+                LaunchRows::Packed { .. } => {
+                    let step = s.on_body_packed(rung.walk);
+                    let card =
+                        scratchy_target_spyre::paged_step::card_step_sources(&step, &wave_steps)
+                            .map_err(staging)?;
+                    (*step, card)
                 }
-            }
+            })
         })
-        .collect::<Result<_, _>>()
-        .map_err(|e| werr(format!("card launch at {seq_pos}: paged step: {e}")))?;
-    // ⭐ ONE TOKEN PER BOUND ROW — a pad row takes its live row's (`LaunchRows::live_of`). An
-    // `OnCard` launch binds none: its seeds are the card's own ChainStage writes, which only a
-    // decode-phase bundle's tape reads.
-    let tokens: Vec<usize> = match seeds {
-        ktir_superdsc::sdsc_abstract::SeedSource::Host(t) => {
-            if t.len() != live {
-                return Err(werr(format!(
-                    "card launch: {} seed token(s) for {live} live row(s) — one per live row",
-                    t.len()
-                )));
-            }
-            (0..mq).map(|r| t[rows_in.live_of(r)]).collect()
-        }
-        ktir_superdsc::sdsc_abstract::SeedSource::OnCard => {
-            if matches!(
-                b.wiring.phase,
-                scratchy_target_spyre::forward_tape::ForwardPhase::Prefill
-            ) {
-                return Err(werr(
-                    "card launch: a prompt chunk cannot seed from the card — every prompt row's \
-                     token is a host fact and the EmbedRow push reads it",
-                ));
-            }
-            Vec::new()
-        }
-    };
+        .collect::<ExecutorResult<_>>()?;
+    let (steps, card): (
+        Vec<scratchy_target_spyre::wiring::PagedStep>,
+        Vec<scratchy_target_spyre::paged_step::CardSources>,
+    ) = staged.into_iter().unzip();
+    // ⭐ THE ROWS' OWN SEEDS, ONE TOKEN PER BOUND ROW — a pad row takes its live row's
+    // (`LaunchRows::seed_of`). A prompt chunk's and a wave's rows carry their tokens (minted from
+    // them, so the count is the rows'); a decode batch's are each live row's own record on a
+    // churned seating, or the card's own on a stable one (its ChainStage writes, which bind
+    // nothing) — every row's seed or none, by the variant.
+    let host_seeded = !matches!(rows_in, LaunchRows::Batch(DecodeRows::Stable(_)));
+    let tokens: Vec<usize> = (0..mq).filter_map(|r| rows_in.seed_of(r)).collect();
     for &tok in &tokens {
         if tok >= vocab {
             return Err(werr(format!("card launch: token {tok} >= vocab {vocab}")));
@@ -361,14 +443,9 @@ pub(crate) fn run_card_launch(
     // fp16 sticks, the pool's own `POOL_STICK` (the emitter's own pad law),
     // never a literal 64.
     let stick = ktir_superdsc::sdsc_abstract::POOL_STICK as usize;
+    // (`h` is whole sticks by the bake's own proof, `emit_superdsc_wiring`.)
     let mq_pad = mq.div_ceil(stick) * stick;
-    if h % stick != 0 {
-        return Err(werr(format!(
-            "card launch: hidden={h} is not a whole number of {stick}-element sticks"
-        )));
-    }
-    let launch_rows = scratchy_target_spyre::wiring::StagedRows::of_launch(mq)
-        .ok_or_else(|| werr("card launch with zero rows".to_string()))?;
+    let launch_rows = scratchy_target_spyre::wiring::StagedRows::of_rung(width);
     // ⭐ THE SESSION'S OWN FACTS: the constants this launch's bundle placed, index for index —
     // never the wiring's bundle's (a decode batch rung runs under the one-request decode's wiring).
     let consts = scratchy_target_spyre::wiring::synthetic_constants(&pf.bake_facts().constant_env(
@@ -389,10 +466,7 @@ pub(crate) fn run_card_launch(
         // ⭐ THE SEED LAW'S WIRE SPELLING: a decode launch seeds the sticks only in the `Host` arm;
         // an `OnCard` launch passes `None` and the launcher's ChainSeed steps stage nothing. A
         // prompt chunk's tape has no ChainSeed step, so `Some` there is inert.
-        chain_seeds: match seeds {
-            ktir_superdsc::sdsc_abstract::SeedSource::Host(_) => Some(&tokens[..]),
-            ktir_superdsc::sdsc_abstract::SeedSource::OnCard => None,
-        },
+        chain_seeds: host_seeded.then_some(&tokens[..]),
         positions: &positions,
         consts: &consts,
         stick_major: true,
@@ -440,51 +514,41 @@ pub(crate) fn run_card_launch(
     // below read this one value, never a second mint — and the seat rides
     // beside it so the pick match binds the pair as its own, never a second
     // Option walk of the wiring.
-    let seat_launch = b
-        .wiring
-        .sample_seat
-        .as_ref()
-        .map(|seat| (seat, SeatWidth::of_launch(seat, &rows_in, mq)));
-    // (the pair is `Copy` — a reference and a `Copy` width — so this binding
-    // copies it and the pick match below binds its own copy of the same one)
-    if let Some((seat, seat_width)) = seat_launch {
-        let laws: Vec<RowLaw<'_>> = match (seat_laws, &rows_in) {
+    let seat = &b.wiring.sample_seat;
+    let seat_width = SeatWidth::of_launch(seat, &rows_in, mq);
+    {
+        // ⭐ THE LAWS ARE THE ROWS' OWN — each launch kind carries its own draws, so a launch's laws
+        // cannot be another kind's; the seat's rows past them run live 0's (`BoundLaws::pad`).
+        let live_laws: Vec<RowLaw<'_>> = match &rows_in {
             // A PROMPT CHUNK: one request, row `r` at its own position, a pad row clamped to the
             // last real one (the consumed pick is the last baked row's, so the pad row carries the
-            // draw the last real row would).
-            (SeatLaws::Prompt { draw }, LaunchRows::Sequence { rows, .. }) => (0..seat_width.get())
+            // draw the last real row would) — every seat row its own.
+            LaunchRows::Sequence { rows, draw, .. } => (0..seat_width.get())
                 .map(|r| RowLaw {
-                    draw,
+                    draw: *draw,
                     step: rows.pos(r) as u32,
                 })
                 .collect(),
-            // A DECODE: live row `s` runs its own request's draw at its own position, and a pad row
-            // runs live 0's ([`pad_law_of`]).
-            (SeatLaws::Batch { draws }, LaunchRows::Batch { .. }) => {
-                let live_pos: Vec<u32> = (0..live).map(|s| rows_in.pos(s) as u32).collect();
-                batch_seat_laws(draws, &live_pos, seat_width.get())?
-            }
+            // A DECODE: live row `s` runs its own request's draw at its own position.
+            LaunchRows::Batch(rows) => (0..live)
+                .map(|s| RowLaw {
+                    draw: rows.draw(s),
+                    step: rows.seq(s).pos as u32,
+                })
+                .collect(),
             // ⭐ A WAVE OF TAILS: seat row `r` is request `r`'s folded answer row — its law is
-            // request `r`'s draw at request `r`'s LAST position, and a pad seat row (an empty
-            // window's answer) runs live 0's, the pad clamp.
-            (SeatLaws::Packed { draws }, LaunchRows::Packed { steps, .. }) => {
-                let last: Vec<u32> = steps.iter().map(|s| (s.rows.end() - 1) as u32).collect();
-                batch_seat_laws(draws, &last, seat_width.get())?
-            }
-            // ⭐ THE LAWS AND THE LAUNCH'S ROWS ARE PAIRED — the enum's own law. A mismatch is
-            // refused where the seat is staged, never silently resolved: staging one
-            // request's Prompt laws over a wave's windows would draw every window with one
-            // request's seed, and a Batch's per-row laws over a wave would salt every seat
-            // row with request 0's positions.
-            _ => {
-                return Err(werr(
-                    "card launch: the seat laws do not match the launch's rows — Prompt laws on a \
-                     sequence, Batch laws on a decode, Packed laws on a wave"
-                        .to_string(),
-                ));
-            }
+            // request `r`'s draw at request `r`'s LAST position (an empty window's answer runs
+            // live 0's, the pad clamp).
+            LaunchRows::Packed { reqs, .. } => reqs
+                .iter()
+                .map(|q| RowLaw {
+                    draw: q.draw,
+                    step: (q.step.rows.end() - 1) as u32,
+                })
+                .collect(),
         };
-        acts_i32.extend(sample_binds(seat, seat_width, &laws)?);
+        let laws = BoundLaws::pad(seat_width, live_laws)?;
+        acts_i32.extend(sample_binds(seat, &laws)?);
     }
     if flags().phase_time {
         let elems: usize = acts.iter().map(|(_, v)| v.len()).sum();
@@ -497,17 +561,130 @@ pub(crate) fn run_card_launch(
         );
     }
     log_binds(&format!("launch mq={mq} at={seq_pos}"), b.wiring, &acts);
-    // ⭐ THE SEAT IS THE PICK'S OWN MATCH — every suffix arm takes the
-    // launch's own (seat, width) pair as the match's binding, never a second
-    // Option and never an unwrap over a guard established lines earlier: a
-    // launch whose suffix runs and whose bundle mints no draw is refused AT
-    // THE ARM, before anything stages.
-    let picked = match (want_logits, seat_launch) {
-        // ⭐ THE ONE DECODE PATH, SUBMITTED: stage, launch, enqueue the idx-stick read, return. The
-        // minted sampler consumes the `[rows, vocab]` result on the card and leaves the idx stick in
-        // its place; this arm defers the ONE raw D2H of that stick — never a logits read, never a
-        // host argmax — and the caller collects it through `collect_decode_tokens`.
-        (LogitsWanted::PerRequestDeferred, Some((seat, seat_width))) => {
+    E::finish(Staged {
+        pf,
+        b,
+        acts,
+        acts_i32,
+        seeds,
+        seat,
+        seat_width,
+        mq,
+        seq_pos,
+        vocab,
+    })
+}
+
+/// ⭐ A LAUNCH, STAGED — everything its suffix's end reads: the session it runs on, its bundle's meta,
+/// its bound sources and seeds, the minted sampler's seat at the launch's one width, and where it runs.
+pub(crate) struct Staged<'s> {
+    pf: &'s mut SuperDscSession,
+    b: &'s BundleMeta,
+    acts: Vec<scratchy_target_spyre::wiring::Bind>,
+    acts_i32: Vec<(scratchy_target_spyre::bundle_code::PlaceId, Vec<u8>)>,
+    seeds: Vec<(
+        scratchy_target_spyre::bundle_code::PlaceId,
+        scratchy_target_spyre::forward_tape::ChainSeed,
+    )>,
+    /// The bundle's minted sampler seat — every rung's (`Wiring::sample_seat`).
+    seat: &'s scratchy_target_spyre::wiring::SampleSeat,
+    seat_width: SeatWidth,
+    mq: usize,
+    seq_pos: usize,
+    vocab: usize,
+}
+
+/// ⭐ WHAT A LAUNCH'S SUFFIX DOES, AS A TYPE — each end names its own output, so a caller's result is
+/// its launch's kind's and no caller matches an outcome its kind cannot produce: a middle prompt
+/// chunk reads nothing ([`Middle`]), a prompt-final chunk or a wave reads its picks back in-call
+/// ([`Final`]), a decode batch defers its read to the one collect door ([`Decode`]).
+pub(crate) trait LaunchEnd {
+    type Out;
+    fn finish(staged: Staged<'_>) -> ExecutorResult<Self::Out>;
+}
+
+/// A middle prompt chunk: no suffix runs and nothing is read back.
+pub(crate) struct Middle;
+
+/// ⭐ THE PROMPT-FINAL CHUNK'S PICK (or a wave's picks) — on the card, through the rung's own
+/// minted sampler: the suffix runs, the sampler consumes the folded lm-head row there, and the idx
+/// stick comes back raw, exactly like a decode's.
+pub(crate) struct Final;
+
+/// ⭐ THE ONE DECODE PATH, SUBMITTED: stage, launch, enqueue the idx-stick read, return. The minted
+/// sampler consumes the `[rows, vocab]` result on the card and leaves the idx stick in its place;
+/// this end defers the ONE raw D2H of that stick — never a logits read, never a host argmax — and
+/// the caller collects it through `collect_decode_tokens`.
+pub(crate) struct Decode;
+
+impl LaunchEnd for Middle {
+    type Out = ();
+    fn finish(staged: Staged<'_>) -> ExecutorResult<()> {
+        let Staged {
+            pf,
+            acts,
+            acts_i32,
+            seeds,
+            mq,
+            seq_pos,
+            ..
+        } = staged;
+        // A discarded suffix answers no row: the step's own `None`.
+        pf.stage_step_acts_seeded(&acts, &[], &acts_i32, &seeds)
+            .and_then(|()| pf.run_staged_step(mq, seq_pos, StepLogits::Discarded))
+            .map_err(|e| werr(format!("superdsc prefill run_step (mq={mq}, at={seq_pos}): {e}")))?;
+        Ok(())
+    }
+}
+
+impl LaunchEnd for Final {
+    type Out = Vec<u32>;
+    fn finish(staged: Staged<'_>) -> ExecutorResult<Vec<u32>> {
+        let Staged {
+            pf,
+            b,
+            acts,
+            acts_i32,
+            seeds,
+            seat,
+            seat_width,
+            mq,
+            seq_pos,
+            vocab,
+        } = staged;
+        pf.stage_step_acts_seeded(&acts, &[], &acts_i32, &seeds)
+            .and_then(|()| pf.run_staged_step(mq, seq_pos, StepLogits::LeftOnDevice))
+            .map_err(|e| werr(format!("superdsc prefill run_step (mq={mq}, at={seq_pos}): {e}")))?;
+        // The prompt-final width is the launch's one typed width — the mint's verbatim prompt
+        // case, the same value the staging block bound the seat's rows at.
+        let picked = read_sampled_tokens(pf, seat, seat_width, b.result_id as u32, vocab)?;
+        log_seat_readback(
+            pf,
+            seat,
+            b.wiring.load_consts,
+            &picked,
+            &format!("prefill-final mq={mq} at={seq_pos}"),
+        );
+        Ok(picked)
+    }
+}
+
+impl LaunchEnd for Decode {
+    type Out = SubmittedDecode;
+    fn finish(staged: Staged<'_>) -> ExecutorResult<SubmittedDecode> {
+        let Staged {
+            pf,
+            b,
+            acts,
+            acts_i32,
+            seeds,
+            seat,
+            seat_width,
+            mq,
+            seq_pos,
+            vocab,
+        } = staged;
+        {
             // ⭐ #32 (E) — THE OVERLAP PROBE'S ASK: had the PREVIOUS step's stick read already
             // landed? NOT-yet-landed is "card busy at submit".
             let card_busy_at_submit = PRIOR_READ
@@ -570,7 +747,7 @@ pub(crate) fn run_card_launch(
             } else {
                 None
             };
-            return Ok(BatchOut::Deferred(SubmittedDecode {
+            Ok(SubmittedDecode {
                 read,
                 rows: seat_width,
                 // The collect half's own typed readback fact — the idx
@@ -580,62 +757,9 @@ pub(crate) fn run_card_launch(
                 result_id: b.result_id as u32,
                 vocab,
                 dbg_seat,
-            }));
+            })
         }
-        // A deferred decode whose bundle mints no draw — refused at the arm,
-        // before anything stages (the match's own binding, no second Option).
-        (LogitsWanted::PerRequestDeferred, None) => {
-            return Err(werr(format!(
-                "bundle has no sampler seat (result t{}) — a deferred decode cannot pick \
-                 without the minted draw",
-                b.result_id
-            )));
-        }
-        // A middle prompt chunk: no suffix runs and nothing is read back.
-        (LogitsWanted::None, _) => {
-            pf.stage_step_acts_seeded(&acts, &[], &acts_i32, &seeds)
-                .and_then(|()| pf.run_staged_step(mq, seq_pos, StepLogits::Discarded))
-                .map_err(|e| {
-                    werr(format!(
-                        "superdsc prefill run_step (mq={mq}, at={seq_pos}): {e}"
-                    ))
-                })?;
-            None
-        }
-        // ⭐ THE PROMPT-FINAL CHUNK'S PICK — on the card, through the prefill rung's own minted
-        // sampler: the suffix runs, the sampler consumes the folded lm-head row there, and the idx
-        // stick comes back raw, exactly like a decode's.
-        (LogitsWanted::LastRow, Some((seat, seat_width))) => {
-            pf.stage_step_acts_seeded(&acts, &[], &acts_i32, &seeds)
-                .and_then(|()| pf.run_staged_step(mq, seq_pos, StepLogits::LeftOnDevice))
-                .map_err(|e| {
-                    werr(format!(
-                        "superdsc prefill run_step (mq={mq}, at={seq_pos}): {e}"
-                    ))
-                })?;
-            // The prompt-final width is the launch's one typed width — the
-            // mint's verbatim prompt case, the same value the staging block
-            // bound the seat's rows at.
-            let picked = read_sampled_tokens(pf, seat, seat_width, b.result_id as u32, vocab)?;
-            log_seat_readback(
-                pf,
-                seat,
-                b.wiring.load_consts,
-                &picked,
-                &format!("prefill-final mq={mq} at={seq_pos}"),
-            );
-            Some(picked)
-        }
-        // A prompt-final pick whose bundle mints no draw — refused at the arm.
-        (LogitsWanted::LastRow, None) => {
-            return Err(werr(format!(
-                "bundle has no sampler seat (result t{}) — a prompt-final pick cannot run \
-                 without the minted draw",
-                b.result_id
-            )));
-        }
-    };
-    Ok(BatchOut::Done(picked))
+    }
 }
 /// Every activation a forward binds, against what the BAKE says that tensor is — one line, at
 /// `debug`, per launch.
@@ -847,72 +971,52 @@ fn pad_law_of<'a>(live0: &RowLaw<'a>) -> RowLaw<'a> {
     }
 }
 
-/// ⭐ THE DECODE'S OWN LAW WALK — one law per baked row of the seat:
-/// live slot `s` runs its request's draw at that request's own position
-/// (`positions[s]`), and a padding slot runs live 0's ([`pad_law_of`]).
-/// Extracted from the staging arm so the pad clamp is pinnable without a
-/// launch.
-fn batch_seat_laws<'a>(
-    draws: &[Option<&'a SampledDraw>],
-    positions: &[u32],
-    seat_rows: usize,
-) -> ExecutorResult<Vec<RowLaw<'a>>> {
-    if draws.len() != positions.len() || draws.len() > seat_rows {
-        return Err(werr(format!(
-            "card launch: {} seat law(s) for {} live row(s) in a {seat_rows}-row seat — one law \
-             per live request, in slot order",
-            draws.len(),
-            positions.len()
-        )));
-    }
-    let mut laws: Vec<RowLaw<'_>> = Vec::with_capacity(seat_rows);
-    for s in 0..seat_rows {
-        match (draws.get(s), positions.get(s)) {
-            (Some(&draw), Some(&step)) => laws.push(RowLaw { draw, step }),
-            _ => laws.push(match laws.first() {
-                Some(live0) => pad_law_of(live0),
-                // A launch with no live row at all: nothing replicates, and
-                // the greedy law stands.
-                None => RowLaw {
-                    draw: None,
-                    step: 0,
-                },
-            }),
-        }
-    }
-    Ok(laws)
+/// ⭐ ONE LAW PER BAKED ROW OF THE SEAT — the seat's width and its laws as one value, minted only by
+/// [`Self::pad`]: live slot `s` runs its own law (its request's draw at that request's own
+/// position), and a padding slot runs live 0's ([`pad_law_of`]). So [`sample_binds`] reads exactly
+/// one law per baked row by type. Its own value so the pad clamp is pinnable without a launch.
+pub(crate) struct BoundLaws<'a> {
+    width: SeatWidth,
+    laws: Vec<RowLaw<'a>>,
 }
 
-/// ⭐ THE SEAT LAWS ONE LAUNCH RUNS ITS ROWS UNDER — the three shapes a caller
-/// can know them in, and ONLY those three: a prompt-final chunk serves ONE
-/// request whose rows are consecutive positions of one sequence, a decode
-/// batch serves one request PER LIVE ROW, and a wave of tails serves one
-/// request PER WINDOW. The variant must match the launch's own rows (the
-/// staging match refuses every other pairing); a mismatch is refused where
-/// the seat is staged, never silently resolved.
-pub(crate) enum SeatLaws<'a> {
-    /// A prompt-final chunk: every baked row runs `draw` — real row `i` at its
-    /// own position `start + i`, and a pad row at the last real position it
-    /// clamps to (the pad row replicates the last real token's entire forward,
-    /// and the CONSUMED pick is the last baked row's, so the pad row must carry
-    /// the same draw the last real row would, or an unfilled rung would pick
-    /// greedy for a sampled request).
-    Prompt { draw: Option<&'a SampledDraw> },
-    /// A decode: one law per LIVE row, in slot order — that row's request's
-    /// draw at that request's own position. A padding slot runs LIVE 0'S LAW
-    /// ([`pad_law_of`], the pad clamp); its pick is never read.
-    Batch {
-        draws: &'a [Option<&'a SampledDraw>],
-    },
-    /// ⭐ A WAVE OF TAILS: one law per REQUEST, in window order — seat row `r`
-    /// is request `r`'s folded answer row, so it runs request `r`'s draw at
-    /// request `r`'s LAST position (the row the lm-head fold takes). A pad seat
-    /// row — an empty window's answer — runs live 0's law ([`pad_law_of`]); its
-    /// pick is never read.
-    Packed {
-        draws: &'a [Option<&'a SampledDraw>],
-    },
+impl<'a> BoundLaws<'a> {
+    /// The seat's `width` rows' laws: the `live` laws in slot order, every row past them live 0's
+    /// ([`pad_law_of`]). `Err` for more live rows than the seat holds.
+    fn pad(width: SeatWidth, live: Vec<RowLaw<'a>>) -> ExecutorResult<Self> {
+        let seat_rows = width.get();
+        if live.len() > seat_rows {
+            return Err(werr(format!(
+                "card launch: {} live row(s) in a {seat_rows}-row seat — one law per live \
+                 request, in slot order",
+                live.len()
+            )));
+        }
+        let mut laws: Vec<RowLaw<'_>> = Vec::with_capacity(seat_rows);
+        let mut live = live.into_iter();
+        for _ in 0..seat_rows {
+            match live.next() {
+                Some(law) => laws.push(law),
+                None => laws.push(match laws.first() {
+                    Some(live0) => pad_law_of(live0),
+                    // A launch with no live row at all: nothing replicates, and
+                    // the greedy law stands.
+                    None => RowLaw {
+                        draw: None,
+                        step: 0,
+                    },
+                }),
+            }
+        }
+        Ok(BoundLaws { width, laws })
+    }
+
+    /// One law per baked row of the seat, in row order.
+    fn laws(&self) -> &[RowLaw<'a>] {
+        &self.laws
+    }
 }
+
 
 /// ⭐ THE SEAT BINDS EVERY LAUNCH STAGES — the seat's per-step operands at
 /// their baked offsets, one law per baked row. Spelled so the greedy law is
@@ -943,17 +1047,10 @@ pub(crate) enum SeatLaws<'a> {
 /// to SEN169 and is NOT verbatim.
 fn sample_binds(
     seat: &scratchy_target_spyre::wiring::SampleSeat,
-    width: SeatWidth,
-    laws: &[RowLaw<'_>],
+    bound: &BoundLaws<'_>,
 ) -> ExecutorResult<Vec<(scratchy_target_spyre::bundle_code::PlaceId, Vec<u8>)>> {
-    let rows = width.get();
-    if laws.len() != rows {
-        return Err(werr(format!(
-            "the sampler seat holds {rows} baked row(s) but {} law(s) were staged — one law per \
-             baked row, never fewer, never more",
-            laws.len()
-        )));
-    }
+    // One law per baked row, by type (`BoundLaws::pad`).
+    let (rows, laws) = (bound.width.get(), bound.laws());
     // ⭐ THE SEAT'S OWN LINE — what this launch's rows draw, stated where the
     // words are built. The chat leg's order requires the server log to SHOW
     // the seat binding the seeds (a seeded request served greedy, or two
@@ -1404,29 +1501,17 @@ fn log_seat_readback(
     );
 }
 
-/// ⭐ THE PREFILL LADDERS THE CHUNK LOOP CLIMBS, ONE BUNDLE: the ladder a prompt's first chunk picks
-/// from (each rung walks only its own chunk's pages), and the ladder a continuation chunk picks from
-/// (each rung's walks reach up to the whole pool) — both borrowed mutably because the picked rung's
-/// session is run in place.
-pub(crate) struct PrefillLadders<'a> {
-    /// Ascending by baked width. A chunk at position 0 runs on the smallest rung holding it.
-    pub(crate) rungs: &'a mut [(usize, SuperDscSession)],
-    /// The rungs a chunk past position 0 runs on — its walk reaches every key before it.
-    pub(crate) prefix: &'a mut PrefixLadder,
-}
-
 /// ⭐ A PROMPT ON THE CARD — its tokens `start..start + toks.len()` as a sequence of chunks, each on
-/// the narrowest prefill rung that holds it and reaches its positions (`PagedStep::reach`): a chunk at
-/// position 0 on the ladder whose walk covers its own pages, a chunk past it on the ladder whose walk
-/// covers the pool. Each chunk stages its paged step from the request's KV blocks, writes its keys at
-/// its own positions and attends every key at or before each row's position; a chunk's pad rows
-/// repeat its last real token, so their writes are the last real token's own. The chunk that finishes
-/// the prompt runs its suffix: the rung's minted sampler picks the first generated token on the card.
+/// the rung [`ChunkLadder::rung_for`] chooses by the chunk's reach and rows: a chunk at position 0 on
+/// a rung whose walk covers its own pages, a chunk past it on a prefix-capable rung whose walk covers
+/// the pool. Each chunk runs on its rung's OWN session under its rung's OWN wiring. Each chunk stages
+/// its paged step from the request's KV blocks, writes its keys at its own positions and attends
+/// every key at or before each row's position; a chunk's pad rows repeat its last real token, so
+/// their writes are the last real token's own. The chunk that finishes the prompt runs its suffix:
+/// the rung's minted sampler picks the first generated token on the card.
 pub(crate) fn superdsc_forward_chunk(
     sh: &Shared<'_>,
-    ladders: PrefillLadders<'_>,
-    // The prompt chunks' wiring — every rung of both ladders binds its tensor ids.
-    prefill_meta: Option<&BundleMeta>,
+    chunks: &mut ChunkLadder,
     Chunk {
         state: req,
         id,
@@ -1435,45 +1520,31 @@ pub(crate) fn superdsc_forward_chunk(
         toks,
     }: Chunk<'_>,
 ) -> ExecutorResult<ChunkOut> {
-    let PrefillLadders { rungs, prefix } = ladders;
     let n = toks.len();
     if n == 0 {
         return Err(werr("superdsc_forward_chunk: n=0".to_string()));
     }
-    let pmeta = prefill_meta.ok_or_else(|| {
-        werr("superdsc prefill: this bundle bakes no prompt chunk — a prompt has nothing to run on")
-    })?;
     // ⭐ THE REQUEST'S KV BLOCKS — the scheduler's grant, read out of the one store it was installed
     // in, as pool pages. Its pages already hold the keys of positions `0..start` (this request's
     // earlier chunks, or the request whose prefix a cache hit shares).
-    let blocks: Vec<u32> = tokens
+    let blocks = tokens
         .block_table(id)
-        .map(|t| {
-            t.iter()
-                .map(|&b| scratchy_target_spyre::paged_step::page_of_block(b as u32))
-                .collect()
-        })
+        .map(scratchy_target_spyre::paged_step::request_pages)
         .unwrap_or_default();
-    let top_m = rungs.last().map(|(m, _)| *m).unwrap_or(0);
     let end = start + n;
     let mut pos = start;
     let mut pick: Option<Vec<u32>> = None;
     while pos < end {
         let left = end - pos;
-        let (width, sess) = if pos == 0 {
-            let ri = prefill_rung_for(rungs, left.min(top_m))
-                .ok_or_else(|| werr("superdsc prefill: no prompt chunk rung baked".to_string()))?;
-            let (m, sess) = &mut rungs[ri];
-            (*m, sess)
-        } else {
-            let r = prefix.rung_for(left).ok_or_else(|| {
-                werr(format!(
-                    "superdsc prefill: a chunk at position {pos} needs a rung whose walk reaches the \
-                     keys before it, and none is baked"
-                ))
-            })?;
-            (r.width(), prefix.session(r))
-        };
+        // ⭐ THE ONE SELECTION — the chunk's rung by its reach and rows, its session and its wiring
+        // borrowed together off that one rung.
+        let ChunkRung {
+            width: rung,
+            meta,
+            sess,
+        } = chunks.rung_for(pos, left);
+        let rung = *rung;
+        let width = rung.count();
         let real = left.min(width);
         let chunk_toks: Vec<usize> = (pos..pos + real)
             .map(|p| {
@@ -1487,47 +1558,24 @@ pub(crate) fn superdsc_forward_chunk(
             .collect::<ExecutorResult<Vec<usize>>>()?;
         let last = pos + real == end;
         let finishes = last && end >= tokens.prompt_len(id);
-        let rung = ktir_superdsc::sdsc_abstract::RungWidth::of_baked_rows(width as u32)
-            .ok_or_else(|| werr("superdsc prefill: the selected rung has zero rows".to_string()))?;
-        let out = run_card_launch(
-            LaunchRows::Sequence {
-                blocks: &blocks,
-                rows: StepRows::new(width, pos, real).ok_or_else(|| {
-                    werr(
-                        "superdsc prefill: a chunk of zero real rows — or one wider than the rung \
-                         — the chunker staged no chunk"
-                            .to_string(),
-                    )
-                })?,
-            },
-            sh,
-            sess,
-            pmeta,
-            rung,
-            SamplerLaws {
-                seeds: ktir_superdsc::sdsc_abstract::SeedSource::Host(&chunk_toks),
-                want_logits: if finishes {
-                    LogitsWanted::LastRow
-                } else {
-                    LogitsWanted::None
-                },
-                laws: SeatLaws::Prompt {
-                    draw: req.draw.as_ref(),
-                },
-            },
-        )?;
-        pick = match out {
-            BatchOut::Done(p) => p,
-            BatchOut::Deferred(_) => {
-                return Err(werr(
-                    "a prompt chunk deferred its read — only a decode can".to_string(),
-                ));
-            }
+        let rows_in = LaunchRows::sequence(&blocks, width, pos, &chunk_toks, req.draw.as_ref())
+            .ok_or_else(|| {
+                werr(
+                    "superdsc prefill: a chunk of zero real rows — or one wider than the rung — \
+                     the chunker staged no chunk"
+                        .to_string(),
+                )
+            })?;
+        // The chunk that finishes the prompt reads its pick back; every other reads nothing.
+        pick = if finishes {
+            Some(run_card_launch::<Final>(rows_in, sh, sess, meta, rung)?)
+        } else {
+            run_card_launch::<Middle>(rows_in, sh, sess, meta, rung)?;
+            None
         };
         tracing::debug!(
-            "PREFILL_PATH=batched rung={width} rows={real} pos={pos} end={end} top_m={top_m} \
-             prefix={}",
-            pos > 0
+            "PREFILL_PATH=batched rung={width} rows={real} pos={pos} end={end} reach={:?}",
+            ChunkReach::of_start(pos)
         );
         pos += real;
     }
@@ -1547,7 +1595,7 @@ pub(crate) struct PackedTail {
     pub(crate) id: String,
     pub(crate) start: usize,
     pub(crate) toks: Vec<usize>,
-    pub(crate) blocks: Vec<u32>,
+    pub(crate) blocks: Vec<scratchy_target_spyre::paged_step::PoolPage>,
     pub(crate) draw: Option<SampledDraw>,
     pub(crate) finishes: bool,
 }
@@ -1576,53 +1624,34 @@ pub(crate) fn superdsc_forward_packed(
 ) -> ExecutorResult<Vec<Option<u32>>> {
     let (meta, sess) = prefix.packed_parts(rung);
     let (w, s) = (rung.width(), rung.seqs());
-    // ⭐ REQUEST `r`'S OWN STEP — its tail's rows from its own start, at most the window's
-    // width (the selection held the widest tail), in its own pages.
-    let steps: Vec<scratchy_target_spyre::paged_step::RequestStep<'_>> = tails
+    // ⭐ REQUEST `r`'S OWN RECORD — its tail's rows minted from its own tokens from its own
+    // start, at most the window's width (the selection held the widest tail), in its own pages,
+    // with its own draw.
+    let reqs: Vec<PackedRequest<'_>> = tails
         .iter()
         .map(|t| {
-            Ok(scratchy_target_spyre::paged_step::RequestStep {
-                blocks: &t.blocks,
-                rows: StepRows::new(w, t.start, t.toks.len()).ok_or_else(|| {
-                    werr("a wave tail of zero real rows — or one wider than its window — the gatherer staged no tail".to_string())
-                })?,
+            PackedRequest::new(&t.blocks, w, t.start, &t.toks, t.draw.as_ref()).ok_or_else(|| {
+                werr(
+                    "a wave tail of zero real rows — or one wider than its window — the \
+                     gatherer staged no tail"
+                        .to_string(),
+                )
             })
         })
         .collect::<ExecutorResult<_>>()?;
-    // ⭐ THE SEEDS, CONCATENATED — one token per live row, window order: request `r`'s rows
-    // take request `r`'s tokens ([`LaunchRows::live_of`]'s window law).
-    let seeds: Vec<usize> = tails.iter().flat_map(|t| t.toks.iter().copied()).collect();
-    let draws: Vec<Option<&SampledDraw>> = tails.iter().map(|t| t.draw.as_ref()).collect();
     let width = ktir_superdsc::sdsc_abstract::RungWidth::of_baked_rows((w * s) as u32)
         .ok_or_else(|| werr("the packed rung bakes zero rows".to_string()))?;
-    let picked = match run_card_launch(
+    // ⭐ A WAVE READS ITS PICKS BACK IN-CALL — every window's answer, the rung's own minted draw.
+    let picked = run_card_launch::<Final>(
         LaunchRows::Packed {
-            steps: &steps,
+            reqs: &reqs,
             width: w,
         },
         sh,
         sess,
         meta,
         width,
-        SamplerLaws {
-            seeds: ktir_superdsc::sdsc_abstract::SeedSource::Host(&seeds),
-            want_logits: LogitsWanted::LastRow,
-            laws: SeatLaws::Packed { draws: &draws },
-        },
-    )? {
-        BatchOut::Done(picked) => picked.ok_or_else(|| {
-            werr(
-                "the packed launch picked no tokens — its minted draw never ran, and every \
-                 window's answer is the readback's to carry"
-                    .to_string(),
-            )
-        })?,
-        BatchOut::Deferred(_) => {
-            return Err(werr(
-                "a packed prefill deferred its read — only a decode can".to_string(),
-            ));
-        }
-    };
+    )?;
     if picked.len() != s {
         return Err(werr(format!(
             "the packed rung (w={w}, s={s}) picked {} token(s) — one per window, never another \
@@ -1633,7 +1662,7 @@ pub(crate) fn superdsc_forward_packed(
     tracing::debug!(
         "PREFILL_PATH=packed rung_w={w} rung_s={s} tails={} rows={}",
         tails.len(),
-        seeds.len()
+        reqs.iter().map(|q| q.step.rows.real()).sum::<usize>()
     );
     // ⭐ THE BOOKKEEPING, PER REQUEST — its pool count always, its pick iff this step
     // finished its prompt (the pick is request `r`'s own: seat row `r`, window `r`).
@@ -1657,8 +1686,6 @@ pub(crate) fn forward_chunk(
     sh: &Shared<'_>,
     session: &mut SendnnSession,
     b: &BundleMeta,
-    // The prompt chunks' wiring, which every rung of both prompt ladders binds.
-    prefill_meta: Option<&BundleMeta>,
     Chunk {
         state: req,
         id,
@@ -1668,22 +1695,14 @@ pub(crate) fn forward_chunk(
     }: Chunk<'_>,
 ) -> ExecutorResult<ChunkOut> {
     let SendnnSession::SuperDsc(sb) = session;
-    // ⭐ ONLY THE LADDERS: the prompt runs through the prompt-chunk rungs, and a generation step
+    // ⭐ ONLY THE LADDER: the prompt runs through the prompt-chunk rungs, and a generation step
     // decodes on the decode sessions through the shared decode path in `spyre_exec`. The cap-bucket
-    // meta `b` is not a fact this path reads: the ladder picks the rung.
-    let SuperDscBundle {
-        prefill_rungs,
-        prefill_prefix,
-        ..
-    } = sb;
+    // meta `b` is not a fact this path reads: the ladder picks the rung, and the rung carries its
+    // own wiring.
     let _ = b;
     superdsc_forward_chunk(
         sh,
-        PrefillLadders {
-            rungs: prefill_rungs.as_mut_slice(),
-            prefix: prefill_prefix,
-        },
-        prefill_meta,
+        &mut sb.chunks,
         Chunk {
             state: req,
             id,
@@ -1736,6 +1755,16 @@ mod pad_clamp_tests {
     /// Two live rows in a 4-row rung — slots 2 and 3 are padding — at positions 10 and 11.
     const TWO_OF_FOUR: [u32; 2] = [10, 11];
 
+    /// A fixture's live laws — row `s` runs `draws[s]` at `steps[s]`, one value per row.
+    fn live_laws<'a>(draws: &[Option<&'a SampledDraw>], steps: &[u32]) -> Vec<RowLaw<'a>> {
+        assert_eq!(draws.len(), steps.len(), "a fixture states one step per draw");
+        draws
+            .iter()
+            .zip(steps)
+            .map(|(&draw, &step)| RowLaw { draw, step })
+            .collect()
+    }
+
     /// Every staged bind's pad-row words equal row 0's — the four seed tables
     /// and inv_t alike. EVERY word sits at its row's STICK HEAD
     /// (the seat's own `seed_row_words` stride): the gate table's reservation is wider (the
@@ -1743,26 +1772,21 @@ mod pad_clamp_tests {
     /// second sticks are the reservation's own zero tail — the word the
     /// kernel reads is still the head, at the same stride as every other
     /// table.
+    /// The four-row seat's width through the REAL DOOR — `of_launch` over a real `LaunchRows` (a
+    /// sequence of four real rows at positions 10..13, the TWO_OF_FOUR rung's own shape), never a
+    /// spelled number: the width these pins pad to is the same mint every launch reads.
+    fn four_wide(seat: &scratchy_target_spyre::wiring::SampleSeat) -> SeatWidth {
+        let rows_in = LaunchRows::sequence(&[], 4, 10, &[1, 2, 3, 4], None)
+            .expect("the four-real-row rung the pad clamp pins stages");
+        SeatWidth::of_launch(seat, &rows_in, seat.rows as usize)
+    }
+
     fn assert_pads_stage_live_0(
         seat: &scratchy_target_spyre::wiring::SampleSeat,
-        laws: &[RowLaw<'_>],
+        laws: &BoundLaws<'_>,
         ctx: &str,
     ) {
-        // The width comes through the REAL DOOR — `of_launch` over a real
-        // `LaunchRows` (a sequence of four real rows at positions 10..13, the
-        // TWO_OF_FOUR rung's own shape), never a spelled number: the staging
-        // this pin checks is the same mint every launch reads.
-        let rows_in = LaunchRows::Sequence {
-            blocks: &[],
-            rows: scratchy_target_spyre::paged_step::StepRows::new(4, 10, 4)
-                .expect("the four-real-row rung the pad clamp pins stages"),
-        };
-        let binds = sample_binds(
-            seat,
-            SeatWidth::of_launch(seat, &rows_in, seat.rows as usize),
-            laws,
-        )
-        .expect("the seat stages");
+        let binds = sample_binds(seat, laws).expect("the seat stages");
         let head_stride = seat.seed_row_words as usize * 4;
         assert_eq!(binds.len(), 5, "{ctx}: four seed tables and inv_t");
         for (tid, bytes) in &binds {
@@ -1791,7 +1815,9 @@ mod pad_clamp_tests {
             })
             .collect();
         let draws: Vec<Option<&SampledDraw>> = owned.iter().map(Some).collect();
-        let laws = batch_seat_laws(&draws, &positions, 4).expect("the full laws lay");
+        let bound = BoundLaws::pad(four_wide(&seat_of(4)), live_laws(&draws, &positions))
+            .expect("the full laws lay");
+        let laws = bound.laws();
         assert_eq!(laws.len(), 4);
         for (s, row) in laws.iter().enumerate() {
             let law = row.draw.unwrap_or_else(|| {
@@ -1806,13 +1832,15 @@ mod pad_clamp_tests {
     fn a_greedy_live_0_clamps_its_pads_to_greedy() {
         let seat = seat_of(4);
         let draws: [Option<&SampledDraw>; 2] = [None, None];
-        let laws = batch_seat_laws(&draws, &TWO_OF_FOUR, 4).expect("the greedy laws lay");
+        let bound = BoundLaws::pad(four_wide(&seat), live_laws(&draws, &TWO_OF_FOUR))
+            .expect("the greedy laws lay");
+        let laws = bound.laws();
         // The law itself: pads 2 and 3 carry live 0's law — greedy, at live
         // 0's own step salt (the word the gate's 0 makes inert).
         assert!(laws[2].draw.is_none() && laws[3].draw.is_none());
         assert_eq!(laws[2].step, laws[0].step, "the pad clamps live 0's step");
         assert_eq!(laws[3].step, laws[0].step, "every pad clamps live 0's step");
-        assert_pads_stage_live_0(&seat, &laws, "greedy live 0");
+        assert_pads_stage_live_0(&seat, &bound, "greedy live 0");
     }
 
     #[test]
@@ -1825,7 +1853,9 @@ mod pad_clamp_tests {
         // Live 0 sampled, live 1 greedy: the pads clamp LIVE 0'S law, not the
         // last live row's and not the greedy one.
         let draws: [Option<&SampledDraw>; 2] = [Some(&draw), None];
-        let laws = batch_seat_laws(&draws, &TWO_OF_FOUR, 4).expect("the sampled laws lay");
+        let bound = BoundLaws::pad(four_wide(&seat), live_laws(&draws, &TWO_OF_FOUR))
+            .expect("the sampled laws lay");
+        let laws = bound.laws();
         for r in [2usize, 3] {
             let pad = laws[r]
                 .draw
@@ -1840,7 +1870,7 @@ mod pad_clamp_tests {
         }
         // Live 1 keeps its OWN greedy law — the clamp touches pads alone.
         assert!(laws[1].draw.is_none());
-        assert_pads_stage_live_0(&seat, &laws, "sampled live 0");
+        assert_pads_stage_live_0(&seat, &bound, "sampled live 0");
     }
 
     /// ⭐⭐⭐ THE ONCARD HAND-OFF'S OWN PIN (card-pinned 2026-10-27): an `OnCard` decode

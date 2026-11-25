@@ -12,10 +12,11 @@ use std::collections::HashMap;
 use crate::affine::{AffineExpr, AffineMap, AffineSet, BoxSet};
 use crate::dtypes::DType;
 
-/// HBM stick size in bytes (the Spyre layout granularity). Lives in core because
-/// `memref` byte-addressing depends on it; the emulator's `memory` module
-/// re-exports it so `crate::memory::STICK_BYTES` keeps resolving.
-pub const STICK_BYTES: i64 = 128;
+/// HBM stick size in bytes (the Spyre layout granularity) — the baked generation's flit
+/// ([`crate::ddl_binds::DeviceGen::FLIT_BYTES`]): a stick is one flit wide. Lives in core because
+/// `memref` byte-addressing depends on it; the emulator's `memory` module re-exports it.
+pub const STICK_BYTES: i64 =
+    <crate::ddl_binds::Baked as crate::ddl_binds::DeviceGen>::FLIT_BYTES as i64;
 
 /// Memory space of a view. Replaces the Python `memory_space: str` +
 /// `lx_core_id: Optional[int]` pair (with its `__post_init__` cross-check that

@@ -24,6 +24,18 @@
 
 use std::collections::HashSet;
 
+use scratchy_target_spyre::paged_step::PoolPage;
+
+/// A golden's pool page by number, minted through the type's own constructors: page 0 is
+/// [`PoolPage::NULL`] (these goldens deal out every page of their pool, the null page included —
+/// a fixture holding the page no request may hold), page `p` the page of scheduler block `p − 1`.
+fn pool_page(p: u32) -> PoolPage {
+    match p.checked_sub(1) {
+        Some(b) => PoolPage::of_block(b),
+        None => PoolPage::NULL,
+    }
+}
+
 use ktir_superdsc::emit::ktir_matmul_fp8::QuantizedActivations;
 use scratchy_subtile::subtile_ir::{
     EwKind, GainConvention, Range, Region, SubOp, SubtileIR, SubtileNode, TensorId, TensorRegion,
@@ -77,7 +89,7 @@ fn spliced_rmsnorm_lowers_through_the_door() {
             PagedRows::Sequence,
             &[],
             &Default::default(),
-            pair_of_one_request(m),
+            pair_of_one_request(&ir, m),
         )
         .unwrap_or_else(|e| panic!("layout minted m={m} c={c}: {e}"));
 
@@ -135,7 +147,7 @@ fn spliced_oneplus_rmsnorm_lowers_through_the_door() {
             PagedRows::Sequence,
             &[],
             &Default::default(),
-            pair_of_one_request(m),
+            pair_of_one_request(&ir, m),
         )
         .unwrap_or_else(|e| panic!("layout minted m={m} c={c}: {e}"));
         assert!(
@@ -208,7 +220,7 @@ fn spliced_oneplus_rmsnorm_lowers_through_the_door() {
             PagedRows::Sequence,
             &[],
             &Default::default(),
-            pair_of_one_request(m),
+            pair_of_one_request(&ir, m),
         )
         .unwrap_or_else(|e| panic!("scale layout minted m={m} c={c}: {e}"));
         assert!(
@@ -272,7 +284,7 @@ fn spliced_silumul_lowers_through_the_door() {
             PagedRows::Sequence,
             &[],
             &Default::default(),
-            pair_of_one_request(m),
+            pair_of_one_request(&ir, m),
         )
         .unwrap_or_else(|e| panic!("layout minted m={m} c={c}: {e}"));
 
@@ -366,7 +378,7 @@ fn a_column_chunked_silumul_splices_through_the_door() {
         PagedRows::Sequence,
         &[],
         &Default::default(),
-        pair_of_one_request(1),
+        pair_of_one_request(&ir, 1),
     )
     .unwrap_or_else(|e| panic!("layout minted for the chunked node: {e}"));
 
@@ -468,7 +480,7 @@ fn spliced_elementwise_lowers_through_the_door() {
                 PagedRows::Sequence,
                 &[],
                 &Default::default(),
-                pair_of_one_request(m),
+                pair_of_one_request(&ir, m),
             )
             .unwrap_or_else(|e| panic!("layout minted {kind:?} m={m} c={c}: {e}"));
 
@@ -580,7 +592,7 @@ fn spliced_dense_matmul_lowers_through_the_door() {
             PagedRows::Sequence,
             &[],
             &Default::default(),
-            pair_of_one_request(m),
+            pair_of_one_request(&ir, m),
         )
         .unwrap_or_else(|e| panic!("layout minted m={m} k={k} n={n}: {e}"));
 
@@ -1132,7 +1144,7 @@ fn spliced_scalarmul_lowers_through_the_door() {
             PagedRows::Sequence,
             &[],
             &Default::default(),
-            pair_of_one_request(m),
+            pair_of_one_request(&ir, m),
         )
         .unwrap_or_else(|e| panic!("layout minted m={m} c={c}: {e}"));
 
@@ -1189,7 +1201,7 @@ fn spliced_column_chunked_scalarmul_lowers_per_chunk() {
         PagedRows::Sequence,
         &[],
         &Default::default(),
-        pair_of_one_request(1),
+        pair_of_one_request(&ir, 1),
     )
     .unwrap_or_else(|e| panic!("layout minted for the chunked logits: {e}"));
 
@@ -1487,7 +1499,7 @@ fn batched_decode_odd_vocab_lm_head_splices() {
         PagedRows::Sequence,
         &[],
         &Default::default(),
-        pair_of_one_request(m),
+        pair_of_one_request(&ir, m),
     )
     .unwrap_or_else(|e| panic!("layout minted m={m} k={k} n={n}: {e}"));
 
@@ -1543,7 +1555,7 @@ fn spliced_prefill_lm_head_fold_lowers_through_the_door() {
             PagedRows::Sequence,
             &[],
             &Default::default(),
-            pair_of_one_request(mq),
+            pair_of_one_request(&ir, mq),
         )
         .unwrap_or_else(|e| panic!("layout minted mq={mq} k={k} n={n}: {e}"));
 
@@ -1552,7 +1564,7 @@ fn spliced_prefill_lm_head_fold_lowers_through_the_door() {
         let spliced_ops = scratchy_triton_splice::lower_all::<
             ktir_superdsc::collective::TpWorld<1>,
             _,
-        >(node, &ir, false, pair_of_one_request(mq))
+        >(node, &ir, false, pair_of_one_request(&ir, mq))
         .unwrap_or_else(|e| panic!("splice folded mq={mq} k={k} n={n}: {e}"));
         assert_eq!(
             spliced_ops.len(),
@@ -1621,7 +1633,7 @@ fn spliced_fp8_matmul_lowers_through_the_door() {
             PagedRows::Sequence,
             &[],
             &Default::default(),
-            pair_of_one_request(m),
+            pair_of_one_request(&ir, m),
         )
         .unwrap_or_else(|e| panic!("layout minted m={m} k={k} n={n}: {e}"));
 
@@ -1919,7 +1931,7 @@ fn spliced_rope_lowers_through_the_door() {
                 PagedRows::Sequence,
                 &[],
                 &Default::default(),
-                pair_of_one_request(mq),
+                pair_of_one_request(&ir, mq),
             )
             .unwrap_or_else(|e| {
                 panic!("layout minted mq={mq} heads={heads} hd={hd} r_ar={rows_are_requests}: {e}")
@@ -2454,6 +2466,7 @@ fn attn_ir(s: AttnShape, scale: f32) -> SubtileIR {
             attention,
             valid_len,
             scratchy_subtile::subtile_ir::AttnMask::Causal,
+            scratchy_subtile::subtile_ir::AttnLayout::of_arity(5).expect("a two-segment layout"),
         ),
         m: mq,
         inputs: vec![
@@ -2560,7 +2573,13 @@ fn attn_ir_fp8(s: AttnShape, scale: f32) -> SubtileIR {
                 inputs: vec![Op(0), Op(1), Ext(1), Ext(2)],
             },
             OpDesc {
-                op: SubOp::attn_decode(attention, s.cap, AttnMask::Causal),
+                op: SubOp::attn_decode(
+                    attention,
+                    s.cap,
+                    AttnMask::Causal,
+                    scratchy_subtile::subtile_ir::AttnLayout::of_arity(5)
+                        .expect("a two-segment layout"),
+                ),
                 m: mq,
                 inputs: vec![Ext(0), Ext(1), Ext(2), Op(2), Ext(4)],
             },
@@ -2597,7 +2616,7 @@ fn a_sliding_window_attention_lowers_on_the_mask_stack() {
             scratchy_subtile::subtile_ir::AttnScaleSite::InKernel,
             s.active_cap(),
             // One request of the graph's `mq` rows.
-            pair_of_one_request(s.mq),
+            pair_of_one_request(ir, s.mq),
             PagedRows::Sequence,
         )
     };
@@ -2608,8 +2627,14 @@ fn a_sliding_window_attention_lowers_on_the_mask_stack() {
     // staged page table names and what the mask tiles hold, never the splice's own shape.
     assert_eq!(c.len(), w.len(), "one window a request, windowed or causal");
     assert_eq!(
-        c[0].ktir.as_ref().expect("a spliced op carries its ktir node").bindings,
-        w[0].ktir.as_ref().expect("a spliced op carries its ktir node").bindings
+        c[0].ktir
+            .as_ref()
+            .expect("a spliced op carries its ktir node")
+            .bindings,
+        w[0].ktir
+            .as_ref()
+            .expect("a spliced op carries its ktir node")
+            .bindings
     );
     // And the step's walk is the window's own bound, capped by the causal sweep the rung states.
     let step_of = |ir: &scratchy_subtile::subtile_ir::SubtileIR| {
@@ -2617,7 +2642,7 @@ fn a_sliding_window_attention_lowers_on_the_mask_stack() {
             ir,
             s.active_cap(),
             PagedRows::Sequence,
-            pair_of_one_request(s.mq),
+            pair_of_one_request(ir, s.mq),
         )
         .expect("the step derives")
         .pop()
@@ -2627,14 +2652,14 @@ fn a_sliding_window_attention_lowers_on_the_mask_stack() {
     let ww = step_of(&windowed);
     assert_eq!(ww.window.map(|x| x.get()), Some(window.get()));
     let bound = scratchy_triton_splice::window_walk_blocks(
-        ww.pages,
+        ww.view.get(),
         window,
         s.mq,
         scratchy_triton_splice::SchedulerBlockTokens::REFERENCE.get(),
     );
     assert_eq!(
-        ww.walk,
-        cw.walk.min(bound),
+        ww.walk.get(),
+        cw.walk.get().min(bound),
         "the windowed walk is its own bound inside the causal sweep, never wider"
     );
 }
@@ -2665,7 +2690,7 @@ fn a_pool_no_bigger_than_a_chunk_is_refused() {
         scratchy_subtile::subtile_ir::AttnScaleSite::InKernel,
         small.active_cap(),
         // The one-request decode's own pair: one row that is one request.
-        batch_pair_of_one_row_each(small.mq),
+        batch_pair_of_one_row_each(&ir, small.mq),
         PagedRows::Batch,
     ) else {
         panic!("a chunk gathering the whole pool must be refused");
@@ -2685,7 +2710,7 @@ fn a_pool_no_bigger_than_a_chunk_is_refused() {
         scratchy_subtile::subtile_ir::AttnScaleSite::InKernel,
         big.active_cap(),
         // The one-request decode's own pair: one row that is one request.
-        batch_pair_of_one_row_each(big.mq),
+        batch_pair_of_one_row_each(&ir, big.mq),
         PagedRows::Batch,
     )
     .expect("a pool wider than one chunk splices");
@@ -2731,7 +2756,7 @@ fn the_pools_page_count_moves_no_synthetic() {
                 PagedRows::Sequence,
                 &[],
                 &Default::default(),
-                pair_of_one_request(s.mq),
+                pair_of_one_request(&ir, s.mq),
             )
             .unwrap_or_else(|e| panic!("{format}: the layout at {pages} pages: {e}"))
         };
@@ -2793,7 +2818,7 @@ fn the_paged_attention_splices_with_its_contract() {
             scratchy_subtile::subtile_ir::AttnScaleSite::InKernel,
             s.active_cap(),
             // One request of the graph's `mq` rows — the S=1 extent pair.
-            pair_of_one_request(s.mq),
+            pair_of_one_request(&ir, s.mq),
             PagedRows::Sequence,
         );
         // ⛔ A PRE-POPULATED CACHE IS REFUSED: the walk reads the step's keys from the pools, and
@@ -3037,7 +3062,8 @@ fn spliced_paged_step_executes_the_real_programs() {
 /// graph minted `(64, 2)` SPLICES — `NUM_TOKENS` stays the graph's 128 rows while
 /// `PADDED_QUERY_LEN` and the walk become one request's 64 (the compile fixture in the splice's
 /// own roster states that exact constexpr pair) — and a mint whose held product is NOT the
-/// graph's rows is REFUSED BY NAME, the one place the two are proven to agree. The S=1 spelling
+/// graph's rows gets no witness: `GraphExtent::of`, the one place the two are proven to agree,
+/// refuses it by name. The S=1 spelling
 /// (`(128, ONE)`) splices the same graph too: at one request the two extents agree, which is why
 /// one `mq` served until now.
 #[test]
@@ -3053,12 +3079,14 @@ fn the_extent_pair_meets_the_graph_at_the_splice() {
     let ir = attn_ir(s, 0.125f32);
     let attn = &ir.nodes[1];
     let splice = |pair: ktir_superdsc::sdsc_abstract::QueryExtent| {
+        let graph = scratchy_triton_splice::GraphExtent::of(&ir, pair, false)
+            .unwrap_or_else(|e| panic!("the pair describes the 128-row graph: {e}"));
         scratchy_triton_splice::lower_attn::<ktir_superdsc::collective::TpWorld<1>, _>(
             attn,
             &ir,
             scratchy_subtile::subtile_ir::AttnScaleSite::InKernel,
             s.active_cap(),
-            pair,
+            graph,
             PagedRows::Sequence,
         )
     };
@@ -3088,10 +3116,12 @@ fn the_extent_pair_meets_the_graph_at_the_splice() {
         "every window of the packed mint is the prefill walk's own program"
     );
     // The S=1 mint of the SAME graph — one request of all 128 rows — still splices.
-    splice(pair_of_one_request(128))
+    splice(pair_of_one_request(&ir, 128).extent())
         .unwrap_or_else(|e| panic!("the S=1 mint splices the same graph: {e}"));
-    // ⛔ AND A MINT THAT DOES NOT DESCRIBE THE GRAPH IS REFUSED, BY NAME, with both extents
-    // stated — never a silently-wrong `PADDED_QUERY_LEN`.
+    // ⛔ AND A MINT THAT DOES NOT DESCRIBE THE GRAPH HAS NO WITNESS: `GraphExtent::of` — the one
+    // statement of the agreement, which the splice, the lm-head fold and the paged step's mint
+    // all spend — refuses it by name with both extents stated, so no lowering ever sees a
+    // silently-wrong `PADDED_QUERY_LEN` or per-request width.
     let mismatch = ktir_superdsc::sdsc_abstract::QueryExtent::of_baked_rung(
         ktir_superdsc::sdsc_abstract::RungWidth::of_baked_rows(64)
             .expect("the rung's width is nonzero"),
@@ -3099,53 +3129,46 @@ fn the_extent_pair_meets_the_graph_at_the_splice() {
             .expect("the rung's capacity is nonzero"),
     )
     .expect("192 rows fit a u32");
-    let err = splice(mismatch)
-        .err()
-        .expect("a 192-row mint does not describe a 128-row graph");
+    let err = scratchy_triton_splice::GraphExtent::of(&ir, mismatch, false)
+        .expect_err("a 192-row mint does not describe a 128-row graph");
     assert!(
-        err.contains("the graph's 128 row(s) are not the extent pair's 192"),
+        err.contains("64 × 3 request(s) = 192 row(s)") && err.contains("runs 128 row(s)"),
         "the refusal names both extents: {err}"
-    );
-    // ⛔ THE PAGED STEP'S OWN AGREEMENT — `paged_step_of_ir` mints the wiring's step (the
-    // layout sizes the tables by the pair), so the SAME mismatched pair is refused at the step
-    // mint too, naming the graph's rows and the pair's — never a silently-wrong per-request
-    // width the card would stage by.
-    let err = scratchy_target_spyre::lower_subtile_tape_to_ktir::paged_step_of_ir(
-        &ir,
-        s.active_cap(),
-        PagedRows::Sequence,
-        mismatch,
-    )
-    .expect_err("the step mint refuses a pair the graph disagrees with");
-    assert!(
-        err.0
-            .contains("the graph runs 128 query row(s) but the rung's minted extent states 192"),
-        "the refusal names the graph's rows and the pair's: {}",
-        err.0
     );
 }
 
-/// The S=1 extent pair a SEQUENCE walk states: one request of the graph's `mq` rows. Pure arithmetic,
-/// read by the door tests every build runs, so it is not behind the emulator.
-fn pair_of_one_request(mq: u32) -> ktir_superdsc::sdsc_abstract::QueryExtent {
-    ktir_superdsc::sdsc_abstract::QueryExtent::of_baked_rung(
+/// The S=1 extent pair a SEQUENCE walk states: one request of the graph's `mq` rows, proven
+/// against `ir` by the bake's own mint ([`scratchy_triton_splice::GraphExtent::of`]). Read by the
+/// door tests every build runs, so it is not behind the emulator.
+fn pair_of_one_request<F: scratchy_subtile::subtile_ir::RopeForm>(
+    ir: &scratchy_subtile::subtile_ir::SubtileIR<F>,
+    mq: u32,
+) -> scratchy_triton_splice::GraphExtent {
+    let pair = ktir_superdsc::sdsc_abstract::QueryExtent::of_baked_rung(
         ktir_superdsc::sdsc_abstract::RungWidth::of_baked_rows(mq)
             .expect("the shape's row count is nonzero"),
         ktir_superdsc::sdsc_abstract::RungCap::ONE,
     )
-    .expect("one request's rows fit a u32")
+    .expect("one request's rows fit a u32");
+    scratchy_triton_splice::GraphExtent::of(ir, pair, false)
+        .unwrap_or_else(|e| panic!("the one-request pair describes its graph: {e}"))
 }
 
 /// The extent pair a BATCH walk states: `rows` rows that are `rows` requests, one row
 /// each — the pair's held product is the graph's row count, which the batched kernel
-/// arm reads.
-fn batch_pair_of_one_row_each(rows: u32) -> ktir_superdsc::sdsc_abstract::QueryExtent {
-    ktir_superdsc::sdsc_abstract::QueryExtent::of_baked_rung(
+/// arm reads. Proven against `ir` as [`pair_of_one_request`]'s is.
+fn batch_pair_of_one_row_each<F: scratchy_subtile::subtile_ir::RopeForm>(
+    ir: &scratchy_subtile::subtile_ir::SubtileIR<F>,
+    rows: u32,
+) -> scratchy_triton_splice::GraphExtent {
+    let pair = ktir_superdsc::sdsc_abstract::QueryExtent::of_baked_rung(
         ktir_superdsc::sdsc_abstract::RungWidth::of_baked_rows(1).expect("one row is nonzero"),
         ktir_superdsc::sdsc_abstract::RungCap::of_baked_seqs(rows)
             .expect("the batch's sequence count is nonzero"),
     )
-    .expect("the batch's rows fit a u32")
+    .expect("the batch's rows fit a u32");
+    scratchy_triton_splice::GraphExtent::of(ir, pair, true)
+        .unwrap_or_else(|e| panic!("the batch pair describes its graph: {e}"))
 }
 
 /// `n` values uniform in `[-amp, amp)` from a fixed LCG — a stimulus both sides read as the same
@@ -3182,7 +3205,7 @@ fn execute_one_paged_step(s: AttnShape, cached: usize) {
             rope,
             &ir,
             false,
-            pair_of_one_request(s.mq),
+            pair_of_one_request(&ir, s.mq),
         )
         .unwrap_or_else(|e| panic!("the RopeAppend spliced {at}: {e}"));
     programs.extend(
@@ -3193,7 +3216,7 @@ fn execute_one_paged_step(s: AttnShape, cached: usize) {
             s.active_cap(),
             // One request of the graph's `mq` rows — the S=1 extent pair this walk's
             // constexprs state (`NUM_TOKENS` = mq, `PADDED_QUERY_LEN` = mq).
-            pair_of_one_request(s.mq),
+            pair_of_one_request(&ir, s.mq),
             PagedRows::Sequence,
         )
         .unwrap_or_else(|e| panic!("the walk spliced {at}: {e}")),
@@ -3257,14 +3280,14 @@ fn execute_one_paged_step(s: AttnShape, cached: usize) {
         &ir,
         s.active_cap(),
         PagedRows::Sequence,
-        pair_of_one_request(s.mq),
+        pair_of_one_request(&ir, s.mq),
     )
     .expect("the paged step derives")
     .pop()
     .expect("the graph has attention");
     let mq = s.mq as usize;
     let rows = StepRows::new(mq, cached, mq).expect("the golden step holds its query rows");
-    let blocks: Vec<u32> = (0..step.pages).rev().collect();
+    let blocks: Vec<PoolPage> = (0..step.pages.get()).rev().map(pool_page).collect();
     let (q_width, kv_width, hd) = ((nqh * hd) as usize, (nkvh * hd) as usize, hd as usize);
     let kc = attn_stimulus(cached * kv_width, 2, 6.0);
     let vc = attn_stimulus(cached * kv_width, 3, 1.0);
@@ -3272,7 +3295,17 @@ fn execute_one_paged_step(s: AttnShape, cached: usize) {
     let kd = attn_stimulus(mq * kv_width, 4, 6.0);
     let vd = attn_stimulus(mq * kv_width, 5, 1.0);
     let src = |i: usize| u64::from(rope.inputs[i].tensor.index() as u32);
-    let srcs = step_sources(&step, &blocks, &rows).unwrap_or_else(|e| panic!("{at}: {e}"));
+    let scratchy_target_spyre::wiring::StepKind::Sequence(sequence) = step.kind() else {
+        panic!("{at}: the golden's step is a sequence's");
+    };
+    let srcs = step_sources(
+        &sequence,
+        &[scratchy_target_spyre::paged_step::RequestStep {
+            blocks: &blocks,
+            rows,
+        }],
+    )
+    .unwrap_or_else(|e| panic!("{at}: {e}"));
     let typed: Vec<(
         usize,
         scratchy_target_spyre::HostBytes,
@@ -3290,7 +3323,7 @@ fn execute_one_paged_step(s: AttnShape, cached: usize) {
             )
         })
         .collect();
-    let (mask_tid, mask, mask_shape) = srcs.mask;
+    let (mask_tid, mask, mask_shape) = srcs.masks[0].clone();
     let mut sources = vec![
         (
             u64::from(attn.inputs[0].tensor.index() as u32),
@@ -3483,7 +3516,7 @@ fn execute_one_decode_batch(s: AttnShape, contexts: &[usize]) {
             rope,
             &ir,
             true,
-            batch_pair_of_one_row_each(s.mq),
+            batch_pair_of_one_row_each(&ir, s.mq),
         )
         .unwrap_or_else(|e| panic!("the RopeAppend spliced {at}: {e}"));
     programs.extend(
@@ -3495,7 +3528,7 @@ fn execute_one_decode_batch(s: AttnShape, contexts: &[usize]) {
             // The batch's own pair: `mq` rows that are `mq` requests — one row each
             // (the batched kernel arm reads the graph's rows, which the pair's held
             // product states).
-            batch_pair_of_one_row_each(s.mq),
+            batch_pair_of_one_row_each(&ir, s.mq),
             PagedRows::Batch,
         )
         .unwrap_or_else(|e| panic!("the batched walk spliced {at}: {e}")),
@@ -3566,7 +3599,7 @@ fn execute_one_decode_batch(s: AttnShape, contexts: &[usize]) {
         &ir,
         s.active_cap(),
         PagedRows::Batch,
-        batch_pair_of_one_row_each(s.mq),
+        batch_pair_of_one_row_each(&ir, s.mq),
     )
     .expect("the paged step derives")
     .pop()
@@ -3575,10 +3608,15 @@ fn execute_one_decode_batch(s: AttnShape, contexts: &[usize]) {
     let slots = step.page_slots as usize;
     let (q_width, kv_width, hd) = ((nqh * hd) as usize, (nkvh * hd) as usize, hd as usize);
     // Each sequence's blocks: the pool's pages reversed, dealt out in turn.
-    let mut free = (0..step.pages).rev();
-    let blocks: Vec<Vec<u32>> = contexts
+    let mut free = (0..step.pages.get()).rev();
+    let blocks: Vec<Vec<PoolPage>> = contexts
         .iter()
-        .map(|&c| (&mut free).take((c + 1).div_ceil(slots)).collect())
+        .map(|&c| {
+            (&mut free)
+                .take((c + 1).div_ceil(slots))
+                .map(pool_page)
+                .collect()
+        })
         .collect();
     // Each sequence's cached keys and values, and its one new token; a pad row repeats the last
     // real sequence's token (the worker's pad law).
@@ -3606,7 +3644,10 @@ fn execute_one_decode_batch(s: AttnShape, contexts: &[usize]) {
         .zip(&blocks)
         .map(|(&c, bl)| BatchSeq { blocks: bl, pos: c })
         .collect();
-    let srcs = batch_sources(&step, &seqs).unwrap_or_else(|e| panic!("{at}: {e}"));
+    let scratchy_target_spyre::wiring::StepKind::Batch(batch) = step.kind() else {
+        panic!("{at}: the golden's step is a decode batch's");
+    };
+    let srcs = batch_sources(&batch, &seqs).unwrap_or_else(|e| panic!("{at}: {e}"));
     let typed: Vec<(
         usize,
         scratchy_target_spyre::HostBytes,
@@ -3624,7 +3665,7 @@ fn execute_one_decode_batch(s: AttnShape, contexts: &[usize]) {
             )
         })
         .collect();
-    let (mask_tid, mask, mask_shape) = srcs.mask;
+    let (mask_tid, mask, mask_shape) = srcs.masks[0].clone();
     let src = |i: usize| u64::from(rope.inputs[i].tensor.index() as u32);
     let mut sources = vec![
         (
@@ -3639,13 +3680,14 @@ fn execute_one_decode_batch(s: AttnShape, contexts: &[usize]) {
         (u64::from(mask_tid), mask, mask_shape),
     ];
     // The pools: every sequence's cached rows laid into ITS pages (`pool_of_rows`), page by page.
-    let page_elems = step.nkvh as usize * slots * hd;
+    let page_elems = step.nkvh().get() as usize * slots * hd;
     for (i, cache) in [(4usize, &kc), (5, &vc)] {
-        let mut pool = vec![0.0f32; step.pages as usize * page_elems];
+        let mut pool = vec![0.0f32; step.pages.get() as usize * page_elems];
         for (sq, (&c, bl)) in contexts.iter().zip(&blocks).enumerate() {
             let rows = pool_of_rows(&step, hd, bl, &cache[sq], c).unwrap();
             for &p in &bl[..c.div_ceil(slots)] {
-                let r = p as usize * page_elems..(p as usize + 1) * page_elems;
+                let p = p.get() as usize;
+                let r = p * page_elems..(p + 1) * page_elems;
                 pool[r.clone()].copy_from_slice(&rows[r]);
             }
         }
@@ -3920,7 +3962,7 @@ fn a_paged_walks_program_does_not_grow_with_its_rows() {
                 scratchy_subtile::subtile_ir::AttnScaleSite::InKernel,
                 s.active_cap(),
                 // One request of the graph's `mq` rows — the flat walk's own pair.
-                pair_of_one_request(mq),
+                pair_of_one_request(&ir, mq),
                 PagedRows::Sequence,
             )
             .unwrap_or_else(|e| panic!("splice compiled mq={mq}: {e}"));
@@ -4034,7 +4076,7 @@ fn the_tall_wide_hidden_rmsnorm_mean_splits_through_the_door() {
         PagedRows::Sequence,
         &[],
         &Default::default(),
-        pair_of_one_request(m),
+        pair_of_one_request(&ir, m),
     )
     .unwrap_or_else(|e| panic!("layout minted m={m} c={c}: {e}"));
     let node = &ir.nodes[0];

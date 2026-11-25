@@ -104,15 +104,19 @@ mod tests {
     }
 
     /// The extent pair every `lower_graph_*` call below states for its graph: these fixtures are
-    /// ONE request of ONE row (m=1, no AttnDecode — the pair still must describe the graph it is
-    /// handed, and it does: one row, one request).
-    fn one_row_one_request() -> ktir_superdsc::sdsc_abstract::QueryExtent {
-        ktir_superdsc::sdsc_abstract::QueryExtent::of_baked_rung(
+    /// ONE request of ONE row (m=1, no AttnDecode), proven against `ir` by the bake's own mint
+    /// ([`scratchy_triton_splice::GraphExtent::of`]).
+    fn one_row_one_request<F: scratchy_subtile::subtile_ir::RopeForm>(
+        ir: &scratchy_subtile::subtile_ir::SubtileIR<F>,
+    ) -> scratchy_triton_splice::GraphExtent {
+        let pair = ktir_superdsc::sdsc_abstract::QueryExtent::of_baked_rung(
             ktir_superdsc::sdsc_abstract::RungWidth::of_baked_rows(1)
                 .expect("the fixtures' row count is nonzero"),
             ktir_superdsc::sdsc_abstract::RungCap::ONE,
         )
-        .expect("one row at one request fits a u32")
+        .expect("one row at one request fits a u32");
+        scratchy_triton_splice::GraphExtent::of(ir, pair, false)
+            .unwrap_or_else(|e| panic!("one row, one request describes the fixture: {e}"))
     }
 
     /// One rank: no collective, no window — the tp=1 identity at the plan's level.
@@ -173,7 +177,7 @@ mod tests {
                     &ir,
                     ActiveCap::FULL,
                     false,
-                    one_row_one_request(),
+                    one_row_one_request(&ir),
                 ) {
                     NodeLowering::Ops(v) => ops.extend(v),
                     NodeLowering::Unhandled(why) => panic!("the collective did not lower: {why}"),
@@ -269,7 +273,7 @@ mod tests {
                 &weight_ids,
                 ActiveCap::FULL,
                 false,
-                one_row_one_request(),
+                one_row_one_request(&ir),
             )
             .unwrap();
             let shifts = launch_index(&ops, FoldGrouping::Split);
@@ -316,7 +320,7 @@ mod tests {
                 &weight_ids,
                 ActiveCap::FULL,
                 false,
-                one_row_one_request(),
+                one_row_one_request(&ir),
             )
             .unwrap();
             let shifts = launch_index(&ops, FoldGrouping::Split);
@@ -458,7 +462,7 @@ mod tests {
                 &weight_ids,
                 ActiveCap::FULL,
                 false,
-                one_row_one_request(),
+                one_row_one_request(&ir),
             )
             .unwrap();
             let cut = ops.iter().find_map(|e| e.tp_consume).unwrap().cut;
@@ -547,7 +551,7 @@ mod tests {
                 &weight_ids,
                 ActiveCap::FULL,
                 false,
-                one_row_one_request(),
+                one_row_one_request(&ir),
             )
             .unwrap();
             let at = |tid: u32| {
@@ -613,7 +617,7 @@ mod tests {
                 &weight_ids,
                 ActiveCap::FULL,
                 false,
-                one_row_one_request(),
+                one_row_one_request(&ir),
             )
             .unwrap();
             let partial = ir
@@ -678,7 +682,7 @@ mod tests {
                 &weight_ids,
                 ActiveCap::FULL,
                 false,
-                one_row_one_request(),
+                one_row_one_request(&ir),
             )
             .unwrap();
             let groups = ktir_groups(&ops, FoldGrouping::Split, None).unwrap();
@@ -725,13 +729,14 @@ mod tests {
         ) -> ktir_superdsc::placement::BundleLayout {
             let nb = std::num::NonZeroU32::new(128).unwrap();
             let b = tp_bake::<T>(&mlp_sublayer(2048, 8192)).unwrap();
+            let ir = lower_region(&b.sharded.local, nb);
             compute_bundle_layout::<T, _>(
-                &lower_region(&b.sharded.local, nb),
+                &ir,
                 weight_ids,
                 scratchy_triton_splice::PagedRows::Sequence,
                 &[],
                 &Default::default(),
-                one_row_one_request(),
+                one_row_one_request(&ir),
             )
             .expect("the sublayer lays out")
         }

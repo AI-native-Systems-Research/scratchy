@@ -65,36 +65,18 @@ impl LogitsGeom {
         let width = elems / rows;
         (width >= vocab).then_some(LogitsGeom { rows, width })
     }
-    // ⛔ THE HOST READBACK HALF IS GONE — `len` (the whole-placement element count for
-    // `read_tensor`) and `rows_contiguous` (the de-interleave into per-request rows) served
-    // the per-request logits readback the submit/collect split deleted: the sampler answers
-    // on the card now and the idx stick is the only readback. Both deleted with their
-    // readers, at the auditor's order — the struct stays for the load-time placement
-    // refusal and the rung's own log line.
 }
 
-/// What a forward should hand back from its lm-head tail. An enum rather than a `bool` because the
-/// per-request case CANNOT be served without the tensor's geometry — see [`LogitsGeom`] — and a bare
-/// `want_logits: true` gave no place to put it, which is exactly how the batched path came to slice
-/// one row's worth and hand it to eight requests.
 /// One rung of the batched-decode ladder: a bundle baked for exactly `seqs` requests, aliasing the
 /// one-request decode session's weights and page pool.
-// ⛔ `sendnn`-ONLY, restored from 8bd5c755b. My branch was cut BEFORE that commit added
-// these gates, and resolving the rebase conflict in favour of the split took the whole
-// file — which discarded them. They are what makes the KTIR-only build compile.
 pub(crate) struct DecodeRung {
     /// The row count this rung's bundle was BAKED at — every launch on it binds exactly this many
     /// rows, live or padding, and every mask/fold/logits extent below derives from it.
     pub(crate) seqs: ktir_superdsc::sdsc_abstract::RungWidth,
     /// The rung's own session, aliasing the owner's weights and KV pool. Which body of its walk
     /// ladder a step runs is the session's own answer (`SuperDscSession::step_body`), and the step
-    /// the host stages is that body's (`PagedStep::on_body`).
+    /// the host stages is that body's, at the walk its rung records (`RungBody::walk`).
     pub(crate) sess: SuperDscSession,
-    // ⛔ NO `logits` FIELD ANY MORE — the rung's LogitsGeom served the host per-request
-    // readback the submit/collect split deleted (the sampler answers on the card; the idx
-    // stick is the only readback). The LOAD-TIME refusal stays in spyre_load: a rung whose
-    // baked logits placement is missing or not whole rows still panics at load, off
-    // `LogitsGeom::from_placement` directly.
 }
 
 /// WHICH SESSION A DECODE STEP RUNS ON — the one-request OWNER, or one rung of the ladder.
@@ -116,22 +98,6 @@ pub(crate) enum RungId {
 pub(crate) struct DecodeSeat<'a> {
     pub(crate) seqs: ktir_superdsc::sdsc_abstract::RungWidth,
     pub(crate) sess: &'a mut SuperDscSession,
-}
-
-pub(crate) enum LogitsWanted {
-    /// Nothing — every prompt chunk but the final one, which launches no suffix and reads
-    /// nothing back.
-    None,
-    /// The FINAL prompt chunk: its suffix runs, the rung's own minted sampler picks the
-    /// first generated token on the card from the folded lm-head row, and the idx stick
-    /// is read back exactly like a decode launch's.
-    LastRow,
-    /// A DECODE BATCH: one row per request, every row a different request. The
-    /// rung's sampler picks every token on the card; the idx stick's raw read is
-    /// deferred and comes back through the one collect door
-    /// (`collect_decode_tokens`) — in-call when the schedule cannot defer, from
-    /// the drain when it can. There is no synchronous decode arm.
-    PerRequestDeferred,
 }
 
 /// The sendnn session type. ONE variant: the dxp-compiled SuperDSC bundle is the only thing that
@@ -171,25 +137,9 @@ pub(crate) struct SuperDscBundle {
     /// The one-request decode session — the OWNER of the resident weights and the KV pool (with
     /// the pool's statics, `paged_step::card_statics`), which every other session aliases.
     pub(crate) decode: SuperDscSession,
-    /// PREFILL WIDTH LADDER — ASCENDING by baked query-row count `mq`; the last entry is the widest.
-    /// EMPTY ⇒ no batched-prefill bundle at all (multi-token prompts fall back to the sequential
-    /// mq=1 decode path).
-    ///
-    /// Each rung is baked for EXACTLY its `mq` query rows (the tensor shapes are concrete), so
-    /// `run_step` must be called with exactly that m: the real prompt tokens fill rows `[0..real)`
-    /// and rows `[real..mq)` are PAD — future positions the causal mask never lets a real row attend,
-    /// whose KV slots sit beyond `seq_pos` so decode never reads them. Picking the SMALLEST rung that
-    /// still holds the chunk is what keeps that padding cheap: per-chunk cost is `fixed + slope·mq`
-    /// with the fixed term dominant, so one width is wrong both ways (too narrow re-pays the fixed
-    /// term per extra chunk, too wide computes empty rows).
-    ///
-    /// A rung needs its OWN session because `mq` sizes the prefix (embed rows), the suffix and every
-    /// seg0/seg3 activation. Rungs DO share the resident weights (seg1) and KV (seg2) by alias, so the
-    /// ladder costs program + activation memory, not another copy of the model. All rungs carry the
-    /// SAME tensor ids (verified: identical 1467-key placement set across widths 15/31/47/63 — only
-    /// the 611 activation SIZES scale with `mq`), so ONE prefill `BundleMeta` binds any of them, and
-    /// `run_card_launch` rebinds every const on each call — so switching rungs between chunks is free.
-    pub(crate) prefill_rungs: Vec<(usize, SuperDscSession)>,
+    /// ⭐ THE PROMPT-CHUNK LADDER — every rung a prompt chunk can run on, each its session and the
+    /// meta of the wiring cell that session was built from ([`ChunkLadder`]).
+    pub(crate) chunks: ChunkLadder,
     /// DECODE BATCH LADDER `(seqs, session)`, ascending — one session per baked request count.
     ///
     /// A decode step runs one token of each RUNNING request. Without this the worker runs one
@@ -201,48 +151,126 @@ pub(crate) struct SuperDscBundle {
     /// programs and activations, not another copy of the model — exactly as the prefill ladder does.
     /// EMPTY ⇒ no ladder; every request runs its own forward, as before.
     pub(crate) decode_rungs: Vec<DecodeRung>,
-    /// The prefill bundles whose walk ladder tops at the whole pool — what a CONTINUATION chunk
-    /// (`start > 0`) must run on, because it has resident KV to attend; each launch walks the
-    /// narrowest of its rungs that reaches the chunk's last position. See [`PrefixLadder`].
-    ///
-    /// Every entry in [`prefill_rungs`](Self::prefill_rungs) walks only its own chunk's pages, so it
-    /// serves a chunk at `start == 0` (`PagedStep::reach`).
-    ///
-    /// Empty ⇒ no prefix-capable bundle baked, so a continuation chunk cannot run and is refused
-    /// rather than attending a cache its walk does not reach.
-    pub(crate) prefill_prefix: PrefixLadder,
+    /// ⭐ THE PACKED CONTINUATION RUNGS — a wave of continuation tails batched into one launch
+    /// ([`PrefixLadder`]). A lone chunk never runs here: its rung is [`Self::chunks`]'s.
+    pub(crate) packed: PrefixLadder,
 }
 
-/// ⭐ THE PREFIX-CAPABLE PREFILL LADDER — the sessions a continuation chunk can run on, ascending by
-/// (width, seqs), and the ONE place a continuation chunk's width is chosen.
-///
-/// The field is private and [`Self::of_built`] is its only mint, so the entries are exactly the sessions
-/// that were BUILT from baked bundles; [`Self::rung_for`] returns a [`PrefixRung`] naming one of them or
-/// nothing, so a chunk cannot be handed a width no bundle was baked at.
-///
-/// ⛔ IT WAS ONE BUNDLE AT THE WIDEST RUNG, and the tail paid for it: granite-3.1-2b's ~2k-token prompt
-/// ran its 52-row tail as a full 512-row chunk, 460 ms against 384 on the 256-row build.
-pub(crate) struct PrefixLadder(Vec<PrefixRungBuilt>);
+/// ⭐ WHAT A CHUNK'S ATTENTION MUST REACH — which family of rungs can run it, decided by the
+/// chunk's own first position, the one fact that separates them.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ChunkReach {
+    /// The prompt's first chunk (`start == 0`): no key precedes it, so a rung whose walk covers
+    /// only its own pages runs it.
+    First,
+    /// A chunk past the first (`start > 0`): the keys before it are resident, so it runs on a
+    /// prefix-capable rung, whose walk reaches the whole pool.
+    Continuation,
+}
 
-/// One BUILT rung of [`PrefixLadder`] — its per-request width, its request count (a solo rung's is 1;
-/// a packed rung's is the count of tails its wave batches into one launch), its own meta, and its
-/// session. The loader mints these from the bundles the bake shipped; the ladder is their only home.
-pub(crate) struct PrefixRungBuilt {
-    pub(crate) width: usize,
-    pub(crate) seqs: usize,
-    /// ⭐ THE RUNG'S OWN WIRING'S META — a solo rung binds the prefill graph's (every solo rung
-    /// the same tensor ids), a packed rung its OWN pair's cell (its extent pair, its `s`-row
-    /// seat, its own consts are the pair's, no representative's). The wave front launches
-    /// through it beside the session, so a launch's wiring and its session cannot come from
-    /// two rungs.
+impl ChunkReach {
+    /// The reach of a chunk whose first position is `start`.
+    pub(crate) const fn of_start(start: usize) -> Self {
+        if start == 0 {
+            Self::First
+        } else {
+            Self::Continuation
+        }
+    }
+}
+
+/// ⭐ ONE PROMPT-CHUNK RUNG — its baked row count, its session, and the meta of the wiring cell the
+/// session was built from, held together, so a launch's session and its wiring cannot come from two
+/// rungs. Built only by the loader ([`ChunkFamily::of_built`]).
+pub(crate) struct ChunkRung {
+    pub(crate) width: ktir_superdsc::sdsc_abstract::RungWidth,
     pub(crate) meta: crate::spyre_types::BundleMeta,
     pub(crate) sess: SuperDscSession,
 }
 
-/// ONE CHOICE OF [`PrefixLadder`] RUNG, made once per chunk and carried — the chunk's cap, its padded
-/// write, its session and the baked row count its K/V extent is proven against all read THIS value, so
-/// they cannot come from two choices. No public constructor: only [`PrefixLadder::rung_for`] and
-/// [`PrefixLadder::packed_fill`] mint one.
+/// ⭐ ONE FAMILY OF CHUNK RUNGS, NEVER EMPTY — its widest rung, and the narrower ones ascending.
+/// Holding the widest apart is what makes the selection total: every chunk has a rung, so no
+/// chunk can be refused for want of one.
+pub(crate) struct ChunkFamily {
+    narrower: Vec<ChunkRung>,
+    widest: ChunkRung,
+}
+
+impl ChunkFamily {
+    /// The family of the rungs the loader built, or `None` when it built none — the loader's to
+    /// answer for, at load.
+    pub(crate) fn of_built(mut rungs: Vec<ChunkRung>) -> Option<Self> {
+        rungs.sort_by_key(|r| r.width.count());
+        let widest = rungs.pop()?;
+        Some(Self {
+            narrower: rungs,
+            widest,
+        })
+    }
+
+    /// ⭐ THE RUNG A CHUNK RUNS ON — the narrowest that holds the `left` rows the prompt still has,
+    /// else the widest, which then takes as many rows as it holds and leaves the rest to the next
+    /// chunk. The ONE statement of a chunk's width, for both families.
+    fn rung_for(&mut self, left: usize) -> &mut ChunkRung {
+        match self.narrower.iter().position(|r| r.width.count() >= left) {
+            Some(i) => &mut self.narrower[i],
+            None => &mut self.widest,
+        }
+    }
+
+    /// The baked widths, ascending.
+    pub(crate) fn widths(&self) -> Vec<usize> {
+        self.narrower
+            .iter()
+            .chain(std::iter::once(&self.widest))
+            .map(|r| r.width.count())
+            .collect()
+    }
+}
+
+/// ⭐ THE PROMPT-CHUNK LADDER — both families, each never empty: the rungs a prompt's first chunk
+/// runs on, and the prefix-capable rungs every later chunk runs on. [`Self::rung_for`] is the ONE
+/// place a chunk's rung is chosen: by its reach, then its rows.
+pub(crate) struct ChunkLadder {
+    pub(crate) first: ChunkFamily,
+    pub(crate) continuation: ChunkFamily,
+}
+
+impl ChunkLadder {
+    /// The rung a chunk starting at `start` with `left` rows still to run takes.
+    pub(crate) fn rung_for(&mut self, start: usize, left: usize) -> &mut ChunkRung {
+        match ChunkReach::of_start(start) {
+            ChunkReach::First => self.first.rung_for(left),
+            ChunkReach::Continuation => self.continuation.rung_for(left),
+        }
+    }
+}
+
+/// ⭐ THE PACKED CONTINUATION LADDER — the rungs a WAVE of continuation tails runs on, ascending by
+/// (width, seqs), every one packing at least two tails into one launch. A lone chunk is never one
+/// of these: its rung is [`ChunkLadder`]'s.
+///
+/// The field is private and [`Self::of_built`] is its only mint, so the entries are exactly the
+/// sessions that were BUILT from baked bundles; [`Self::packed_fill`] returns a [`PrefixRung`] naming
+/// one of them or nothing, so a wave cannot be handed a pair no bundle was baked at.
+pub(crate) struct PrefixLadder(Vec<PrefixRungBuilt>);
+
+/// One BUILT rung of [`PrefixLadder`] — its per-request width, the count of tails its wave batches
+/// into one launch, its own meta, and its session. The loader mints these from the bundles the bake
+/// shipped; the ladder is their only home.
+pub(crate) struct PrefixRungBuilt {
+    pub(crate) width: usize,
+    pub(crate) seqs: usize,
+    /// ⭐ THE RUNG'S OWN WIRING'S META — its OWN pair's cell (its extent pair, its `s`-row seat,
+    /// its own consts are the pair's, no representative's). The wave front launches through it
+    /// beside the session, so a launch's wiring and its session cannot come from two rungs.
+    pub(crate) meta: crate::spyre_types::BundleMeta,
+    pub(crate) sess: SuperDscSession,
+}
+
+/// ONE CHOICE OF [`PrefixLadder`] RUNG, made once per wave group and carried — its width, its
+/// request count and its session all read THIS value, so they cannot come from two choices. No
+/// public constructor: only [`PrefixLadder::packed_fill`] mints one.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct PrefixRung {
     index: usize,
@@ -255,7 +283,7 @@ impl PrefixRung {
         self.width
     }
 
-    /// The rung's request count — 1 for a solo rung; a packed rung's wave size.
+    /// The rung's request count — its wave size.
     pub(crate) fn seqs(self) -> usize {
         self.seqs
     }
@@ -270,31 +298,9 @@ impl PrefixLadder {
         PrefixLadder(rungs)
     }
 
-    pub(crate) fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
-
     /// The baked (width, seqs) pairs, ascending.
     pub(crate) fn pairs(&self) -> Vec<(usize, usize)> {
         self.0.iter().map(|r| (r.width, r.seqs)).collect()
-    }
-
-    /// ⭐ THE RUNG A CONTINUATION CHUNK RUNS ON — the narrowest SOLO rung that holds the `rows_left`
-    /// rows the prompt still has, else the widest solo (the chunk is then capped at its width). A
-    /// packed rung cannot serve one chunk: its graph is s windows' rows and its answer rows are
-    /// r·width apart, so a lone tail on it would compute s−1 empty windows — the wave front gathers
-    /// tails and picks [`Self::packed_fill`] instead. `None` only when no solo rung baked.
-    pub(crate) fn rung_for(&self, rows_left: usize) -> Option<PrefixRung> {
-        let index = self
-            .0
-            .iter()
-            .position(|r| r.seqs == 1 && r.width >= rows_left)
-            .or_else(|| self.0.iter().rposition(|r| r.seqs == 1))?;
-        Some(PrefixRung {
-            index,
-            width: self.0[index].width,
-            seqs: 1,
-        })
     }
 
     /// ⭐ THE RUNG AND GROUP SIZE A WAVE'S NEXT GROUP RUNS ON — the packed rung that seats the
@@ -332,11 +338,6 @@ impl PrefixLadder {
             },
             rung.seqs.min(live),
         ))
-    }
-
-    /// The session of a rung THIS ladder chose.
-    pub(crate) fn session(&mut self, rung: PrefixRung) -> &mut SuperDscSession {
-        &mut self.0[rung.index].sess
     }
 
     /// ⭐ THE WAVE FRONT'S ONE DOOR — the rung's own meta and its own session, borrowed

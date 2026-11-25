@@ -30,13 +30,17 @@ use scratchy_target_spyre::tp_plan::tp_bake;
 /// width.
 type W = TpWorld<2>;
 
-/// The extent pair both graphs below state: these fixtures are ONE request of ONE row.
-fn one_row_one_request() -> QueryExtent {
-    QueryExtent::of_baked_rung(
-        RungWidth::of_baked_rows(1).expect("the fixtures' row count is nonzero"),
+/// The extent pair both graphs below state — ONE request of ONE row — proven against `ir` by the
+/// bake's own mint.
+fn one_row_one_request(
+    ir: &scratchy_subtile::subtile_ir::SubtileIR,
+) -> Result<scratchy_triton_splice::GraphExtent, String> {
+    let pair = QueryExtent::of_baked_rung(
+        RungWidth::of_baked_rows(1).ok_or("the fixtures' row count is nonzero")?,
         RungCap::ONE,
     )
-    .expect("one row at one request fits a u32")
+    .ok_or("one row at one request fits a u32")?;
+    scratchy_triton_splice::GraphExtent::of(ir, pair, false)
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -54,7 +58,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &weight_ids,
         ActiveCap::FULL,
         false,
-        one_row_one_request(),
+        one_row_one_request(&ir)?,
     )
     .map_err(|e| format!("the sharded sublayer does not lower: {e:?}"))?;
     let consumes: Vec<_> = ops
@@ -99,7 +103,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &weight_ids,
         ActiveCap::FULL,
         false,
-        one_row_one_request(),
+        one_row_one_request(&ir)?,
     )
     .map_err(|e| format!("the sharded projection does not lower: {e:?}"))?;
     let consumes: Vec<_> = ops

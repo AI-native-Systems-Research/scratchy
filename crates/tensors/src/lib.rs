@@ -13,6 +13,7 @@ pub mod bundle_roles;
 pub mod compiler_ids;
 pub mod device_allocator;
 pub mod dtype;
+pub mod fp8;
 pub mod lowering_dtype;
 pub mod owned_tensor;
 pub mod positive;

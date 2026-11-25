@@ -249,8 +249,8 @@ fn sentinel_tids_are_pairwise_distinct() {
 /// whole layout, and no index can leave its region without [`Self::at`] refusing during the bake.
 #[derive(Clone, Copy, Debug)]
 pub struct TidRegion {
-    /// For diagnostics — named so a refusal says WHICH region overflowed.
-    pub name: &'static str,
+    /// Which region this row is — the key [`Region::tids`] reads it by.
+    pub name: Region,
     /// Highest tid in the region; slots count downward from here.
     pub base: u32,
     pub slots: u32,
@@ -330,14 +330,7 @@ pub const ROPE_P_CLASS_BASE: u32 = u32::MAX - 121;
 /// ([`rope_p_table_class_hds`], sorted descending; class 0 = the widest = [`ROPE_P_TID`] itself). The
 /// set holds at most the one-stick head, so class 0 is the one class a bake names.
 pub fn rope_p_class_tid(idx: usize) -> u32 {
-    if idx == 0 {
-        // ⭐ DOCUMENTED WHY: class 0 IS the old single-class tid. Keeping it there is what makes a
-        // uniform model's ops name `ROPE_P_TID` exactly as before — byte-identical bundles — instead
-        // of renumbering every class and silently repointing ids already baked into artifacts.
-        return ROPE_P_TID;
-    }
-    // Class 1 takes the region's BASE slot (class 0 lives on the sentinel, so no slot is wasted).
-    reserved_region("rope_p_class").at(idx as u32 - 1)
+    KernelTableFamily::RopeP.class_tid(idx)
 }
 
 /// ⭐⭐⭐⭐⭐ THE IDENTITY **CLASS** REGION — one `[hd,hd]` identity per DISTINCT attention head dim.
@@ -354,13 +347,7 @@ pub const IDENTITY_CLASS_BASE: u32 = u32::MAX - 129;
 /// Reserved tid for the identity table of attention class `idx` (distinct AttnDecode head dims,
 /// sorted descending; class 0 = the widest = [`IDENTITY_TID`] itself).
 pub fn identity_class_tid(idx: usize) -> u32 {
-    if idx == 0 {
-        // ⭐ Same law as `rope_p_class_tid(0)`: the widest class keeps the old single-class tid so a
-        // uniform model's bundle is byte-identical.
-        return IDENTITY_TID;
-    }
-    // Class 1 takes the region's BASE slot (class 0 lives on the sentinel, so no slot is wasted).
-    reserved_region("identity_class").at(idx as u32 - 1)
+    KernelTableFamily::Identity.class_tid(idx)
 }
 
 // ⛔ THE ROUTER CONST REGION IS GONE — the hand-written per-op MoE card lowering that
@@ -371,27 +358,63 @@ pub fn identity_class_tid(idx: usize) -> u32 {
 // alias anything that took its place, so the ids stay unallocated (the same law the
 // retired one-hot top-k slots followed inside the region while it lived).
 
-/// Does `tid` name a KERNEL-TABLE class table of family `what` (`"rope-P"` or `"identity"`)?
-///
-/// The load-time placement cross-check walks every PLACED tid and asks this, because the reverse
-/// direction of the check ("every placed class tid is in the wiring's set") cannot enumerate the
-/// class ids from a placement — it can only test a tid it finds. Class 0 is the family's sentinel;
-/// classes 1.. live in the family's region.
-pub fn is_kernel_table_class_tid(tid: u32, what: &str) -> bool {
-    match what {
-        "rope-P" => {
-            tid == ROPE_P_TID || {
-                let r = reserved_region("rope_p_class");
-                (r.floor()..=r.base).contains(&tid)
-            }
+/// A KERNEL-TABLE class family: the per-class tables a lowering stages once per distinct head dim.
+/// Class 0 is the family's sentinel ([`Self::sentinel`]); classes 1.. live in its region
+/// ([`Self::region`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KernelTableFamily {
+    /// The rope rotate-half permutation tables ([`rope_p_class_tid`]).
+    RopeP,
+    /// The GQA identity tables ([`identity_class_tid`]).
+    Identity,
+}
+
+impl KernelTableFamily {
+    /// Class 0's tid — the pre-class single tid, kept so a uniform model's bundle is byte-identical.
+    pub const fn sentinel(self) -> u32 {
+        match self {
+            Self::RopeP => ROPE_P_TID,
+            Self::Identity => IDENTITY_TID,
         }
-        "identity" => {
-            tid == IDENTITY_TID || {
-                let r = reserved_region("identity_class");
-                (r.floor()..=r.base).contains(&tid)
-            }
+    }
+
+    /// The region classes 1.. take their slots from.
+    pub const fn region(self) -> Region {
+        match self {
+            Self::RopeP => Region::RopePClass,
+            Self::Identity => Region::IdentityClass,
         }
-        _ => false,
+    }
+
+    /// Class `idx`'s table tid. Class 0 IS the old single-class tid: keeping it there is what
+    /// makes a uniform model's ops name the sentinel exactly as before (byte-identical bundles)
+    /// instead of renumbering every class and silently repointing ids already baked into
+    /// artifacts. Class 1 takes the region's BASE slot, so no slot is wasted.
+    pub const fn class_tid(self, idx: usize) -> u32 {
+        if idx == 0 {
+            self.sentinel()
+        } else {
+            self.region().tids().at(idx as u32 - 1)
+        }
+    }
+
+    /// Does `tid` name one of this family's class tables?
+    ///
+    /// The load-time placement cross-check walks every PLACED tid and asks this, because the
+    /// reverse direction of the check ("every placed class tid is in the wiring's set") cannot
+    /// enumerate the class ids from a placement — it can only test a tid it finds.
+    pub fn is_class_tid(self, tid: u32) -> bool {
+        let r = self.region().tids();
+        tid == self.sentinel() || (r.floor()..=r.base).contains(&tid)
+    }
+}
+
+impl core::fmt::Display for KernelTableFamily {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::RopeP => "rope-P",
+            Self::Identity => "identity",
+        })
     }
 }
 
@@ -445,37 +468,94 @@ pub fn rope_p_table_class_hds(hds: impl Iterator<Item = u32>) -> Vec<u32> {
 pub const PAGED_STEP_BASE: u32 = u32::MAX - 2_000_171;
 
 /// The paged step's mask stack — see [`PAGED_STEP_BASE`].
-pub const PAGED_MASK_TID: u32 = reserved_region("paged_step").at(0);
+pub const PAGED_MASK_TID: u32 = Region::PagedStep.tids().at(0);
 /// The paged step's page table — see [`PAGED_STEP_BASE`].
-pub const PAGED_PAGE_TABLE_TID: u32 = reserved_region("paged_step").at(1);
+pub const PAGED_PAGE_TABLE_TID: u32 = Region::PagedStep.tids().at(1);
 /// The paged step's KV write index — see [`PAGED_STEP_BASE`].
-pub const PAGED_WRITE_ROWS_TID: u32 = reserved_region("paged_step").at(2);
+pub const PAGED_WRITE_ROWS_TID: u32 = Region::PagedStep.tids().at(2);
 /// The paged step's query row index — see [`PAGED_STEP_BASE`].
-pub const PAGED_QUERY_ROWS_TID: u32 = reserved_region("paged_step").at(3);
+pub const PAGED_QUERY_ROWS_TID: u32 = Region::PagedStep.tids().at(3);
 /// The paged step's `kv_row_pool` — see [`PAGED_STEP_BASE`].
-pub const PAGED_KV_ROW_POOL_TID: u32 = reserved_region("paged_step").at(4);
+pub const PAGED_KV_ROW_POOL_TID: u32 = Region::PagedStep.tids().at(4);
 /// A decode batch's `rep_row_ids` — see [`PAGED_STEP_BASE`].
-pub const PAGED_REP_ROWS_TID: u32 = reserved_region("paged_step").at(5);
+pub const PAGED_REP_ROWS_TID: u32 = Region::PagedStep.tids().at(5);
 /// A decode batch's `chunk_page_ids` — see [`PAGED_STEP_BASE`].
-pub const PAGED_CHUNK_PAGES_TID: u32 = reserved_region("paged_step").at(6);
+pub const PAGED_CHUNK_PAGES_TID: u32 = Region::PagedStep.tids().at(6);
 /// A decode batch's `mask_by_chunk` — see [`PAGED_STEP_BASE`].
-pub const PAGED_CHUNK_MASKS_TID: u32 = reserved_region("paged_step").at(7);
+pub const PAGED_CHUNK_MASKS_TID: u32 = Region::PagedStep.tids().at(7);
 /// The decode step's int32 ZERO stick — `INDEX_RUN_WORDS` i32 zeros the host stages beside
 /// `kv_row_pool`: the add identity the chained index's run copy reads (`addi32toi32(zero, run)`, the
 /// int32 copy dxp binds — it has no int32 `identity`). Host-staged, as every int32 the attention
 /// reads is (SENUINT32-tagged i32 bytes) — see [`PAGED_STEP_BASE`].
-pub const PAGED_INT32_ZERO_TID: u32 = reserved_region("paged_step").at(8);
+pub const PAGED_INT32_ZERO_TID: u32 = Region::PagedStep.tids().at(8);
 
-/// Every reserved region, in one place. Order is high tid → low.
-pub const RESERVED_REGIONS: [TidRegion; 11] = [
+/// One enum variant per reserved region, in [`RESERVED_REGIONS`]' own order (high tid → low).
+/// The macro states the list once, so the variant count, the table's length and
+/// [`Region::COUNT`] cannot disagree.
+macro_rules! regions {
+    ($($(#[$doc:meta])* $v:ident),* $(,)?) => {
+        /// ⛔⛔⛔ A REGION IS ADDRESSED BY THIS TYPED NAME, NEVER BY A STRING OR A RAW INDEX.
+        ///
+        /// `KCT_RESIDENT_BASE` and `kct_resident_tid` were spelled `RESERVED_REGIONS[2]`.
+        /// Inserting the `kv_block_index` region at position 2 (the table is ordered high tid →
+        /// low) slid `kct_resident` to 3 and silently repointed both: layer 0's resident Kᵗ
+        /// kernel and the gather's index tensor became ONE tid with ONE placement. A variant is
+        /// read through [`Region::tids`], and [`REGION_ROWS_ARE_IN_NAME_ORDER`] proves at compile
+        /// time that row `r as usize` IS region `r`. So inserting a row without inserting its
+        /// variant at the same position fails the build, and a name the table does not hold
+        /// cannot be written.
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        pub enum Region { $($(#[$doc])* $v),* }
+        impl Region {
+            /// How many reserved regions there are — the length of [`RESERVED_REGIONS`].
+            pub const COUNT: usize = [$(Region::$v),*].len();
+        }
+    };
+}
+
+regions! {
+    /// The single sentinels (`ROPE_P_TID` .. `IDENTITY_TID`).
+    Sentinels,
+    /// The ScalarMul scale constants ([`scalarmul_scale_tid`]).
+    ScalarmulScale,
+    /// The gathered KV read's block index ([`KV_BLOCK_INDEX_TID`]).
+    KvBlockIndex,
+    /// The rope-P class tables past class 0 ([`rope_p_class_tid`]).
+    RopePClass,
+    /// The identity class tables past class 0 ([`identity_class_tid`]).
+    IdentityClass,
+    /// The head-major o_proj copies ([`oproj_headmajor_tid`]).
+    OprojHeadmajor,
+    /// The resident Kᵗ kernels ([`kct_resident_tid`]).
+    KctResident,
+    /// The paged step's host sources ([`PAGED_STEP_BASE`]).
+    PagedStep,
+    /// The tensor-parallel receive window's blocks ([`tp_recv_block_tid`]).
+    TpRecv,
+    /// The packed prefill's window tables past window 0 ([`paged_window_tid`]).
+    PagedWindow,
+    /// The attention classes past class 0 ([`paged_step_class_tid`]).
+    PagedStepClass,
+}
+
+impl Region {
+    /// This region's tids — its row of [`RESERVED_REGIONS`].
+    pub const fn tids(self) -> TidRegion {
+        RESERVED_REGIONS[self as usize]
+    }
+}
+
+/// Every reserved region, in one place. Order is high tid → low, and row `i` is the region whose
+/// [`Region`] discriminant is `i` ([`REGION_ROWS_ARE_IN_NAME_ORDER`]).
+pub const RESERVED_REGIONS: [TidRegion; Region::COUNT] = [
     // The single sentinels (`ROPE_P_TID` .. `IDENTITY_TID`) occupy MAX-1 .. MAX-19.
     TidRegion {
-        name: "sentinels",
+        name: Region::Sentinels,
         base: u32::MAX - 1,
         slots: 19,
     },
     TidRegion {
-        name: "scalarmul_scale",
+        name: Region::ScalarmulScale,
         base: u32::MAX - 20,
         slots: 100,
     },
@@ -483,7 +563,7 @@ pub const RESERVED_REGIONS: [TidRegion; 11] = [
     // is a new region instead of a 20th sentinel (the sentinel region is full, and sliding
     // `scalarmul_scale` down would repoint ids already baked into artifacts).
     TidRegion {
-        name: "kv_block_index",
+        name: Region::KvBlockIndex,
         base: KV_BLOCK_INDEX_TID,
         slots: 1,
     },
@@ -493,14 +573,14 @@ pub const RESERVED_REGIONS: [TidRegion; 11] = [
     // into an artifact is never repointed, and the region's own overflow assert refuses a class
     // set past them at the bake.
     TidRegion {
-        name: "rope_p_class",
+        name: Region::RopePClass,
         base: ROPE_P_CLASS_BASE,
         slots: 8,
     },
     // ⭐ THE IDENTITY CLASS REGION — the same law one rung down, for the attention classes (see
     // [`identity_class_tid`]).
     TidRegion {
-        name: "identity_class",
+        name: Region::IdentityClass,
         base: IDENTITY_CLASS_BASE,
         slots: 8,
     },
@@ -510,7 +590,7 @@ pub const RESERVED_REGIONS: [TidRegion; 11] = [
     // MAX-147, the first free slot below where the router consts lived; `OPROJ_HEADMAJOR_BASE`
     // derives from this row, so nothing else moves.)
     TidRegion {
-        name: "oproj_headmajor",
+        name: Region::OprojHeadmajor,
         base: u32::MAX - 147,
         slots: 1_000_000,
     },
@@ -523,20 +603,20 @@ pub const RESERVED_REGIONS: [TidRegion; 11] = [
     // floor at all: a model with enough tensors walked it downward without limit. One million
     // slots is far past any real tid count and is now a REFUSAL rather than a wrap.
     TidRegion {
-        name: "kct_resident",
+        name: Region::KctResident,
         base: u32::MAX - 1_000_171,
         slots: 1_000_000,
     },
     // ⭐ THE PAGED STEP's host sources — see [`PAGED_STEP_BASE`].
     TidRegion {
-        name: "paged_step",
+        name: Region::PagedStep,
         base: PAGED_STEP_BASE,
         slots: 9,
     },
     // ⭐ THE TENSOR-PARALLEL RECEIVE WINDOW'S BLOCKS — see [`tp_recv_block_tid`]. Below
     // `paged_step`'s floor, in tids no artifact has ever carried.
     TidRegion {
-        name: "tp_recv",
+        name: Region::TpRecv,
         base: TP_RECV_TID,
         slots: TP_WINDOW_CUTS * TP_MAX_WORLD,
     },
@@ -546,7 +626,7 @@ pub const RESERVED_REGIONS: [TidRegion; 11] = [
     // law), so the region holds only the windows PAST the first, three tables each, bounded by
     // [`PAGED_MAX_WINDOWS`].
     TidRegion {
-        name: "paged_window",
+        name: Region::PagedWindow,
         base: PAGED_WINDOW_BASE,
         slots: PAGED_WINDOW_TABLES * (PAGED_MAX_WINDOWS - 1),
     },
@@ -557,7 +637,7 @@ pub const RESERVED_REGIONS: [TidRegion; 11] = [
     // model with more DISTINCT attention step geometries than that is a config error the region's
     // own overflow assert turns into a bake refusal.
     TidRegion {
-        name: "paged_step_class",
+        name: Region::PagedStepClass,
         base: PAGED_STEP_CLASS_BASE,
         slots: PAGED_STEP_CLASS_STRIDE * (PAGED_MAX_STEP_CLASSES - 1),
     },
@@ -619,17 +699,15 @@ pub const PAGED_MAX_WINDOWS: u32 = 8;
 /// tids it has always bound and its bundle is byte-identical. The windows past the first count
 /// DOWN from [`PAGED_WINDOW_BASE`], three tids each, bounded by [`PAGED_MAX_WINDOWS`].
 ///
-/// Which table a window's slot names:
-/// `0` the query row index, `1` the page index table, `2` the mask stack — the order the
-/// `paged_step` region numbers its own sentinels in, so the two spellings of "the step's three
-/// tables" agree by construction.
-pub const fn paged_window_tid(window: u32, table: u32) -> u32 {
-    assert!(table < PAGED_WINDOW_TABLES, "a window has three tables");
+/// Which table a window's slot names is a [`WindowTable`] — the order the `paged_step` region
+/// numbers its own sentinels in, so the two spellings of "the step's three tables" agree by
+/// construction.
+pub const fn paged_window_tid(window: u32, table: WindowTable) -> u32 {
     match window {
         0 => match table {
-            0 => PAGED_QUERY_ROWS_TID,
-            1 => PAGED_PAGE_TABLE_TID,
-            _ => PAGED_MASK_TID,
+            WindowTable::QueryRows => PAGED_QUERY_ROWS_TID,
+            WindowTable::PageTable => PAGED_PAGE_TABLE_TID,
+            WindowTable::Mask => PAGED_MASK_TID,
         },
         w => {
             assert!(
@@ -637,7 +715,49 @@ pub const fn paged_window_tid(window: u32, table: u32) -> u32 {
                 "a packed rung asked for a window past PAGED_MAX_WINDOWS — the bake's packed \
                  table outgrew the reserved tid space"
             );
-            PAGED_WINDOW_BASE - ((w - 1) * PAGED_WINDOW_TABLES + table)
+            PAGED_WINDOW_BASE - ((w - 1) * PAGED_WINDOW_TABLES + table.slot())
+        }
+    }
+}
+
+/// ⭐ ONE OF A STEP WINDOW'S THREE TABLES — the query row index (the graph's own rows, every
+/// class's), the page index table, the mask stack. A type, so no reader names a table by a
+/// number and none can name a fourth.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum WindowTable {
+    QueryRows,
+    PageTable,
+    Mask,
+}
+
+impl WindowTable {
+    /// The three, in their slot order.
+    pub const ALL: [WindowTable; 3] = [Self::QueryRows, Self::PageTable, Self::Mask];
+
+    /// The table's slot within a window's [`PAGED_WINDOW_TABLES`].
+    pub const fn slot(self) -> u32 {
+        match self {
+            Self::QueryRows => 0,
+            Self::PageTable => 1,
+            Self::Mask => 2,
+        }
+    }
+}
+
+/// The two tables a class past the first owns at a window past the first — the page index table
+/// and the mask stack (the query row index is the shared one, [`WindowTable::QueryRows`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ClassWindowTable {
+    PageTable,
+    Mask,
+}
+
+impl ClassWindowTable {
+    /// The table's slot within a class window's [`PAGED_STEP_CLASS_WINDOW_TABLES`].
+    pub const fn slot(self) -> u32 {
+        match self {
+            Self::PageTable => 0,
+            Self::Mask => 1,
         }
     }
 }
@@ -699,16 +819,16 @@ pub const PAGED_MAX_STEP_CLASSES: u32 = 4;
 /// the classes past the first (see [`PAGED_STEP_CLASS_BASE`] for the class law and the seven-table
 /// layout). The splice owns which slot is which table; this is only the region's arithmetic.
 pub const fn paged_step_class_tid(idx: u32) -> u32 {
-    reserved_region("paged_step_class").at(idx)
+    Region::PagedStepClass.tids().at(idx)
 }
 
 /// ⭐ A CLASS's PACKED PREFILL WINDOW past the first — window `window`'s copy of `table` for the
-/// attention class `class` ≥ 1, in [`paged_window_tid`]'s OWN numbering (1 the page index table,
-/// 2 the mask stack; the query row index is shared and never passes through here). The
-/// class-aware half of `paged_window_tid`'s family law: window 0 IS the class's own step tables
-/// (class 0's being the `paged_step` sentinels), and the windows past the first take this region's
-/// slots — stated here so the splice and the wiring's mask-family check read ONE law.
-pub const fn paged_step_class_window_tid(class: u32, window: u32, table: u32) -> u32 {
+/// attention class `class` ≥ 1 (the page index table or the mask stack — a [`ClassWindowTable`];
+/// the query row index is shared and never passes through here). The class-aware half of
+/// `paged_window_tid`'s family law: window 0 IS the class's own step tables (class 0's being the
+/// `paged_step` sentinels), and the windows past the first take this region's slots — stated here
+/// so the splice and the wiring's mask-family check read ONE law.
+pub const fn paged_step_class_window_tid(class: u32, window: u32, table: ClassWindowTable) -> u32 {
     assert!(class >= 1, "class 0's windows are the paged_window family");
     assert!(
         class < PAGED_MAX_STEP_CLASSES,
@@ -717,16 +837,11 @@ pub const fn paged_step_class_window_tid(class: u32, window: u32, table: u32) ->
     );
     assert!(window >= 1, "window 0 is the class's own step tables");
     assert!(window < PAGED_MAX_WINDOWS, "a packed rung asked for a window past PAGED_MAX_WINDOWS");
-    assert!(
-        table == 1 || table == 2,
-        "a window past the first owns the page table and the mask stack, in paged_window_tid's \
-         own numbering (the query row index is shared)"
-    );
     paged_step_class_tid(
         (class - 1) * PAGED_STEP_CLASS_STRIDE
             + PAGED_STEP_CLASS_TABLES
             + (window - 1) * PAGED_STEP_CLASS_WINDOW_TABLES
-            + (table - 1),
+            + table.slot(),
     )
 }
 
@@ -747,71 +862,28 @@ pub fn is_reserved(tid: u32) -> bool {
             .any(|r| tid <= r.base && tid >= r.floor())
 }
 
-/// ⛔⛔⛔ A REGION IS ADDRESSED BY ITS **NAME**, NEVER BY ITS ARRAY INDEX — and this function exists
-/// because indexing it by position has already cost exactly the bug the table was built to prevent.
-///
-/// `KCT_RESIDENT_BASE` and `kct_resident_tid` were spelled `RESERVED_REGIONS[2]`. Inserting the
-/// `kv_block_index` region AT position 2 (it belongs there — the table is ordered high tid → low)
-/// slid `kct_resident` to 3 and silently repointed both: `kct_resident_tid(0)` began answering
-/// `KV_BLOCK_INDEX_TID`, i.e. the resident Kᵗ kernel of layer 0 and the gather's index tensor became
-/// ONE tid with ONE placement. Only the region's `slots: 1` made it loud — `kct_resident_tid(k_id)`
-/// for any `k_id >= 1` overflowed a one-slot region and failed the bake. A wider new region would
-/// have aliased in silence, which is precisely "two tensors landing on one tid is not an error anyone
-/// sees" from this file's own header.
-///
-/// A name cannot be shifted by an insertion, and a name that is not in the table is a BUILD failure
-/// rather than a neighbouring region's base.
-pub const fn reserved_region(name: &str) -> TidRegion {
-    let want = name.as_bytes();
+// ⭐ THE PROOFS, EVALUATED AT COMPILE TIME. An anonymous `const` item is always evaluated, so
+// each lock below runs at every build. Adding, reordering or resizing a region re-runs them; an
+// overlap or a misplaced row is a build error, not a tensor that quietly answers to two names.
+const _: () = SENTINELS_ARE_INSIDE_THEIR_REGION;
+const _: () = RESERVED_REGIONS_ARE_DISJOINT;
+const _: () = REGION_ROWS_ARE_IN_NAME_ORDER;
+const _: () = PAGED_WINDOW_0_IS_THE_SENTINELS;
+const _: () = PAGED_STEP_CLASS_FAMILY_IS_BOUNDED;
+
+/// ⭐⭐⭐ ROW `i` OF [`RESERVED_REGIONS`] IS THE REGION WHOSE DISCRIMINANT IS `i` — the law that
+/// makes [`Region::tids`] an exact read. A row inserted without its variant at the same position
+/// (or the reverse) fails here, at the build, naming neither a neighbour's base nor a silent alias.
+pub const REGION_ROWS_ARE_IN_NAME_ORDER: () = {
     let mut i = 0;
     while i < RESERVED_REGIONS.len() {
-        let have = RESERVED_REGIONS[i].name.as_bytes();
-        if have.len() == want.len() {
-            let mut k = 0;
-            let mut same = true;
-            while k < have.len() {
-                if have[k] != want[k] {
-                    same = false;
-                }
-                k += 1;
-            }
-            if same {
-                return RESERVED_REGIONS[i];
-            }
-        }
+        assert!(
+            RESERVED_REGIONS[i].name as usize == i,
+            "a RESERVED_REGIONS row sits at a position its Region variant does not — the table \
+             and the enum must list the regions in one order",
+        );
         i += 1;
     }
-    panic!("no reserved tid region by that name — a region was renamed or removed");
-}
-
-/// ⭐ THE PROOF, EVALUATED AT COMPILE TIME. Adding or resizing a region re-runs it; an overlap is
-/// a build error naming both regions, not a tensor that quietly answers to two names.
-#[allow(clippy::let_unit_value)]
-const _: () = {
-    // Referencing both proofs is what makes the compiler EVALUATE them; an unused `const` item is
-    // not const-evaluated, so a lock nothing mentions is a lock that never runs.
-    let _ = SENTINELS_ARE_INSIDE_THEIR_REGION;
-    let _ = RESERVED_REGIONS_ARE_DISJOINT;
-    let _ = EVERY_NAMED_REGION_RESOLVES;
-    let _ = PAGED_WINDOW_0_IS_THE_SENTINELS;
-    let _ = PAGED_STEP_CLASS_FAMILY_IS_BOUNDED;
-};
-
-/// ⭐⭐⭐ EVERY NAME THIS MODULE ADDRESSES A REGION BY, RESOLVED AT COMPILE TIME.
-///
-/// [`reserved_region`] panics on a name the table does not hold, and a `const fn` only panics when it
-/// is EVALUATED — so a rename would break the bake at whatever site first called it, or not at all if
-/// that site is behind a `cfg`. Naming them here makes the lookup run at every build.
-pub const EVERY_NAMED_REGION_RESOLVES: () = {
-    assert!(reserved_region("sentinels").base == u32::MAX - 1);
-    assert!(reserved_region("scalarmul_scale").slots > 0);
-    assert!(reserved_region("kv_block_index").base == KV_BLOCK_INDEX_TID);
-    assert!(reserved_region("rope_p_class").base == ROPE_P_CLASS_BASE);
-    assert!(reserved_region("identity_class").base == IDENTITY_CLASS_BASE);
-    assert!(reserved_region("kct_resident").slots > 0);
-    assert!(reserved_region("paged_step").base == PAGED_STEP_BASE);
-    assert!(reserved_region("paged_window").base == PAGED_WINDOW_BASE);
-    assert!(reserved_region("paged_step_class").base == PAGED_STEP_CLASS_BASE);
 };
 
 /// ⭐ WINDOW 0 IS THE SENTINELS — the law a solo rung's byte-identity stands on. Every window
@@ -820,13 +892,13 @@ pub const EVERY_NAMED_REGION_RESOLVES: () = {
 /// call sites; this pins the LAW at the table, so a region edit that broke either fails the build
 /// here rather than at whichever bake first minted a window).
 pub const PAGED_WINDOW_0_IS_THE_SENTINELS: () = {
-    assert!(paged_window_tid(0, 0) == PAGED_QUERY_ROWS_TID);
-    assert!(paged_window_tid(0, 1) == PAGED_PAGE_TABLE_TID);
-    assert!(paged_window_tid(0, 2) == PAGED_MASK_TID);
+    assert!(paged_window_tid(0, WindowTable::QueryRows) == PAGED_QUERY_ROWS_TID);
+    assert!(paged_window_tid(0, WindowTable::PageTable) == PAGED_PAGE_TABLE_TID);
+    assert!(paged_window_tid(0, WindowTable::Mask) == PAGED_MASK_TID);
     // The region's floor holds the LAST window's LAST table, and nothing past it.
-    let r = reserved_region("paged_window");
+    let r = Region::PagedWindow.tids();
     assert!(
-        paged_window_tid(PAGED_MAX_WINDOWS - 1, PAGED_WINDOW_TABLES - 1) == r.floor(),
+        paged_window_tid(PAGED_MAX_WINDOWS - 1, WindowTable::Mask) == r.floor(),
         "the widest window's last table is not the paged_window region's floor — the region \
          does not hold every window the tid mint admits"
     );
@@ -841,14 +913,14 @@ pub const PAGED_WINDOW_0_IS_THE_SENTINELS: () = {
 /// admits lands below it, so a class or window past the constants' bounds is a call-site assert
 /// (a bake refusal by name), never a wrap onto another region's tids.
 pub const PAGED_STEP_CLASS_FAMILY_IS_BOUNDED: () = {
-    let r = reserved_region("paged_step_class");
+    let r = Region::PagedStepClass.tids();
     assert!(
         paged_step_class_window_tid(
             PAGED_MAX_STEP_CLASSES - 1,
             PAGED_MAX_WINDOWS - 1,
-            // The family's LAST table in `paged_window_tid`'s own numbering (2, the mask
-            // stack) — the highest slot the tid mint admits for a class window.
-            PAGED_WINDOW_TABLES - 1
+            // The family's LAST table (the mask stack) — the highest slot the tid mint admits
+            // for a class window.
+            ClassWindowTable::Mask
         ) == r.floor(),
         "the last class's last window table is not the paged_step_class region's floor — the \
          region does not hold every class window the tid mint admits"
@@ -859,7 +931,7 @@ pub const SENTINELS_ARE_INSIDE_THEIR_REGION: () = {
     // ⛔ THE ONE-OFF SENTINELS ARE DECLARED SEPARATELY (`ROPE_P_TID` .. `IDENTITY_TID`), so the
     // region table would happily describe a span they had already outgrown. Adding a 20th sentinel
     // now fails the build instead of silently taking `scalarmul_scale_tid(0)`'s slot.
-    let r = reserved_region("sentinels");
+    let r = Region::Sentinels.tids();
     assert!(r.base == u32::MAX - 1, "sentinels start at MAX-1");
     assert!(
         IDENTITY_TID >= r.floor(),
@@ -897,11 +969,11 @@ pub const RESERVED_REGIONS_ARE_DISJOINT: () = {
 /// below the other reserved ids (u32::MAX-1..-6) with room for many distinct scales.
 ///
 /// [`BundleLayout::scalarmul_scales`]: crate::placement::BundleLayout::scalarmul_scales
-pub const SCALARMUL_SCALE_BASE: u32 = reserved_region("scalarmul_scale").base;
+pub const SCALARMUL_SCALE_BASE: u32 = Region::ScalarmulScale.tids().base;
 
 /// Reserved const TID for the `i`-th distinct ScalarMul scale.
 pub fn scalarmul_scale_tid(idx: usize) -> u32 {
-    reserved_region("scalarmul_scale").at(idx as u32)
+    Region::ScalarmulScale.tids().at(idx as u32)
 }
 
 /// Base of the RESERVED tid block for the RESIDENT per-layer Kᵀ kernel `kct` (the "kill the O(active)
@@ -913,12 +985,12 @@ pub fn scalarmul_scale_tid(idx: usize) -> u32 {
 /// compute the SAME kct tid with no layer-index handoff. A 1M gap below `DOWNPROJ_BLOCK_BASE` keeps it
 /// disjoint from the down_proj blocks (which descend only ~tens-of-K) AND from real source tids (~thousands).
 ///
-/// ⛔ ADDRESSED BY NAME. This was `RESERVED_REGIONS[2]`, and inserting the one-slot `kv_block_index`
-/// region above it made `kct_resident_tid(0)` return `KV_BLOCK_INDEX_TID` — see [`reserved_region`].
-pub const KCT_RESIDENT_BASE: u32 = reserved_region("kct_resident").base;
+/// ⛔ ADDRESSED BY ITS [`Region`]. A positional `RESERVED_REGIONS[2]` once made
+/// `kct_resident_tid(0)` return `KV_BLOCK_INDEX_TID` — see [`Region`].
+pub const KCT_RESIDENT_BASE: u32 = Region::KctResident.tids().base;
 /// Reserved tid for the resident per-layer Kᵀ kernel of the K-cache source tid `k_id`.
 pub fn kct_resident_tid(k_id: u32) -> u32 {
-    reserved_region("kct_resident").at(k_id)
+    Region::KctResident.tids().at(k_id)
 }
 
 /// Base of the RESERVED tid block for the HEAD-MAJOR o_proj weight copy (the "kill the 64-op
@@ -932,10 +1004,10 @@ pub fn kct_resident_tid(k_id: u32) -> u32 {
 /// layer-index handoff. A 1M region keeps it disjoint from `kct_resident` below and from real
 /// source tids (~thousands) — and unlike the kct region, only ~40 slots (one per layer) are ever
 /// taken.
-pub const OPROJ_HEADMAJOR_BASE: u32 = reserved_region("oproj_headmajor").base;
+pub const OPROJ_HEADMAJOR_BASE: u32 = Region::OprojHeadmajor.tids().base;
 /// Reserved tid for the head-major permuted copy of the o_proj weight with source tid `w_id`.
 pub fn oproj_headmajor_tid(w_id: u32) -> u32 {
-    reserved_region("oproj_headmajor").at(w_id)
+    Region::OprojHeadmajor.tids().at(w_id)
 }
 
 /// ⛔⛔⛔ THE REGRESSION THAT ADDING A REGION CAUSED, PINNED — a resident Kᵗ kernel and the gather's
@@ -960,22 +1032,22 @@ fn a_named_region_survives_an_insertion_above_it() {
     );
     assert_eq!(
         KCT_RESIDENT_BASE,
-        reserved_region("kct_resident").base,
+        Region::KctResident.tids().base,
         "KCT_RESIDENT_BASE names a different region than kct_resident_tid does"
     );
     assert_eq!(
         SCALARMUL_SCALE_BASE,
-        reserved_region("scalarmul_scale").base,
+        Region::ScalarmulScale.tids().base,
         "SCALARMUL_SCALE_BASE names a different region than scalarmul_scale_tid does"
     );
     // Every region this module has a door for, resolved by name and asserted to hold the tid that
     // door hands out — so a rename shows up here rather than as a neighbouring region's base.
     assert!(
-        reserved_region("kct_resident").floor() <= kct_resident_tid(999),
+        Region::KctResident.tids().floor() <= kct_resident_tid(999),
         "kct_resident_tid walked below its own region"
     );
     assert_eq!(
-        reserved_region("kv_block_index").at(0),
+        Region::KvBlockIndex.tids().at(0),
         KV_BLOCK_INDEX_TID,
         "the kv_block_index region's only slot is not KV_BLOCK_INDEX_TID"
     );
@@ -1000,8 +1072,8 @@ fn class_tids_keep_class_zero_on_the_sentinel_and_descend_their_own_regions() {
     for i in 0..8u32 {
         for j in 0..8u32 {
             assert_ne!(
-                reserved_region("rope_p_class").at(i),
-                reserved_region("identity_class").at(j),
+                Region::RopePClass.tids().at(i),
+                Region::IdentityClass.tids().at(j),
                 "rope class {i} and identity class {j} are one tid — two kernel tables share one \
                  placement"
             );
@@ -1011,7 +1083,7 @@ fn class_tids_keep_class_zero_on_the_sentinel_and_descend_their_own_regions() {
     // law is worth stating where the class scheme is defined). With 8 slots and class 0 on the
     // sentinel, classes 1..8 are the addressable ones.
     assert!(
-        rope_p_class_tid(8) >= reserved_region("rope_p_class").floor(),
+        rope_p_class_tid(8) >= Region::RopePClass.tids().floor(),
         "rope class 8 walked below the rope_p_class region"
     );
 }

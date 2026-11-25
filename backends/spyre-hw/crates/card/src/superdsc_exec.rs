@@ -931,7 +931,6 @@ impl<T: ktir_superdsc::collective::Tp> OpProg<T> {
             addr: None,
             collective,
             kv: OpKv {
-                page_fold: kv.page_fold,
                 // What sends the group's KV shift to zero — a bake fact, carried on the group.
                 gathered: kv.gathered,
                 walk: kv.walk,
@@ -957,6 +956,18 @@ impl<T: ktir_superdsc::collective::Tp> OpProg<T> {
 
 /// A launch sequence — a body rung, the prefix, the suffix, or a fold-fused twin.
 pub(crate) type Ops<T> = Vec<OpProg<T>>;
+
+/// ⭐ ONE RUNG OF A ROLLED BODY'S LADDER, AS THE EXECUTOR BINDS IT — the columns its body sweeps,
+/// one launch sequence per attention class, and the rung's per-class body records (each class's
+/// baked walk, `RungBody::walk`), so a rung's facts travel as one value.
+struct BoundRung<T: ktir_superdsc::collective::Tp> {
+    /// The columns one fold pass of this rung's body sweeps.
+    swept: SweptCols,
+    /// One launch sequence per attention class, in the meta's `bodies` order.
+    classes: Vec<Ops<T>>,
+    /// The rung's per-class body records, in the same order.
+    records: &'static [bundle::RungBody<'static>],
+}
 
 /// ⭐ THE H2D WINDOW AN ACTIVATION AT `[offset, offset + len)` GOES OUT IN — `offset` down to its
 /// page and the end up to its page cover, the host page law ([`PageExtent`], [`HOST_PAGE`]). Slicing
@@ -1313,9 +1324,10 @@ pub struct Executor<'a, 'c, T: ktir_superdsc::collective::Tp> {
     /// (every model but the hybrid-attention ones) has exactly one.
     body_ops: Vec<Ops<T>>,
     suffix_ops: Ops<T>,
-    /// sk_bucket LADDER (decode): `(active_cap, one ops list per class)` ascending; the top rung
-    /// is the full cap.
-    body_rungs: Vec<(SweptCols, Vec<Ops<T>>)>,
+    /// sk_bucket LADDER (decode): one [`BoundRung`] per rung, ascending; the top rung is the full
+    /// cap. Each rung's records carry each class's baked walk (`RungBody::walk`), which
+    /// [`StepBody::walks`] hands the host to stage at.
+    body_rungs: Vec<BoundRung<T>>,
 
     // ── Device state ──
     // ⛔ The `DevAddr`s below are leaked at shutdown by `impl Drop for Executor` — see the note on
@@ -1865,50 +1877,10 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
     }
 
     fn load_rolled(&mut self, m: &'static bundle::RerollMeta<'static>) -> Result<()> {
-        // A bank index the session has no region for would silently fall back to another bank's
-        // base, which is a whole program reading the wrong weights. Check every launch's bank and
-        // both seam groups at load.
-        let banks = self.weight_bank_bytes.len() + 1;
-        for (what, b) in [
-            ("prefix", m.prefix_weight_bank),
-            ("suffix", m.suffix_weight_bank),
-        ] {
-            if b as usize >= banks {
-                bail!(
-                    "load: reroll meta puts the {what}'s weights in bank {b}, but this bundle has \
-                     only {banks} weight bank(s)"
-                );
-            }
-        }
-        // ⛔ EVERY LAUNCH'S BANK AND BODY, CHECKED AT LOAD. A launch naming a body the meta does
-        // not carry, or a bank the bundle does not hold, is a bake/runtime disagreement that would
-        // otherwise surface as a wrong-base launch — fluent garbage or an unaddressable region.
-        // The launches' bodies also name the CLASS COUNT, which the rungs must agree with.
-        for l in m.launches.iter() {
-            if l.body as usize >= m.bodies.len() {
-                bail!(
-                    "load: reroll meta's launch table names body {} but the meta carries {} \
-                     body(ies)",
-                    l.body,
-                    m.bodies.len()
-                );
-            }
-            if l.w_bank as usize >= banks {
-                bail!(
-                    "load: reroll meta's launch table puts layer (body {}, iter {}) in bank {}, \
-                     but this bundle has only {banks} weight bank(s)",
-                    l.body,
-                    l.iter,
-                    l.w_bank
-                );
-            }
-        }
-        if m.launches.is_empty() {
-            bail!(
-                "load: reroll meta declares an EMPTY launch table — the layer sequence is the one \
-                 thing the executor cannot re-derive"
-            );
-        }
+        // ⛔ THE LAUNCH TABLE IS PLAYED AS BAKED. Every layer's body is one the meta carries and
+        // every bank (each layer's, the prefix's, the suffix's) one this bundle's layout holds — the
+        // bake's proof (`RerollMeta::launch_table_within`), run where the meta is minted beside this
+        // very layout, so nothing here re-checks it.
         self.rolled = Some(Rolled {
             n_bodies: m.bodies.len(),
             launches: m.launches.to_vec(),
@@ -1941,28 +1913,29 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
     /// names — the same rule the prefix/suffix follow. A single-class model's `bodies` is exactly
     /// `[self.code]`.
     fn load_bodies(&mut self) -> Result<()> {
-        // ⭐ A ROLLED BODY'S RUNGS COME OFF ITS LADDER (`RerollMeta::ladder`), the one reading the
-        // bake proves — never empty. Only an unrolled bundle, which carries no ladder, is ladderless.
+        // ⭐ A ROLLED BODY'S RUNGS COME OFF ITS LADDER (`RerollMeta::ladder`) — never empty, by type
+        // (`BakedLadder`). Only an unrolled bundle, which carries no ladder, is ladderless.
         let rungs: &[bundle::LadderRung<'static>] = match &self.code.reroll {
-            Some(m) => m
-                .ladder()
-                .map_err(|e| anyhow!("bundle {}: {e}", self.code.fp))?
-                .rungs(),
+            Some(m) => m.ladder().rungs(),
             None => &[],
         };
         // An UNROLLED bundle is its one body; a rolled one is its ladder, and runs only its rungs.
         if rungs.is_empty() {
             self.body_ops = vec![bind_ops(self.code, self.session())?];
         }
-        // The ladder came ASCENDING by `active_cap` from the emit, so it stays so. Each rung's
+        // The ladder ascends by `active_cap` by type (`BakedLadder`), so it stays so. Each rung's
         // class 0 body IS this bundle's rung sibling — the registry resolves like any other.
         for r in rungs {
             let bodies = r
                 .bodies
                 .iter()
-                .map(|fp| self.sibling_ops("decode rung", fp))
+                .map(|b| self.sibling_ops("decode rung", &b.body))
                 .collect::<Result<Vec<_>>>()?;
-            self.body_rungs.push((r.active_cap, bodies));
+            self.body_rungs.push(BoundRung {
+                swept: r.active_cap,
+                classes: bodies,
+                records: &r.bodies[..],
+            });
         }
         // ⛔⛔⛔ THE PROGRAM COUNT IS NOT A DEBUG DETAIL — IT IS WHETHER THIS MODEL COMPUTES.
         //
@@ -1980,7 +1953,7 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
             + self
                 .body_rungs
                 .iter()
-                .flat_map(|(_, classes)| classes.iter())
+                .flat_map(|r| r.classes.iter())
                 .map(|o| o.len())
                 .sum::<usize>();
         if n_body == 0 && self.prefix_ops.is_empty() && self.suffix_ops.is_empty() {
@@ -1997,7 +1970,7 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
                 self.code.fp,
             );
         }
-        let caps: Vec<u32> = self.body_rungs.iter().map(|(c, _)| c.get()).collect();
+        let caps: Vec<u32> = self.body_rungs.iter().map(|r| r.swept.get()).collect();
         info!(
             "[sdsc-superdsc] bundle {}: {n_body} body launch group(s) over {} rung(s) (active_cap \
              {caps:?}) + {} prefix + {} suffix",
@@ -3087,7 +3060,7 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
                 self.alloc_ops_at(ListSel::Body(c))?;
             }
             for i in 0..self.body_rungs.len() {
-                for c in 0..self.body_rungs[i].1.len() {
+                for c in 0..self.body_rungs[i].classes.len() {
                     self.alloc_ops_at(ListSel::Rung(i, c))?;
                 }
             }
@@ -3560,7 +3533,7 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
             ListSel::Prefix => &mut self.prefix_ops,
             ListSel::Body(c) => &mut self.body_ops[c],
             ListSel::Suffix => &mut self.suffix_ops,
-            ListSel::Rung(i, c) => &mut self.body_rungs[i].1[c],
+            ListSel::Rung(i, c) => &mut self.body_rungs[i].classes[c],
         }
     }
 
@@ -3571,7 +3544,7 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
             ListSel::Prefix => &self.prefix_ops,
             ListSel::Body(c) => &self.body_ops[c],
             ListSel::Suffix => &self.suffix_ops,
-            ListSel::Rung(i, c) => &self.body_rungs[i].1[c],
+            ListSel::Rung(i, c) => &self.body_rungs[i].classes[c],
         }
     }
 
@@ -3618,11 +3591,12 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
                 self.list(ls).iter().map(|o| o.kv.gathered),
             )
             .get();
-            folds_any |= self.list(ls).iter().any(|o| o.kv.page_fold);
+            folds_any |= self.list(ls).iter().any(|o| o.kv.page_fold());
         }
         Ok(StepBody {
             sel,
             swept: self.body_swept(sel),
+            walks: self.body_walks(sel),
             gathers: scratchy_target_spyre::wiring::GathersKv::of_launch_groups([gathers_any]),
             folds: folds_any,
             // The rung's op-local pin slots, the same layout's baked sum — every bundle of the
@@ -3646,7 +3620,17 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
     /// no sweep — there is no walk to stage for it, and none is made up).
     fn body_swept(&self, sel: BodySel) -> Option<SweptCols> {
         match sel {
-            BodySel::Rung(i) => Some(self.body_rungs[i].0),
+            BodySel::Rung(i) => Some(self.body_rungs[i].swept),
+            BodySel::Body => None,
+        }
+    }
+
+    /// THIS selection's per-class body records — its own ladder rung's, each carrying the walk its
+    /// class's step is staged at (`RungBody::walk`, minted at the bake). `None` for the ladderless
+    /// arm, which bakes no rung.
+    fn body_walks(&self, sel: BodySel) -> Option<&'static [bundle::RungBody<'static>]> {
+        match sel {
+            BodySel::Rung(i) => Some(self.body_rungs[i].records),
             BodySel::Body => None,
         }
     }
@@ -3667,26 +3651,18 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
     /// Select the decode body for a valid KV length of `valid_len` positions: the smallest rung whose
     /// `active_cap` ≥ it, which bounds the O(cap) attention sweep. Every body is allocated at prepare.
     fn select_body(&mut self, valid_len: i64) -> Result<BodySel> {
-        if self.body_rungs.is_empty() {
+        // The reroll alone says whether there is a ladder: the load binds `body_rungs` from exactly
+        // its ladder, which is never empty (`BakedLadder`), and an unrolled bundle carries none.
+        let Some(meta) = self.code.reroll.as_ref() else {
             // The ladderless single body — traced: an untraced return is indistinguishable from a
             // step that never reached the selector at all.
             self.trace_body("noladder", valid_len, 0);
             return Ok(BodySel::Body);
-        }
-        // ⭐ THE ONE SELECTION (`Ladder::rung_for`), which the bake ran over every position this bundle
-        // admits: the narrowest rung whose sweep covers `valid_len` (`SweptCols::covers`, never `>=` on
-        // bare integers — the sibling ladder is keyed by the batch WIDTH), else the baked fallback.
-        let Some(meta) = self.code.reroll.as_ref() else {
-            return Err(anyhow!(
-                "bundle {}: {} decode rung(s) and no ladder to select among them",
-                self.code.fp,
-                self.body_rungs.len()
-            ));
         };
-        let (at, rung) = meta
-            .ladder()
-            .map_err(|e| anyhow!("bundle {}: {e}", self.code.fp))?
-            .rung_for(valid_len.max(0) as u64);
+        // ⭐ THE ONE SELECTION (`Ladder::rung_for`): the narrowest rung whose sweep covers
+        // `valid_len` (`SweptCols::covers`, never `>=` on bare integers — the sibling ladder is keyed
+        // by the batch WIDTH), else the baked fallback.
+        let (at, rung) = meta.ladder().rung_for(valid_len.max(0) as u64);
         let variant = if rung.active_cap.covers(valid_len.max(0) as u64) {
             "rung"
         } else {
@@ -3839,7 +3815,7 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
                         off[SEG_KV.get()],
                         off[SEG_MASK.get()],
                         op.kv.gathered,
-                        op.kv.page_fold,
+                        op.kv.page_fold(),
                         op.label()
                     );
                     eprint!("{one}");
@@ -6600,6 +6576,7 @@ enum SuffixLaunch {
 pub struct StepBody {
     sel: BodySel,
     swept: Option<SweptCols>,
+    walks: Option<&'static [bundle::RungBody<'static>]>,
     gathers: scratchy_target_spyre::wiring::GathersKv,
     folds: bool,
     lx_op_local_bytes: u64,
@@ -6616,6 +6593,14 @@ impl StepBody {
     /// `None` for an unrolled bundle's body, which bakes no rung and so states no sweep.
     pub const fn swept(self) -> Option<SweptCols> {
         self.swept
+    }
+
+    /// ⭐ EACH CLASS'S WALK AT **THIS** BODY — its rung's baked records, one per class in the
+    /// wiring's class order (`RungBody::walk`, minted at the bake by `PagedStep::staged_walk`). The
+    /// host stages each class's step at its record and derives no walk. `None` for an unrolled
+    /// bundle's body, which bakes no rung and so states no walk.
+    pub const fn walks(self) -> Option<&'static [bundle::RungBody<'static>]> {
+        self.walks
     }
 
     /// ⭐ WHETHER **THIS** BODY READS ITS KV THROUGH A GATHERED SCRATCH — off the body's own launch

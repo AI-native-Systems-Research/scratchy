@@ -65,27 +65,26 @@ pub struct ProgramSpec {
 }
 
 /// One execution unit produced by [`plan_segments`]: either a fused run of
-/// consecutive non-attention nodes (run once at grid `[1,1]`, with intra-segment
-/// HBM edges forwarded as SSA) or a single attention node kept verbatim so the
-/// executor runs it across its NATIVE head-parallel grid.
+/// consecutive fusable nodes (run once at grid `[1,1]`, with intra-segment HBM
+/// edges forwarded as SSA) or a single node kept verbatim so the executor runs
+/// it across its NATIVE grid.
 ///
-/// Why the split: an attention node selects its head with
-/// `ktdp.get_compute_tile_id` against a grid like `[32,1]`/`[9,1]`. Collapsed
-/// into a single `[1,1]` function that primitive returns 0, so only head 0's
-/// slice is computed — the rest of the output rows stay whatever the input was.
-/// Running that node SEPARATELY at its native grid drives every head's core
-/// (the per-node multi-core SPMD path, verified correct), and threading the
-/// inter-segment tensors through HBM stitches the segments back together in
-/// program order.
+/// Why the split: a node whose body reads `ktdp.get_compute_tile_id` (or whose
+/// kind is a DOOR) cannot be collapsed into a `[1,1]` function — the tile-id
+/// primitive returns 0 there, so a work-divided body computes only core 0's
+/// blocks (see [`work_divided`]). Running that node SEPARATELY at its native
+/// grid drives every core the grid names (the per-node multi-core SPMD path,
+/// verified correct), and threading the inter-segment tensors through HBM
+/// stitches the segments back together in program order.
 #[derive(Clone, Debug)]
 pub enum Segment<'a> {
-    /// A fused function over a maximal run of consecutive non-attention nodes.
+    /// A fused function over a maximal run of consecutive fusable nodes.
     /// Its `func.grid` is `[1,1]`; the GPU GEMM reconstruction handles the
     /// token-parallel (`[8,1]`) matmul nodes folded in here by ignoring the SPMD
     /// grid and rebuilding the whole GEMM. Pointer args are named `%t<id>_ptr`.
     Fused(FusedSegment<'a>),
-    /// A single node the executor must run SEPARATELY from any fused run — an
-    /// attention node at its native multi-core grid (the `bindings` carry the
+    /// A single node the executor must run SEPARATELY from any fused run — a
+    /// work-divided node at its native multi-core grid (the `bindings` carry the
     /// original arg→tensor mapping the executor marshals), or a chained-head
     /// DOOR (#603) whose host implementation the resident substitutes by
     /// `program` kind.
@@ -241,33 +240,63 @@ pub fn node_partition_dims(func: &IRFunction, node: &NodeSpec) -> PartitionDims 
     PartitionDims { reads, writes }
 }
 
+/// ⭐ WORK DIVISION, READ OFF THE BODY — true iff the function's op stream
+/// (regions included) contains `ktdp.get_compute_tile_id`.
+///
+/// A pid-reading kernel's work is DIVIDED BY CORE, and the division is stated
+/// by the kernel's own lowering, not by this crate: `distribute_work` rewrites
+/// every `tt.get_program_id` into the work loop `scf.for %pid = %core_id to
+/// %num_blocks step %num_cores`, where `%core_id` is the tile id and
+/// `%num_cores` is the DEVICE's core count — a card constant (32), baked into
+/// the body because the card really does have that many cores. A body with no
+/// tile-id read is whole-work: any grid ≥ one core computes all of it (the
+/// token-parallel `[8,1]` matmul nodes are exactly this — their grid is
+/// redundant SPMD, which is why folding them at `[1,1]` is correct). A body
+/// WITH one walks `1/NC`-th of its blocks per core.
+///
+/// That is why such a node cannot be collapsed into a fused `[1,1]` segment:
+/// one core, tile id 0, step `NC` — the loop computes core 0's blocks only and
+/// the output keeps its seeded value everywhere else. MEASURED, gemma-4
+/// tiny-paged bundle `8e4a8ace`: the batch rung's sampler (grid `[32]`, one
+/// program per request row) fused into the tail `[1,1]` segment wrote row 0
+/// (correct, argmax 149) and left rows 1..31 at their zero seed — the solo
+/// rung (grid `[1]`) could never see it. Run at its NATIVE grid instead
+/// ([`Segment::Native`]): core `c` walks `pid = c, c+NC, …`, every block
+/// exactly once across the grid.
+pub fn work_divided(func: &IRFunction) -> bool {
+    func.ops_deep()
+        .iter()
+        .any(|op| op.op_type == OpKind::KtdpGetComputeTileId)
+}
+
 /// Partition `spec` into ordered execution segments: maximal runs of consecutive
-/// non-attention nodes fused into one `[1,1]` function each, with every
-/// attention node kept as its own [`Segment::Native`] to run at its native grid.
+/// fusable nodes fused into one `[1,1]` function each, with every node a law
+/// holds out (a DOOR, a work-divided body) kept as its own [`Segment::Native`]
+/// to run at its native grid.
 ///
 /// Each fused segment is fused with a segment-LOCAL `ProgramSpec` whose
 /// `sources`/`results` are widened to pin every tensor that crosses the
 /// segment's boundary (read from another segment / a true source, or written
 /// for another segment / a true result) as an HBM pointer arg. Only edges
 /// internal to the run forward as SSA / `extract_slice`; boundary edges stay HBM
-/// so the caller can thread them between segments and the native attention nodes.
+/// so the caller can thread them between segments and the native nodes.
 ///
 /// The returned segments execute in order; the caller marshals one HBM buffer
 /// per tensor id, runs each segment (fused via the interpreter at `[1,1]`,
 /// native at its grid), and copies every output buffer forward — exactly the
-/// proven per-node threading, just with non-attention runs collapsed.
+/// proven per-node threading, just with fusable runs collapsed.
 pub fn plan_segments<'a>(
     a: &'a Arena,
     module: &IRModule<'a>,
     spec: &ProgramSpec,
 ) -> Result<Vec<Segment<'a>>, String> {
-    // No LX budget: maximal-fuse every non-attention run (the historical behavior;
+    // No LX budget: maximal-fuse every fusable run (the historical behavior;
     // the optimizer's own unit tests use this).
     plan_segments_budgeted(a, module, spec, usize::MAX, &HashMap::new())
 }
 
 /// Like [`plan_segments`], but bounds each FUSED segment's peak LX live-set to
-/// `lx_budget` bytes — splitting a maximal non-attention run into several fused
+/// `lx_budget` bytes — splitting a maximal fusable run into several fused
 /// segments when its co-resident `[m, *]` intermediates would overflow LX.
 /// `tensor_bytes[id]` is a tensor's LX footprint (numel × storage-dtype bytes).
 ///
@@ -283,26 +312,39 @@ pub fn plan_segments_budgeted<'a>(
     lx_budget: usize,
     tensor_bytes: &HashMap<u64, usize>,
 ) -> Result<Vec<Segment<'a>>, String> {
-    // Per-node DOOR classification (the chained head, #603). A door node's KTIR
-    // body is a STRUCTURAL SKELETON minted for the card-side door assembly — a
-    // load of the first operand's view and a store to the last — not door
-    // semantics, so executing it op by op inside a fused function computes a
-    // copy, not the door. Isolated as its own `Segment::Native` (the same law
-    // so the resident executor can substitute the host door, keyed on the
-    // node's CARRIED `program` kind — the mint's one statement of the fact,
-    // never the func name (the spelling this crate retired). NO opt-out: the
-    // door's decomposed path is the missing-Strides refusal, not an oracle, so
-    // there is nothing sound to fall back to.
-    let door: Vec<bool> = spec
+    // Per-node NATIVE classification — the two laws that say a node cannot be
+    // collapsed into a fused `[1,1]` function:
+    //
+    // 1. THE DOOR (the chained head, #603). A door node's KTIR body is a
+    //    STRUCTURAL SKELETON minted for the card-side door assembly — a load of
+    //    the first operand's view and a store to the last — not door semantics,
+    //    so executing it op by op inside a fused function computes a copy, not
+    //    the door. Isolated as its own `Segment::Native` (the same law so the
+    //    resident executor can substitute the host door, keyed on the node's
+    //    CARRIED `program` kind — the mint's one statement of the fact, never
+    //    the func name (the spelling this crate retired). NO opt-out: the
+    //    door's decomposed path is the missing-Strides refusal, not an oracle,
+    //    so there is nothing sound to fall back to.
+    // 2. WORK DIVISION ([`work_divided`]). A node whose body reads the
+    //    compute-tile id has its blocks divided across cores by its own
+    //    lowering (the `scf.for` step is the device core count), so a `[1,1]`
+    //    fused execution computes core 0's blocks only. It must run at its
+    //    NATIVE grid, where the grid's cores together walk every block. Read
+    //    off the body's ops — no kernel, model or shape knowledge; the sampler
+    //    (one program per request row) is the production case.
+    let native: Vec<bool> = spec
         .nodes
         .iter()
         .map(|n| {
-            matches!(
+            if matches!(
                 n.program,
                 Program::EmbedRowGather { .. } | Program::ChainStage { .. }
-            )
+            ) {
+                return Ok(true);
+            }
+            Ok(work_divided(module.get_function(&n.func)?))
         })
-        .collect();
+        .collect::<Result<_, String>>()?;
 
     // For widening segment-local sources/results: which node indices produce /
     // consume each tensor, across the WHOLE program.
@@ -329,15 +371,15 @@ pub fn plan_segments_budgeted<'a>(
     let mut segments: Vec<Segment> = Vec::new();
     let mut i = 0;
     while i < spec.nodes.len() {
-        if door[i] {
+        if native[i] {
             segments.push(Segment::Native(spec.nodes[i].clone()));
             i += 1;
             continue;
         }
-        // Maximal run [start, j) of consecutive non-door nodes.
+        // Maximal run [start, j) of consecutive fusable nodes.
         let start = i;
         let mut j = i;
-        while j < spec.nodes.len() && !door[j] {
+        while j < spec.nodes.len() && !native[j] {
             j += 1;
         }
         // Split the maximal run into sub-runs that each fit the LX live-set
@@ -1220,6 +1262,47 @@ mod tests {
         (func, in_ssa, out_ssa)
     }
 
+    /// A WORK-DIVIDED node — the folded single-trip form the ladder mints for a
+    /// pid-reading kernel at a grid of one work item per core (`distribute_work`
+    /// plants the landmark, `fold_grid_work_loop` inlines the loop and makes the
+    /// induction variable the landmark itself): the compute-tile id addresses
+    /// the access tiles directly, exactly the sampler's `[pid, 0]` loads at
+    /// grid `[rows]`. Its work is divided across the grid's cores.
+    fn work_divided_node(name: &str, shape: i64) -> (IRFunction<'static>, Ssa, Ssa) {
+        let mut ops = Ops::new();
+        let mk_view = |ops: &mut Ops, res: &'static str, arg: &'static str| {
+            let o = ops.op(Some(res), OpKind::KtdpConstructMemoryView, &[arg]);
+            let o = ops.attr(o, AttrKey::Shape, ops.int_list(vec![shape]));
+            let o = ops.attr(o, AttrKey::Strides, ops.int_list(vec![1]));
+            let o = ops.attr(o, AttrKey::MemorySpace, Attr::Str("HBM"));
+            ops.attr(o, AttrKey::Dtype, Attr::Dtype(DType::F16))
+        };
+        let mk_tile = |ops: &mut Ops, res: &'static str, view: &'static str| {
+            // The tile's index IS the landmark — core c's slice of the view.
+            let o = ops.op(Some(res), OpKind::KtdpConstructAccessTile, &[view, "%ctid"]);
+            ops.attr(o, AttrKey::Shape, ops.int_list(vec![shape]))
+        };
+        let body = vec![
+            ops.op(Some("%ctid"), OpKind::KtdpGetComputeTileId, &[]),
+            mk_view(&mut ops, "%vin", "%in"),
+            mk_tile(&mut ops, "%tin", "%vin"),
+            ops.op(Some("%loaded"), OpKind::KtdpLoad, &["%tin"]),
+            mk_view(&mut ops, "%vout", "%out"),
+            mk_tile(&mut ops, "%tout", "%vout"),
+            ops.op(None, OpKind::KtdpStore, &["%loaded", "%tout"]),
+            ops.op(None, OpKind::FuncReturn, &[]),
+        ];
+        let in_ssa = ops.ssa("%in");
+        let out_ssa = ops.ssa("%out");
+        let func = ops.func(
+            name,
+            &[("%in", IrType::Index), ("%out", IrType::Index)],
+            body,
+            (32, 1, 1),
+        );
+        (func, in_ssa, out_ssa)
+    }
+
     /// Consumer that reads a contiguous sub-tile of `%in` at a dynamic offset
     /// (`construct_access_tile %vin[%c0]`, identity base_map) — the tiled edge
     /// forwards via `tensor.extract_slice`. Produces a `tile`-sized result
@@ -1606,5 +1689,39 @@ mod tests {
             vec![1, 4],
             "intra-run edges forwarded: {tensor_ids:?}"
         );
+    }
+
+    #[test]
+    fn plan_isolates_work_divided_node_into_native_segment() {
+        // a -> b -> c where b's body reads the compute-tile id (the folded
+        // single-trip work loop — the sampler's own minted form): b's blocks are
+        // divided across its grid's cores, so collapsing it into a `[1,1]` fused
+        // function would compute core 0's blocks only. The planner isolates it
+        // Native — read off the body's ops, the same law the resident's Native
+        // arm executes at the node's own grid.
+        let (fa, a_in, a_out) = copy_node("a", 16, true);
+        let (fb, b_in, b_out) = work_divided_node("b", 16);
+        let (fc, c_in, c_out) = copy_node("c", 16, true);
+        let m = module(vec![fa, fb, fc]);
+        let spec = three_node_spec(a_in, a_out, b_in, b_out, c_in, c_out);
+        assert!(
+            !work_divided(&fa),
+            "a whole-work body does not read the tile id"
+        );
+        assert!(work_divided(&fb), "b's body reads the tile id");
+        let segs = plan_segments(Arena::global(), &m, &spec).unwrap();
+        assert_eq!(
+            segs.len(),
+            3,
+            "the work-divided node breaks the run: [fused a], [native b], [fused c]"
+        );
+        match &segs[1] {
+            Segment::Native(n) => {
+                assert_eq!(n.func, "b", "the work-divided node stays native")
+            }
+            _ => panic!("expected the work-divided node in a native segment, never fused"),
+        }
+        assert!(matches!(segs[0], Segment::Fused(_)), "node a fused");
+        assert!(matches!(segs[2], Segment::Fused(_)), "node c fused");
     }
 }

@@ -43,14 +43,17 @@ use scratchy_target_spyre::lower_subtile_tape_to_superdsc as superdsc;
 
 /// The extent pair every lowering call here states for its graph: one request of the
 /// graph's own `m` rows — the S=1 prefill pair. None of these graphs carries an
-/// `AttnDecode`; the pair still must describe the graph it is handed, and it does.
-fn superdsc_pair_of_one_request(m: u32) -> ktir_superdsc::sdsc_abstract::QueryExtent {
-    ktir_superdsc::sdsc_abstract::QueryExtent::of_baked_rung(
+/// `AttnDecode`; the pair still must describe the graph it is handed, and the bake's own mint
+/// ([`scratchy_triton_splice::GraphExtent::of`]) proves it does.
+fn superdsc_pair_of_one_request(ir: &SubtileIR, m: u32) -> scratchy_triton_splice::GraphExtent {
+    let pair = ktir_superdsc::sdsc_abstract::QueryExtent::of_baked_rung(
         ktir_superdsc::sdsc_abstract::RungWidth::of_baked_rows(m)
             .expect("the fixture's row count is nonzero"),
         ktir_superdsc::sdsc_abstract::RungCap::ONE,
     )
-    .expect("one request's rows fit a u32")
+    .expect("one request's rows fit a u32");
+    scratchy_triton_splice::GraphExtent::of(ir, pair, false)
+        .unwrap_or_else(|e| panic!("one request of {m} row(s) describes the fixture: {e}"))
 }
 
 // ── FIXTURES ────────────────────────────────────────────────────────────────────
@@ -273,7 +276,7 @@ fn windowed_rmsnorm_matches_the_unfused_sandwich() {
                     false,
                     // One request of the graph's m rows — the S=1 prefill pair (no
                     // AttnDecode here; the pair still states what the graph is).
-                    superdsc_pair_of_one_request(m),
+                    superdsc_pair_of_one_request(&ir, m),
                 )
                 .unwrap_or_else(|e| panic!("lower the sandwich (m={m}, H={heads}, D={d}): {e:?}"));
             let windowed: Vec<&str> = ops
@@ -384,7 +387,7 @@ fn a_whole_row_rmsnorm_never_enters_the_windowed_path() {
         &weight_ids,
         superdsc::ActiveCap::FULL,
         false,
-        superdsc_pair_of_one_request(m),
+        superdsc_pair_of_one_request(&ir, m),
     )
     .expect("lower the granite-shaped norm");
     for e in &ops {
@@ -426,7 +429,7 @@ fn an_extra_consumer_of_the_split_refuses_the_fusion() {
                 &weight_ids,
                 superdsc::ActiveCap::FULL,
                 false,
-                superdsc_pair_of_one_request(m),
+                superdsc_pair_of_one_request(&ir, m),
             )
             .expect("lower the refused sandwich");
         // NO windowed program was minted...

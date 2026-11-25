@@ -22,7 +22,9 @@
 //! - The pattern is a real match pattern, so an elementwise kind (`Elementwise(EwKind::Silu)`) is
 //!   a row in its own right rather than a special case the consumer has to unpack.
 //! - `arity` is a closure-form predicate over the operand count (the binder is declared IN the
-//!   row so macro hygiene ties it to the body).
+//!   row so macro hygiene ties it to the body). An optional second binder, `(|n, op| …)`, names
+//!   the op itself, for an op whose operand count is a function of its own fields (a matmul's
+//!   weight scheme states its [`crate::subtile_ir::MatmulLayout`]).
 //! - `cols` is one of (bracketed so it stays one macro token tree):
 //!   - `[in0]` — shape-preserving: output width = `inputs[0]` width;
 //!   - `[in1]` — output width = `inputs[1]` width (GDN's z operand);
@@ -80,9 +82,11 @@
 macro_rules! for_each_subop {
     ($cb:ident) => {
         $cb! {
-            // 2 = [act, W] fp16 / affine; 3 = [act, W, w_scale] fp8 W8A8.
-            MatmulTile [SubOp::MatmulTile { .. }] arity = (|n| n == 2 || n == 3),
-                cols = [field n], rows = [in0], gemm_w = [in 1], tp = [contract];
+            // The weight scheme's own layout (`MatmulLayout::of`): `[act, W]`, plus `w_scale`
+            // for fp8 W8A8.
+            MatmulTile [SubOp::MatmulTile { .. }]
+                arity = (|n, op| matches!(op.matmul(), Some(l) if l.arity() == n)),
+                cols = [field n], rows = [in0], gemm_w = [matmul], tp = [contract];
             SumReduce [SubOp::SumReduce { .. }] arity = (|n| n >= 1), cols = [in0], rows = [in0],
                 gemm_w = [none], tp = [linear];
             // The one op with its own row scale: `m · mult / div`, stated by its payload.
@@ -118,18 +122,16 @@ macro_rules! for_each_subop {
                 rows = [in0], gemm_w = [none], tp = [rowwise];
             RopeRotate [SubOp::RopeRotate { .. }] arity = (|n| n == 3), cols = [in0], rows = [in0],
                 gemm_w = [none], tp = [heads];
-            // E.12: RopeAppend takes [K, cos, sin, V, K_cache, V_cache]
-            // — the caches are per-layer PrefixK / PrefixV sources used
-            // as TMA-store destinations for the new decode token's K/V.
-            RopeAppend [SubOp::RopeAppend { .. }] arity = (|n| n == 6), cols = [in0], rows = [in0],
-                gemm_w = [none], tp = [heads];
-            // `[K, V, K_cache, V_cache]`: the un-rotated writer.
-            KvAppend [SubOp::KvAppend { .. }] arity = (|n| n == 4), cols = [in0], rows = [in0],
-                gemm_w = [none], tp = [heads];
-            // `[Q, (K_seg, V_seg)...]`, optionally with a trailing
-            // `[num_heads]` sinks weight source (gpt-oss attention
-            // sinks — a 6th input read as a weight, not a K/V pair).
-            AttnDecode [SubOp::AttnDecode { .. }] arity = (|n| (n >= 3 && n % 2 == 1) || n == 6),
+            // The KV writers' arities are their layouts' (`KvWriterLayout`); the caches are
+            // per-layer PrefixK / PrefixV sources the new token's K/V land in.
+            RopeAppend [SubOp::RopeAppend { .. }]
+                arity = (|n| n == $crate::subtile_ir::KvWriterLayout::ROPE_APPEND.arity()),
+                cols = [in0], rows = [in0], gemm_w = [none], tp = [heads];
+            KvAppend [SubOp::KvAppend { .. }]
+                arity = (|n| n == $crate::subtile_ir::KvWriterLayout::KV_APPEND.arity()),
+                cols = [in0], rows = [in0], gemm_w = [none], tp = [heads];
+            // The layout's own law (`AttnLayout::of_arity`).
+            AttnDecode [SubOp::AttnDecode { .. }] arity = (|n| $crate::subtile_ir::AttnLayout::of_arity(n).is_some()),
                 cols = [q_width_masked attention mask], rows = [in0], gemm_w = [none], tp = [heads];
             TanhSoftCap [SubOp::TanhSoftCap { .. }] arity = (|n| n == 1), cols = [in0],
                 rows = [in0], gemm_w = [none], tp = [pointwise];
@@ -400,14 +402,19 @@ macro_rules! __out_rows_body {
 }
 
 // ── Derived: the gemm-weight operand ───────────────────────────────
-// One class pair: `[in k]` names operand k as the op's GEMM WEIGHT, `[none]` says it has none.
-// The arm's pattern is the row's own `$pat` — no field of the op keys the fact.
+// The classes: `[in k]` names operand k as the op's GEMM WEIGHT, `[none]` says it has none, and
+// `[matmul]` reads the matmul's own layout (`MatmulLayout::weight`), the one statement of where
+// a matmul keeps its weight. `$op` is the method's own `self`, passed in so hygiene ties it to the
+// method.
 macro_rules! __gemm_w_body {
-    ([none]) => {
+    ([none], $op:tt) => {
         None
     };
-    ([in $i:literal]) => {
+    ([in $i:literal], $op:tt) => {
         Some($i)
+    };
+    ([matmul], $op:tt) => {
+        $op.matmul().map(|l| l.weight())
     };
 }
 
@@ -441,15 +448,15 @@ macro_rules! __tp_body {
 }
 
 macro_rules! __derive_registry {
-    ($( $kind:ident [$pat:pat] arity = (|$an:ident| $arity:expr), cols = $cols:tt,
-        rows = $rows:tt, gemm_w = $gw:tt, tp = $tp:tt; )*
-     @expansion $( $ek:ident [$ep:pat] arity = (|$ean:ident| $ea:expr), cols = $ec:tt,
-        rows = $erc:tt, gemm_w = $egw:tt, tp = $etp:tt; )*) => {
+    ($( $kind:ident [$pat:pat] arity = (|$an:ident $(, $aop:ident)?| $arity:expr),
+        cols = $cols:tt, rows = $rows:tt, gemm_w = $gw:tt, tp = $tp:tt; )*
+     @expansion $( $ek:ident [$ep:pat] arity = (|$ean:ident $(, $eaop:ident)?| $ea:expr),
+        cols = $ec:tt, rows = $erc:tt, gemm_w = $egw:tt, tp = $etp:tt; )*) => {
         __derive_registry! {
-            $( $kind [$pat] arity = (|$an| $arity), cols = $cols, rows = $rows, gemm_w = $gw,
-                tp = $tp; )*
-            $( $ek [$ep] arity = (|$ean| $ea), cols = $ec, rows = $erc, gemm_w = $egw,
-                tp = $etp; )*
+            $( $kind [$pat] arity = (|$an $(, $aop)?| $arity), cols = $cols, rows = $rows,
+                gemm_w = $gw, tp = $tp; )*
+            $( $ek [$ep] arity = (|$ean $(, $eaop)?| $ea), cols = $ec, rows = $erc,
+                gemm_w = $egw, tp = $etp; )*
         }
 
         /// Every op an arch-level construct expands to, as ONE match pattern (use it with
@@ -461,8 +468,8 @@ macro_rules! __derive_registry {
             };
         }
     };
-    ($( $kind:ident [$pat:pat] arity = (|$an:ident| $arity:expr), cols = $cols:tt,
-        rows = $rows:tt, gemm_w = $gw:tt, tp = $tp:tt; )*) => {
+    ($( $kind:ident [$pat:pat] arity = (|$an:ident $(, $aop:ident)?| $arity:expr),
+        cols = $cols:tt, rows = $rows:tt, gemm_w = $gw:tt, tp = $tp:tt; )*) => {
         /// An op without its fields: how a declared target table names an op. Derived from the
         /// registry, so no table keeps a parallel list.
         #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -494,7 +501,7 @@ macro_rules! __derive_registry {
             pub fn arity_ok(&self, n_operands: usize) -> bool {
                 use $crate::subtile_ir::{EwKind, SubOp};
                 match self {
-                    $( $pat => { let $an = n_operands; $arity } )*
+                    $( $pat => { let $an = n_operands; $( let $aop = self; )? $arity } )*
                 }
             }
 
@@ -541,7 +548,7 @@ macro_rules! __derive_registry {
             pub fn gemm_weight_input(&self) -> Option<usize> {
                 use $crate::subtile_ir::{EwKind, SubOp};
                 match self {
-                    $( $pat => __gemm_w_body!($gw), )*
+                    $( $pat => __gemm_w_body!($gw, self), )*
                 }
             }
 

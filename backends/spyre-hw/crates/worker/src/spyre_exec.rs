@@ -139,13 +139,13 @@ impl Worker for SpyreWorker {
     }
 
     /// ⭐ THE POOL'S PAGE COUNT, so every block id the scheduler hands out is a page this pool has —
-    /// every page but the null page a padded row writes (`paged_step::page_of_block`). The pool is the
+    /// every page but the null page a padded row writes (`paged_step::PoolPage::NULL`). The pool is the
     /// bake's: every bundle places it, at the decode wiring's `PagedStep::pages` (the classes share
     /// one pool, refused at the mint, so the first step's count is every class's).
     fn kv_cache_num_blocks_override(&self) -> Option<usize> {
         self.model
             .as_ref()
-            .and_then(|m| m.decode.first())
+            .map(|m| m.decode.narrowest())
             .and_then(|b| {
                 #[cfg(feature = "spyre-hw")]
                 {
@@ -313,13 +313,9 @@ impl Worker for SpyreWorker {
                             })
                     })
                     .collect::<ExecutorResult<_>>()?;
-                let blocks: Vec<u32> = input_batch
+                let blocks = input_batch
                     .block_table(&nr.req_id)
-                    .map(|t| {
-                        t.iter()
-                            .map(|&b| scratchy_target_spyre::paged_step::page_of_block(b as u32))
-                            .collect()
-                    })
+                    .map(scratchy_target_spyre::paged_step::request_pages)
                     .unwrap_or_default();
                 wave.push(PackedTail {
                     id: nr.req_id.clone(),
@@ -393,9 +389,10 @@ impl Worker for SpyreWorker {
                 .copied()
                 .unwrap_or(0);
             let start = cr.num_computed_tokens.get(i).copied().unwrap_or(0) as usize;
-            if n <= 1 || !requests.contains_key(id) {
+            // The request bound ONCE: the guard and the draw read the same lookup.
+            let Some(req) = requests.get(id).filter(|_| n > 1) else {
                 continue;
-            }
+            };
             let prompt_len = input_batch.prompt_len(id);
             let toks: Vec<usize> = (start..start + n)
                 .map(|p| {
@@ -405,15 +402,11 @@ impl Worker for SpyreWorker {
                         .ok_or_else(|| werr(format!("prefill wave: req {id} has no token at {p}")))
                 })
                 .collect::<ExecutorResult<_>>()?;
-            let blocks: Vec<u32> = input_batch
+            let blocks = input_batch
                 .block_table(id)
-                .map(|t| {
-                    t.iter()
-                        .map(|&b| scratchy_target_spyre::paged_step::page_of_block(b as u32))
-                        .collect()
-                })
+                .map(scratchy_target_spyre::paged_step::request_pages)
                 .unwrap_or_default();
-            let draw = requests.get(id).expect("checked contains_key").draw;
+            let draw = req.draw;
             wave.push(PackedTail {
                 id: id.clone(),
                 start,
@@ -439,7 +432,7 @@ impl Worker for SpyreWorker {
             while rest.len() >= 2 {
                 let widest = rest[0].toks.len();
                 let SendnnSession::SuperDsc(sb) = &mut model.session;
-                let Some((rung, seats)) = sb.prefill_prefix.packed_fill(widest, rest.len()) else {
+                let Some((rung, seats)) = sb.packed.packed_fill(widest, rest.len()) else {
                     break;
                 };
                 let sh = Shared {
@@ -450,7 +443,7 @@ impl Worker for SpyreWorker {
                 let SendnnSession::SuperDsc(sb) = &mut model.session;
                 let (group, tail) = rest.split_at(seats);
                 let picks =
-                    superdsc_forward_packed(&sh, &mut sb.prefill_prefix, rung, group, input_batch)?;
+                    superdsc_forward_packed(&sh, &mut sb.packed, rung, group, input_batch)?;
                 for (t, pick) in group.iter().zip(picks) {
                     order.push(t.id.clone());
                     sampled.push(pick);
@@ -620,18 +613,12 @@ impl Worker for SpyreWorker {
                 // this step decodes — its token count before the step. The paged step's tables are
                 // built from exactly these; a padding slot writes the null slot and is read by
                 // nobody.
-                let blocks: Vec<Vec<u32>> = decode_ids
+                let blocks: Vec<Vec<scratchy_target_spyre::paged_step::PoolPage>> = decode_ids
                     .iter()
                     .map(|(id, _)| {
                         input_batch
                             .block_table(id)
-                            .map(|t| {
-                                t.iter()
-                                    .map(|&b| {
-                                        scratchy_target_spyre::paged_step::page_of_block(b as u32)
-                                    })
-                                    .collect()
-                            })
+                            .map(scratchy_target_spyre::paged_step::request_pages)
                             .unwrap_or_default()
                     })
                     .collect();
@@ -640,66 +627,56 @@ impl Worker for SpyreWorker {
                 // pick, uncollected, and reading it is exactly the fence the seed law deletes. On
                 // churn the drain above has already collected, so `token_at(id, start)` answers:
                 // a FRESH row's prompt-final token, or a continuing row's just-collected pick.
-                let mut toks: Vec<usize> = Vec::with_capacity(decode_ids.len());
-                // ⭐ THE LIVE ROWS' DRAWS, one per live slot, in slot order, so a law can never
-                // describe another request's row.
-                let mut draws: Vec<Option<&SampledDraw>> = Vec::with_capacity(decode_ids.len());
-                for (id, start) in &decode_ids {
+                //
+                // ⭐ ONE RECORD PER LIVE ROW, in slot order — its pages and position, its request's
+                // draw and (churned) its seed — so no law or seed can describe another row.
+                let mut churned_rows: Vec<crate::card::forward::DecodeRow<'_, usize>> =
+                    Vec::new();
+                let mut stable_rows: Vec<crate::card::forward::DecodeRow<'_, ()>> = Vec::new();
+                for ((id, start), b) in decode_ids.iter().zip(&blocks) {
                     let req = requests
                         .get(id)
                         .ok_or_else(|| werr(format!("unknown cached req {id}")))?;
-                    draws.push(req.draw.as_ref());
-                    if churned {
-                        let tok = input_batch.token_at(id, *start).ok_or_else(|| {
-                            werr(format!("decode: req {id} has no token at {start}"))
-                        })? as usize;
-                        toks.push(tok);
-                    }
-                }
-                let seqs_in: Vec<scratchy_target_spyre::paged_step::BatchSeq<'_>> = decode_ids
-                    .iter()
-                    .zip(&blocks)
-                    .map(
-                        |((_, start), b)| scratchy_target_spyre::paged_step::BatchSeq {
+                    let (seq, draw) = (
+                        scratchy_target_spyre::paged_step::BatchSeq {
                             blocks: b,
                             pos: *start,
                         },
-                    )
-                    .collect();
+                        req.draw.as_ref(),
+                    );
+                    if churned {
+                        let seed = input_batch.token_at(id, *start).ok_or_else(|| {
+                            werr(format!("decode: req {id} has no token at {start}"))
+                        })? as usize;
+                        churned_rows.push(crate::card::forward::DecodeRow { seq, draw, seed });
+                    } else {
+                        stable_rows.push(crate::card::forward::DecodeRow {
+                            seq,
+                            draw,
+                            seed: (),
+                        });
+                    }
+                }
                 // Every decode rung is a decode batch (`batched_decode_head_major`), the W=1 seat
                 // one sequence of it: spyre-inference's sequence buckets start at 1.
-                let rows_in = LaunchRows::Batch { seqs: &seqs_in };
+                let rows_in = LaunchRows::Batch(if churned {
+                    crate::card::forward::DecodeRows::Churned(&churned_rows)
+                } else {
+                    crate::card::forward::DecodeRows::Stable(&stable_rows)
+                });
                 // ⭐ THE ONE DECODE PATH, SUBMITTED: every row is a different request and every row
                 // is sampled ON THE CARD by the rung's minted sampler; the idx stick's raw D2H is
                 // enqueued and comes back through the SAME collect door whether this schedule
                 // defers it to the drain or collects it right here.
-                let sub = match run_card_launch(
+                let sub = run_card_launch::<crate::card::forward::Decode>(
                     rows_in,
                     &sh,
                     sess,
                     // The one-request decode's wiring: every rung is the same tape at its own rows,
                     // binding the same tensor ids.
-                    model.decode.last().expect("at least one decode bucket"),
+                    model.decode.widest(),
                     seqs,
-                    SamplerLaws {
-                        seeds: if churned {
-                            ktir_superdsc::sdsc_abstract::SeedSource::Host(&toks)
-                        } else {
-                            ktir_superdsc::sdsc_abstract::SeedSource::OnCard
-                        },
-                        want_logits: LogitsWanted::PerRequestDeferred,
-                        laws: SeatLaws::Batch { draws: &draws },
-                    },
-                )? {
-                    BatchOut::Deferred(sub) => sub,
-                    BatchOut::Done(_) => {
-                        return Err(werr(
-                            "decode: the rung finished in-call — the deferred arm is the only \
-                             decode path"
-                                .to_string(),
-                        ));
-                    }
-                };
+                )?;
                 // ⭐ #32 (c4) — THE STEP IS SUBMITTED; its collect is QUEUED, not run. Everything
                 // the drain needs rides in `InFlightDecode` — per live row, in `decode_ids` order,
                 // the request, its position and the launch slot its token lands in.

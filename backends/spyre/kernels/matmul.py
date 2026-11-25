@@ -16,10 +16,10 @@ THE SPLICE'S OWN CONTRACT (what `scratchy-triton-splice` states about this kerne
   `matmul_fp8.py` (the activation-quantize dedup the old note here called a
   bundle-level blocker lives in the DOOR, downstream of both producers — see
   the splice module header).
-* CONSTEXPRS: `M`, `K`, `N`, `BLOCK_M`, `BLOCK_K`, `BLOCK_N`, `M_TOTAL` — stated by
-  the splice from the node's own regions (`A is [M, K]`, the out tile is `[M, N]`,
-  all blocks the whole extents — ONE tile, the same whole-region law
-  main's `KtirFunc::matmul` states).
+* CONSTEXPRS: `M`, `K`, `N`, `BLOCK_M`, `BLOCK_K`, `BLOCK_N`, `M_TOTAL`,
+  `N_TOTAL`, `C_START` — stated by the splice from the node's own regions
+  (`A is [M, K]`, the out tile is `[M, N]`, all blocks the whole extents — ONE
+  tile, the same whole-region law main's `KtirFunc::matmul` states).
 * GRID: `[1]`.
 
 THE ORIENTATION: the weight descriptor is the PRESENTED weight's own on-disk `[n, k]`
@@ -73,6 +73,8 @@ def matmul_fwd(desc_a, desc_w, desc_o,  #
                BLOCK_K: tl.constexpr,  #
                BLOCK_N: tl.constexpr,  #
                M_TOTAL: tl.constexpr,  #
+               N_TOTAL: tl.constexpr,  #
+               C_START: tl.constexpr,  #
                ):
     start_m = tl.program_id(0)
     # Descriptors, not pointer blocks (swiglu delta 3). The W descriptor is the
@@ -81,29 +83,37 @@ def matmul_fwd(desc_a, desc_w, desc_o,  #
     # (`tt.trans` directly over the load), which `dot_to_linalg` folds into the
     # transpose-B indexing maps — the same maps main's `KtirFunc::matmul` states over the
     # same bytes.
-    # ⛔ THE DESCRIPTOR NAMES THE STORAGE, THE STORE NAMES THE WINDOW — the out
-    # descriptor's shape is the OUTPUT TENSOR's `[M_TOTAL, N]` (the storage the
-    # layout reserved, N the device width), while the store takes the `[M, N]`
-    # tile at row 0: the prefill lm-head fold re-lowers the tail at m=S over the
-    # LAST_HIDDEN staging, and its output is the `[S, vocab]` prefix of the
-    # `[mq, vocab]` logits storage (row 0 alone at S = 1). A whole-region node
-    # states `M_TOTAL = M`, so nothing changes for it.
+    # ⛔ THE DESCRIPTOR NAMES THE STORAGE, THE STORE NAMES THE WINDOW — in BOTH
+    # axes. The out descriptor's shape is the OUTPUT TENSOR's `[M_TOTAL, N_TOTAL]`
+    # with row stride `N_TOTAL` (the storage the layout reserved), while the store
+    # takes the `[M, N]` tile at `[0, C_START]`. Rows: the prefill lm-head fold
+    # re-lowers the tail at m=S over the LAST_HIDDEN staging, and its output is
+    # the `[S, vocab]` prefix of the `[mq, vocab]` logits storage (row 0 alone at
+    # S = 1). Columns: a PAD_V logits tensor is minted wider than the projection
+    # that fills it (the sampler's argmax mint law), and a col-tiled matmul's
+    # region sits at a nonzero column corner — a descriptor pitched at the tile's
+    # own `N` places every row past row 0 over the wrong bytes (MEASURED,
+    # gemma-4-12b-it-parity-tiny-paged bundle ed46275: the lm_head's [32, 512]
+    # region of a [32, 4096] tensor — right values at pitch 512 where the golden
+    # writes pitch 4096; row 0 alone at offset 0 both ways, so the solo decode
+    # rung never saw it). A whole-region node states `M_TOTAL = M`,
+    # `N_TOTAL = N`, `C_START = 0`, so nothing changes for it.
     a_desc = tl.make_tensor_descriptor(desc_a, shape=[M, K],
                                        strides=[K, 1],
                                        block_shape=[BLOCK_M, BLOCK_K])
     w_desc = tl.make_tensor_descriptor(desc_w, shape=[N, K],
                                        strides=[K, 1],
                                        block_shape=[BLOCK_N, BLOCK_K])
-    o_desc = tl.make_tensor_descriptor(desc_o, shape=[M_TOTAL, N],
-                                       strides=[N, 1],
+    o_desc = tl.make_tensor_descriptor(desc_o, shape=[M_TOTAL, N_TOTAL],
+                                       strides=[N_TOTAL, 1],
                                        block_shape=[BLOCK_M, BLOCK_N])
 
     # The canonical single-dot offsets, framed by the orientation: A loads at
     # `[pid, k]`, the `.T` B loads its `[N, K]` slice at `[pid, k]` (an n ROW by pid,
-    # k in place), the store at `[pid, pid]` — with every k index 0 at single-tile
-    # (grid [1], BLOCK_K == K), which is what the splice states. At grid [1] `start_m`
-    # is 0, and a `start_m * BLOCK_M` multiply would be an op the shape-keyed template
-    # refuses ("does not model").
+    # k in place), the store at `[pid, C_START]` — with every k index 0 at
+    # single-tile (grid [1], BLOCK_K == K), which is what the splice states. At
+    # grid [1] `start_m` is 0, and a `start_m * BLOCK_M` multiply would be an op
+    # the shape-keyed template refuses ("does not model").
     a = a_desc.load([start_m, 0])
     w = w_desc.load([start_m, 0]).T
     # f16 accumulator (swiglu delta 2): device floats are DL16-f16; Triton defaults
@@ -113,4 +123,4 @@ def matmul_fwd(desc_a, desc_w, desc_o,  #
     # ONE dot, no K-loop: BLOCK_K == K, the same single-tile whole-region law
     # `KtirFunc::matmul` from main states (one `linalg.matmul`, no scf.for).
     p = tl.dot(a, w, acc)
-    o_desc.store([start_m, start_m], p)
+    o_desc.store([start_m, C_START], p)

@@ -288,6 +288,30 @@ pub struct SengraphBundleGroup {
     pub prefill_prefix: &'static [(u32, u32, &'static str)],
 }
 
+impl SengraphBundleGroup {
+    /// ⭐ THE PROMPT-CHUNK RUNGS — the [`Self::prefill_rungs`] rows that run a multi-token chunk
+    /// (`m > 1`; a one-row row names a session the decode side already built), in the manifest's
+    /// order. THE ONE filter every reader of the prompt-chunk ladder takes.
+    pub fn prompt_chunk_rungs(&self) -> impl Iterator<Item = &'static (u32, &'static str)> {
+        self.prefill_rungs.iter().filter(|(m, _)| *m > 1)
+    }
+
+    /// ⭐ THE ANCHOR RUNG — the narrowest prompt-chunk rung: the session built first, beside the
+    /// owner, whose allocation every other prompt-chunk rung borrows. `None` when the manifest
+    /// states no prompt-chunk rung.
+    pub fn anchor_rung(&self) -> Option<&'static (u32, &'static str)> {
+        self.prompt_chunk_rungs().min_by_key(|(m, _)| *m)
+    }
+
+    /// ⭐ THE LADDER RUNGS — every prompt-chunk rung but the anchor: the sessions built off the
+    /// owner's thread once the anchor stands.
+    pub fn ladder_rungs(&self) -> impl Iterator<Item = &'static (u32, &'static str)> {
+        let anchor = self.anchor_rung().map(|(m, _)| *m);
+        self.prompt_chunk_rungs()
+            .filter(move |(m, _)| Some(*m) != anchor)
+    }
+}
+
 /// The per-model sendnn bundle. With the layer-group split it is a vector of
 /// `[prefill, decode]` sub-bundles (one per layer group); the worker compiles
 /// each group independently and threads the hidden state on the host. A single-

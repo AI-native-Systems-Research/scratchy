@@ -144,6 +144,12 @@ all-arches = [
 "gemma-4-12b-it" = ["arch-gemma4"]
 "gemma-4-12b-it-parity-tiny" = ["arch-gemma4"]
 "gemma-4-12b-it-parity-tiny-allglobal" = ["arch-gemma4"]
+# The paged compose's own tiny fixture: a context of 8192 (64 pool pages — a chunk's gather is
+# capped at the 32 cores, so a pool the walk fills cannot exceed it and the splice lawfully
+# refuses a smaller context) and head_dim 128/global 256 on the two attention classes, whole
+# float8 sticks, so `kv-fp8` selects it. The smallest model the spyre emu+lower bake — the
+# numeric gate over prefix/continuation FULL bundles, dense or fp8 KV — runs end to end.
+"gemma-4-12b-it-parity-tiny-paged" = ["arch-gemma4"]
 "gemma-4-31b-it" = ["arch-gemma4"]
 
 # gemma4-moe (6 configs)

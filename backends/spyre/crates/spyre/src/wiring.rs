@@ -36,19 +36,16 @@ use scratchy_tensors::GpuTensor;
 // and `PagedStep` carries the pair ([`PagedStep::extent`]) — so its literal needs the types in
 // reach through the same prefix every other wiring type uses.
 pub use ktir_superdsc::sdsc_abstract::{
-    HeadWidth, QueryExtent, RotSign, RungCap, RungWidth, SignedSin, SinTable,
+    ContextPages, HeadWidth, QueryExtent, RotSign, RungCap, RungWidth, SignedSin, SinTable,
 };
+// The step's head facts, as the model facts state them — `PagedStep`'s literal names them through
+// this same prefix.
+pub use scratchy_triton_splice::{BlockSize, HeadDim, HeadGeometry, KvHeads, QueryHeads, RotDim};
 
 /// ⭐ A SIN SOURCE'S TABLE FORM, AS BAKED — [`SinTable`] over the bake's `&'static` sign list (a
 /// signed table's [`SignedSin::baked`], its width and one sign per stick of it), the fourth field
 /// of every [`Wiring::sin_srcs`] entry. The stagers read it; nothing at run time derives it.
 pub type BakedSinTable = SinTable<&'static [RotSign]>;
-
-// ⭐ `act_name` MOVED TO `ktir_superdsc::place`, BESIDE THE `PlaceId` WHOSE `Display` IT CALLS. Its
-// whole body was `bundle::PlaceId::Act(tid).to_string()`, and that module's header already claimed
-// to hold "the ONE site that spells an operand" — so this was simply left behind when `PlaceId` and
-// the `SynthRole` vocabulary went. Its 22 call sites are all in the lowering, which is now in that
-// crate too.
 
 /// The staged tensor of a linear layer, whatever its quant variant.
 ///
@@ -263,87 +260,6 @@ impl Wiring {
         )
     }
 
-    /// ⛔ THE CLASS SETS, CHECKED AGAINST THE PLACEMENTS — ONCE, AT LOAD.
-    ///
-    /// The bake used to emit the identity and rope-P tables as f32 LITERALS staged at the BASE head
-    /// dim, while the placement pass sized their tids at the MAX head dim over the tape's classes.
-    /// Both halves were individually "correct by construction" — the same shared helpers, the same
-    /// `ir` — and their disagreement was the gemma-4 card-garbage defect: a `[64,64]` table in a
-    /// `[128,128]` placement, the wide class's rope rotating pairs at half=32 and its GQA krep
-    /// reading slab 1 as zeros. No layer of the old check could see it, because the old check
-    /// (`verify_kernel_tables`'s literal-vs-freshcomputation form) re-staged at the SAME base head
-    /// dim the emission used.
-    ///
-    /// The class fix moves the tables to LOAD-TIME staging (a 512² literal table is 262k f32 of
-    /// expansion), so what the bake emits is the class SET — and the check that replaces the old
-    /// one is the fact that actually failed: every rope-P class tid must be placed at exactly
-    /// `hd_c² · 2` bytes, every identity class tid likewise, and every PLACED class tid must be in
-    /// the wiring's set. A mismatch means the wiring and the layout come from different bakes —
-    /// which is silent otherwise (fluent, incoherent output), and is exactly what an
-    /// "emu green, card garbage" divergence looks like from the inside: the emulator executes the
-    /// KTIR dialect ops and never reads these tids at all.
-    pub fn verify_class_placements(&self, layout: &bundle::BundleLayout<'_>) -> Result<(), String> {
-        use crate::lower_subtile_tape_to_superdsc as sd;
-        // One class family's check: every class in the wiring's set is placed at exactly hd²·2
-        // bytes, and every placed tid of that family is in the set. Both directions, because a
-        // one-sided check passes on exactly the desync that produced this bug (a stale set naming
-        // a tid the newer layout never placed, or a newer layout placing a class the wiring
-        // predates).
-        let check = |hds: &'static [u32],
-                     tid_of: fn(usize) -> u32,
-                     what: &str|
-         -> Result<(), String> {
-            for (class, &hd) in hds.iter().enumerate() {
-                let tid = tid_of(class);
-                let want = hd as u64 * hd as u64 * 2;
-                match layout.place_of_tid(tid) {
-                    Some(p) if p.size == want => {}
-                    Some(p) => {
-                        return Err(format!(
-                            "class {class} of {what} (t{tid}, head_dim {hd}) is placed at {} B, \
-                             but its table is {want} B — the wiring and the layout come from \
-                             different bakes; a table that does not fill its placement is the \
-                             wide-class-reads-zeros defect",
-                            p.size,
-                        ));
-                    }
-                    None => {
-                        return Err(format!(
-                            "class {class} of {what} (t{tid}, head_dim {hd}) is in the wiring's \
-                             class set but the layout never placed it — the wiring and the layout \
-                             come from different bakes"
-                        ));
-                    }
-                }
-            }
-            // The other direction: a placed tid of this family that the wiring's set does not
-            // resolve to. The family is identified by tid (`is_kernel_table_class_tid`), not by
-            // size — a size match is what a desynced pair would get WRONG, not right.
-            for p in layout.places.iter() {
-                let bundle::PlaceId::Act(tid) = p.id else {
-                    continue;
-                };
-                if sd::is_kernel_table_class_tid(tid, what)
-                    && !hds
-                        .iter()
-                        .enumerate()
-                        .any(|(class, _)| tid_of(class) == tid)
-                {
-                    return Err(format!(
-                        "the layout placed t{tid} ({} B) as a {what} class table, but the \
-                         wiring's class set {hds:?} does not name it — the wiring and the layout \
-                         come from different bakes",
-                        p.size,
-                    ));
-                }
-            }
-            Ok(())
-        };
-        check(self.rope_class_hds, sd::rope_p_class_tid, "rope-P")?;
-        check(self.attn_class_hds, sd::identity_class_tid, "identity")?;
-        Ok(())
-    }
-
     /// The query-row CAPACITY this bundle was baked at — the embedding activation's placement rows.
     ///
     /// ⛔⛔⛔ THIS IS A CAPACITY, NOT THE ROW COUNT OF A LAUNCH, AND IT IS NOT WHAT THE TAPE
@@ -371,7 +287,12 @@ impl Wiring {
         rows: StagedRows,
         n_consts: usize,
     ) -> crate::forward_tape::ForwardShape {
-        self.forward_shape_within(self.baked_row_capacity(), rows, self.paged.to_vec(), n_consts)
+        self.forward_shape_within(
+            self.baked_row_capacity(),
+            rows,
+            self.paged.to_vec(),
+            n_consts,
+        )
     }
 
     /// [`Self::forward_shape`] with the capacity and the paged step supplied by the CALLER rather
@@ -382,7 +303,7 @@ impl Wiring {
     /// tensor ids correctly while carrying only the single-request graph's ROW COUNT and step. A
     /// launch on the `B`-row rung is legitimate and [`Self::baked_row_capacity`] answers 1 for it, so
     /// checking against the wiring rejects a correct launch; and its step is the batch's, at the walk
-    /// of the body that runs ([`PagedStep::on_body`]).
+    /// of the body that runs ([`PagedStep::on_batch_body`]).
     ///
     /// ⛔ THE GUARD IS NOT WEAKENED, IT IS POINTED AT THE RIGHT NUMBER. `RowCapacity` still has no
     /// integer door: the only way to obtain one is this wiring's own placement
@@ -397,7 +318,7 @@ impl Wiring {
         // ⛔ THE ROWS THIS LAUNCH FILLS — 1 for a decode step, `mq` for a prompt chunk.
         rows: StagedRows,
         // The steps of the body that runs — this wiring's own for its own bundle, one per
-        // attention class, already adjusted to the body (`PagedStep::on_body`).
+        // attention class, already at the body's baked walk (`PagedStep::on_sequence_body`).
         paged: Vec<PagedStep>,
         n_consts: usize,
     ) -> crate::forward_tape::ForwardShape {
@@ -472,8 +393,8 @@ impl GathersKv {
 ///
 /// Both were written by the same hand, in the same file, from the same assumption — which is why
 /// the fix is a TYPE and not two corrected call sites. There is no `From<usize>` and no
-/// conversion from a capacity: the only way in is [`Self::of_launch`], at the site that knows how
-/// many rows it is about to stage.
+/// conversion from a capacity: the ways in are [`Self::of_launch`], at the site that knows how
+/// many rows it is about to stage, and [`Self::of_rung`], a launch of a rung's every baked row.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub struct StagedRows(usize);
 
@@ -482,6 +403,12 @@ impl StagedRows {
     /// forward, and zero is the value this hardware reads as a maximum.
     pub fn of_launch(rows: usize) -> Option<StagedRows> {
         (rows >= 1).then_some(StagedRows(rows))
+    }
+
+    /// The rows a launch of a `width`-row rung fills — every one of the rung's baked rows, which
+    /// a launch binds whether live or padding. Total: a rung width is nonzero by type.
+    pub const fn of_rung(width: RungWidth) -> StagedRows {
+        StagedRows(width.count())
     }
 
     /// Exactly one row — a decode step. Named, so the common case cannot be spelled with a bare
@@ -687,44 +614,34 @@ pub fn sin_table_of(kind: RotaryKind, model: &str) -> SinTable<Vec<RotSign>> {
 /// persist across steps.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct PagedStep {
-    pub mask: u32,
-    pub page_table: u32,
-    pub write_rows: u32,
-    pub query_rows: u32,
-    pub kv_row_pool: u32,
-    pub rep_rows: u32,
-    pub chunk_pages: u32,
-    pub chunk_masks: u32,
-    /// The int32 zero stick staged beside `kv_row_pool` ([`Self::card_int32_zero_bytes`]).
-    pub int32_zero: u32,
-    /// Pages in each layer's pools — the scheduler's block count.
-    pub pages: u32,
+    /// ⭐ THE PAGES THE KERNEL VIEWS — the context's ([`ContextPages`], the attention kernel's own
+    /// `NUM_PAGES`), minted with the step from the graph's cache and never re-placed: the one input
+    /// every walk of this step is stated over ([`Self::walk_at`]), so the walk the host stages and
+    /// the walk the kernel was compiled at are one law over one count.
+    pub view: ContextPages,
+    /// Pages in each layer's pools — the scheduler's block count. A step not yet placed holds its
+    /// context's pool ([`Self::view`]'s pages — the pool law off the card, `pool_pages::of_bake`);
+    /// the bake's pool once the step is placed over it ([`Self::over_pool`]).
+    pub pages: crate::pool_pages::PoolPages,
     /// Token slots per page — the scheduler's block size.
     pub page_slots: u32,
-    /// Query rows one forward of this bundle carries.
-    pub rows: u32,
-    /// KV heads per layer.
-    pub nkvh: u32,
-    /// The query's row width, `num_heads · head_size` — what a decode batch's fold cuts a query
-    /// row into whole sticks by ([`crate::paged_step::BatchChunking::of`]).
-    pub q_width: u32,
-    /// The head's width — whether a decode batch's fold may cut a page finer than its kv heads
-    /// ([`crate::paged_step::BatchChunking::of`]).
-    pub head_size: u32,
+    /// ⭐ THE CLASS'S HEAD GEOMETRY — the model facts' own value (query and kv heads, the head's
+    /// width, and the query width they make, proven at its constructor), so the step states its
+    /// kv heads, head width and query width once. Read through [`Self::nkvh`],
+    /// [`Self::head_size`] and [`Self::q_width`].
+    pub heads: HeadGeometry,
     /// Blocks of the page table this bundle's attention walks — the bake's
-    /// `scratchy_triton_splice::walk_pages` for the rung, so at most the context's pages.
-    pub walk: u32,
+    /// `scratchy_triton_splice::walk_pages` for the rung, so at most the context's pages: the
+    /// kernel's own `NUM_BLOCKS` type, nonzero by type.
+    pub walk: scratchy_triton_splice::WalkBlocks,
     /// What the rows are: one sequence's, or a decode batch's — one token of each of `rows`
     /// sequences, read by `batched_decode_head_major` ([`Self::batch`]).
     pub paged_rows: crate::paged_step::PagedRows,
     /// ⭐ THE QUERY'S EXTENT PAIR — the rung's own `(per-request width, capacity)`, minted once
-    /// at the bake from the rung (never a division of [`Self::rows`]) and threaded here so the
-    /// card stager and the layout state the per-request laws off the ONE pair the splice already
-    /// checks against the graph ([`QueryExtent`]'s own doc). The pair's held product IS
-    /// `rows` — the two are one fact in two spellings, pinned at the one mint
-    /// ([`crate::lower_subtile_tape_to_ktir::paged_step_of_ir`]'s agreement check) and maintained
-    /// by [`Self::on_body`]'s own re-mint, so a `PagedStep` can never carry a pair its rows
-    /// disagree with.
+    /// at the bake from the rung and threaded here so the card stager and the layout state the
+    /// per-request laws off the ONE pair the splice already checks against the graph
+    /// ([`QueryExtent`]'s own doc). Its held product is the step's query rows ([`Self::rows`]),
+    /// so the step states its rows once.
     pub extent: QueryExtent,
     /// ⭐ THE OP'S OWN SLIDING WINDOW — [`scratchy_subtile::subtile_ir::AttnMask::SlidingWindow`]'s
     /// `window`, `None` for a causal op. The step's one statement of its queries' reach: a query
@@ -741,7 +658,77 @@ pub struct PagedStep {
     /// has; the tids above are that class's. A hybrid model's classes each get their own step,
     /// their own tables through `PagedStepTids::of_class`, and their own packed-prefill window
     /// family through `scratchy_triton_splice::paged_window_of_class`.
-    pub class: u32,
+    pub class: AttnClass,
+}
+
+/// ⭐ AN ATTENTION CLASS — a step's index among the graph's distinct attention step geometries
+/// (`scratchy_triton_splice::attn_step_classes`'s order): the ONE index its tables' tids
+/// (`PagedStepTids::of_class`), its packed windows' (`paged_window_of_class`) and its rolled body
+/// (`RolledSuperDsc::bodies`) are all read by.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct AttnClass(u32);
+
+impl AttnClass {
+    /// Class 0 — the only class a uniform model has.
+    pub const FIRST: AttnClass = AttnClass(0);
+
+    /// The class at `index` of the graph's class list.
+    pub const fn of_index(index: usize) -> AttnClass {
+        AttnClass(index as u32)
+    }
+
+    /// The class's index into every per-class list.
+    pub const fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
+impl std::fmt::Display for AttnClass {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// ⭐ A PAGED STEP BY ITS ROWS' KIND — [`PagedStep::kind`]'s answer, exhaustive.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum StepKind {
+    Sequence(SequenceStep),
+    Batch(BatchStep),
+}
+
+/// ⭐ ONE SEQUENCE'S STEP — a [`PagedStep`] whose rows are one request's (or a packed rung's windows
+/// of requests'). Minted only by [`PagedStep::kind`], so a sequence stager never re-checks the rows.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct SequenceStep(PagedStep);
+
+impl std::ops::Deref for SequenceStep {
+    type Target = PagedStep;
+    fn deref(&self) -> &PagedStep {
+        &self.0
+    }
+}
+
+/// ⭐ A DECODE BATCH'S STEP — a [`PagedStep`] whose rows are one token of each of its sequences, with
+/// the chunking its batched kernel folds the walk by. Minted only by [`PagedStep::kind`], so a batch
+/// stager never re-checks the rows nor re-derives the chunking.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct BatchStep {
+    step: PagedStep,
+    chunking: crate::paged_step::BatchChunking,
+}
+
+impl BatchStep {
+    /// The batch's chunking of its walk.
+    pub const fn chunking(&self) -> crate::paged_step::BatchChunking {
+        self.chunking
+    }
+}
+
+impl std::ops::Deref for BatchStep {
+    type Target = PagedStep;
+    fn deref(&self) -> &PagedStep {
+        &self.step
+    }
 }
 
 /// ⭐ THE ROW POOL'S PAGE — the bytes one page of `kv_row_pool` holds on the card: the run of
@@ -777,15 +764,90 @@ impl KvPool {
 }
 
 impl PagedStep {
+    /// Query rows one forward of this bundle carries — its [`Self::extent`]'s held product, so
+    /// the rows cannot disagree with the pair they are the product of.
+    pub const fn rows(self) -> u32 {
+        self.extent.graph_rows().get()
+    }
+
+    /// KV heads per layer — the class's geometry's.
+    pub const fn nkvh(self) -> KvHeads {
+        self.heads.kv_heads()
+    }
+
+    /// The head's width — whether a decode batch's fold may cut a page finer than its kv heads
+    /// ([`crate::paged_step::BatchChunking::of`]). The class's geometry's.
+    pub const fn head_size(self) -> HeadDim {
+        self.heads.head_dim()
+    }
+
+    /// The query's row width, `q_heads · head_size` — what a decode batch's fold cuts a query row
+    /// into whole sticks by ([`crate::paged_step::BatchChunking::of`]). The class's geometry's.
+    pub const fn q_width(self) -> u32 {
+        self.heads.q_width()
+    }
+
+    /// ⭐ THE STEP'S TABLES' TIDS — its class's own ([`scratchy_triton_splice::PagedStepTids::of_class`],
+    /// class 0 on the reserved sentinels). A pure function of [`Self::class`], so the step stores the
+    /// class alone: the tids cannot disagree with the class they belong to.
+    pub fn tids(self) -> scratchy_triton_splice::PagedStepTids {
+        scratchy_triton_splice::PagedStepTids::of_class(self.class.index())
+    }
+
+    /// The mask stack's tid ([`Self::tids`]).
+    pub fn mask(self) -> u32 {
+        self.tids().mask
+    }
+
+    /// The page index table's tid ([`Self::tids`]).
+    pub fn page_table(self) -> u32 {
+        self.tids().page_table
+    }
+
+    /// The KV write index's tid ([`Self::tids`]).
+    pub fn write_rows(self) -> u32 {
+        self.tids().write_rows
+    }
+
+    /// The query row index's tid ([`Self::tids`]).
+    pub fn query_rows(self) -> u32 {
+        self.tids().query_rows
+    }
+
+    /// `kv_row_pool`'s tid ([`Self::tids`]).
+    pub fn kv_row_pool(self) -> u32 {
+        self.tids().kv_row_pool
+    }
+
+    /// A decode batch's `rep_row_ids` tid ([`Self::tids`]).
+    pub fn rep_rows(self) -> u32 {
+        self.tids().rep_rows
+    }
+
+    /// A decode batch's `chunk_page_ids` tid ([`Self::tids`]).
+    pub fn chunk_pages(self) -> u32 {
+        self.tids().chunk_pages
+    }
+
+    /// A decode batch's `mask_by_chunk` tid ([`Self::tids`]).
+    pub fn chunk_masks(self) -> u32 {
+        self.tids().chunk_masks
+    }
+
+    /// The int32 zero stick staged beside `kv_row_pool` ([`Self::card_int32_zero_bytes`]).
+    pub fn int32_zero(self) -> u32 {
+        self.tids().int32_zero
+    }
+
     /// The blocks the scheduler may hand out — every page but the null page
     /// ([`crate::paged_step::page_of_block`]).
     pub const fn host_blocks(self) -> u32 {
-        self.pages - 1
+        self.pages.get() - 1
     }
 
     /// The pool's token capacity: every page's slots.
     pub const fn capacity(self) -> usize {
-        self.pages as usize * self.page_slots as usize
+        self.pages.get() as usize * self.page_slots as usize
     }
 
     /// ⭐ THE STEP OVER THE BAKE'S POOL — this step at the pool's pages
@@ -796,7 +858,7 @@ impl PagedStep {
     /// placement ([`crate::lower_subtile_tape_to_superdsc::place_kv_pools_at`]).
     pub const fn over_pool(self, pool: crate::pool_pages::PoolPages) -> Self {
         PagedStep {
-            pages: pool.get(),
+            pages: pool,
             ..self
         }
     }
@@ -808,7 +870,7 @@ impl PagedStep {
     /// attends), the window's span for a windowed one, whatever the step's absolute position. A
     /// step whose span exceeds it would lose keys.
     pub const fn reach(self) -> usize {
-        self.walk as usize * self.page_slots as usize
+        self.walk.get() as usize * self.page_slots as usize
     }
 
     /// ⭐ THE STEP'S SPAN — the positions its queries' windows sweep, in the walk's own frame:
@@ -826,14 +888,33 @@ impl PagedStep {
     /// sequence's rows.
     pub const fn batch(self) -> Option<crate::paged_step::BatchChunking> {
         match self.paged_rows {
-            crate::paged_step::PagedRows::Batch => Some(crate::paged_step::BatchChunking::of(
-                self.rows,
-                self.walk,
-                self.nkvh,
-                self.q_width,
-                self.head_size,
-            )),
+            crate::paged_step::PagedRows::Batch => Some(self.chunking()),
             crate::paged_step::PagedRows::Sequence => None,
+        }
+    }
+
+    /// The chunking law over this step's rows and walk — read through [`Self::batch`] and
+    /// [`Self::kind`], the two places a batch's chunking is asked for.
+    const fn chunking(self) -> crate::paged_step::BatchChunking {
+        crate::paged_step::BatchChunking::of(
+            self.rows(),
+            self.walk.get(),
+            self.nkvh(),
+            self.q_width(),
+            self.head_size(),
+        )
+    }
+
+    /// ⭐ WHAT THIS STEP'S ROWS ARE, AS A TYPE — one sequence's ([`SequenceStep`]) or a decode batch's
+    /// ([`BatchStep`], its chunking carried beside it). The ONE mint of either: every stager takes the
+    /// kind it stages, so none re-checks the rows.
+    pub const fn kind(self) -> StepKind {
+        match self.paged_rows {
+            crate::paged_step::PagedRows::Sequence => StepKind::Sequence(SequenceStep(self)),
+            crate::paged_step::PagedRows::Batch => StepKind::Batch(BatchStep {
+                step: self,
+                chunking: self.chunking(),
+            }),
         }
     }
 
@@ -841,7 +922,7 @@ impl PagedStep {
     /// kernel at one query row of one sequence does; the prefill kernel past it and the batched
     /// decode kernel do not.
     pub const fn reads_kv_row_pool(self) -> bool {
-        self.rows == 1 && self.batch().is_none()
+        self.rows() == 1 && self.batch().is_none()
     }
 
     /// ⭐ THE FOLDED-CACHE ROW — the ONE statement of the paged KV cache's layout law: kv head `h`
@@ -854,9 +935,9 @@ impl PagedStep {
     /// ([`crate::paged_step::batch_sources`]), the card's packed windows
     /// ([`crate::paged_step::card_step_sources`]), the pool stimulus
     /// ([`crate::paged_step::pool_of_rows`]) — CONSUMES this law; none re-derives it.
-    pub fn cache_row(self, blocks: &[u32], pos: usize, h: usize) -> usize {
+    pub fn cache_row(self, blocks: &[crate::paged_step::PoolPage], pos: usize, h: usize) -> usize {
         let slots = self.page_slots as usize;
-        (blocks[pos / slots] as usize * self.nkvh as usize + h) * slots + pos % slots
+        (blocks[pos / slots].get() as usize * self.nkvh().get() as usize + h) * slots + pos % slots
     }
 
     /// ⭐ THE NULL CACHE ROW — where a row with no request's KV write lands: [`NULL_SLOT`]'s own,
@@ -865,7 +946,7 @@ impl PagedStep {
     /// of sparse slots consumes; `cache_row` at the null page's own slot.
     pub const fn null_cache_row(self, h: usize) -> usize {
         let slots = self.page_slots as usize;
-        ((crate::paged_step::NULL_SLOT / slots) * self.nkvh as usize + h) * slots
+        ((crate::paged_step::NULL_SLOT / slots) * self.nkvh().get() as usize + h) * slots
             + crate::paged_step::NULL_SLOT % slots
     }
 
@@ -887,11 +968,27 @@ impl PagedStep {
         rows as u64 * Df::Fp16.elems_per_stick() as u64 * 2
     }
 
+    /// ⭐ ONE WINDOW'S PAGE TABLE ON THE CARD, in bytes — one row per walked block, each at the
+    /// walk's card step ([`Self::card_walk_step`]). The ONE size both the placement
+    /// ([`Self::card_placements`]) and the card stager (`paged_step::card_step_sources`) read.
+    pub const fn card_window_table_bytes(self) -> usize {
+        self.walk.get() as usize * self.card_walk_step() as usize
+    }
+
+    /// ⭐ ONE WINDOW'S MASK STACK, in elements — `[walk · w, page_slots]`, `w` the extent's
+    /// per-request width. The ONE count both the placement (at two bytes an fp16 element) and the
+    /// card stager read.
+    pub const fn card_window_mask_elems(self) -> usize {
+        self.walk.get() as usize
+            * self.extent.per_request().get() as usize
+            * self.page_slots as usize
+    }
+
     /// `kv_row_pool` on the card: each page's run of `nkvh` rows held at
     /// [`KV_ROW_POOL_PAGE_BYTES`] int32 bytes — the run the decode walk's chained index
     /// copies per page — the pool's pages at the one page law.
     pub const fn card_kv_row_pool_bytes(self) -> u64 {
-        self.pages as u64 * KV_ROW_POOL_PAGE_BYTES
+        self.pages.get() as u64 * KV_ROW_POOL_PAGE_BYTES
     }
 
     /// The int32 zero stick on the card: one run of
@@ -912,26 +1009,26 @@ impl PagedStep {
         let sticks = |words: u64| words.div_ceil(int32_stick) * int32_stick * 4;
         let slots = u64::from(self.page_slots);
         let mut v = vec![(
-            self.write_rows,
+            self.write_rows(),
             CardSeat::Step,
-            sticks(u64::from(self.rows * self.nkvh)),
+            sticks(u64::from(self.rows() * self.nkvh().get())),
         )];
         match self.batch() {
             Some(c) => {
                 let (chunks, entries) = (u64::from(c.num_chunks), u64::from(c.entries()));
                 v.extend([
                     (
-                        self.rep_rows,
+                        self.rep_rows(),
                         CardSeat::Step,
                         sticks(u64::from(c.index_rows())),
                     ),
                     (
-                        self.chunk_pages,
+                        self.chunk_pages(),
                         CardSeat::Step,
                         chunks * self.card_walk_step(),
                     ),
                     (
-                        self.chunk_masks,
+                        self.chunk_masks(),
                         CardSeat::Step,
                         chunks * entries * slots * 2,
                     ),
@@ -948,22 +1045,27 @@ impl PagedStep {
                 // sizes, same order, byte for byte.
                 let w = u64::from(self.extent.per_request().get());
                 let windows = u64::from(self.extent.requests().get());
-                let window_tid = |r: u64, table: u32| {
-                    scratchy_triton_splice::paged_window_of_class(self.class as usize, r as u32, table)
+                use scratchy_triton_splice::WindowTable as W;
+                let window_tid = |r: u64, table: W| {
+                    scratchy_triton_splice::paged_window_of_class(
+                        self.class.index(),
+                        r as u32,
+                        table,
+                    )
                 };
                 for r in 0..windows {
                     v.extend([
                         (
-                            window_tid(r, 1),
+                            window_tid(r, W::PageTable),
                             CardSeat::Step,
-                            u64::from(self.walk) * self.card_walk_step(),
+                            self.card_window_table_bytes() as u64,
                         ),
                         (
-                            window_tid(r, 2),
+                            window_tid(r, W::Mask),
                             CardSeat::Step,
-                            u64::from(self.walk) * w * slots * 2,
+                            self.card_window_mask_elems() as u64 * 2,
                         ),
-                        (window_tid(r, 0), CardSeat::Step, sticks(w)),
+                        (window_tid(r, W::QueryRows), CardSeat::Step, sticks(w)),
                     ]);
                 }
             }
@@ -974,12 +1076,12 @@ impl PagedStep {
         if self.reads_kv_row_pool() {
             v.extend([
                 (
-                    self.int32_zero,
+                    self.int32_zero(),
                     CardSeat::Static,
                     self.card_int32_zero_bytes(),
                 ),
                 (
-                    self.kv_row_pool,
+                    self.kv_row_pool(),
                     CardSeat::Static,
                     self.card_kv_row_pool_bytes(),
                 ),
@@ -988,81 +1090,96 @@ impl PagedStep {
         v
     }
 
-    /// ⭐ THE STEP OF THE BODY THAT RUNS — this bundle's pool and tids at a rung's own rows (a batch or
-    /// prompt-width rung is the same tape baked at `rows` rows), walking the blocks the body sweeps:
-    /// `swept` slots, whole pages for every body (a `walk_buckets` rung, or the ceiling's walk).
-    /// `None` when `swept` is no walk of this pool.
+    /// ⭐ THE WALK OF A BODY SWEEPING `swept` SLOTS (its resolved sweep), at a per-request width of
+    /// `per_request` — the splice's own law ([`scratchy_triton_splice::walk_of_sweep`], the one the
+    /// kernel's `NUM_BLOCKS` was compiled by) over the kernel's own view ([`Self::view`]), this
+    /// step's window and its pages' slots. `None` when `swept` is no whole number of pages, or
+    /// reaches past the pages the kernel views — no body walks it.
     ///
     /// ⭐ A WINDOWED BODY WALKS ITS OWN BOUND, not the rung's sweep: whatever the ladder swept to
     /// reach the context (the causal class's need), the windowed body baked
     /// [`window_walk_blocks`][crate::paged_step::window_walk_blocks] at, and the step the worker
-    /// stages must name the same walk its body walks — the same bound, the same one function, never
-    /// restated. The cap never widens: a rung narrower than the bound keeps its own sweep.
-    ///
-    /// ⭐ THE EXTENT IS THE LAUNCH'S OWN PAIR, by the launch's own kind — never a comparison
-    /// against the wiring's stated pair. The wiring states ONE representative of a tape the
-    /// ladders bake at several widths (the prefill ladder's rungs all bind the same tensor ids,
-    /// so one wiring serves them; `rows` here is the rung actually launching), and the runtime
-    /// truth is what the launch itself is: a `Sequence` launch is ONE request of `rows` rows —
-    /// `(rows, 1)` — and a `Batch` launch is one row per request — `(1, rows)`. Both are the
-    /// same law the bake's codegen minted each rung's own pair by, so a launch on the
-    /// representative's own width re-derives the wiring's pair exactly.
-    pub fn on_body(
-        self,
-        rows: u32,
-        paged_rows: crate::paged_step::PagedRows,
-        swept: u32,
-    ) -> Option<PagedStep> {
-        let mut walk = swept / self.page_slots;
-        let extent = match paged_rows {
-            crate::paged_step::PagedRows::Sequence => {
-                QueryExtent::of_baked_rung(RungWidth::of_baked_rows(rows)?, RungCap::ONE)?
-            }
-            crate::paged_step::PagedRows::Batch => {
-                QueryExtent::of_baked_rung(RungWidth::ONE, RungCap::of_baked_seqs(rows)?)?
-            }
-        };
-        if let Some(w) = self.window {
-            walk = walk.min(crate::paged_step::window_walk_blocks(
-                self.pages,
-                w,
-                extent.per_request().get(),
+    /// stages names the same walk its body walks. The cap never widens: a rung narrower than the
+    /// bound keeps its own sweep. Read through [`Self::staged_walk`], at the bake only.
+    fn walk_at(self, swept: u32, per_request: u32) -> Option<scratchy_triton_splice::WalkBlocks> {
+        (swept > 0
+            && swept.is_multiple_of(self.page_slots)
+            && swept / self.page_slots <= self.view.get())
+        .then(|| {
+            scratchy_triton_splice::walk_of_sweep(
+                swept,
+                self.rows(),
+                self.view.get(),
+                per_request,
+                self.window,
                 self.page_slots,
-            ));
-        }
-        (rows > 0 && walk > 0 && swept.is_multiple_of(self.page_slots) && walk <= self.pages)
-            .then_some(PagedStep {
-                rows,
-                paged_rows,
-                walk,
-                extent,
-                ..self
-            })
+            )
+        })
+        .and_then(std::num::NonZeroU32::new)
+        .map(scratchy_triton_splice::WalkBlocks::new)
     }
 
-    /// ⭐ THE PACKED LAUNCH'S EXTENT — the wiring's OWN stated pair, kept verbatim.
-    ///
-    /// A packed rung's wiring is not a representative of a tape baked at several widths: the
-    /// bake minted the pair `(w, s)` for THIS rung ([`QueryExtent`]'s own law), and a wave
-    /// launch IS that pair — `s` requests of `w` rows each, neither the one request of
-    /// [`Self::on_body`]'s `Sequence` law nor the one-row-per-request of its `Batch` law, so
-    /// there is no pair to re-derive from the launch's rows. Only the walk is the launch's to
-    /// derive, from the sweep of the body the session selected — exactly `on_body`'s own law.
-    pub fn on_body_packed(self, swept: u32) -> Option<PagedStep> {
-        let mut walk = swept / self.page_slots;
-        if let Some(w) = self.window {
-            walk = walk.min(crate::paged_step::window_walk_blocks(
-                self.pages,
-                w,
-                self.extent.per_request().get(),
-                self.page_slots,
-            ));
+    /// ⭐ THE WALK THIS STEP IS STAGED AT FOR A BODY SWEEPING `swept` SLOTS — the BAKE's one
+    /// evaluation of the walk law ([`Self::walk_at`]) at the step's own extent (one sequence's
+    /// rows, a decode batch's one row each, or a packed rung's `(w, s)`: the session's own pair,
+    /// minted with its graph). The bake records it on the rung
+    /// ([`crate::bundle_code::RungBody::walk`]) and the host stages the body at that record, so
+    /// nothing at run time re-derives a walk. `None` when `swept` is no walk of this step's view;
+    /// the bake refuses a rung that would be.
+    pub fn staged_walk(self, swept: u32) -> Option<scratchy_triton_splice::WalkBlocks> {
+        self.walk_at(swept, self.extent.per_request().get())
+    }
+
+    /// The step at a body's baked walk — the bake's view of the body it stages.
+    pub const fn at_walk(self, walk: scratchy_triton_splice::WalkBlocks) -> PagedStep {
+        PagedStep { walk, ..self }
+    }
+
+    /// ⭐ ONE SEQUENCE'S LAUNCH of a `width`-row rung at its body's baked walk — one request of
+    /// `width` rows ([`QueryExtent::one_request`]), the step as the kind its launch is, so the
+    /// sequence stager takes it without asking. Total: the walk is the bake's
+    /// ([`crate::bundle_code::RungBody::walk`]) and the pair is the width's.
+    pub const fn on_sequence_body(
+        self,
+        width: RungWidth,
+        walk: scratchy_triton_splice::WalkBlocks,
+    ) -> SequenceStep {
+        SequenceStep(PagedStep {
+            extent: QueryExtent::one_request(width),
+            paged_rows: crate::paged_step::PagedRows::Sequence,
+            walk,
+            ..self
+        })
+    }
+
+    /// ⭐ A DECODE BATCH'S LAUNCH of a `width`-row rung at its body's baked walk — `width` requests
+    /// of one row each ([`QueryExtent::one_row_each`]), its chunking carried beside it. Total.
+    pub const fn on_batch_body(
+        self,
+        width: RungWidth,
+        walk: scratchy_triton_splice::WalkBlocks,
+    ) -> BatchStep {
+        let step = PagedStep {
+            extent: QueryExtent::one_row_each(width),
+            paged_rows: crate::paged_step::PagedRows::Batch,
+            walk,
+            ..self
+        };
+        BatchStep {
+            step,
+            chunking: step.chunking(),
         }
-        (self.extent.requests().get() > 1
-            && walk > 0
-            && swept.is_multiple_of(self.page_slots)
-            && walk <= self.pages)
-            .then_some(PagedStep { walk, ..self })
+    }
+
+    /// ⭐ A WAVE'S LAUNCH at its body's baked walk — the packed rung's wiring's OWN pair, kept
+    /// verbatim: the bake minted `(w, s)` for this rung ([`QueryExtent`]'s own law) and a wave
+    /// launch IS that pair, so only the walk is the body's. Total.
+    pub const fn on_body_packed(self, walk: scratchy_triton_splice::WalkBlocks) -> SequenceStep {
+        SequenceStep(PagedStep {
+            walk,
+            paged_rows: crate::paged_step::PagedRows::Sequence,
+            ..self
+        })
     }
 }
 
@@ -1208,10 +1325,11 @@ pub struct Wiring {
     /// fresh seed/inv_t bind REFUSES LOUDLY (the PrefixMask precedent), never
     /// a held default, because a held seed row is a held TOKEN — every
     /// subsequent draw would repeat the same pick wherever temperature was
-    /// live. `None` on every rung that mints no draw (prefill rungs, host-sampled
-    /// emulators), and a `None` on a rung the worker samples through is a
-    /// wiring/consumer mismatch the launch gate names.
-    pub sample_seat: Option<SampleSeat>,
+    /// live. EVERY rung carries one: the bake mints the draw into every rung it
+    /// bakes (`mint_sample`, prefill and decode alike), and its codegen fails the
+    /// build on a rung that arrives without it — so no launch asks whether a seat
+    /// exists.
+    pub sample_seat: SampleSeat,
     /// ⭐ THE FORWARD'S OWN PHASE — the same
     /// [`crate::forward_tape::ForwardPhase`] the tape's shape carries, spelled
     /// once here and projected into the shape (`phase: self.phase`, never a
@@ -2137,6 +2255,15 @@ pub struct Wirings {
     /// entry whose pair matches the rung it loaded. EMPTY ⇒ no packed rungs baked (every model
     /// whose ladder bakes none, and every build before the packed table existed).
     pub packed_prefill: &'static [(u32, u32, Wiring)],
+    /// ⭐ EACH SOLO FIRST-CHUNK RUNG'S OWN WIRING `[(width, Wiring)]` — one per prefix-free prompt
+    /// chunk rung the bake shipped (`ActiveCap::NONE`, a prompt's first chunk), ascending by width,
+    /// each its own graph's bindings. A first-chunk session is built under its own cell and its
+    /// meta read off it, so no rung runs under another rung's wiring.
+    pub first_chunk: &'static [(u32, Wiring)],
+    /// ⭐ EACH SOLO CONTINUATION RUNG'S OWN WIRING `[(width, Wiring)]` — one per prefix-capable
+    /// solo rung (`ActiveCap::FULL`, every chunk past a prompt's first), ascending by width, each
+    /// its own graph's bindings, as [`Self::first_chunk`]'s are.
+    pub continuation_chunk: &'static [(u32, Wiring)],
     /// ⭐ THE KV POOL THE BAKE PLACED — its pages (every wiring's [`PagedStep::pages`]) and one
     /// page of this world's pools: the serving step's KV budget and block. Every forward the bake
     /// ships places one; a forward whose decode places none fails the BUILD (the bake's
@@ -3087,119 +3214,6 @@ mod constant_tape_tests {
         );
     }
 
-    /// ⭐ THE LOAD-TIME CROSS-CHECK — `verify_class_placements` fires on exactly the desync that
-    /// produced the card garbage: a wiring/layout pair whose class set and placements disagree.
-    /// Both directions, because a one-sided check passes on the mismatch that actually happened
-    /// (the value/placement size disagreement) while missing the stale-set direction.
-    #[test]
-    fn the_class_placement_cross_check_fires_on_a_desynced_pair() {
-        use crate::lower_subtile_tape_to_superdsc as sd;
-        // A wiring with the gemma-4 tiny-allglobal class sets.
-        let wiring = Wiring {
-            rope_class_hds: &[128, 64],
-            attn_class_hds: &[128, 64],
-            ..uniform_wiring()
-        };
-        // A layout that places BOTH rope classes at the MAX size — the defect's exact shape: the
-        // placement pass's max-fold, held against the class set.
-        let lay_max = class_layout(&[
-            (sd::rope_p_class_tid(0), 128),
-            (sd::rope_p_class_tid(1), 128),
-        ]);
-        let why = wiring
-            .verify_class_placements(&lay_max)
-            .expect_err("a class-1 placement sized at the max must refuse");
-        assert!(
-            why.contains("t") && why.to_lowercase().contains("class 1"),
-            "the refusal names the class and its tid, got {why:?}"
-        );
-        // A layout that places only class 0 — the stale-set direction.
-        let lay_missing = class_layout(&[(sd::rope_p_class_tid(0), 128)]);
-        assert!(
-            wiring.verify_class_placements(&lay_missing).is_err(),
-            "a class the layout never placed must refuse"
-        );
-        // And the AGREED pair passes — the check is not a blanket refusal.
-        let lay_ok = class_layout(&[
-            (sd::rope_p_class_tid(0), 128),
-            (sd::rope_p_class_tid(1), 64),
-            (sd::identity_class_tid(0), 128),
-            (sd::identity_class_tid(1), 64),
-        ]);
-        wiring
-            .verify_class_placements(&lay_ok)
-            .expect("an agreed wiring/layout pair passes");
-
-        // ⭐ A UNIFORM MODEL'S PAIR, STILL ONE CLASS — the byte-identity case: class 0 is the
-        // sentinel and the check is satisfied by the single placement it always had.
-        let uniform = Wiring {
-            rope_class_hds: &[64],
-            attn_class_hds: &[64],
-            ..uniform_wiring()
-        };
-        let lay_uniform = class_layout(&[
-            (sd::rope_p_class_tid(0), 64),
-            (sd::identity_class_tid(0), 64),
-        ]);
-        uniform
-            .verify_class_placements(&lay_uniform)
-            .expect("a uniform model's single-class pair passes");
-    }
-
-    /// A minimal `Wiring` for the cross-check tests — only the class fields are load-bearing.
-    fn uniform_wiring() -> Wiring {
-        Wiring {
-            result: 0,
-            result_dtype: scratchy_tensors::DType::F16,
-            num_sources: 0,
-            attn_mask: None,
-            paged: &[],
-            decode_position: 0,
-            tensor_shapes: &[],
-            embed_src: 0,
-            cos_srcs: &[],
-            sin_srcs: &[],
-            layers: &[],
-            geometry: Geometry {
-                hidden: 128,
-                kv_dim: 128,
-                vocab: 512,
-                layers: 1,
-                head_dim: 64,
-                nqh: 2,
-                rope_theta_bits: 0,
-            },
-            rope_class_hds: &[],
-            attn_class_hds: &[],
-            rms_invcols: &[],
-            scalarmul_scales: &[],
-            fp8_k_pads: &[],
-            weight_scale_folds: &[],
-            load_consts: &[],
-            sample_seat: None,
-            phase: crate::forward_tape::ForwardPhase::Prefill,
-        }
-    }
-
-    /// A layout placing one `[hd,hd]` fp16 table per `(tid, hd)` pair.
-    fn class_layout(tables: &[(u32, u32)]) -> bundle::BundleLayout<'static> {
-        bundle::BundleLayout {
-            places: std::borrow::Cow::Owned(
-                tables
-                    .iter()
-                    .map(|&(tid, hd)| bundle::Placement {
-                        id: bundle::PlaceId::Act(tid),
-                        segment: 0,
-                        bank: 0,
-                        offset: 0,
-                        size: hd as u64 * hd as u64 * 2,
-                        is_logits: false,
-                    })
-                    .collect(),
-            ),
-            ..Default::default()
-        }
-    }
 
     /// The staged pad lanes spell the sampler's all-NaN answer (#666): an all-NaN row's one-hot
     /// falls on a pad lane, whose `ginc`, `binc` and `linc` read back idx = `ginc·4096 + binc·64 +

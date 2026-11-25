@@ -7,8 +7,6 @@
 //! stages the paged step's tables from that table (`scratchy_target_spyre::paged_step`).
 
 #[cfg(feature = "spyre-hw")]
-use crate::spyre_types::SuperDscSession;
-#[cfg(feature = "spyre-hw")]
 use scratchy_target_spyre::manifest::SengraphBundle;
 
 /// EVERY PRINT-ONLY FLAG THIS FILE READS ON A PER-STEP OR PER-LAUNCH PATH, RESOLVED ONCE PER PROCESS.
@@ -33,16 +31,6 @@ pub(crate) fn flags() -> &'static Flags {
             phase_time: on("SCRATCHY_SDSC_PHASE_TIME"),
         }
     })
-}
-
-/// Index of the SMALLEST prefill rung that can hold `real` query rows. `rungs` is ascending, and the
-/// caller caps its chunk at the top rung, so this only returns `None` for an EMPTY ladder.
-#[cfg(feature = "spyre-hw")]
-pub(crate) fn prefill_rung_for(rungs: &[(usize, SuperDscSession)], real: usize) -> Option<usize> {
-    rungs
-        .iter()
-        .position(|(m, _)| *m >= real)
-        .or_else(|| rungs.len().checked_sub(1))
 }
 
 /// The decode-slot sentinel prefix the SuperDSC codegen stamps into

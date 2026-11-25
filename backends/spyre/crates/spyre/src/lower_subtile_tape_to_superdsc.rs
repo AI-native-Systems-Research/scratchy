@@ -190,9 +190,9 @@ pub use ktir_superdsc::reserved_tids::{
     NEW_V_PROBE_TID, ONES_REDUCE_TID, OPROJ_HEADMAJOR_BASE, PAGED_WRITE_ROWS_TID, RESERVED_REGIONS,
     RESERVED_REGIONS_ARE_DISJOINT, RMS_HALF_TID, RMS_INVCOLS_TID, RMS_RSQRT_PROBE_TID,
     RMS_SEED_TID, RMS_VAR_PROBE_TID, ROPE_P_TID, SCALARMUL_SCALE_BASE, SEL_HEADMAJOR_TID,
-    SEL_KV_HEADMAJOR_TID, SELT_HEADMAJOR_TID, SENTINELS_ARE_INSIDE_THEIR_REGION, TidRegion,
-    identity_class_tid, is_kernel_table_class_tid, kct_resident_tid, oproj_headmajor_tid,
-    reserved_region, rope_p_class_hds, rope_p_class_tid, scalarmul_scale_tid,
+    SEL_KV_HEADMAJOR_TID, SELT_HEADMAJOR_TID, SENTINELS_ARE_INSIDE_THEIR_REGION, KernelTableFamily,
+    Region, TidRegion, identity_class_tid, kct_resident_tid, oproj_headmajor_tid,
+    rope_p_class_hds, rope_p_class_tid, scalarmul_scale_tid,
 };
 
 // ⭐⭐⭐ THE MEMORY PLAN LIVES IN `ktir_superdsc::placement` — `SegRole`, `TensorPlacement`,
@@ -609,7 +609,7 @@ pub fn bundle_registry<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     // The graph's query extents, minted by the bake — threaded, never re-derived here:
     // a registry walk that minted its own pair from graph rows would agree with the
     // graph yet state the wrong per-request width the day a packed prefill arrives.
-    query_rows: ktir_superdsc::sdsc_abstract::QueryExtent,
+    query_rows: scratchy_triton_splice::GraphExtent,
 ) -> Result<Vec<f32>, SuperDscError> {
     use crate::lower_subtile_tape_to_ktir::{NodeLowering, lower_one_node};
     let mut registry = scalar_registry(ir);
@@ -755,6 +755,43 @@ pub fn kv_pools<F: RopeForm>(
         .collect())
 }
 
+/// ⭐ THE GRAPH'S KERNEL-TABLE CLASS SETS — the ONE derivation of which rope-P and identity
+/// tables a bundle stages, one class per distinct head dim, widest first.
+/// - `rope`: the ropes that read a P table ([`rope_p_table_class_hds`]).
+/// - `attn`: every attention's class head dim ([`rope_p_class_hds`]).
+///
+/// The placement pass ([`compute_bundle_layout`]) places each class's table from these sets, and
+/// the wiring ([`crate::lower_subtile_tape_to_ktir::graph_wiring`]) bakes the same sets for the
+/// worker's load-time bind. One value, two consumers, so the wiring's class set and the
+/// layout's placements cannot disagree, and no reader re-checks that they do.
+///
+/// [`rope_p_table_class_hds`]: ktir_superdsc::reserved_tids::rope_p_table_class_hds
+/// [`rope_p_class_hds`]: ktir_superdsc::reserved_tids::rope_p_class_hds
+pub(crate) struct KernelTableClasses {
+    pub(crate) rope: Vec<u32>,
+    pub(crate) attn: Vec<u32>,
+}
+
+impl KernelTableClasses {
+    pub(crate) fn of<F: RopeForm>(ir: &SubtileIR<F>) -> Self {
+        Self {
+            rope: ktir_superdsc::reserved_tids::rope_p_table_class_hds(
+                ir.nodes
+                    .iter()
+                    .filter_map(|n| n.op.rope_head_dim().map(|d| d.get())),
+            ),
+            attn: ktir_superdsc::reserved_tids::rope_p_class_hds(ir.nodes.iter().filter_map(
+                |n| match &n.op {
+                    SubOp::AttnDecode {
+                        mask, attention, ..
+                    } => Some(attention.class(mask.class()).head_dim().get()),
+                    _ => None,
+                },
+            )),
+        }
+    }
+}
+
 pub fn compute_bundle_layout<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     ir: &SubtileIR<F>,
     weight_ids: &std::collections::HashSet<u32>,
@@ -772,16 +809,16 @@ pub fn compute_bundle_layout<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     twins: &std::collections::BTreeMap<u32, u32>,
     // The graph's query extents, minted by the bake — threaded to the registry walk below,
     // never re-derived from graph rows (see [`bundle_registry`]'s own parameter note).
-    query_rows: ktir_superdsc::sdsc_abstract::QueryExtent,
+    query_rows: scratchy_triton_splice::GraphExtent,
 ) -> Result<BundleLayout, SuperDscError> {
-    // fp8 W8A8 weights (SEN143_FP8: 1-byte / 128-elem stick) are `input[1]` of any arity-3 MatmulTile.
-    // Their device footprint is HALF the fp16 weight — this is the unfakeable 1-byte-read proxy: it is
-    // what shrinks `seg_bytes[1]` (the weight segment). A dequant-to-f16 transient would NOT shrink it.
+    // fp8 W8A8 weights (SEN143_FP8: 1-byte / 128-elem stick) are the graph's fp8 payloads
+    // (`SubtileIR::fp8_weight_payloads`). Their device footprint is HALF the fp16 weight — this is
+    // the unfakeable 1-byte-read proxy: it is what shrinks `seg_bytes[1]` (the weight segment). A
+    // dequant-to-f16 transient would NOT shrink it.
     let fp8_weight_tids: std::collections::HashSet<u32> = ir
-        .nodes
-        .iter()
-        .filter(|n| matches!(n.op, SubOp::MatmulTile { .. }) && n.inputs.len() == 3)
-        .map(|n| n.inputs[1].tensor.index() as u32)
+        .fp8_weight_payloads()
+        .into_iter()
+        .map(|t| t.index() as u32)
         .collect();
     // ⭐ THE PER-TENSOR DEVICE FORMAT, FROM THE KERNEL SIGNATURES — a tensor whose
     // consumer is a spliced kernel is sized at the format that kernel's signature
@@ -1175,11 +1212,10 @@ pub fn compute_bundle_layout<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     // for all three. ⭐ ONLY THE ROPES THAT READ A TABLE TAKE A CLASS: a one-stick head's rotate is
     // its lane factor, one matmul against P; a head whose half is whole sticks rotates by stick
     // moves and names no table, so it is placed none and bound none.
-    let rope_class_hds = ktir_superdsc::reserved_tids::rope_p_table_class_hds(
-        ir.nodes
-            .iter()
-            .filter_map(|n| n.op.rope_head_dim().map(|d| d.get())),
-    );
+    let KernelTableClasses {
+        rope: rope_class_hds,
+        attn: attn_class_hds,
+    } = KernelTableClasses::of(ir);
     for (class, &hd) in rope_class_hds.iter().enumerate() {
         let tid = ktir_superdsc::reserved_tids::rope_p_class_tid(class);
         let seg = SegRole::Activation.segment();
@@ -1248,14 +1284,6 @@ pub fn compute_bundle_layout<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     // sorted descending) keeps `IDENTITY_TID`, so a uniform model's bundle is byte-identical.
     // `attn_class_hds` is the SHARED registry the door resolves a program's class through and the
     // worker's load-time bind builds each class's table from.
-    let attn_class_hds = ktir_superdsc::reserved_tids::rope_p_class_hds(
-        ir.nodes.iter().filter_map(|n| match &n.op {
-            SubOp::AttnDecode {
-                mask, attention, ..
-            } => Some(attention.class(mask.class()).head_dim().get()),
-            _ => None,
-        }),
-    );
     if let Some((&hd_max, _)) = attn_class_hds.split_first() {
         for (class, &hd) in attn_class_hds.iter().enumerate() {
             let tid = ktir_superdsc::reserved_tids::identity_class_tid(class);
@@ -1283,7 +1311,7 @@ pub fn compute_bundle_layout<T: ktir_superdsc::collective::Tp, F: RopeForm>(
         let seg = SegRole::Activation.segment();
 
         // ATTN_ZERO (BUG #3, same class as #1/#2 above, found by re-auditing this exact area 2026-07-28):
-        // `new_k`/`new_v` (AttnDecode's inputs[3]/[4]) are declared "[mq_pad, nkvh·hd] (worker zero-pads
+        // `new_k`/`new_v` (AttnDecode's step segment) are declared "[mq_pad, nkvh·hd] (worker zero-pads
         // rows)" — but nothing ever actually zeroed rows [mq..mq_pad) at ANY mq. This tid's placement was
         // ALSO stuck inside the old mq>1-only selector guard (moved out alongside IDENTITY_TID above), and
         // even there it was placed but never CONSUMED anywhere in this file — dead. `new_k`/`new_v` are a
@@ -1399,12 +1427,13 @@ pub fn compute_bundle_layout<T: ktir_superdsc::collective::Tp, F: RopeForm>(
 
     // ── fp8 W8A8 activation-quant consts [1,stick] (seg0, worker-bound like RMS_HALF) ── E4M3 clamp
     // bounds ±448 + 1/448 for `qfp8ch` (per-token amax → a_scale). Placed iff the tape has an fp8
-    // (arity-3) MatmulTile. Unplaced (and thus value-0) was the "clamp consts default 0 → wrong
-    // quant" gap; placing them here + binding in the worker gives the real E4M3 bounds.
+    // MatmulTile (its layout states a scale). Unplaced (and thus value-0) was the "clamp consts
+    // default 0 → wrong quant" gap; placing them here + binding in the worker gives the real E4M3
+    // bounds.
     if ir
         .nodes
         .iter()
-        .any(|n| matches!(n.op, SubOp::MatmulTile { .. }) && n.inputs.len() == 3)
+        .any(|n| n.op.matmul().is_some_and(|l| l.scale().is_some()))
     {
         let a = SegRole::Activation.segment();
         let sz = Fp16::ELEMS_PER_STICK as u64 * 2; // [1, stick] fp16
@@ -2032,6 +2061,41 @@ mod weight_tail_tests {
 /// pool table's bank per iteration, keyed by the table's layer-0 tid.
 type KvPoolBanks = (Vec<u64>, std::collections::BTreeMap<u32, Vec<KvBank>>);
 
+/// ⭐ ONE SLOT OF A KV BANK — an offset and the bytes it owns, minted ONLY by [`KvCarve::take`]. A
+/// KV placement takes its offset from a slot ([`place_kv_pools`]' `place`), never from a bare
+/// integer, so two caches sharing a byte of a bank is unrepresentable: every slot a carve hands out
+/// starts where the one before it ended. No public constructor; the fields are private.
+#[derive(Clone, Copy, Debug)]
+struct KvSlot {
+    offset: u64,
+}
+
+/// ⭐ A KV BANK CARVED FRONT TO BACK — the one writer of KV offsets, the KV twin of `SynthAlloc`:
+/// each [`Self::take`] hands out the next `bytes` past the last slot (flit-aligned), so the slots of
+/// one carve are pairwise disjoint by construction and [`Self::end`] is exactly the bank's extent.
+struct KvCarve {
+    next: u64,
+}
+
+impl KvCarve {
+    /// A carve of a bank whose first `start` bytes are already owned.
+    const fn from(start: u64) -> Self {
+        Self { next: start }
+    }
+
+    /// The next slot: `bytes` wide, starting where the last one ended.
+    fn take(&mut self, bytes: u64) -> KvSlot {
+        let slot = KvSlot { offset: self.next };
+        self.next = align128(self.next + bytes);
+        slot
+    }
+
+    /// The bank's extent: every slot carved, flit-aligned.
+    const fn end(&self) -> u64 {
+        self.next
+    }
+}
+
 fn place_kv_pools(
     pools: &[u32],
     per_layer_ext: &[std::collections::BTreeMap<u32, Vec<u32>>],
@@ -2041,7 +2105,9 @@ fn place_kv_pools(
 ) -> Result<KvPoolBanks, SuperDscError> {
     let kv_seg = SegRole::Kv.segment();
     let is_pool: std::collections::BTreeSet<u32> = pools.iter().copied().collect();
-    let mut place = |tid: u32, bank: KvBank, offset: u64| -> Result<(), SuperDscError> {
+    // ⭐ A KV PLACEMENT IS A SLOT'S — its offset is the slot's, never a bare integer. The slot is
+    // carved at its table's widest layer (below), so every tensor placed in it fits whole.
+    let mut place = |tid: u32, bank: KvBank, slot: KvSlot| -> Result<(), SuperDscError> {
         placements.insert(
             tid,
             TensorPlacement {
@@ -2049,7 +2115,7 @@ fn place_kv_pools(
                 role: SegRole::Kv,
                 segment: kv_seg,
                 bank: bank.get(),
-                offset,
+                offset: slot.offset,
                 size: size_of(tid)?,
             },
         );
@@ -2067,23 +2133,24 @@ fn place_kv_pools(
             continue;
         };
         // Each table's slot is as wide as its widest layer, so no layer's tensor reaches into
-        // the next table's slot.
-        let mut intra: Vec<u64> = Vec::with_capacity(tables.len());
-        let mut block = 0u64;
+        // the next table's slot. ONE carve states the class's block — every bank of the class
+        // (one per layer) is that block, so its slots are the same in every bank.
+        let mut carve = KvCarve::from(0);
+        let mut intra: Vec<KvSlot> = Vec::with_capacity(tables.len());
         for (_, tids) in &tables {
-            intra.push(block);
             let widest = tids
                 .iter()
                 .try_fold(0u64, |w, &t| size_of(t).map(|s| w.max(s)))?;
-            block = align128(block + widest);
+            intra.push(carve.take(widest));
         }
+        let block = carve.end();
         let banks: Vec<KvBank> = (0..first.len())
             .map(|j| KvBank::of_placement((bank_bytes.len() + j) as u32))
             .collect();
         bank_bytes.extend(std::iter::repeat_n(block, banks.len()));
-        for ((t0, tids), &off) in tables.iter().zip(&intra) {
+        for ((t0, tids), &slot) in tables.iter().zip(&intra) {
             for (&tid, &bank) in tids.iter().zip(&banks) {
-                place(tid, bank, off)?;
+                place(tid, bank, slot)?;
             }
             table_banks.insert(*t0, banks.clone());
         }
@@ -2095,12 +2162,13 @@ fn place_kv_pools(
         .iter()
         .flat_map(|class| class.values().flatten().copied())
         .collect();
-    let mut tail = bank_bytes[0];
+    // Bank 0's tail continues bank 0's carve: past its block, one slot per unowned pool.
+    let mut tail = KvCarve::from(bank_bytes[0]);
     for &tid in pools.iter().filter(|t| !owned.contains(t)) {
-        place(tid, KvBank::BASE, tail)?;
-        tail = align128(tail + size_of(tid)?);
+        let slot = tail.take(size_of(tid)?);
+        place(tid, KvBank::BASE, slot)?;
     }
-    bank_bytes[0] = tail;
+    bank_bytes[0] = tail.end();
     seg_bytes[kv_seg] = bank_bytes[0];
     Ok((bank_bytes.split_off(1), table_banks))
 }
@@ -2108,23 +2176,26 @@ fn place_kv_pools(
 /// ⭐ THE SESSION'S POOLS AT THE BAKE'S PAGES — every pool the layout placed, re-placed by [`place_kv_pools`] at `pages` pages of each pool's own page ([`crate::wiring::KvPool::page_bytes`], its format's), with the KV segment's banks and each table's banks. Each pool's row-outermost arrangement is re-sized with it ([`BundleLayout::resize_row_outermost`]). The row pool (`step`'s, at the bake's pages) is the LAST placement of its segment, so it grows in place at that segment's end; a row pool something sits after is refused. The pools are the KV segment's only tenants, so nothing else moves; a layout that placed no pool (every off-card bake) places none.
 pub fn place_kv_pools_at<T: ktir_superdsc::collective::Tp>(
     rolled: &mut RolledSuperDsc<T>,
-    step: Option<crate::wiring::PagedStep>,
+    // ⭐ EVERY ATTENTION CLASS'S STEP — the pools are the session's, placed ONCE; each class's step
+    // brings only its own facts: its batch rule and its own row pool.
+    steps: &[crate::wiring::PagedStep],
     pages: crate::pool_pages::PoolPages,
 ) -> Result<(), SuperDscError> {
-    // ⭐ THE BATCH RULE AT THE POOL THE CARD IS GIVEN ([`scratchy_triton_splice::chunk_fits_pool`]): the
-    // splice checked it at the context's pool; the bake's pool may hold fewer pages, so it is checked
-    // again here, a build error naming both counts.
-    if let Some(step) = step
-        && let Some(chunking) = step.batch()
-        && !scratchy_triton_splice::chunk_fits_pool(&chunking, pages.get())
-    {
-        return Err(SuperDscError(format!(
-            "a {}-sequence decode batch gathers {} page(s) a chunk, and the bake's KV pool holds {} \
-             — a gather of the whole pool faults the card (torch-spyre#4033)",
-            step.rows,
-            chunking.entries(),
-            pages.get()
-        )));
+    // ⭐ THE BATCH RULE AT THE POOL THE CARD IS GIVEN ([`scratchy_triton_splice::chunk_fits_pool`]),
+    // for every class's step: the splice states the rule at the context's pool and the bake's pool
+    // may hold fewer pages, so the pool the card is given is the one it is stated over here.
+    for step in steps {
+        if let Some(chunking) = step.batch()
+            && !scratchy_triton_splice::chunk_fits_pool(&chunking, pages.get())
+        {
+            return Err(SuperDscError(format!(
+                "a {}-sequence decode batch gathers {} page(s) a chunk, and the bake's KV pool \
+                 holds {} — a gather of the whole pool faults the card (torch-spyre#4033)",
+                step.rows(),
+                chunking.entries(),
+                pages.get()
+            )));
+        }
     }
     let RolledSuperDsc {
         layout,
@@ -2165,9 +2236,11 @@ pub fn place_kv_pools_at<T: ktir_superdsc::collective::Tp>(
     for &tid in &tids {
         layout.resize_row_outermost(tid)?;
     }
-    if let Some(step) = step.filter(|s| s.reads_kv_row_pool())
-        && let Some(p) = layout.placements.get_mut(&step.kv_row_pool)
-    {
+    // Each class's own row pool, grown to the bake's pages where its attention reads one.
+    for step in steps.iter().filter(|s| s.reads_kv_row_pool()) {
+        let Some(p) = layout.placements.get_mut(&step.kv_row_pool()) else {
+            continue;
+        };
         if align128(p.offset + p.size) != layout.segment_bytes[p.segment] {
             return Err(SuperDscError(format!(
                 "t{}: the row pool ends at {} of seg{}, which runs to {} — it grows in place only as \
@@ -2672,6 +2745,13 @@ pub fn staged_rope_rows<F: RopeForm>(
     ir: &SubtileIR<F>,
     rotary_cos: &[(u32, crate::wiring::RotaryKind)],
     rotary_sin: &[(u32, crate::wiring::RotaryKind)],
+    // The chunk's POSITION ORIGIN — row `r` of the table rotates at sequence
+    // position `start + r` ([`crate::paged_step::StepRows::pos`]'s law, the one
+    // statement): `0` for a first chunk, a resident prefix's length for a
+    // continuation chunk. The pad clamp downstream indexes rows CHUNK-RELATIVELY
+    // (`StepRows::live`), so the clamp needs no start of its own — the two laws
+    // compose by construction.
+    start: u32,
 ) -> Result<std::collections::HashMap<u32, Vec<f32>>, String> {
     let rope_table_half = rope_table_periods(ir);
     let mut out = std::collections::HashMap::new();
@@ -2694,7 +2774,7 @@ pub fn staged_rope_rows<F: RopeForm>(
             let chd = kind.head_dim() as usize;
             let mut buf = vec![0.0f32; rows * cols];
             for r in 0..rows {
-                let (c, s) = crate::manifest::rope_cos_sin_kind(r as u32, kind);
+                let (c, s) = crate::manifest::rope_cos_sin_kind(start + r as u32, kind);
                 let row =
                     crate::forward_tape::tile_rotary_row(if want_cos { &c } else { &s }, cols, chd);
                 buf[r * cols..(r + 1) * cols].copy_from_slice(&row);
@@ -2889,17 +2969,21 @@ fn stage_synth_weights<F: RopeForm>(
     // sharded gate gives a rank's slice of a sharded weight a stream of its own.
     seed: &dyn Fn(u32) -> usize,
 ) -> StagedWeights {
-    use scratchy_subtile::lower::GemmWeight;
     // ── The fp8 operand classification, off the IR the lowering itself read ──
     let mut fp8_payloads: std::collections::HashSet<u32> = std::collections::HashSet::new();
     let mut scale_rows: std::collections::HashSet<u32> = std::collections::HashSet::new();
     for node in &ir.nodes {
         match &node.op {
-            SubOp::MatmulTile { weight, .. }
-                if matches!(weight, GemmWeight::Fp8Dynamic) && node.inputs.len() == 3 =>
-            {
-                fp8_payloads.insert(node.inputs[1].tensor.index() as u32);
-                scale_rows.insert(node.inputs[2].tensor.index() as u32);
+            SubOp::MatmulTile { .. } => {
+                // The scheme's layout names the payload and the scale — a scale-free scheme has
+                // neither.
+                let layout = node.op.matmul();
+                if let Some(l) = layout
+                    && let (Some(payload), Some(scale)) = (l.fp8_payload(), l.scale())
+                {
+                    fp8_payloads.insert(node.inputs[payload].tensor.index() as u32);
+                    scale_rows.insert(node.inputs[scale].tensor.index() as u32);
+                }
             }
             // `[rows, over, weight(, w_scale)]` — same law for the all-rows form.
             SubOp::AllRowsMatmul if node.inputs.len() == 4 => {
@@ -2940,8 +3024,9 @@ fn stage_synth_weights<F: RopeForm>(
     let mut gemm_weights: std::collections::HashSet<u32> = std::collections::HashSet::new();
     for node in &ir.nodes {
         match &node.op {
-            SubOp::MatmulTile { .. } => {
-                gemm_weights.insert(node.inputs[1].tensor.index() as u32);
+            SubOp::MatmulTile { weight, .. } => {
+                let w = scratchy_subtile::subtile_ir::MatmulLayout::of(*weight).weight();
+                gemm_weights.insert(node.inputs[w].tensor.index() as u32);
             }
             SubOp::AllRowsMatmul => {
                 gemm_weights.insert(node.inputs[2].tensor.index() as u32);
@@ -3076,6 +3161,11 @@ struct EmuReadback<'a> {
     /// pad rows past `real` are the golden's unclamped view of states the runtime never
     /// reads, and grading them would refuse a correct run.
     real: Option<u32>,
+    /// ⭐ THE PACKED WINDOW FRAME THIS RUN WAS STAGED AT — `(per-request width, requests)`,
+    /// `None` for a rung with no frame (a decode bundle, rows-are-requests). The walk's
+    /// per-request attention products and fold rows state the same law the golden's do
+    /// ([`eval_attn_packed`], [`folded_answer_rows`]).
+    packed: Option<(u32, u32)>,
 }
 
 /// Whether `op` reads across ranks — the nodes a rank's reference evaluates against its peer.
@@ -3134,6 +3224,81 @@ impl GatePeer<'_> {
 /// One rank of a sharded forward evaluates its collectives against its `peer`
 /// ([`GatePeer`]): the reference walks the rank's own graph, and only a collective
 /// reads across ranks.
+/// ⭐ THE PACKED WINDOW VIEW — request `r` owns graph rows `r·w .. r·w+w` (the splice's own
+/// law, [`crate::paged_step::QueryRowIndex::of_request`]; the card stager's windows; the
+/// packed write index's rows). The golden states it as a PER-REQUEST VIEW of the attention
+/// node: the query and the NEW K/V segments re-sliced to the request's rows — an op-output
+/// segment spans the graph's rows; a SOURCE segment is a pool prefix and stays whole (every
+/// request of the probe reads the same staged prefix values) — and the per-request products
+/// CONCATENATED in request order, which IS the graph's rows, so the caller's own scatter
+/// lands each request's rows at its window. `eval_node`'s law then reads one request exactly
+/// as it reads a solo sequence: `own_pos = seq_len − mq + qi` over the request's pool prefix
+/// and its own new rows — the continuation positions and the ISOLATION the card's per-request
+/// masks stage. The card never lets a request attend another's keys; a golden that evaluated
+/// the packed graph as ONE sequence leaked requests into each other and would have convicted a
+/// correct staging. At one request the view is the identity — `packed` is `None` for a graph
+/// that is not a packed prefill's, and every such golden keeps the bytes it has always had.
+fn eval_attn_packed<F: RopeForm>(
+    node: &scratchy_subtile::subtile_ir::SubtileNode<F>,
+    ir: &SubtileIR<F>,
+    scale_site: scratchy_subtile::subtile_ir::AttnScaleSite,
+    bufs: &[Vec<f32>],
+    packed: Option<(u32, u32)>,
+) -> Vec<f32> {
+    use scratchy_subtile::subtile_ir as sir;
+    let (Some((w, requests)), sir::SubOp::AttnDecode { operands, .. }) = (packed, &node.op) else {
+        return sir::eval_node(node, ir, scale_site, bufs);
+    };
+    let g = w * requests;
+    // A region on the graph's row frame: the whole rows of a tensor whose row count IS the
+    // graph's. Anything else an attention's Q / new-KV / output might name has no staging law
+    // to view by — panic rather than silently misread (the rope eval's own precedent).
+    let graph_framed = |r: &sir::TensorRegion| {
+        r.region.rows == sir::Range::new(0, g) && ir.tensors[r.tensor.index()].rows == g
+    };
+    let reslice = |r: &sir::TensorRegion, req: u32| sir::TensorRegion {
+        region: sir::Region {
+            rows: sir::Range::new(req * w, w),
+            cols: r.region.cols,
+        },
+        tensor: r.tensor,
+    };
+    let mut out = Vec::new();
+    for req in 0..requests {
+        let mut viewed = node.clone();
+        // Q — the graph's rows.
+        let q = operands.q();
+        assert!(
+            graph_framed(&viewed.inputs[q]),
+            "a packed attention's query region is not the graph's whole rows — no staging law \
+             to view it by"
+        );
+        viewed.inputs[q] = reslice(&viewed.inputs[q], req);
+        // The (K,V) segments (the layout's — the sinks weight is none of them): an op-output is
+        // the request's NEW rows; a source is the pool prefix every request reads, whole.
+        for inp in &mut viewed.inputs[operands.segment_inputs()] {
+            if ir.is_source(inp.tensor) {
+                continue;
+            }
+            assert!(
+                graph_framed(inp),
+                "a packed attention's new K/V region is not the graph's whole rows — no \
+                 staging law to view it by"
+            );
+            let framed = reslice(inp, req);
+            *inp = framed;
+        }
+        assert!(
+            graph_framed(&viewed.output),
+            "a packed attention's output region is not the graph's whole rows — no staging law \
+             to view it by"
+        );
+        viewed.output = reslice(&viewed.output, req);
+        out.extend(sir::eval_node(&viewed, ir, scale_site, bufs));
+    }
+    out
+}
+
 pub(crate) fn eval_golden_buffers<F: RopeForm>(
     ir: &SubtileIR<F>,
     staged_rope: &std::collections::HashMap<u32, Vec<f32>>,
@@ -3155,6 +3320,10 @@ pub(crate) fn eval_golden_buffers<F: RopeForm>(
     // Each synth source's stream — `stage_gate_probe`'s own `seed`, so the reference reads exactly
     // the values the session was handed.
     seed: &dyn Fn(u32) -> usize,
+    // ⭐ THE PACKED WINDOW FRAME — `(per-request width, requests)` for a packed prefill's graph
+    // (each attention viewed per request, [`eval_attn_packed`]); `None` for every graph whose
+    // rows are one sequence's.
+    packed: Option<(u32, u32)>,
 ) -> Vec<Vec<f32>> {
     let nsrc = ir.num_sources as usize;
     // ⭐ THE FOLD, STATED FOR THE GOLDEN TOO — BOTH KINDS. A weight-folded ScalarMul has no
@@ -3281,18 +3450,28 @@ pub(crate) fn eval_golden_buffers<F: RopeForm>(
     // the quant model's round trip below already states exactly that grid —
     // pre-rounding here would round-trip the wrong value.
     let fp8_payloads: std::collections::HashSet<usize> = ir
-        .nodes
-        .iter()
-        .filter_map(|n| match &n.op {
-            SubOp::MatmulTile {
-                weight: scratchy_subtile::lower::GemmWeight::Fp8Dynamic,
-                ..
-            } if n.inputs.len() == 3 => Some(n.inputs[1].tensor.index()),
-            _ => None,
-        })
+        .fp8_weight_payloads()
+        .into_iter()
+        .map(|t| t.index())
+        .collect();
+    // ⭐⭐ THE FLOAT8 POOLS' ROWS — the same exemption the fp8 payloads take, at the OTHER grid:
+    // a float8 KV pool's stick is e4m3 (`Df::Fp8`, the splice's `kv_pool_formats` law), and the
+    // value its readers see is the stimulus through the SATURATING round trip — the staged
+    // bytes' own encode (`stage_gate_probe`'s typed channel), never an f16 hop first: pre-rounding
+    // here would round-trip the wrong value. The law is the splice's, consumed (a pool's format
+    // is its writer's codec); the graph is validated and the lowering already read it, so its
+    // refusal here is a bug, stated loudly.
+    let fp8_pools: std::collections::HashSet<u32> = scratchy_triton_splice::kv_pool_formats(ir)
+        .unwrap_or_else(|e| panic!("the golden's pool format law: {e} — the graph is validated"))
+        .into_iter()
+        .filter_map(|(t, f)| matches!(f, scratchy_triton_splice::KvPoolFormat::Fp8(_)).then_some(t))
         .collect();
     for (id, vals) in src_vals.iter_mut().enumerate() {
-        if !fp8_payloads.contains(&id) {
+        if fp8_pools.contains(&(id as u32)) {
+            for v in vals.iter_mut() {
+                *v = scratchy_tensors::fp8::e4m3_saturating_round_trip(*v);
+            }
+        } else if !fp8_payloads.contains(&id) {
             for v in vals.iter_mut() {
                 *v = half::f16::from_f32(*v).to_f32();
             }
@@ -3438,7 +3617,7 @@ pub(crate) fn eval_golden_buffers<F: RopeForm>(
         };
         let mut out = match peer {
             Some(p) if is_collective(&node_ref.op) => p.collective(node_ref, ir, &bufs),
-            _ => scratchy_subtile::subtile_ir::eval_node(node_ref, ir, scale_site, &bufs),
+            _ => eval_attn_packed(node_ref, ir, scale_site, &bufs, packed),
         };
         // The fp8 matmul's quant model (see the closures above): the ideal product over
         // the ROUND-TRIPPED payload, then the ws mulf — fold included — on the result.
@@ -3449,13 +3628,10 @@ pub(crate) fn eval_golden_buffers<F: RopeForm>(
         // `e4m3_rt` on the raw synth) — re-tripping it would quantize the decoded
         // value a second time at the same scale, so only an UNstaged payload (one
         // the byte staging does not own) takes the round-trip re-eval.
-        if let SubOp::MatmulTile {
-            weight: scratchy_subtile::lower::GemmWeight::Fp8Dynamic,
-            ..
-        } = &node_ref.op
-            && node_ref.inputs.len() == 3
+        if let Some(l) = node_ref.op.matmul()
+            && let (Some(payload), Some(scale)) = (l.fp8_payload(), l.scale())
         {
-            let w_tid = node_ref.inputs[1].tensor.index();
+            let w_tid = node_ref.inputs[payload].tensor.index();
             if !saved_weights.iter().any(|(t, _)| *t == w_tid) {
                 let saved = std::mem::take(&mut bufs[w_tid]);
                 bufs[w_tid] = saved.iter().map(|v| e4m3_rt(*v)).collect();
@@ -3463,7 +3639,7 @@ pub(crate) fn eval_golden_buffers<F: RopeForm>(
                 bufs[w_tid] = saved;
             }
             let ws_eff = half::f16::from_f32(
-                ws_fold(node_ref.inputs[2].tensor.index() as u32) / FP8_SYNTH_SCALE,
+                ws_fold(node_ref.inputs[scale].tensor.index() as u32) / FP8_SYNTH_SCALE,
             )
             .to_f32();
             for v in out.iter_mut() {
@@ -3654,6 +3830,7 @@ fn teacher_forced_walk<F: RopeForm>(
         own: emu,
         peer,
         real,
+        packed,
     } = run;
     let nsrc = ir.num_sources as usize;
     let scalarmul_folds = crate::lower_subtile_tape_to_ktir::scalar_mul_weight_folds(ir);
@@ -3777,15 +3954,12 @@ fn teacher_forced_walk<F: RopeForm>(
         }
         let mut tf_out = match peer {
             Some(p) if is_collective(&node_ref.op) => p.collective(node_ref, ir, &tf),
-            _ => scratchy_subtile::subtile_ir::eval_node(node_ref, ir, scale_site, &tf),
+            _ => eval_attn_packed(node_ref, ir, scale_site, &tf, packed),
         };
-        if let SubOp::MatmulTile {
-            weight: scratchy_subtile::lower::GemmWeight::Fp8Dynamic,
-            ..
-        } = &node_ref.op
-            && node_ref.inputs.len() == 3
+        if let Some(l) = node_ref.op.matmul()
+            && let (Some(payload), Some(scale)) = (l.fp8_payload(), l.scale())
         {
-            let w_tid = node_ref.inputs[1].tensor.index();
+            let w_tid = node_ref.inputs[payload].tensor.index();
             // Same law as the golden's arm: a materialized payload IS the
             // round trip already; only an unstaged payload re-evaluates.
             if !saved_weights.iter().any(|(t, _)| *t == w_tid) {
@@ -3795,7 +3969,7 @@ fn teacher_forced_walk<F: RopeForm>(
                 tf[w_tid] = saved;
             }
             let ws_eff = half::f16::from_f32(
-                ws_fold(node_ref.inputs[2].tensor.index() as u32) / FP8_SYNTH_SCALE,
+                ws_fold(node_ref.inputs[scale].tensor.index() as u32) / FP8_SYNTH_SCALE,
             )
             .to_f32();
             for v in tf_out.iter_mut() {
@@ -3868,76 +4042,172 @@ fn teacher_forced_walk<F: RopeForm>(
                     && tf_out.len() % rcols == 0
                     && e_region.len() >= rcols
                 {
-                    let e_row = &e_region[..rcols];
-                    // ⭐ THE PAD LAW'S ANSWER ROW — at a padded staging the fold's product is
-                    // the LAST REAL row's (`real − 1`), the row the worker reads the answer
-                    // from; the golden's own last row is a pad row it never reads. A folded
-                    // tid's walk product may itself be ONE row (the fold's own product, not
-                    // `[mq, cols]`), so the walk's row clamps to its own product's last row —
-                    // at a full probe both clamps are the last row, the law unchanged.
-                    let want = real.map(|rz| (rz as usize).saturating_sub(1));
+                    // ⭐ THE FOLD'S PRODUCT IS S ROWS, ONE ANSWER ROW PER REQUEST of the
+                    // packed frame (`S = 1` at one request — row 0 alone, the law as it has
+                    // always read): request `r`'s answer row is ITS window's last real row —
+                    // the ONE `folded_answer_rows` law — stated per request, with each row
+                    // clamped to its own product's last row (a walk product shorter than
+                    // the graph's rows still grades the rows it holds; at a full
+                    // one-request probe the clamp is the last row, the law unchanged). The
+                    // compare grades the
+                    // emulator's S rows against the walk's per-request answer rows, and the
+                    // pin scatters the emulator's answer rows at rows `0..S` — the rows the
+                    // fold's consumers read (the Sample's `SampleRows::Folded` region is
+                    // rows `0..S`) — so the emulator's rows are pinned there and the rows
+                    // past them stay as the walk computed them (the program never wrote
+                    // them). Without this pin the walk's Sample re-drew from the WALK's
+                    // row 0 — the FIRST prompt position's logits, not the fold's product —
+                    // and the draw's local read golden-draw-vs-emu-draw (measured: granite
+                    // 1771-vs-12660 = 6.1485, llama 113360-vs-67129 = 0.4078, both exactly
+                    // |g−e|/g).
+                    //
+                    // A folded tail rides a prefill rung, which always states the packed
+                    // frame (a decode bundle never folds — the judge's own `folded` set is
+                    // empty there).
+                    let (w, requests) = packed.expect(
+                        "a folded tail tid outside a prefill rung's packed frame",
+                    );
+                    let answers = folded_answer_rows(w, requests, real);
+                    // ⭐ THE PRODUCT'S OWN FRAME — a folded tid's product is
+                    // framed by the rows its OWN tensor declares: a
+                    // GRAPH-ROW-FRAMED one (the logits sticks the fold
+                    // re-lowers — rows = the graph's `w·R`) has request `r`'s
+                    // answer row at `answers[r]`; an S-FRAMED one (the mint's
+                    // idx stick, rows = the requests — the fold's OWN
+                    // product, `SampleRows::Folded`'s declared rows) holds
+                    // one row per request at row `r` itself. A folded tid
+                    // framed as neither is a defect this states, not papers
+                    // over (measured, gate15 t570: the idx stick's answer
+                    // rows clamped onto the walk's last row for every
+                    // request — local 0.2774 = 15872/57216, exactly).
+                    let out_rows_declared = ir.tensors[node.output.tensor.index()].rows as usize;
+                    let s_framed = out_rows_declared == requests as usize;
+                    assert!(
+                        s_framed || out_rows_declared == w as usize * requests as usize,
+                        "a folded tail tid whose product frame is neither the graph's \
+                         rows nor the fold's S rows"
+                    );
                     let tf_rows = tf_out.len() / rcols;
-                    let tf_at = want
-                        .unwrap_or(tf_rows.saturating_sub(1))
-                        .min(tf_rows.saturating_sub(1));
-                    let tf_row = &tf_out[tf_at * rcols..(tf_at + 1) * rcols];
                     let g_rows = g_region.len().checked_div(rcols).unwrap_or(0);
-                    let g_at = want
-                        .unwrap_or(g_rows.saturating_sub(1))
-                        .min(g_rows.saturating_sub(1));
-                    let g_row = &g_region[g_at * rcols..(g_at + 1) * rcols];
+                    let e_avail = e_region.len() / rcols;
+                    let mut e_sel = Vec::new();
+                    let mut tf_sel = Vec::new();
+                    let mut g_sel = Vec::new();
+                    for r in 0..requests as usize {
+                        if r >= e_avail {
+                            break;
+                        }
+                        let at = if s_framed {
+                            r
+                        } else {
+                            answers[r] as usize
+                        };
+                        e_sel.extend_from_slice(&e_region[r * rcols..][..rcols]);
+                        let tf_at = at.min(tf_rows.saturating_sub(1));
+                        tf_sel.extend_from_slice(&tf_out[tf_at * rcols..][..rcols]);
+                        let g_at = at.min(g_rows.saturating_sub(1));
+                        g_sel.extend_from_slice(&g_region[g_at * rcols..][..rcols]);
+                    }
                     rows.push(TeacherForcedRow {
                         tid,
                         node: ni,
                         op: node.op.name(),
                         fp8: tainted.contains(&(tid as u32)),
-                        local: rel_l1(e_row, tf_row),
-                        inherited: rel_l1(tf_row, g_row),
+                        local: rel_l1(&e_sel, &tf_sel),
+                        inherited: rel_l1(&tf_sel, &g_sel),
                     });
-                    let row0 = scratchy_subtile::subtile_ir::Region {
-                        rows: scratchy_subtile::subtile_ir::Range::new(0, 1),
+                    let pinned = scratchy_subtile::subtile_ir::Region {
+                        rows: scratchy_subtile::subtile_ir::Range::new(
+                            0,
+                            (e_sel.len() / rcols) as u32,
+                        ),
                         cols: node.output.region.cols,
                     };
                     scratchy_subtile::subtile_ir::scatter(
                         &mut tf,
                         node.output.tensor,
-                        row0,
-                        e_row,
+                        pinned,
+                        &e_sel,
                         shape,
                     );
                 } else {
                     // ⭐ THE PAD LAW'S LOCAL ROWS — a padded run grades only the rows the
-                    // runtime reads: the first `real` rows of this op's region (the pad rows
-                    // past `real` are the golden's unclamped view of states the runtime never
-                    // reads). The teacher's pin below still scatters the WHOLE region — the
-                    // walk's downstream rows keep the emulator's own values, pads included.
-                    let mask = real
-                        .map(|rz| {
-                            let cols = node.output.region.cols.len as usize;
-                            let rows = node.output.region.rows;
-                            let live = (rz as usize).saturating_sub(rows.start as usize);
-                            if cols > 0 {
-                                (live.min(rows.len as usize)) * cols
+                    // runtime reads: a GRAPH-ROW-FRAMED region's live rows are each
+                    // request's first `real` (its window's rows `r·w .. r·w+real` — the
+                    // per-request pad law, the golden's own), any other region's the first
+                    // `real` of it (the prefix law as it has always read; at one request
+                    // the framed law is that same prefix). The pad rows past them are the
+                    // golden's unclamped view of states the runtime never reads. The
+                    // teacher's pin below still scatters the WHOLE region — the walk's
+                    // downstream rows keep the emulator's own values, pads included.
+                    let region = node.output.region;
+                    let (local, inherited) = match real {
+                        // A full-rows probe grades the WHOLE region (the law as
+                        // it has always read — the golden's unclamped view).
+                        None => (rel_l1(&e_region, &tf_out), rel_l1(&tf_out, &g_region)),
+                        Some(rz) => {
+                            let rz = rz as usize;
+                            // `real` rides a prefill pad probe, whose rung always
+                            // states the packed frame.
+                            let (w, reqs) = packed.expect(
+                                "a padded probe rides a prefill rung, which states the packed frame",
+                            );
+                            let g = w * reqs;
+                            let framed = ir.tensors[node.output.tensor.index()].rows == g
+                                && region.rows
+                                    == scratchy_subtile::subtile_ir::Range::new(0, g);
+                            if !framed || reqs == 1 {
+                                // The PREFIX law as it has always read (at one
+                                // request the framed law IS that prefix): the
+                                // region's first `real` rows; a zero-width one
+                                // grades the whole region, as it always has.
+                                let live = rz
+                                    .saturating_sub(region.rows.start as usize)
+                                    .min(region.rows.len as usize);
+                                let m = live * rcols;
+                                if m > 0 {
+                                    (
+                                        rel_l1(
+                                            &e_region[..m.min(e_region.len())],
+                                            &tf_out[..m.min(tf_out.len())],
+                                        ),
+                                        rel_l1(
+                                            &tf_out[..m.min(tf_out.len())],
+                                            &g_region[..m.min(g_region.len())],
+                                        ),
+                                    )
+                                } else {
+                                    (rel_l1(&e_region, &tf_out), rel_l1(&tf_out, &g_region))
+                                }
                             } else {
-                                0
+                                // The framed packed law: each request's first
+                                // `real` rows — its window's rows `r·w .. r·w+real`.
+                                let keep: Vec<usize> = (0..region.rows.len as usize)
+                                    .filter(|l| l % (w as usize) < rz)
+                                    .collect();
+                                let sel = |buf: &[f32]| -> Vec<f32> {
+                                    let mut out = Vec::with_capacity(keep.len() * rcols);
+                                    for l in &keep {
+                                        let at = l * rcols;
+                                        if at + rcols <= buf.len() {
+                                            out.extend_from_slice(&buf[at..at + rcols]);
+                                        }
+                                    }
+                                    out
+                                };
+                                let (e_j, tf_j, g_j) =
+                                    (sel(&e_region), sel(&tf_out), sel(&g_region));
+                                (rel_l1(&e_j, &tf_j), rel_l1(&tf_j, &g_j))
                             }
-                        })
-                        .filter(|m| *m > 0);
-                    let (e_j, tf_j, g_j) = match mask {
-                        Some(m) => (
-                            &e_region[..m.min(e_region.len())],
-                            &tf_out[..m.min(tf_out.len())],
-                            &g_region[..m.min(g_region.len())],
-                        ),
-                        None => (&e_region[..], &tf_out[..], &g_region[..]),
+                        }
                     };
                     rows.push(TeacherForcedRow {
                         tid,
                         node: ni,
                         op: node.op.name(),
                         fp8: tainted.contains(&(tid as u32)),
-                        local: rel_l1(e_j, tf_j),
-                        inherited: rel_l1(tf_j, g_j),
+                        local,
+                        inherited,
                     });
                     // The teacher's pin: downstream nodes see the EMULATOR's
                     // value, not the golden's product.
@@ -3995,7 +4265,9 @@ pub fn write_eval_golden<F: RopeForm>(
     // it per node: the same product, the same values, no all-weights f32.
     let staged = stage_synth_weights(ir, weight_ids, None, &|tid| tid as usize);
     let view = staged.view();
-    let bufs = eval_golden_buffers(ir, staged_rope, &view, None, None, &|tid| tid as usize);
+    // No packed frame: the DBG oracle states the whole graph's law at one
+    // sequence, as it always has.
+    let bufs = eval_golden_buffers(ir, staged_rope, &view, None, None, &|tid| tid as usize, None);
     // The scales manifest's skip set — the same folded-node predicate the walk used.
     let scalarmul_folds = crate::lower_subtile_tape_to_ktir::scalar_mul_weight_folds(ir);
     let folded_node = |id: scratchy_subtile::subtile_ir::SubtileId| {
@@ -4083,6 +4355,40 @@ struct GateProbe {
     load_consts: Vec<BuiltConst>,
     staged_rope: std::collections::HashMap<u32, Vec<f32>>,
     sources: Vec<(u64, Vec<f32>, Vec<usize>)>,
+    /// ⭐ THE FLOAT8 POOLS' STIMULUS — page-laid e4m3 bytes, staged through the TYPED channel
+    /// (`set_typed_sources`), never `run_step`'s f16 one: a float8 pool's view is `Df::Fp8`
+    /// (the splice's `kv_pool_formats` law) and the f16 channel would write f16-encoded bytes
+    /// into it. The golden's pool rows are the SAME stimulus through the e4m3 grid's saturating
+    /// round trip (`eval_golden_buffers`) — the two legs meet at the grid like the fp8 weight
+    /// payloads, never at a guessed f16 floor.
+    fp8_pool_bytes: Vec<(usize, Vec<u8>, Vec<usize>)>,
+    /// The pool's token slots per page — the step's own `PagedStep::page_slots`, `None` when
+    /// the bundle stages no paged step. The continuation probe's position origin: the card's
+    /// earliest second chunk begins at exactly one page boundary, so the gate restates the
+    /// rung at `start = page_slots` — the first cell that exercises a resident prefix.
+    page_slots: Option<u32>,
+}
+
+/// Stage a probe's float8 pool stimulus into a fresh session — the TYPED channel
+/// (`set_typed_sources`), the same one the paged step's int32 tables ride: a float8 pool's
+/// view is `Df::Fp8` and widens each byte on read (`weight_arg`'s fp8 law), so the e4m3 bytes
+/// must land verbatim, never through `run_step`'s f16 source channel. No-op for a probe that
+/// staged no float8 pool (every dense-KV bundle).
+#[cfg(feature = "spyre-emu")]
+fn stage_fp8_pools(
+    session: &mut crate::runner::SpyreSession,
+    pools: Vec<(usize, Vec<u8>, Vec<usize>)>,
+) -> Result<(), String> {
+    if pools.is_empty() {
+        return Ok(());
+    }
+    let typed = pools
+        .into_iter()
+        .map(|(id, bytes, shape)| (id, bytes, scratchy_tensors::DType::Fp8E4m3, shape))
+        .collect();
+    session
+        .set_typed_sources(typed)
+        .map_err(|e| format!("the gate's float8 pool staging: {e}"))
 }
 
 #[cfg(feature = "spyre-emu")]
@@ -4202,7 +4508,7 @@ fn stage_gate_probe<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     // synth below — its tables are one row, where the periodic pattern and
     // the run-time staging agree by construction.
     let mut staged_rope: std::collections::HashMap<u32, Vec<f32>> = match prefill {
-        Some(pg) => staged_rope_rows(ir, &pg.rotary_cos, &pg.rotary_sin)?,
+        Some(pg) => staged_rope_rows(ir, &pg.rotary_cos, &pg.rotary_sin, pg.start)?,
         None => Default::default(),
     };
     // ⭐ THE PAGED STEP, STAGED BY THE WORKER'S OWN LAW (`crate::paged_step`). The gate's one step
@@ -4212,10 +4518,10 @@ fn stage_gate_probe<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     // table rather than at its block's own index. The reference attends the cache's token-major
     // rows; the pools the paged walk reads are those SAME values laid into their pages
     // (`pool_of_rows`), so the two read one set of keys.
-    // One request's step: the gate runs in an emulator bake, whose decode rungs are one request
-    // wide (the batch rungs, `PagedKvPool::BATCH_RUNGS`, bake for the card alone) — a decode
-    // bundle's one row is that request's, read by the batched kernel at one sequence, and a prompt
-    // chunk's rows are one sequence's (the bake's `rows_are_requests`).
+    // The rung's whole step: a decode bundle's rows are one token of each of its requests — the
+    // solo rung's one row and a batch rung's (`PagedKvPool::BATCH_RUNGS`) every request alike,
+    // both baked and both gated whenever `spyre-lower` and `spyre-emu` are on together — and a
+    // prompt chunk's rows are one sequence's (the bake's `rows_are_requests`).
     let paged = crate::lower_subtile_tape_to_ktir::paged_step_of_ir(
         ir,
         rung.active_cap,
@@ -4233,20 +4539,25 @@ fn stage_gate_probe<T: ktir_superdsc::collective::Tp, F: RopeForm>(
         .iter()
         .filter_map(|n| match &n.op {
             SubOp::AttnDecode {
-                mask, attention, ..
-            } if n.inputs.len() >= 3 => {
+                mask,
+                attention,
+                operands,
+                ..
+            } => {
                 let g = attention.class(mask.class());
-                let key = (
-                    mask.window().map(|w| w.get()).unwrap_or(0),
+                // The node's class by the splice's one classifier; its step is that class's.
+                let class = scratchy_triton_splice::attn_step_class_of(
+                    ir,
+                    mask.window(),
                     g.kv_heads().get(),
-                );
-                let step = paged
-                    .iter()
-                    .find(|p| (p.window.map(|w| w.get()).unwrap_or(0), p.nkvh) == key)?;
+                )
+                .ok()?;
+                let step = paged.iter().find(|p| p.class.index() == class)?;
                 let hd = g.head_dim().get() as usize;
+                // The pools are the resident prefix — the layout's first segment.
                 Some([
-                    (n.inputs[1].tensor.index() as u32, (*step, hd)),
-                    (n.inputs[2].tensor.index() as u32, (*step, hd)),
+                    (n.inputs[operands.k(0)].tensor.index() as u32, (*step, hd)),
+                    (n.inputs[operands.v(0)].tensor.index() as u32, (*step, hd)),
                 ])
             }
             _ => None,
@@ -4257,9 +4568,9 @@ fn stage_gate_probe<T: ktir_superdsc::collective::Tp, F: RopeForm>(
         .nodes
         .iter()
         .filter_map(|n| match &n.op {
-            SubOp::AttnDecode { .. } if n.inputs.len() >= 3 => Some([
-                n.inputs[1].tensor.index() as u32,
-                n.inputs[2].tensor.index() as u32,
+            SubOp::AttnDecode { operands, .. } => Some([
+                n.inputs[operands.k(0)].tensor.index() as u32,
+                n.inputs[operands.v(0)].tensor.index() as u32,
             ]),
             _ => None,
         })
@@ -4271,63 +4582,143 @@ fn stage_gate_probe<T: ktir_superdsc::collective::Tp, F: RopeForm>(
             // `check` used to validate at every call, now the mint's fact: `real ≤ width` is
             // carried by the type, and a step wider than its rung does not exist to stage.
             pg.mq as usize,
-            0,
+            // The chunk's position origin ([`PrefillGate::start`]) — the pool stimulus, the
+            // block walk and every derived index below read it through the type's own law.
+            pg.start as usize,
             pad.map(|real| real as usize).unwrap_or(pg.mq as usize),
         )
-        .expect(
-            "the prefill wiring's rung holds no query rows — the bake cannot stage its step",
-        ),
+        .expect("the prefill wiring's rung holds no query rows — the bake cannot stage its step"),
         (None, Some(p)) => {
             let cached = ir
                 .nodes
                 .iter()
                 .filter_map(|n| match &n.op {
-                    SubOp::AttnDecode { .. } if n.inputs.len() >= 5 => {
-                        Some(n.inputs[1].region.rows.len as usize)
+                    // The cached rows: the resident prefix of an attention with a step segment.
+                    SubOp::AttnDecode { operands, .. } if operands.step_segment().is_some() => {
+                        Some(n.inputs[operands.k(0)].region.rows.len as usize)
                     }
                     _ => None,
                 })
                 .max()
                 .unwrap_or(0);
-            crate::paged_step::StepRows::one_at(cached.min(p.capacity().saturating_sub(1)))
+            // ⭐ THE RUNG'S OWN ROWS, NOT ONE — a decode rung's step carries every row the rung
+            // bakes ([`GateRung::query_rows`], the pair `paged_step_of_ir` already checked
+            // against this graph): the solo rung's one row — the old `one_at`, byte-identical
+            // at `graph_rows == 1` — and a batch rung's one token of EACH of its requests. The
+            // positions the type states, row `r` at `start + r`, are the golden's own
+            // `own_pos = seq_len − mq + qi` over the same region, so the batched kernel's
+            // per-request windows and the reference's chunk windows read one set of keys.
+            let rows = rung.query_rows.graph_rows().get() as usize;
+            crate::paged_step::StepRows::new(rows, cached.min(p.capacity().saturating_sub(1)), rows)
+                .expect("the rung's query rows are its step's — a zero-row rung cannot bake")
         }
         (None, None) => crate::paged_step::StepRows::one_at(0),
     };
     // The request's blocks name the pages ONE ON — block `i` is page `i + 1` — so the walk reads
     // every page through the table rather than at its block's own index, and the pages the step
     // touches stay at the pool's start (the staging below writes only that prefix).
-    let blocks: Vec<u32> = paged
+    let blocks: Vec<crate::paged_step::PoolPage> = paged
         .first()
         .map(|p| {
             let need = step_rows.end().div_ceil(p.page_slots as usize) as u32;
-            if need < p.pages {
-                (1..=need).collect()
+            if need < p.pages.get() {
+                (0..need)
+                    .map(crate::paged_step::PoolPage::of_block)
+                    .collect()
             } else {
-                (0..need).collect()
+                // ⛔ A PROBE POOL WITH NO PAGE TO SPARE STAGES THE REQUEST ON THE NULL PAGE — the
+                // one page no request may hold. Spelled with `PoolPage::NULL` so the law it breaks
+                // is visible here, byte-identical to the pages it always staged (0..need); the fix
+                // is a probe pool one page past the request's (gemma4's gate, flagged).
+                std::iter::once(crate::paged_step::PoolPage::NULL)
+                    .chain((0..need.saturating_sub(1)).map(crate::paged_step::PoolPage::of_block))
+                    .collect()
             }
         })
         .unwrap_or_default();
+    // ⭐ THE LAUNCH'S REQUESTS — the rung's extent states how many requests the graph's rows pack
+    // ([`QueryExtent::requests`]: one for every solo rung, the packed count for a packed one),
+    // and the probe stages EACH REQUEST ITS OWN BLOCKS — request `r`'s block `i` is page
+    // `r·need + i + 1`, the pages DISJOINT across requests so every request's cache rows are its
+    // own ([`PagedStep::cache_row`] is page-keyed: distinct page ids name distinct folded-cache
+    // rows). At one request the law is the solo `blocks` above, byte for byte (its flagged
+    // null-page fallback included). A pool that cannot seat the rung's requests on distinct
+    // pages REFUSES — two requests on one page would stage a cross-request leak, which the gate
+    // refuses, never stages.
+    // The packed count is a SEQUENCE rung's law alone — a decode batch's extent counts its
+    // ROWS as requests (`(1 row, decode_rows)`), a different fact entirely; a batch rung's
+    // staging is the Batch arm's own below and stages no windows.
+    let requests: u32 = paged
+        .first()
+        .and_then(|p| match p.kind() {
+            crate::wiring::StepKind::Sequence(_) => Some(p.extent.requests().get()),
+            crate::wiring::StepKind::Batch(_) => None,
+        })
+        .unwrap_or(1);
+    let req_blocks: Vec<Vec<crate::paged_step::PoolPage>> = if requests > 1 {
+        let need = paged
+            .first()
+            .map(|p| step_rows.end().div_ceil(p.page_slots as usize) as u32)
+            .unwrap_or(0);
+        let pages = paged.first().map(|p| p.pages.get()).unwrap_or(0);
+        if requests * need >= pages {
+            return Err(format!(
+                "the gate's packed probe: {} request(s) of {} block(s) each need {} distinct \
+                 pages of a {}-page pool — the probe pool is sized for one request",
+                requests,
+                need,
+                requests * need,
+                pages
+            ));
+        }
+        (0..requests)
+            .map(|r| {
+                (0..need)
+                    .map(|i| crate::paged_step::PoolPage::of_block(r * need + i))
+                    .collect()
+            })
+            .collect()
+    } else {
+        vec![blocks.clone()]
+    };
     // ⭐ THE PAD LAW'S ROPE ROWS — a row past the real ones rotates at the LAST REAL ROW's
     // position ([`crate::paged_step::StepRows::live`], the one law every front reads — the
     // worker's `positions` staging and the emu's alike — never re-derived here), never at the
     // phantom position its graph row names. The full-rows table already holds position
     // `real − 1`'s row at row `real − 1`, so the clamp is a rewrite of rows `real..` from the
-    // row the law names.
-    if let Some(real) = pad {
+    // row the law names. A PACKED rung's pad rows are the last row of EACH request's window
+    // (the worker stages every request its own `StepRows`; the probe's one `step_rows` serves
+    // them all), so global row `q` reads the live row of ITS request —
+    // `(q / w)·w + live(q % w)`, `w` the chunk's own width ([`StepRows::width`], the graph's
+    // whole rows at one request, where the law is the one the gate has always staged). The
+    // source row is always a real row (its `j` sits under `real`), so no clamp reads a row an
+    // earlier clamp rewrote.
+    if pad.is_some() {
+        let w = step_rows.width();
         for (tid, buf) in staged_rope.iter_mut() {
             let cols = ir.tensors[*tid as usize].cols as usize;
             if cols == 0 || buf.len() % cols != 0 {
                 continue;
             }
-            for r in real as usize..(buf.len() / cols) {
-                let (dst, src) = (r * cols, step_rows.live(r) * cols);
-                if dst + cols <= buf.len() && src + cols <= buf.len() {
+            for q in 0..(buf.len() / cols) {
+                let src = ((q / w) * w + step_rows.live(q % w)) * cols;
+                let dst = q * cols;
+                if dst != src && dst + cols <= buf.len() && src + cols <= buf.len() {
                     buf.copy_within(src..src + cols, dst);
                 }
             }
         }
     }
     let mut sources: Vec<(u64, Vec<f32>, Vec<usize>)> = Vec::new();
+    // ⭐ THE FLOAT8 POOLS, by the splice's ONE format law — which tids the typed channel below
+    // takes (a pool's format is the WRITER's codec, `kv_pool_formats`; the graph is validated and
+    // the lowering already consumed this law, so its refusal here is a bug, stated loudly).
+    let fp8_pool_tids: std::collections::HashSet<u32> = scratchy_triton_splice::kv_pool_formats(ir)
+        .map_err(|e| format!("the gate's pool formats: {e}"))?
+        .into_iter()
+        .filter_map(|(t, f)| matches!(f, scratchy_triton_splice::KvPoolFormat::Fp8(_)).then_some(t))
+        .collect();
+    let mut fp8_pool_bytes: Vec<(usize, Vec<u8>, Vec<usize>)> = Vec::new();
     for tid in 0..ir.num_sources {
         // The covering slice: a source only the dropped launches read is not
         // part of the graph under test. The reserved-tid sources appended
@@ -4367,11 +4758,43 @@ fn stage_gate_probe<T: ktir_superdsc::collective::Tp, F: RopeForm>(
         }
         match pool_class.get(&tid) {
             Some((p, hd)) => {
-                let pool = crate::paged_step::pool_of_rows(p, *hd, &blocks, &vals, step_rows.start())
-                    .map_err(|e| format!("the gate's pool t{tid}: {e}"))?;
+                // ⭐ EACH REQUEST'S OWN PAGES — the pool stimulus lays the SAME cached rows into
+                // every request's pages (the probe's own choice of stimulus: the golden's pool
+                // buffer is one token-major prefix every request reads, so both legs read one
+                // set of values per request). The requests' pages are DISJOINT (distinct page
+                // ids ⇒ distinct folded-cache rows, [`PagedStep::cache_row`]'s page keying), so
+                // each request's laid prefix lands where no other request's does — the additive
+                // merge is an overlay of disjoint writes, exact in f32 (0 + v = v). At one
+                // request the merge is the one law's own bytes.
+                let mut pool: Vec<f32> = Vec::new();
+                for b in &req_blocks {
+                    let laid =
+                        crate::paged_step::pool_of_rows(p, *hd, b, &vals, step_rows.start())
+                            .map_err(|e| format!("the gate's pool t{tid}: {e}"))?;
+                    if pool.len() < laid.len() {
+                        pool.resize(laid.len(), 0.0);
+                    }
+                    for (d, s) in pool.iter_mut().zip(laid) {
+                        *d += s;
+                    }
+                }
                 if !pool.is_empty() {
                     let rows = pool.len() / t.cols as usize;
-                    sources.push((tid as u64, pool, vec![rows, t.cols as usize]));
+                    if fp8_pool_tids.contains(&tid) {
+                        // The float8 pool's stimulus as the pools hold it — the saturating e4m3
+                        // encode (the quantize kernel's own clamp + cast, ONE law:
+                        // `scratchy_tensors::fp8`), page-laid by the same `pool_of_rows` the
+                        // dense pools take. The golden reads the round trip of the SAME values.
+                        fp8_pool_bytes.push((
+                            tid as usize,
+                            pool.iter()
+                                .map(|&v| scratchy_tensors::fp8::e4m3_saturating_encode(v))
+                                .collect(),
+                            vec![rows, t.cols as usize],
+                        ));
+                    } else {
+                        sources.push((tid as u64, pool, vec![rows, t.cols as usize]));
+                    }
                 }
             }
             None => {
@@ -4382,12 +4805,15 @@ fn stage_gate_probe<T: ktir_superdsc::collective::Tp, F: RopeForm>(
                 // tables are clamped above at their own statement; every other source repeats
                 // here, so a pad row's product is the last real row's on BOTH legs.
                 let mut vals = vals;
-                if let Some(real) = pad {
-                    let cols = t.cols as usize;
-                    if cols > 0 && (t.rows as usize) > real as usize {
-                        for r in real as usize..(t.rows as usize) {
-                            let (dst, src) = (r * cols, step_rows.live(r) * cols);
-                            if dst + cols <= vals.len() && src + cols <= vals.len() {
+                // The pad law's rows are the REQUEST's own (see the rope clamp above): global
+                // row `q` repeats ITS request's live row.
+                if pad.is_some() {
+                    let (cols, w) = (t.cols as usize, step_rows.width());
+                    if cols > 0 {
+                        for q in 0..(t.rows as usize) {
+                            let src = ((q / w) * w + step_rows.live(q % w)) * cols;
+                            let dst = q * cols;
+                            if dst != src && dst + cols <= vals.len() && src + cols <= vals.len() {
                                 vals.copy_within(src..src + cols, dst);
                             }
                         }
@@ -4413,18 +4839,53 @@ fn stage_gate_probe<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     for (i, v) in sm.iter().enumerate() {
         sources.push((u64::from(scalarmul_scale_tid(i)), vec![*v], vec![1, 1]));
     }
-    // Every class's paged step sources, by the worker's law: the mask stack an f16 source like
-    // any other, the page table and the write rows int32 words on the typed channel (the f16
-    // source channel would encode them into half the bytes their views span). One request's
-    // blocks and rows serve every class — the classes share one pool.
+    // Every class's paged step sources, by the worker's law: the mask stacks f16 sources like
+    // any other, the page tables and the write rows int32 words on the typed channel (the f16
+    // source channel would encode them into half the bytes their views span). The classes
+    // share one pool — the launch's request blocks below serve every class.
     for p in &paged {
-        let srcs = crate::paged_step::request_sources(p, &blocks, &step_rows)
-            .map_err(|e| format!("the gate's paged step: {e}"))?;
+        // ⭐ THE RUNG'S WHOLE STEP, EVERY REQUEST — a sequence rung's rows are its requests'
+        // windows (one request's for a solo rung, the rung's whole count for a packed one),
+        // staged by the ONE logical law ([`step_sources`], the same core the card stager
+        // transforms): request `r`'s window tables at their own tids, its blocks its own, its
+        // rows the probe's own `step_rows` — every request of a packed rung rides the SAME
+        // chunk geometry, the state the card's packed launch stages. A packed rung staged by
+        // the ONE-REQUEST law left every window past the first reading zero-seeded tables —
+        // their programs scattered their answers onto row 0 and read a page map no request
+        // named: the gemma-4 concurrent leg's gate refusal. A decode BATCH rung's rows are one
+        // token of each of the rung's requests, staged by the batch law
+        // ([`batch_sources`], the same core the card stager calls) over the probe's shared
+        // blocks at the positions the step's own type states ([`StepRows::pos`]): request `r`
+        // at `start + r`, the golden's `own_pos` law, so every request's window reads the very
+        // rows the reference's chunk window does.
+        let staged = match p.kind() {
+            crate::wiring::StepKind::Sequence(sequence) => {
+                let reqs: Vec<crate::paged_step::RequestStep<'_>> = req_blocks
+                    .iter()
+                    .map(|b| crate::paged_step::RequestStep {
+                        blocks: b,
+                        rows: step_rows,
+                    })
+                    .collect();
+                crate::paged_step::step_sources(&sequence, &reqs)
+            }
+            crate::wiring::StepKind::Batch(batch) => {
+                let seqs: Vec<crate::paged_step::BatchSeq<'_>> = (0..step_rows.real())
+                    .map(|r| crate::paged_step::BatchSeq {
+                        blocks: &blocks,
+                        pos: step_rows.pos(r),
+                    })
+                    .collect();
+                crate::paged_step::batch_sources(&batch, &seqs)
+            }
+        };
+        let srcs = staged.map_err(|e| format!("the gate's paged step: {e}"))?;
         for (tid, bytes, shape) in srcs.int32 {
             emu_weights.push((tid as usize, bytes, scratchy_tensors::DType::I32, shape));
         }
-        let (mask_tid, mask, mask_shape) = srcs.mask;
-        sources.push((u64::from(mask_tid), mask, mask_shape));
+        for (mask_tid, mask, mask_shape) in srcs.masks {
+            sources.push((u64::from(mask_tid), mask, mask_shape));
+        }
     }
     Ok(GateProbe {
         emu_weights,
@@ -4434,6 +4895,8 @@ fn stage_gate_probe<T: ktir_superdsc::collective::Tp, F: RopeForm>(
         load_consts,
         staged_rope,
         sources,
+        fp8_pool_bytes,
+        page_slots: paged.first().map(|p| p.page_slots),
     })
 }
 
@@ -4503,6 +4966,16 @@ pub const GATE_DECODE_CONTEXT: u32 = 10
 pub struct PrefillGate {
     /// The bundle's query-row count — the rung it was baked at.
     pub mq: u32,
+    /// ⭐ THE RESIDENT PREFIX THIS PROBE STAGES — the chunk runs at sequence positions
+    /// `start..start+real`, its rope rows rotate at those positions, its write rows land
+    /// there, and the pool holds `start` stimulus rows the walk reads back. `0` is a
+    /// FIRST chunk (the dead-prefix law: nothing resident, the plain `[mq, mq]`
+    /// triangle); a positive `start` is a CONTINUATION chunk, the state a prefix-capable
+    /// rung (ActiveCap::FULL) exists to serve. The bake's own fixtures state `0`; the
+    /// gate's continuation probe ([`numeric_gate`]) mints the page boundary — the
+    /// earliest position a second chunk runs at on the card — restating this same gate
+    /// at it, exactly as the pad probe restates the rung at `mq − 1`.
+    pub start: u32,
     /// ⭐ THE REAL-ROW COUNT THIS PROBE STAGES — `None` for the rung's full rows. The runtime
     /// stages a prompt chunk at `real ≤ mq` rows and every table the step reads follows the pad
     /// law ([`crate::paged_step::StepRows::live`]: a row past the real ones repeats the last real
@@ -4536,14 +5009,88 @@ pub struct GateRung<'a> {
     /// The rung's sweep — its paged walk ([`crate::lower_subtile_tape_to_ktir::paged_step_of_ir`]),
     /// so the gate stages the step against the reach the bundle was baked with.
     pub active_cap: ActiveCap,
-    /// The rung's query extents — the pair the bake minted for the graph under test
-    /// ([`ktir_superdsc::sdsc_abstract::QueryExtent`]), so the gate lowers the
-    /// graph's nodes under the SAME extents the bundle was baked with.
-    pub query_rows: ktir_superdsc::sdsc_abstract::QueryExtent,
+    /// The rung's query extents — the pair the bake minted for the graph under test, proven
+    /// against it ([`scratchy_triton_splice::GraphExtent`]), so the gate lowers the graph's nodes
+    /// under the SAME extents the bundle was baked with.
+    pub query_rows: scratchy_triton_splice::GraphExtent,
     /// The slice law of every source, when the rung was baked for a sharded world (the analysis's
     /// `ShardedForward::sources`) — `None` for a world of one. A sharded rung is gated on both
     /// ranks at once ([`numeric_gate_sharded`]).
     pub shards: Option<&'a [scratchy_subtile::tensor_parallel::SourceShard]>,
+}
+
+#[cfg(feature = "spyre-emu")]
+impl GateRung<'_> {
+    /// ⭐ THE CONTEXT THE GATE'S DECODE STEP ATTENDS ON THIS RUNG — [`GATE_DECODE_CONTEXT`],
+    /// bounded by the rung's own walk. A sweep rung whose walk ends short of it attends its walk's
+    /// last page, mid-page, instead, so the step reads only keys the rung's program walks and still
+    /// exercises a partly valid page. The ceiling (`ActiveCap::FULL`, the whole pool) resolves to
+    /// its pool, so its context is `GATE_DECODE_CONTEXT` itself.
+    pub fn decode_context(&self) -> u32 {
+        let page = scratchy_triton_splice::SchedulerBlockTokens::REFERENCE.get();
+        let walk = self
+            .active_cap
+            .resolve(self.cap, ktir_superdsc::sdsc_abstract::POOL_STICK);
+        GATE_DECODE_CONTEXT.min(walk.saturating_sub(page) + page / 2)
+    }
+}
+
+/// ⭐ THE GATE'S PREFIX VIEW — ONE statement of the AttnDecode rope-append prefix's region law:
+/// the resident prefix segment (`AttnLayout`'s first) re-sliced to `min(len, bound)` rows, `bound`
+/// naming the view the probe stages.
+/// `0` is the DEAD prefix a prefix-free rung (ActiveCap::NONE) lowers — the splice's own law
+/// (`lower_attn` keeps the prefix's VIEW and drops its compute), restated for eval; a positive
+/// bound is a LIVE resident prefix — the state a continuation chunk reads, `own_pos = seq_len −
+/// mq + qi` deriving its positions from the concatenated rows; `GATE_DECODE_CONTEXT` is the
+/// decode gate's bounded cache view. A gate-local VIEW over a clone, never a law change: every
+/// other consumer keeps the original IR.
+#[cfg(feature = "spyre-emu")]
+fn reslice_attn_prefix<F: RopeForm>(ir: &mut SubtileIR<F>, bound: u32) {
+    for n in &mut ir.nodes {
+        if let SubOp::AttnDecode {
+            producer: scratchy_subtile::subtile_ir::KvCacheProducer::SameForwardRopeAppend { .. },
+            operands,
+            ..
+        } = &n.op
+        {
+            // The resident prefix — the layout's first segment.
+            for idx in [operands.k(0), operands.v(0)] {
+                let r = &mut n.inputs[idx];
+                r.region.rows = scratchy_subtile::subtile_ir::Range::new(
+                    r.region.rows.start,
+                    r.region.rows.len.min(bound),
+                );
+            }
+        }
+    }
+}
+
+/// The gate's view of the IR — [`reslice_attn_prefix`]'s law at `prefix_bound` (`None` leaves
+/// the regions whole), then the truncation twin's suffix retarget (the tail seam: the truncated
+/// bundle's suffix reads the KEPT prefix's last hidden-out, `unroll_layers`' own suffix
+/// binding). Every gate-local IR rewrite stated in this one place.
+#[cfg(feature = "spyre-emu")]
+fn gate_view<F: RopeForm>(
+    ir: &SubtileIR<F>,
+    prefix_bound: Option<u32>,
+    trunc: Option<&GateTrunc>,
+) -> SubtileIR<F> {
+    let mut g = ir.clone();
+    if let Some(bound) = prefix_bound {
+        reslice_attn_prefix(&mut g, bound);
+    }
+    if let Some(t) = trunc {
+        for n in &mut g.nodes {
+            for r in &mut n.inputs {
+                if r.tensor.index() as u32 == t.suffix_rebind.0 {
+                    r.tensor = scratchy_subtile::subtile_ir::TensorId::from_index(
+                        t.suffix_rebind.1 as usize,
+                    );
+                }
+            }
+        }
+    }
+    g
 }
 
 #[cfg(feature = "spyre-emu")]
@@ -4564,6 +5111,17 @@ pub fn numeric_gate<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     // The rung's identity, named for the body: the messages say `{fp}`, the
     // decode mask stages `cap` — both off the ONE param that carried them in.
     let (fp, cap) = (rung.fp, rung.cap);
+    // ⭐ THE PACKED WINDOW FRAME — the rung's own `QueryExtent` pair
+    // (`prefill_mq`'s law: the width is ONE request's query rows, never the
+    // graph's), stated for every prefill rung — `R = 1` at a solo chunk, where
+    // the frame is the identity — and `None` for decode, whose rows-are-
+    // requests law stands as it has always read.
+    let packed: Option<(u32, u32)> = prefill.map(|_| {
+        (
+            rung.query_rows.per_request().get(),
+            rung.query_rows.requests().get(),
+        )
+    });
     // ⛔ A SHARDED FORWARD HAS NO ONE-RANK RUN. Its consumes read the receive window the peer's
     // send fills, and its collectives have no one-rank reference, so it is gated on every rank at
     // once — below, once the covering slice is known. Which gate runs is the rung's WORLD, its
@@ -4623,10 +5181,12 @@ pub fn numeric_gate<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     // `valid_len - 1` rows (>= 1) — the DECODE contract, where the runtime length
     // mask bounds the sweep to that same extent. The rung consumes no length mask
     // for the prefix (the one-pass arm reads only the `[mq, mq]` triangle), so the
-    // golden must see the prefix as the splice does: DEAD. The clone re-slices
-    // those input regions to 0 rows — a gate-local VIEW of the same IR, never a
-    // law change: every other consumer keeps the original, and a bundle whose
-    // prefix is live (decode, a prefix-capable rung) never enters this arm.
+    // golden must see the prefix as the splice does: DEAD. The view re-slices those
+    // input regions to `min(len, bound)` rows — [`reslice_attn_prefix`]'s ONE law, a
+    // gate-local VIEW of the same IR, never a law change: every other consumer keeps
+    // the original, and the bake's own prefill fixtures state `bound = 0` (the
+    // prefix-capable rung's continuation law is minted by the continuation probe
+    // below, at a LIVE bound).
     // ── The decode golden: a step at a REAL position, not the cache's last ──
     // `lower_region` pins a SameForwardRopeAppend prefix at `valid_len - 1` rows, and a paged
     // bundle's `valid_len` is its pool: the model's whole context. A step there attends every
@@ -4648,74 +5208,25 @@ pub fn numeric_gate<T: ktir_superdsc::collective::Tp, F: RopeForm>(
             ) && n
                 .inputs
                 .get(1)
-                .is_some_and(|r| r.region.rows.len > GATE_DECODE_CONTEXT)
+                .is_some_and(|r| r.region.rows.len > rung.decode_context())
         });
+    // The original IR, kept for the continuation probe below — its re-slice bounds the
+    // ORIGINAL region lens, so it must clone from the un-viewed graph, never this view.
+    let ir_in = ir;
     let ir_owned;
     let ir: &SubtileIR<F> = if prefill.is_some() || trunc.is_some() || decode_reslice {
-        ir_owned = {
-            let mut g = ir.clone();
-            if decode_reslice {
-                for n in &mut g.nodes {
-                    if matches!(
-                        &n.op,
-                        SubOp::AttnDecode {
-                            producer:
-                                scratchy_subtile::subtile_ir::KvCacheProducer::SameForwardRopeAppend { .. },
-                            ..
-                        }
-                    ) {
-                        for idx in [1usize, 2usize] {
-                            if let Some(r) = n.inputs.get_mut(idx) {
-                                r.region.rows = scratchy_subtile::subtile_ir::Range::new(
-                                    r.region.rows.start,
-                                    r.region.rows.len.min(GATE_DECODE_CONTEXT),
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-            if prefill.is_some() {
-                for n in &mut g.nodes {
-                    if matches!(
-                        &n.op,
-                        SubOp::AttnDecode {
-                            producer:
-                                scratchy_subtile::subtile_ir::KvCacheProducer::SameForwardRopeAppend { .. },
-                            ..
-                        }
-                    ) {
-                        for idx in [1usize, 2usize] {
-                            if let Some(r) = n.inputs.get_mut(idx) {
-                                r.region.rows =
-                                    scratchy_subtile::subtile_ir::Range::new(r.region.rows.start, 0);
-                            }
-                        }
-                    }
-                }
-            }
-            if let Some(t) = trunc {
-                // ⭐ THE TAIL SEAM RETARGET — the same view-law shape as the
-                // dead-prefix re-slice above. The full-depth IR's suffix ops
-                // read the LAST launch's hidden-out; the truncated bundle's
-                // suffix reads the KEPT prefix's last hidden-out
-                // (`unroll_layers`' own suffix binding for the truncated
-                // twin). Every hidden-out of every launch shares one shape,
-                // so the retarget rewrites only the input's tid and carries
-                // the region verbatim — the golden then evaluates the tail
-                // over exactly the product the twin's programs consume.
-                for n in &mut g.nodes {
-                    for r in &mut n.inputs {
-                        if r.tensor.index() as u32 == t.suffix_rebind.0 {
-                            r.tensor = scratchy_subtile::subtile_ir::TensorId::from_index(
-                                t.suffix_rebind.1 as usize,
-                            );
-                        }
-                    }
-                }
-            }
-            g
+        // The view's prefix bound — [`reslice_attn_prefix`]'s ONE law: a prompt chunk's
+        // resident prefix ([`PrefillGate::start`] — 0 for the bake's own first-chunk
+        // fixtures, the dead-prefix view a prefix-free rung lowers), or the decode gate's
+        // bounded cache view.
+        let bound = if let Some(pg) = prefill {
+            Some(pg.start)
+        } else if decode_reslice {
+            Some(rung.decode_context())
+        } else {
+            None
         };
+        ir_owned = gate_view(ir_in, bound, trunc);
         &ir_owned
     } else {
         ir
@@ -4817,6 +5328,8 @@ pub fn numeric_gate<T: ktir_superdsc::collective::Tp, F: RopeForm>(
         load_consts,
         staged_rope,
         sources,
+        fp8_pool_bytes,
+        page_slots,
     } = stage_gate_probe::<T, F>(
         ir,
         weight_ids,
@@ -4903,6 +5416,7 @@ pub fn numeric_gate<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     let mut session =
         crate::runner::SpyreSession::new_multi_floored(&refs, emu_weights, &shape_floor)
             .map_err(|e| format!("gate session: {e}"))?;
+    stage_fp8_pools(&mut session, fp8_pool_bytes)?;
     let observables = session.observable_tids(0);
     let compare: Vec<(u64, usize)> = golden_tids
         .iter()
@@ -4927,7 +5441,7 @@ pub fn numeric_gate<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     // clamp-invariant (a row's own position is its index while it is real), so ONE golden
     // serves both the full-rows probe and the pad probe below.
     let mut eval_bufs =
-        eval_golden_buffers(ir, &staged_rope, &view, covering, None, &|tid| tid as usize);
+        eval_golden_buffers(ir, &staged_rope, &view, covering, None, &|tid| tid as usize, packed);
     let GateWorst {
         local_clean: worst_local_clean,
         local_fp8: worst_local_fp8,
@@ -4948,6 +5462,7 @@ pub fn numeric_gate<T: ktir_superdsc::collective::Tp, F: RopeForm>(
             cap,
             peer: None,
             real: None,
+            packed,
         },
         &mut eval_bufs,
     )?;
@@ -5009,6 +5524,8 @@ pub fn numeric_gate<T: ktir_superdsc::collective::Tp, F: RopeForm>(
             load_consts: _,
             staged_rope: _,
             sources: pad_sources,
+            fp8_pool_bytes: pad_fp8_pools,
+            page_slots: _,
         } = stage_gate_probe::<T, F>(
             ir,
             weight_ids,
@@ -5025,6 +5542,7 @@ pub fn numeric_gate<T: ktir_superdsc::collective::Tp, F: RopeForm>(
         let mut session =
             crate::runner::SpyreSession::new_multi_floored(&refs, emu_weights, &shape_floor)
                 .map_err(|e| format!("gate session (pad real={real}): {e}"))?;
+        stage_fp8_pools(&mut session, pad_fp8_pools)?;
         let out = session
             .run_step(0, pad_sources, &compare)
             .map_err(|e| format!("gate run (pad real={real}): {e}"))?;
@@ -5048,6 +5566,7 @@ pub fn numeric_gate<T: ktir_superdsc::collective::Tp, F: RopeForm>(
                 cap,
                 peer: None,
                 real: Some(real),
+                packed,
             },
             &mut eval_bufs,
         )?;
@@ -5064,6 +5583,133 @@ pub fn numeric_gate<T: ktir_superdsc::collective::Tp, F: RopeForm>(
                 f64::NAN
             }
         );
+    }
+    // ⭐⭐⭐ THE CONTINUATION PROBE — the resident-prefix law, the family this gate SKIPPED
+    // from its first day (measured: the bake printed "NUMERIC GATE SKIP prefill bundle …
+    // prefix-capable … UNCHECKED" for every ActiveCap::FULL bundle while the card's SECOND
+    // chunk souped — the day-1 defect). A prefix-capable rung exists to serve a chunk that
+    // runs at positions past a resident prefix; this probe mints the earliest continuation
+    // the card runs — ONE PAGE BOUNDARY (`start = page_slots`, the pool's own slots per
+    // page: a first chunk fills exactly one page before a second begins) — and restates the
+    // SAME gate there: the prefix regions LIVE at `min(len, start)` rows (the golden's
+    // `own_pos = seq_len − mq + qi` deriving the continuation positions from the
+    // concatenated rows), the rope rows rotating at positions `start..start+real`, the pool
+    // holding `start` stimulus rows the TWO-PAGE walk reads back, the KV writes landing at
+    // positions `start..start+real`. The pad probe's own bisection, restated at the
+    // boundary: the full-rows chunk (`real = mq`), then the widest pad (`real = mq − 1`).
+    if let Some(pg) = prefill
+        && rung.active_cap == ActiveCap::FULL
+    {
+        match page_slots {
+            None => eprintln!(
+                "[spyre-superdsc] NUMERIC GATE SKIP {fp}: the rung is prefix-capable \
+                 (ActiveCap::FULL) but stages no paged step — no page boundary mints its \
+                 continuation chunk; this bundle's continuation law is UNCHECKED"
+            ),
+            Some(slots) => {
+                let cont_ir = gate_view(ir_in, Some(slots), trunc);
+                // The pad law's own bisection: the full-rows chunk, then the widest pad the
+                // rung admits (`mq > 1` — a one-row rung has no pad row to stage).
+                let reals: Vec<Option<u32>> = if pg.mq > 1 {
+                    vec![None, Some(pg.mq - 1)]
+                } else {
+                    vec![None]
+                };
+                for real in reals {
+                    // The SAME rung's gate, restated at the boundary — one staging fact
+                    // changed ([`PrefillGate::start`]), every table the probe reads
+                    // following it through the type's own laws.
+                    let cont_gate = PrefillGate {
+                        start: slots,
+                        pad: real,
+                        ..pg.clone()
+                    };
+                    let GateProbe {
+                        emu_weights,
+                        view_bytes: _,
+                        gemm: _,
+                        scale_rows: _,
+                        load_consts: _,
+                        staged_rope: cont_rope,
+                        sources: cont_sources,
+                        fp8_pool_bytes: cont_fp8_pools,
+                        page_slots: _,
+                    } = stage_gate_probe::<T, F>(
+                        &cont_ir,
+                        weight_ids,
+                        covering,
+                        Some(&cont_gate),
+                        rung,
+                        &|tid| tid as usize,
+                        None,
+                    )?;
+                    let emu_weights = emu_weights
+                        .into_iter()
+                        .map(|(id, b, dt, s)| (id, crate::allocator::HostBytes::Owned(b), dt, s))
+                        .collect::<Vec<_>>();
+                    let mut session = crate::runner::SpyreSession::new_multi_floored(
+                        &refs,
+                        emu_weights,
+                        &shape_floor,
+                    )
+                    .map_err(|e| format!("gate session (continuation start={slots}): {e}"))?;
+                    stage_fp8_pools(&mut session, cont_fp8_pools)?;
+                    let out = session
+                        .run_step(0, cont_sources, &compare)
+                        .map_err(|e| format!("gate run (continuation start={slots}): {e}"))?;
+                    // The continuation's OWN golden — the live prefix changes every
+                    // attention product, so the main probe's buffers do not serve it.
+                    let mut cont_bufs = eval_golden_buffers(
+                        &cont_ir,
+                        &cont_rope,
+                        &view,
+                        covering,
+                        None,
+                        &|tid| tid as usize,
+                        packed,
+                    );
+                    let GateWorst {
+                        local_clean,
+                        local_fp8,
+                        total_clean,
+                        total_fp8,
+                    } = judge_gate_run(
+                        GateRun {
+                            ir: &cont_ir,
+                            prefill: Some(&cont_gate),
+                            compare: &compare,
+                            out: &out,
+                            tainted: &tainted,
+                            golden_op: &golden_op,
+                            golden_ins: &golden_ins,
+                            view: &view,
+                            covering,
+                            fp,
+                            cap,
+                            peer: None,
+                            real,
+                            packed,
+                        },
+                        &mut cont_bufs,
+                    )?;
+                    let (lx_peak, lx_cap) = (session.lx_peak_used(), session.lx_capacity());
+                    let pad_tag = real.map(|r| format!(" pad real={r}")).unwrap_or_default();
+                    eprintln!(
+                        "[spyre-superdsc] NUMERIC GATE PASS {fp} [continuation \
+                         start={slots}{pad_tag}]: {} tensors at the floor (worst local clean \
+                         {local_clean:.4}, worst local fp8-chained {local_fp8:.4}; worst total \
+                         clean {total_clean:.4}, worst total fp8-chained {total_fp8:.4}; LX peak \
+                         {lx_peak} of {lx_cap} bytes, {:.1}% of capacity)",
+                        compare.len(),
+                        if lx_cap > 0 {
+                            lx_peak as f64 * 100.0 / lx_cap as f64
+                        } else {
+                            f64::NAN
+                        }
+                    );
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -5091,6 +5737,12 @@ struct GateRun<'a, F: RopeForm> {
     /// reads the answer from), never the pad rows past it, whose golden has no clamp and whose
     /// values the runtime never reads.
     real: Option<u32>,
+    /// ⭐ THE PACKED WINDOW FRAME — `(per-request width, requests)` for a packed prefill's
+    /// graph (each attention viewed per request, [`eval_attn_packed`]; the rung's own
+    /// `QueryExtent` pair, `prefill_mq`'s law); `None` for every graph whose rows are one
+    /// sequence's (decode) — and EVERY prefill rung states one (`R = 1` at a solo chunk,
+    /// where the frame is the identity).
+    packed: Option<(u32, u32)>,
 }
 
 /// A passing run's worst errors: each compared tensor's producing op's own execution (`local`) and
@@ -5106,6 +5758,20 @@ struct GateWorst {
 /// ⭐ THE GATE'S VERDICT ON ONE RUN — every compared tensor at its floor, judged on its producing
 /// op's own execution (the teacher-forced walk), the refusal carrying its evidence. The one-rank
 /// gate judges its one run here; the sharded gate each rank's.
+#[cfg(feature = "spyre-emu")]
+/// ⭐ THE FOLD'S ANSWER ROWS — request `r`'s answer row in the graph's rows:
+/// its window's LAST REAL row (`r·w + real − 1` at a padded staging,
+/// `r·w + w − 1` at a full one), the `selector_lastrow_col` extraction the
+/// lowering pins. ONE statement of the law — the judge's tail-fold compare,
+/// the walk's fold rows and the draw's per-probe relocation all consume it;
+/// a second derivation of this arithmetic anywhere is the defect.
+fn folded_answer_rows(w: u32, requests: u32, real: Option<u32>) -> Vec<u32> {
+    let offset = real
+        .map(|rz| rz.saturating_sub(1))
+        .unwrap_or(w.saturating_sub(1));
+    (0..requests).map(|r| r * w + offset).collect()
+}
+
 #[cfg(feature = "spyre-emu")]
 fn judge_gate_run<F: RopeForm>(
     run: GateRun<'_, F>,
@@ -5125,6 +5791,7 @@ fn judge_gate_run<F: RopeForm>(
         cap,
         peer,
         real,
+        packed,
     } = run;
     // ── Compare at the floor, against the in-memory reference ──
     const CLEAN_TOL: f32 = 5e-3;
@@ -5249,6 +5916,79 @@ fn judge_gate_run<F: RopeForm>(
         crate::lower_subtile_tape_to_ktir::result_dtype_of_ir(ir),
         Ok(scratchy_tensors::DType::I32) | Ok(scratchy_tensors::DType::U32)
     );
+    // The fold's frame laws, derived ONCE for every compare and the draw's
+    // relocation below: the rung's graph rows are one window per request
+    // (`w·R`), the frame the golden and the staging both state; a rung with
+    // no frame (a decode bundle, rows-are-requests) keeps its own one-row
+    // law as it has always read.
+    let mq_rows = prefill.map(|p| p.mq as usize).unwrap_or(1);
+    let (w, requests, graph_rows) = match packed {
+        Some((w, r)) => {
+            let (w, r) = (w as usize, r as usize);
+            (w, r, w * r)
+        }
+        None => (mq_rows, 1, mq_rows),
+    };
+    let answers = folded_answer_rows(w as u32, requests as u32, real);
+    let real_rows = real.map(|rz| rz as usize);
+    // ⭐ THE DRAW'S GOLDEN IS PER-PROBE — the fold's write law lands each
+    // request's answer row at the stick's rows `0..S` for the Sample to read
+    // (`SampleRows::Folded`'s declared window), and the answer row is the
+    // ONE golden product that is not clamp-invariant (`r·w + real − 1` at a
+    // pad, `r·w + w − 1` at full), so the shared golden's own draw — taken
+    // over the stick's rows `0..S`, which the UNFOLDED product holds the
+    // FIRST positions in — is no probe's law. The judge re-states the
+    // Sample's own eval at THIS run's window: the folded root's answer rows
+    // relocated to rows `0..S` (the same write law the walk's pin states for
+    // the emulator side), the Sample evaluated over them by its own node and
+    // the mint's own regions — no law restated — and the root's window
+    // restored (every compare below and the walk read the root's own rows,
+    // never the window). Prefill only: a decode bundle never folds, and at
+    // one request the relocation is the law as it has always read.
+    if let Some(sample) = ir.nodes.iter().find(|n| matches!(n.op, SubOp::Sample { .. }))
+        && let Some(&logits_in) = sample.inputs.first()
+        && folded.contains(&(logits_in.tensor.index() as u64))
+        && ir.tensors[logits_in.tensor.index()].rows as usize == graph_rows
+    {
+        let t = logits_in.tensor.index();
+        let region = &logits_in.region;
+        let stride = ir.tensors[t].cols as usize;
+        assert_eq!(
+            (
+                region.rows.start as usize,
+                region.rows.len as usize,
+                region.cols.start as usize,
+                region.cols.len as usize
+            ),
+            (0, requests, 0, stride),
+            "the folded Sample's input region is the stick's rows 0..S, full width"
+        );
+        let buf_len = eval_bufs[t].len();
+        assert_eq!(
+            buf_len,
+            graph_rows * stride,
+            "the folded Sample's root is a compared whole stick"
+        );
+        let save: Vec<f32> = eval_bufs[t][..requests * stride].to_vec();
+        for (r, &a) in answers.iter().enumerate() {
+            let (from, to) = (a as usize * stride, r * stride);
+            eval_bufs[t].copy_within(from..from + stride, to);
+        }
+        let draws = scratchy_subtile::subtile_ir::eval_node(
+            sample,
+            ir,
+            scratchy_subtile::subtile_ir::AttnScaleSite::InKernel,
+            eval_bufs,
+        );
+        eval_bufs[t][..save.len()].copy_from_slice(&save);
+        let idx_t = sample.output.tensor.index();
+        assert_eq!(
+            eval_bufs[idx_t].len(),
+            draws.len(),
+            "the idx stick's golden buffer is the Sample's own product size"
+        );
+        eval_bufs[idx_t].copy_from_slice(&draws);
+    }
     for &(tid, _) in compare {
         let g_full = &eval_bufs[tid as usize];
         let e = match out.get(&tid) {
@@ -5271,37 +6011,73 @@ fn judge_gate_run<F: RopeForm>(
         // that grabs the WRONG row still diverges. A tid that comes back
         // shorter than one row without matching the predicate takes the plain
         // law below, which refuses.
-        let mq_rows = prefill.map(|p| p.mq as usize).unwrap_or(1);
         let tail_fold = folded.contains(&tid)
             && !g_full.is_empty()
             && !e.is_empty()
-            && g_full.len().is_multiple_of(mq_rows)
-            && g_full.len() / mq_rows <= e.len();
+            && g_full.len().is_multiple_of(graph_rows)
+            && g_full.len() / graph_rows <= e.len()
+            // ⭐ GRAPH-ROW-FRAMED ONLY — a folded tid's product is framed by
+            // the rows its own tensor declares, and only a graph-row-framed
+            // one (rows = `w·R`, the logits sticks the fold re-lowers) takes
+            // this per-request last-row law. The fold's S-FRAMED products
+            // (the mint's idx stick, rows = the requests) hold one row per
+            // request in request order already: they fall to the plain exact
+            // compare below, against the per-probe draw re-evalued above.
+            // Without this conjunct the idx stick's lanes divided "evenly"
+            // into nonsense cols (measured, gate15 t570: 192 lanes over 96
+            // graph rows compared as 2-col rows).
+            && ir.tensors[tid as usize].rows as usize == graph_rows;
         // ⭐ THE PAD LAW'S COMPARE SET — a run staged at `real` rows is judged on what the
-        // runtime reads of it: the first `real` rows of a per-token tensor (`[mq, cols]` — the
-        // pad rows past `real` are the golden's unclamped view, values the runtime never
-        // reads), and the tail fold's answer row at `real − 1` — the LAST REAL row, the one
-        // the worker reads the answer from — never the golden's last row, which at a padded
+        // runtime reads of it: each request's first `real` rows of a graph-row-framed
+        // per-token tensor (`[w·R, cols]` — rows `q` with `q % w < real`; at one request
+        // the first `real` rows, the law as it has always read; the pad rows past them are
+        // the golden's unclamped view, values the runtime never reads), and the tail
+        // fold's answer rows at `real − 1` — each request's LAST REAL row, the one the
+        // worker reads the answer from — never the golden's last row, which at a padded
         // staging is a pad row.
-        let real_rows = real.map(|rz| rz as usize);
-        let (g, e): (&[f32], &[f32]) = if tail_fold {
-            let cols = g_full.len() / mq_rows;
-            let answer = real_rows.unwrap_or(mq_rows).saturating_sub(1);
-            (
-                &g_full[answer * cols..(answer + 1) * cols],
-                &e[..cols.min(e.len())],
-            )
+        let owned: Option<(Vec<f32>, Vec<f32>)> = if tail_fold {
+            // The fold's product is S rows — ONE ANSWER ROW PER REQUEST (`S = 1`
+            // at one request, the law as it has always read): request `r`'s
+            // answer row is its window's last real row — the ONE
+            // `folded_answer_rows` law — and the emulator's S rows (rows
+            // `0..S` of the readback) compare against them in request order.
+            let cols = g_full.len() / graph_rows;
+            let mut gs = Vec::with_capacity(requests * cols);
+            let mut es = Vec::with_capacity(requests * cols);
+            for r in 0..requests {
+                let at = answers[r] as usize * cols;
+                gs.extend_from_slice(&g_full[at..at + cols]);
+                if r * cols < e.len() {
+                    es.extend_from_slice(&e[r * cols..(r * cols + cols).min(e.len())]);
+                }
+            }
+            Some((gs, es))
         } else if let (Some(rz), true) = (
             real_rows,
-            mq_rows > 1 && ir.tensors[tid as usize].rows as usize == mq_rows,
+            graph_rows > 1 && ir.tensors[tid as usize].rows as usize == graph_rows,
         ) {
-            let cols = g_full.len() / mq_rows;
-            (
-                &g_full[..(rz * cols).min(g_full.len())],
-                &e[..(rz * cols).min(e.len())],
-            )
+            let cols = g_full.len() / graph_rows;
+            let mut gs = Vec::new();
+            let mut es = Vec::new();
+            for q in 0..graph_rows {
+                if q % w >= rz {
+                    continue;
+                }
+                let at = q * cols;
+                if at < g_full.len() {
+                    gs.extend_from_slice(&g_full[at..(at + cols).min(g_full.len())]);
+                }
+                if at < e.len() {
+                    es.extend_from_slice(&e[at..(at + cols).min(e.len())]);
+                }
+            }
+            Some((gs, es))
         } else {
-            (g_full, e)
+            None
+        };
+        let (g, e): (&[f32], &[f32]) = match &owned {
+            Some((gs, es)) => (gs, es),
+            None => (g_full, e),
         };
         let n = g.len().min(e.len());
         if n == 0 {
@@ -5361,7 +6137,12 @@ fn judge_gate_run<F: RopeForm>(
     let (walk_tf, split) = teacher_forced_walk(
         ir,
         eval_bufs,
-        EmuReadback { own: out, peer, real },
+        EmuReadback {
+            own: out,
+            peer,
+            real,
+            packed,
+        },
         tainted,
         &folded,
         view,
@@ -5437,6 +6218,7 @@ fn judge_gate_run<F: RopeForm>(
                     own: &overlay,
                     peer,
                     real,
+                    packed,
                 },
                 tainted,
                 &folded,
@@ -5568,7 +6350,7 @@ struct ShardedGate<'a, T: ktir_superdsc::collective::Tp, F: RopeForm> {
     fp: &'a str,
     cap: u32,
     active_cap: ActiveCap,
-    query_rows: ktir_superdsc::sdsc_abstract::QueryExtent,
+    query_rows: scratchy_triton_splice::GraphExtent,
     shards: &'a [scratchy_subtile::tensor_parallel::SourceShard],
     scope: String,
 }
@@ -5631,6 +6413,12 @@ fn numeric_gate_sharded<T: ktir_superdsc::collective::Tp, F: RopeForm>(
         query_rows,
         shards: Some(shards),
     };
+    // ⭐ THE PACKED WINDOW FRAME — the rung's own `QueryExtent` pair for every
+    // prefill rung (`R = 1` at a solo chunk, where the frame is the identity);
+    // `None` for decode, whose rows-are-requests law stands as it has always
+    // read. The one-rank gate's own law, stated from this gate's `query_rows`.
+    let packed: Option<(u32, u32)> =
+        prefill.map(|_| (query_rows.per_request().get(), query_rows.requests().get()));
     let mut probes: Vec<GateProbe> = Vec::with_capacity(ranks.len());
     for me in &ranks {
         probes.push(stage_gate_probe::<T, F>(
@@ -5697,7 +6485,7 @@ fn numeric_gate_sharded<T: ktir_superdsc::collective::Tp, F: RopeForm>(
             .zip(&results)
             .map(|(seg, res)| (seg.as_slice(), res.as_slice()))
             .collect();
-        let session = crate::runner::SpyreSession::new_multi_floored(
+        let mut session = crate::runner::SpyreSession::new_multi_floored(
             &refs,
             std::mem::take(&mut probes[r].emu_weights)
                 .into_iter()
@@ -5706,6 +6494,7 @@ fn numeric_gate_sharded<T: ktir_superdsc::collective::Tp, F: RopeForm>(
             &shape_floor,
         )
         .map_err(|e| format!("rank {r}'s gate session: {e}"))?;
+        stage_fp8_pools(&mut session, std::mem::take(&mut probes[r].fp8_pool_bytes))?;
         observables.push((0..nseg).map(|k| session.observable_tids(k)).collect());
         sessions.push(session);
     }
@@ -5882,6 +6671,7 @@ fn numeric_gate_sharded<T: ktir_superdsc::collective::Tp, F: RopeForm>(
                         ranks: &golden,
                     }),
                     &seed(r),
+                    packed,
                 )
             })
             .collect();
@@ -5940,6 +6730,7 @@ fn numeric_gate_sharded<T: ktir_superdsc::collective::Tp, F: RopeForm>(
                         ranks: &rank_bufs,
                     }),
                     real: None,
+                    packed,
                 },
                 &mut golden[r],
             )
@@ -5995,6 +6786,19 @@ fn numeric_gate_sharded<T: ktir_superdsc::collective::Tp, F: RopeForm>(
         w(|g| g.total_clean),
         w(|g| g.total_fp8),
     );
+    // ⛔ THE SHARDED GATE'S CONTINUATION ARM IS NOT BUILT YET — stated LOUDLY, never skipped
+    // silently: a sharded prefix-capable rung's resident-prefix law (the one-rank gate's
+    // continuation probe, `numeric_gate`'s) has no sharded restatement here, so its
+    // continuation chunk runs UNCHECKED by this gate. The main probe above honors
+    // `PrefillGate::start` through `stage_gate_probe` — first chunks are covered; the
+    // continuation is the open rung.
+    if active_cap == ActiveCap::FULL && prefill.is_some() {
+        eprintln!(
+            "[spyre-superdsc] NUMERIC GATE SKIP {fp}: the SHARDED gate holds no continuation \
+             probe yet — this prefix-capable rung's resident-prefix law is staged at first \
+             chunks only; its continuation chunk is UNCHECKED"
+        );
+    }
     Ok(())
 }
 
@@ -6840,7 +7644,6 @@ pub fn launch_index<T: ktir_superdsc::collective::Tp>(
         // The group's first trip's owning op supplies any per-group metadata.
         let e = &ops[owner[r.start]];
         let fold_group = matches!(kinds[r.start].kind, GroupKind::PageFold { .. });
-        let _ = gi; // launch order is the slice position now, not a field
         // ⭐ A WALK'S BODY GROUP relaunches as its walk says — ONE walk per group, since the group is
         // one launch and one relaunch count. A group mixing a walk's body with anything else (another
         // walk, or ops run once) would run them all `trips` times or the body once.
@@ -6855,9 +7658,16 @@ pub fn launch_index<T: ktir_superdsc::collective::Tp>(
                 o.walk
             );
         }
+        // ⭐ A PAGE-FOLD GROUP IS A WALK'S BODY, AND ONLY ONE IS — the group's kind and its ops'
+        // relaunch are two statements of one fact, so the record carries the walk alone
+        // (`KvShifts::page_fold` reads it) and the two must agree here, at the one mint.
+        assert!(
+            fold_group == walk.is_some(),
+            "group {gi}: a {} group whose ops relaunch as {walk:?} — a page-fold group is exactly \
+             a walk's body",
+            if fold_group { "page-fold" } else { "non-fold" }
+        );
         shifts.push(bundle::KvShifts {
-            // `page_fold` marks the group the runtime re-launches: a walk's body.
-            page_fold: fold_group,
             // ⭐ WHETHER THE GROUP READS THROUGH A GATHERED SCRATCH — what sends its KV shift to zero.
             // A non-fold group gathers only as a `Gathered` run (the split-KV chunk's copies), which
             // takes the same zero shift and the same staged index.
@@ -7733,8 +8543,8 @@ pub fn emitted_bundle_folds<T: ktir_superdsc::collective::Tp>(fp: &str) -> Optio
     let c = emitted::<T>().lock().ok()?;
     let (b, _) = c.get(fp)?;
     Some(match &b.groups {
-        PendingGroups::Ready(groups) => groups.iter().any(|g| g.kv.page_fold),
-        PendingGroups::Staged(groups) => groups.iter().any(|(kv, _)| kv.page_fold),
+        PendingGroups::Ready(groups) => groups.iter().any(|g| g.kv.page_fold()),
+        PendingGroups::Staged(groups) => groups.iter().any(|(kv, _)| kv.page_fold()),
     })
 }
 
@@ -8056,8 +8866,7 @@ fn tiled_trips_alias<T: ktir_superdsc::collective::Tp>(e: &EmittedOp<T>) -> bool
             for dsc in dsc_map.values() {
                 for node in &dsc.scheduleTree_ {
                     if node.component_ != "hbm"
-                        || e
-                            .arg_bindings
+                        || e.arg_bindings
                             .get(node.ldsIdx_ as usize)
                             .is_some_and(|b| b.is_input)
                     {
@@ -8652,8 +9461,14 @@ fn ktir_groups_via_superdsc<T: ktir_superdsc::collective::Tp>(
                     let tids = scratchy_triton_splice::PagedStepTids::of_class(class);
                     walked.extend([tids.chunk_pages, tids.chunk_masks]);
                     for r in 0..ktir_superdsc::reserved_tids::PAGED_MAX_WINDOWS {
-                        walked.push(scratchy_triton_splice::paged_window_of_class(class, r, 1));
-                        walked.push(scratchy_triton_splice::paged_window_of_class(class, r, 2));
+                        for table in [
+                            scratchy_triton_splice::WindowTable::PageTable,
+                            scratchy_triton_splice::WindowTable::Mask,
+                        ] {
+                            walked.push(scratchy_triton_splice::paged_window_of_class(
+                                class, r, table,
+                            ));
+                        }
                     }
                 }
                 if in_act && !walked.contains(&tid) {
@@ -8957,7 +9772,7 @@ pub fn lower_subtile_tape_to_superdsc<T: ktir_superdsc::collective::Tp, F: RopeF
     weight_ids: &std::collections::HashSet<u32>,
     active_cap: ActiveCap,
     rows_are_requests: bool,
-    query_rows: ktir_superdsc::sdsc_abstract::QueryExtent,
+    query_rows: scratchy_triton_splice::GraphExtent,
 ) -> Result<RolledSuperDsc<T>, SuperDscError> {
     crate::lower_subtile_tape_to_ktir::lower_subtile_tape_to_ktir(
         tape,
@@ -8989,7 +9804,16 @@ mod tests {
     /// The extent pair the lowering calls below state for their graphs: one request of
     /// the graph's own row count — the S=1 prefill pair. None of these fixtures carries
     /// an `AttnDecode`; the pair still must describe the graph it is handed, and it does.
-    fn one_request_of(rows: u32) -> ktir_superdsc::sdsc_abstract::QueryExtent {
+    fn one_request_of<F: RopeForm>(
+        ir: &SubtileIR<F>,
+        rows: u32,
+    ) -> scratchy_triton_splice::GraphExtent {
+        scratchy_triton_splice::GraphExtent::of(ir, one_request_pair(rows), false)
+            .unwrap_or_else(|e| panic!("one request of {rows} row(s) describes the fixture: {e}"))
+    }
+
+    /// The bare S=1 pair [`one_request_of`] proves against its graph.
+    fn one_request_pair(rows: u32) -> ktir_superdsc::sdsc_abstract::QueryExtent {
         ktir_superdsc::sdsc_abstract::QueryExtent::of_baked_rung(
             ktir_superdsc::sdsc_abstract::RungWidth::of_baked_rows(rows)
                 .expect("the fixture's row count is nonzero"),
@@ -9070,7 +9894,7 @@ mod tests {
     fn an_index_past_its_region_refuses_instead_of_aliasing_the_next_one() {
         // The 101st scale is past scalarmul's floor. Asked BY NAME — see
         // `the_declared_bases_are_the_regions_bases` for what a positional index cost here.
-        let _ = scalarmul_scale_tid(reserved_region("scalarmul_scale").slots as usize);
+        let _ = scalarmul_scale_tid(Region::ScalarmulScale.tids().slots as usize);
     }
 
     /// ⛔⛔⛔ EVERY DECLARED BASE IS ITS OWN **NAMED** REGION'S BASE — and this test previously
@@ -9089,9 +9913,9 @@ mod tests {
     fn the_declared_bases_are_the_regions_bases() {
         assert_eq!(
             SCALARMUL_SCALE_BASE,
-            reserved_region("scalarmul_scale").base
+            Region::ScalarmulScale.tids().base
         );
-        assert_eq!(KCT_RESIDENT_BASE, reserved_region("kct_resident").base);
+        assert_eq!(KCT_RESIDENT_BASE, Region::KctResident.tids().base);
         // ⭐ AND THE TWO DOORS THAT SHARE A NEIGHBOURHOOD MUST NOT MEET. This is the assertion the
         // positional form could not make: it compares two INDEPENDENTLY derived tids rather than one
         // constant against its own definition.
@@ -9107,7 +9931,7 @@ mod tests {
         for w in RESERVED_REGIONS.windows(2) {
             assert!(
                 w[1].base < w[0].floor(),
-                "{} overlaps {} or sits above it",
+                "{:?} overlaps {:?} or sits above it",
                 w[1].name,
                 w[0].name
             );
@@ -9118,9 +9942,9 @@ mod tests {
     #[test]
     fn a_regions_last_slot_belongs_to_it_and_the_next_tid_does_not() {
         for r in RESERVED_REGIONS {
-            assert_eq!(r.at(r.slots - 1), r.floor(), "{}", r.name);
+            assert_eq!(r.at(r.slots - 1), r.floor(), "{:?}", r.name);
         }
-        assert_eq!(scalarmul_scale_tid(99), RESERVED_REGIONS[1].floor());
+        assert_eq!(scalarmul_scale_tid(99), Region::ScalarmulScale.tids().floor());
     }
 
     /// ⭐⭐⭐ THE ARGUMENT ORDER OF `for_output` IS LOAD-BEARING, AND THIS IS THE MODEL THAT PROVES
@@ -9371,7 +10195,7 @@ mod tests {
             scratchy_triton_splice::PagedRows::Sequence,
             &[],
             &Default::default(),
-            one_request_of(4),
+            one_request_of(&ir, 4),
         )
         .expect("a layout for a plain matmul bundle");
 
@@ -9490,7 +10314,7 @@ mod tests {
             scratchy_triton_splice::PagedRows::Sequence,
             &[],
             &Default::default(),
-            one_request_of(1),
+            one_request_of(&plain, 1),
         )
         .expect("plain lays out");
         let l_minted = compute_bundle_layout::<ktir_superdsc::collective::TpWorld<1>, _>(
@@ -9499,7 +10323,7 @@ mod tests {
             scratchy_triton_splice::PagedRows::Sequence,
             &[],
             &Default::default(),
-            one_request_of(1),
+            one_request_of(&minted, 1),
         )
         .expect("the minted graph lays out");
 
@@ -9597,7 +10421,7 @@ mod tests {
             scratchy_triton_splice::PagedRows::Sequence,
             &[],
             &Default::default(),
-            one_request_of(4),
+            one_request_of(&minted, 4),
         )
         .expect("the minted graph lays out");
 
@@ -9918,16 +10742,18 @@ mod tests {
             let (_, ir) = build(m);
             // t1 is the lm_head weight; t0 is the activation source.
             let weight_ids: std::collections::HashSet<u32> = [1u32].into_iter().collect();
+            let graph = scratchy_triton_splice::GraphExtent::of(&ir, extent, false)
+                .map_err(SuperDscError)?;
             lower_graph_to_superdsc::<ktir_superdsc::collective::TpWorld<1>, _>(
                 &ir,
                 &weight_ids,
                 ActiveCap::FULL,
                 false,
-                extent,
+                graph,
             )
             .map(|(ops, _)| ops.into_iter().map(|e| e.op_name).collect::<Vec<_>>())
         };
-        let lower = |m: u32| lower_at(one_request_of(m));
+        let lower = |m: u32| lower_at(one_request_pair(m));
         let packed_rung_of = |w: u32, s: u32| {
             ktir_superdsc::sdsc_abstract::QueryExtent::of_baked_rung(
                 ktir_superdsc::sdsc_abstract::RungWidth::of_baked_rows(w)
@@ -10010,13 +10836,13 @@ mod tests {
             scratchy_triton_splice::PagedRows::Sequence,
             &[],
             &Default::default(),
-            one_request_of(mq),
+            one_request_of(&ir, mq),
         )
         .expect("the tail's layout mints");
         let mut programs = scratchy_triton_splice::lower_all::<
             ktir_superdsc::collective::TpWorld<1>,
             _,
-        >(&node, &ir, false, one_request_of(mq))
+        >(&node, &ir, false, one_request_of(&ir, mq))
         .expect("the splice's fold mints the tail");
         let extract = programs
             .iter_mut()
@@ -10046,7 +10872,7 @@ mod tests {
         let mut programs = scratchy_triton_splice::lower_all::<
             ktir_superdsc::collective::TpWorld<1>,
             _,
-        >(&node, &ir, false, one_request_of(mq))
+        >(&node, &ir, false, one_request_of(&ir, mq))
         .expect("the splice's fold mints the tail");
         let extract = programs
             .iter_mut()
@@ -10128,7 +10954,7 @@ mod tests {
             scratchy_triton_splice::PagedRows::Sequence,
             &[],
             &Default::default(),
-            one_request_of(1),
+            one_request_of(&ir, 1),
         )
         .expect("the fp8 layout mints");
         let p = layout.placements.get(&1).expect("the fp8 weight is placed");
@@ -10144,7 +10970,7 @@ mod tests {
             scratchy_triton_splice::PagedRows::Sequence,
             &[],
             &Default::default(),
-            one_request_of(1),
+            one_request_of(&ir, 1),
         )
         .expect("the fp16 layout mints");
         let p = layout
@@ -10226,7 +11052,7 @@ mod tests {
             &weight_ids,
             ActiveCap::FULL,
             false,
-            one_request_of(1),
+            one_request_of(&ir, 1),
         )
         .expect("two-fp8-matmul lowering");
         let quantizes = ops
@@ -10315,7 +11141,7 @@ mod tests {
             &weight_ids,
             ActiveCap::FULL,
             false,
-            one_request_of(1),
+            one_request_of(&ir, 1),
         )
         .expect("the folded residual shape lowers");
 
@@ -10391,7 +11217,7 @@ mod tests {
             &weight_ids,
             ActiveCap::FULL,
             false,
-            one_request_of(1),
+            one_request_of(&ir, 1),
         )
         .expect("the refused residual shape still lowers");
 
@@ -10896,7 +11722,7 @@ mod tests {
             scratchy_triton_splice::PagedRows::Sequence,
             &[],
             &Default::default(),
-            one_request_of(1),
+            one_request_of(&ir, 1),
         )
         .expect_err("the placement pass is the budget law and must refuse 32 GiB in seg1");
         assert!(
@@ -10913,7 +11739,7 @@ mod tests {
             &weight_ids,
             ActiveCap::FULL,
             scratchy_triton_splice::PagedRows::Sequence,
-            one_request_of(1),
+            one_request_of(&ir, 1),
         )
         .expect("the wiring is a registry and never runs the budget pass");
         assert_eq!(
@@ -11214,7 +12040,7 @@ mod tests {
                 &weight_ids,
                 ActiveCap::FULL,
                 false,
-                one_request_of(1),
+                one_request_of(&ir, 1),
             )
             .unwrap();
             // The card path's groups: one per `launch_index` entry, as `into_code` assembles them.
@@ -11321,7 +12147,7 @@ mod tests {
                 scratchy_triton_splice::PagedRows::Sequence,
                 &per_layer_ext,
                 twins,
-                one_request_of(1),
+                one_request_of(&ir, 1),
             )
             .expect("the stack lays out")
         };

@@ -526,15 +526,13 @@ pub fn lower<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile_ir::
 /// The prefill lm-head tail predicate, stated ONCE — every consumer of the fold
 /// (the `lower_all` rewrite, the one-op `lower`'s routing echo below, and the
 /// bake-time numeric gate's tail compare, which states the fold's last-row law
-/// against the golden) reads
-/// the SAME five conjuncts, because the width test alone was falsified by the
-/// gemma-4 parity fixture (vocab 512), whose GLOBAL-layer q projection is ALSO
-/// 512 cols (4 heads × hd 128) — the fold fired on every global layer's Q, and
-/// the model's first sampled token was garbage while every width-128 tensor
-/// stayed fp16-clean. A width COLLISION is not an identity: only the tail's own
-/// rows are dead, and only the result's ancestors are the tail. The walk is
-/// [`tensor_feeds_result_through_row_local_ops`] (main's own law). The fifth
-/// conjunct names the fold's own product: a matmul whose activation is the
+/// against the golden) reads the SAME conjuncts. The tail is the lm-head's own
+/// chain to the draw ([`lm_head_tail`], by data flow): a width is no identity —
+/// the gemma-4 parity fixture's GLOBAL-layer q projection is as wide as its
+/// vocabulary (512), and a width test folded every global layer's Q. Only the
+/// tail's own rows are dead, which the forward walk
+/// [`tensor_feeds_result_through_row_local_ops`] (main's own law) states. The
+/// last conjunct names the fold's own product: a matmul whose activation is the
 /// beyond-the-graph `LAST_HIDDEN` staging is the fold's re-lowered half-2
 /// ALREADY — never a tail to fold (at m=1 the rows conjunct excluded it; at
 /// m=S the activation must).
@@ -543,42 +541,12 @@ pub fn is_prefill_lm_head_tail<F: scratchy_subtile::subtile_ir::RopeForm>(
     ir: &SubtileIR<F>,
     rows_are_requests: bool,
 ) -> bool {
-    // ⭐ THE MINTED DRAW STATES THE TAIL'S PRODUCT. A graph the sampler minted
-    // re-points its result at the idx stick and pads the tail's storage width,
-    // so the original width conjunct (the node's output region width equals the
-    // result tensor's cols) can no longer see the tail. The draw restates it:
-    // the lm-head's OWN full output width N equals the vocab the draw serves,
-    // and an elementwise tail node's region width equals that vocab — the same
-    // "this node is vocab-wide like the result" statement, read off the ops'
-    // own fields, immune to the re-point and the padding. A graph without a
-    // draw keeps the original conjunct verbatim. One predicate, read by every
-    // caller — the `lower_all` rewrite, the one-op routing echo, and the
-    // bake-time numeric gate — so all three state the SAME fold. (The width
-    // alone was never sufficient — the gemma-4 q-projection collision is what
-    // the feeds-walk conjunct below kills — and that protection is unchanged.)
-    let draw = ir
-        .nodes
-        .iter()
-        .find(|n| matches!(n.op, SubOp::Sample { .. }));
-    // ⭐ A SPLIT HEAD IS THE TAIL'S PRODUCT TOO. A vocabulary projection split across ranks is one
-    // rank's block (`n` < vocab), and it reaches the draw through the all-gather that restores the
-    // whole vocabulary — the same product, gathered.
-    let feeds_the_tail_product = match (&draw, &node.op) {
-        (Some(sample), SubOp::MatmulTile { n, .. }) => match &sample.op {
-            SubOp::Sample { vocab, .. } => {
-                *n == *vocab || gathers_to_width(ir, node.output.tensor, *vocab)
-            }
-            _ => false,
-        },
-        (Some(sample), _) => match &sample.op {
-            SubOp::Sample { vocab, .. } => node.output.region.cols.len == *vocab,
-            _ => false,
-        },
-        (None, _) => {
-            let result_cols = ir.tensors[ir.result.index()].cols;
-            node.output.region.cols.len == result_cols
-        }
-    };
+    // ⭐ THE TAIL IS THE LM-HEAD'S CHAIN TO THE DRAW, BY DATA FLOW ([`lm_head_tail`]) — the
+    // projection the draw samples and the single-input epilogue between, never a node that happens
+    // to be as wide as the vocabulary. One predicate, read by every caller — the `lower_all`
+    // rewrite, the one-op routing echo, and the bake-time numeric gate — so all three state the
+    // SAME fold.
+    let feeds_the_tail_product = lm_head_tail(ir).is_some_and(|tail| tail.contains(&node.id));
     // A projection's rows are its ACTIVATION's: a folded tail that gathers is declared one row from
     // the projection's output down (`subtile_ir::mint_sample`, so the gather's operand is a whole
     // one-row tensor), while the prompt rows it folds over are still `mq`. Every other tail op, and
@@ -602,23 +570,129 @@ pub fn is_prefill_lm_head_tail<F: scratchy_subtile::subtile_ir::RopeForm>(
         && tensor_feeds_result_through_row_local_ops(ir, node.output.tensor)
 }
 
-/// Whether `t` reaches an all-gather restoring `width` columns through single-input logit
-/// epilogues — the path a split vocabulary projection takes to the draw.
-fn gathers_to_width<F: scratchy_subtile::subtile_ir::RopeForm>(
+/// ⭐ THE LM-HEAD AND ITS TAIL, BY DATA FLOW — the projection whose product the forward's draw
+/// samples (with no draw, whose product is the result), and the single-input logit epilogue
+/// between them (a soft cap, a scale, the all-gather a split vocabulary projection restores its
+/// width through): walked BACK from the draw's logits ([`SAMPLE_LOGITS_INPUT`]) through those ops to
+/// the first matmul, which IS the lm-head. Every node writing a tensor of that chain — each column
+/// tile — is the tail. Stated over op kinds and operand identity alone, never a width (a q
+/// projection as wide as the vocabulary has one: the gemma-4 parity fixture). `None` when the
+/// chain meets any other op — no tail to fold.
+///
+/// [`SAMPLE_LOGITS_INPUT`]: scratchy_subtile::subtile_ir::SAMPLE_LOGITS_INPUT
+pub fn lm_head_tail<F: scratchy_subtile::subtile_ir::RopeForm>(
     ir: &SubtileIR<F>,
-    t: scratchy_subtile::subtile_ir::TensorId,
-    width: u32,
-) -> bool {
-    ir.nodes
-        .iter()
-        .filter(|n| n.inputs.iter().any(|i| i.tensor == t))
-        .any(|n| match &n.op {
-            SubOp::AllGather { cols } => *cols == width,
-            SubOp::ScalarMul { .. } | SubOp::TanhSoftCap { .. } if n.inputs.len() == 1 => {
-                gathers_to_width(ir, n.output.tensor, width)
+) -> Option<Vec<scratchy_subtile::subtile_ir::SubtileId>> {
+    let mut t = match ir.nodes.iter().find(|n| matches!(n.op, SubOp::Sample { .. })) {
+        Some(draw) => {
+            draw.inputs
+                .get(scratchy_subtile::subtile_ir::SAMPLE_LOGITS_INPUT)?
+                .tensor
+        }
+        None => ir.result,
+    };
+    let mut tail = Vec::new();
+    loop {
+        let writers: Vec<&SubtileNode<F>> =
+            ir.nodes.iter().filter(|n| n.output.tensor == t).collect();
+        let first = writers.first()?;
+        tail.extend(writers.iter().map(|n| n.id));
+        match &first.op {
+            // The projection — the chain's end.
+            SubOp::MatmulTile { .. } => return Some(tail),
+            // A single-input epilogue: the chain continues through its one input, which every
+            // tile of it reads.
+            SubOp::TanhSoftCap { .. } | SubOp::ScalarMul { .. } | SubOp::AllGather { .. }
+                if writers.iter().all(|n| {
+                    n.inputs.len() == 1 && n.inputs[0].tensor == first.inputs[0].tensor
+                }) =>
+            {
+                t = first.inputs[0].tensor;
             }
-            _ => false,
-        })
+            _ => return None,
+        }
+    }
+}
+
+/// ⭐⭐ THE RUNG'S EXTENT PAIR, PROVEN TO DESCRIBE ITS GRAPH — the one witness every lowering of
+/// a rung's graph spends instead of a bare [`QueryExtent`].
+///
+/// The pair is minted from the rung ([`QueryExtent::of_baked_rung`], never a division of the
+/// graph's rows), and every reader that spends it against the graph needs the same fact: the
+/// pair's held product IS the row count of the nodes it sizes. Those readers are the attention
+/// splice ([`lower_attn`]), the prefill lm-head tail's fold and the paged step's mint. [`Self::of`]
+/// is the ONE statement of that agreement, checked once per rung over every node that spends the
+/// pair:
+/// - every `AttnDecode`'s query rows;
+/// - every prefill lm-head tail matmul's activation rows ([`is_prefill_lm_head_tail`], the fold's
+///   own predicate).
+///
+/// A reader holding a `GraphExtent` takes the agreement as given, and no reader restates it.
+///
+/// [`QueryExtent`]: ktir_superdsc::sdsc_abstract::QueryExtent
+/// [`QueryExtent::of_baked_rung`]: ktir_superdsc::sdsc_abstract::QueryExtent::of_baked_rung
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GraphExtent(ktir_superdsc::sdsc_abstract::QueryExtent);
+
+impl GraphExtent {
+    /// THE MINT — `extent` checked against `ir`, the graph it is the rung of. `rows_are_requests`
+    /// is the rung's row kind, which decides whether the lm-head tail folds (the fold's own
+    /// predicate reads it). A disagreement is a bake bug, named here by the node that disagrees.
+    pub fn of<F: scratchy_subtile::subtile_ir::RopeForm>(
+        ir: &SubtileIR<F>,
+        extent: ktir_superdsc::sdsc_abstract::QueryExtent,
+        rows_are_requests: bool,
+    ) -> Result<Self, String> {
+        let want = extent.graph_rows().get();
+        for node in &ir.nodes {
+            let spent = match &node.op {
+                SubOp::AttnDecode { .. } => {
+                    Some(("AttnDecode query rows", node.output.region.rows.len))
+                }
+                SubOp::MatmulTile { .. }
+                    if is_prefill_lm_head_tail(node, ir, rows_are_requests) =>
+                {
+                    node.inputs
+                        .first()
+                        .map(|a| ("prefill lm-head tail activation rows", a.region.rows.len))
+                }
+                _ => None,
+            };
+            if let Some((what, rows)) = spent
+                && rows != want
+            {
+                return Err(format!(
+                    "the rung's extent pair (per-request {} × {} request(s) = {want} row(s)) does \
+                     not describe its graph: node s{} ({what}) runs {rows} row(s) — the mint and \
+                     the graph come from different rungs",
+                    extent.per_request().get(),
+                    extent.requests().get(),
+                    node.id.index(),
+                ));
+            }
+        }
+        Ok(Self(extent))
+    }
+
+    /// The proven pair.
+    pub const fn extent(self) -> ktir_superdsc::sdsc_abstract::QueryExtent {
+        self.0
+    }
+
+    /// The pair's per-request width.
+    pub const fn per_request(self) -> ktir_superdsc::sdsc_abstract::RungWidth {
+        self.0.per_request()
+    }
+
+    /// The pair's request count.
+    pub const fn requests(self) -> ktir_superdsc::sdsc_abstract::RungCap {
+        self.0.requests()
+    }
+
+    /// The pair's held product — the graph's own row count, proven by [`Self::of`].
+    pub const fn graph_rows(self) -> ktir_superdsc::sdsc_abstract::RungWidth {
+        self.0.graph_rows()
+    }
 }
 
 /// EVERY OP THE SPLICE EMITS FOR ONE NODE. Every kind is one op except the prefill
@@ -630,12 +704,11 @@ pub fn lower_all<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile_
     node: &SubtileNode<F>,
     ir: &SubtileIR<F>,
     rows_are_requests: bool,
-    // ⭐ THE QUERY'S EXTENT PAIR — the rung's own `(width, capacity)`, the same mint
-    // `lower_attn` takes. The lm-head tail's fold is the reader here: it mints the tail's
-    // [`AnswerRows`] from the pair and refuses a mint that does not describe the graph
-    // being lowered. Every other interception ignores it, exactly as the decode and batch
-    // arms of `lower_attn` read the graph's rows and never the pair's split.
-    query_rows: ktir_superdsc::sdsc_abstract::QueryExtent,
+    // ⭐ THE QUERY'S EXTENT PAIR, PROVEN AGAINST THIS GRAPH ([`GraphExtent`]) — the same
+    // witness `lower_attn` takes. The lm-head tail's fold is the reader here: it mints the
+    // tail's [`AnswerRows`] from the pair. Every other interception ignores it, exactly as the
+    // decode and batch arms of `lower_attn` read the graph's rows and never the pair's split.
+    query_rows: GraphExtent,
 ) -> Result<Vec<EmittedOp<T>>, String> {
     // ── THE HEAD-NORM SANDWICH'S THREE SEATS — the split (head) is where the fused
     // program is emitted; the flatten-back (tail) and the middle (norm) self-identify
@@ -751,8 +824,8 @@ fn node_at_tail_rows<F: scratchy_subtile::subtile_ir::RopeForm>(
 /// rung, including the empty windows a launch seated fewer requests leaves (their
 /// logits rows are pads, never read); the readback takes the live count off the
 /// launch's own slot list.
-fn tail_requests(query_rows: ktir_superdsc::sdsc_abstract::QueryExtent) -> u32 {
-    query_rows.requests().get()
+fn tail_requests(query_rows: GraphExtent) -> u32 {
+    query_rows.extent().requests().get()
 }
 
 // ══════════════════════════════════════════════════════════════════════════════════════════════
@@ -1330,16 +1403,13 @@ fn lower_one<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile_ir::
     let arity = match &node.op {
         SubOp::RmsNorm { .. } => 2,
         SubOp::SiluMul => 2,
-        // ⭐ THE MATMUL'S ARITY IS THE WEIGHT SCHEME'S OWN: Dense is arity-2
-        // `[act, weight]`, Fp8Dynamic is arity-3 `[act, weight_fp8, weight_scale]`
-        // (the same routing `lower_matmul_node` does on `node.inputs.get(2)`). The
-        // Affine scheme stays arity-2 (its scales/biases resolve from the SAME weight
-        // source under tensor roles, not as separate IR operands).
-        SubOp::MatmulTile { weight, .. } => match weight {
-            GemmWeight::Dense => 2,
-            GemmWeight::Fp8Dynamic => 3,
-            GemmWeight::Affine { .. } => 2,
-        },
+        // ⭐ THE MATMUL'S ARITY IS THE WEIGHT SCHEME'S OWN LAYOUT
+        // (`scratchy_subtile::subtile_ir::MatmulLayout`): `[act, weight]`, plus the
+        // fp8 scheme's `weight_scale`. The Affine scheme states no scale operand (its
+        // scales/biases resolve from the SAME weight source under tensor roles).
+        SubOp::MatmulTile { weight, .. } => {
+            scratchy_subtile::subtile_ir::MatmulLayout::of(*weight).arity()
+        }
         SubOp::Elementwise(EwKind::Silu | EwKind::Gelu) => 1,
         SubOp::Elementwise(_) => 2,
         SubOp::ScalarMul { .. } => 1,
@@ -1418,9 +1488,8 @@ fn lower_one<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile_ir::
 /// the extraction addresses the buffer the tape takes to be exactly `[mq, hidden]`
 /// at row 0, which is the only shape that reaches the fold (a non-whole activation
 /// region is refused by the whole-region guard before this), and the pair's held
-/// product must BE that `mq` — the same agreement check `lower_attn` runs, so a mint
-/// that does not describe the graph being lowered is a refusal by name, never a
-/// silently-wrong row. At `S = 1` (`w = mq`) request 0's row is
+/// product IS that `mq` by its witness ([`GraphExtent::of`], the one agreement
+/// `lower_attn` spends too). At `S = 1` (`w = mq`) request 0's row is
 /// `selector_lastrow_col(mq)`, exactly the single-row law, and every tile, corner and
 /// constexpr the fold states is byte-identical to it.
 ///
@@ -1435,14 +1504,15 @@ fn lower_prefill_lm_head_fold<
 >(
     node: &SubtileNode<F>,
     ir: &SubtileIR<F>,
-    query_rows: ktir_superdsc::sdsc_abstract::QueryExtent,
+    query_rows: GraphExtent,
 ) -> Result<Vec<EmittedOp<T>>, String> {
     use scratchy_subtile::subtile_ir::Region as SubRegion;
 
     let a = &node.inputs[0];
-    let (mq, hidden) = (a.region.rows.len, a.region.cols.len);
-    let stk = 64u32; // Fp16::ELEMS_PER_STICK — the stick the door's lmlast arm checks
-    if hidden % stk != 0 {
+    let hidden = a.region.cols.len;
+    // The fp16 stick — the one the door's lmlast arm checks.
+    let stk = ktir_superdsc::sdsc_abstract::POOL_STICK;
+    if !hidden.is_multiple_of(stk) {
         return Err(format!(
             "triton splice: matmul_s{} (prefill lm-head tail): hidden={hidden} is not a whole \
              {stk}-fp16 stick, so the last prompt row is not a run of whole stick-groups — the \
@@ -1450,22 +1520,10 @@ fn lower_prefill_lm_head_fold<
             node.id.index()
         ));
     }
-    // ⭐ THE PAIR MEETS THE GRAPH HERE, ONCE — the same check `lower_attn` runs: the
-    // mint's held product must be this graph's own row count, or the mint describes a
-    // different rung than the one being lowered. A disagreement is a REFUSAL by name,
-    // never a silently-wrong answer row.
-    if query_rows.graph_rows().get() != mq {
-        return Err(format!(
-            "triton splice: matmul_s{} (prefill lm-head tail): the graph's {} row(s) are not the \
-             extent pair's {} (per-request {} × {} request(s)) — the mint does not describe the \
-             graph it lowers",
-            node.id.index(),
-            mq,
-            query_rows.graph_rows().get(),
-            query_rows.per_request().get(),
-            query_rows.requests().get(),
-        ));
-    }
+    // ⭐ THE PAIR DESCRIBES THIS GRAPH BY ITS WITNESS ([`GraphExtent::of`] checked this tail's
+    // activation rows against the pair's product), so the pair is spent as given.
+    let query_rows = query_rows.extent();
+    let mq = query_rows.graph_rows().get();
     let answers = ktir_superdsc::sdsc_abstract::AnswerRows::of_extent(query_rows);
     let (w, s) = (
         query_rows.per_request().get(),
@@ -1735,8 +1793,11 @@ pub use scratchy_ir::model_facts::{
     AttnScale, BlockSize, HeadDim, HeadGeometry, KvHeads, QueryHeads, RotDim,
 };
 
-/// An int32 stick (spyre-inference's `INT32_ELEMS_PER_STICK`).
-pub const INT32_STICK: u32 = 32;
+/// An int32 stick (spyre-inference's `INT32_ELEMS_PER_STICK`) — the baked generation's flit in
+/// 4-byte elements, the stick law every `DataFormat` states (`FLIT_BYTES / element size`).
+pub const INT32_STICK: u32 =
+    (<ktir_core::ddl_binds::Baked as ktir_core::ddl_binds::DeviceGen>::FLIT_BYTES
+        / std::mem::size_of::<i32>() as u64) as u32;
 
 /// ⭐ WHAT A PAGED BUNDLE'S ROWS ARE — the fact spyre-inference's dispatch reads besides the query
 /// width: one sequence's query rows, or one decode row of each sequence of a batch
@@ -1792,8 +1853,8 @@ impl BatchChunking {
     pub const GATHER_FLOOR: u32 = 8;
 
     /// One stick of fp16 lanes — a gathered row of the folded cache or the folded query is whole
-    /// sticks of it, or the gather has no addressing for it.
-    pub const STICK: u32 = 64;
+    /// sticks of it, or the gather has no addressing for it. The pool's own stick.
+    pub const STICK: u32 = ktir_superdsc::sdsc_abstract::POOL_STICK;
 
     /// The fold's page-side law, stated rather than relied on: the cut is `kv_heads · 2^i` rows a
     /// page with `2^i < GATHER_FLOOR`, so a page's share is `page_slots · head_size / 2^i`, whole
@@ -1806,16 +1867,11 @@ impl BatchChunking {
         "a page's slots must divide by the gather floor, or a fold cut of a page is not whole rows"
     );
 
-    /// ⛔ `seqs` AND `nkvh` ARE COUNTS, ONE OR MORE. Both divide here, so a zero is a panic at BAKE
-    /// and not a wrong answer — `seqs` has divided since this function existed (`CORES / seqs`) and
-    /// `nkvh` since the fold was added (`GATHER_FLOOR.div_ceil(seqs · rows_per_page)`). Every
-    /// producer already has them non-zero (`nkvh` is the attention facts' class head count, minted
-    /// at the bridge off `ModelFacts` — a non-zero `kv_heads` is a law of the facts' own mint —
-    /// and a bundle's rows are its baked width), so the clamps below are not a tolerance for zero:
-    /// they keep this `const fn` TOTAL, so a malformed step is a wrong chunking a test can catch
-    /// rather than a build that dies inside a `const` evaluation. The honest end state is a
-    /// `NonZeroU32` pair in the signature; that waits on `PagedStep`'s fields, which the bake's
-    /// codegen quotes as `u32`.
+    /// ⛔ `nkvh` AND `head_size` ARE THE MODEL FACTS' OWN TYPES ([`KvHeads`], [`HeadDim`]), positive
+    /// by construction, so the fold's cut starts at one kv head or more without a clamp. `seqs`
+    /// divides (`CORES / seqs`) and stays a bare count, clamped to one so this `const fn` is TOTAL —
+    /// a malformed step is a wrong chunking a test can catch, never a build dying inside a `const`
+    /// evaluation.
     ///
     /// The fold also reads the query's own row width, `q_width = num_heads · head_size`, and the
     /// head's: a page and a query row split into `rows_per_page` rows each, and every one of those
@@ -1833,9 +1889,9 @@ impl BatchChunking {
     pub const fn of(
         seqs: u32,
         blocks: u32,
-        nkvh: u32,
+        nkvh: KvHeads,
         q_width: u32,
-        head_size: u32,
+        head_size: HeadDim,
     ) -> BatchChunking {
         let () = Self::PAGE_TAKES_THE_CUT;
         let seqs = if seqs < 1 { 1 } else { seqs };
@@ -1845,7 +1901,7 @@ impl BatchChunking {
             if j < 1 { 1 } else { j }
         };
         let rows_per_page = if theirs * seqs < Self::GATHER_FLOOR {
-            let mut rows = if nkvh < 1 { 1 } else { nkvh };
+            let mut rows = nkvh.get();
             // Double the cut while it is short of the floor at their block slots and the doubled
             // query share is still whole sticks — and only for a head one stick wide: a kv head's
             // page is then its slots' rows one after another, so a finer cut is whole rows of it,
@@ -1853,7 +1909,7 @@ impl BatchChunking {
             // frame law). Two sticks or wider, a page's sticks interleave its rows, and a sub-page
             // entry is no block of it.
             // `rows < GATHER_FLOOR` bounds it: every doubling stays below twice the floor.
-            while head_size == Self::STICK
+            while head_size.get() == Self::STICK
                 && rows < Self::GATHER_FLOOR
                 && theirs * seqs * rows < Self::GATHER_FLOOR
                 && q_width.is_multiple_of(rows * 2)
@@ -1983,26 +2039,23 @@ impl PagedStepTids {
 /// ONE source: the splice's operand binding and the wiring's mask-family check both read this
 /// function, so a class's bound masks cannot be one family at the kernel and another at the staged
 /// tables.
-pub fn paged_window_of_class(class: usize, window: u32, table: u32) -> u32 {
-    if class == 0 {
-        return ktir_superdsc::reserved_tids::paged_window_tid(window, table);
-    }
-    match table {
+pub fn paged_window_of_class(class: usize, window: u32, table: WindowTable) -> u32 {
+    use ktir_superdsc::reserved_tids::{
+        ClassWindowTable, paged_step_class_window_tid, paged_window_tid,
+    };
+    match (class, window, table) {
+        // Class 0 is the `paged_window` family, sentinels at window 0.
+        (0, _, t) => paged_window_tid(window, t),
         // The query row index gathers the graph's own rows — class-independent.
-        0 => ktir_superdsc::reserved_tids::paged_window_tid(window, 0),
-        1 | 2 => {
-            if window == 0 {
-                let tids = PagedStepTids::of_class(class);
-                if table == 1 { tids.page_table } else { tids.mask }
-            } else {
-                ktir_superdsc::reserved_tids::paged_step_class_window_tid(
-                    class as u32,
-                    window,
-                    table,
-                )
-            }
+        (_, _, WindowTable::QueryRows) => paged_window_tid(window, WindowTable::QueryRows),
+        // Window 0 is the class's own step tables.
+        (c, 0, WindowTable::PageTable) => PagedStepTids::of_class(c).page_table,
+        (c, 0, WindowTable::Mask) => PagedStepTids::of_class(c).mask,
+        // The windows past the first take the class region's slots.
+        (c, w, WindowTable::PageTable) => {
+            paged_step_class_window_tid(c as u32, w, ClassWindowTable::PageTable)
         }
-        _ => unreachable!("a window owns three tables (paged_window_tid's own assert)"),
+        (c, w, WindowTable::Mask) => paged_step_class_window_tid(c as u32, w, ClassWindowTable::Mask),
     }
 }
 
@@ -2268,15 +2321,34 @@ pub fn walk_pages(
         context_pages * SchedulerBlockTokens::REFERENCE.get(),
         ktir_superdsc::sdsc_abstract::POOL_STICK,
     );
+    walk_of_sweep(
+        swept,
+        mq,
+        context_pages,
+        per_request,
+        window,
+        SchedulerBlockTokens::REFERENCE.get(),
+    )
+}
+
+/// ⭐ THE WALK OF A RESOLVED SWEEP — the blocks of `block` slots a body sweeping `swept` slots reads
+/// (its own `mq` rows when it sweeps none), capped by the op's window and by the `context_pages` the
+/// kernel views. THE ONE statement of a walk's block count: [`walk_pages`] reads it after resolving
+/// a rung's sweep, and the host's staged step reads it at the sweep the body it launches resolved
+/// (`scratchy_target_spyre::wiring::PagedStep::walk_at`), so the host's tables and the kernel's
+/// `NUM_BLOCKS` are one law.
+pub fn walk_of_sweep(
+    swept: u32,
+    mq: u32,
+    context_pages: u32,
+    per_request: u32,
+    window: Option<std::num::NonZeroU32>,
+    block: u32,
+) -> u32 {
     let walked = if swept == 0 { mq } else { swept };
-    let mut blocks = walked.div_ceil(SchedulerBlockTokens::REFERENCE.get());
+    let mut blocks = walked.div_ceil(block);
     if let Some(w) = window {
-        blocks = blocks.min(window_walk_blocks(
-            context_pages,
-            w,
-            per_request,
-            SchedulerBlockTokens::REFERENCE.get(),
-        ));
+        blocks = blocks.min(window_walk_blocks(context_pages, w, per_request, block));
     }
     blocks.min(context_pages)
 }
@@ -2364,12 +2436,12 @@ pub fn lower_attn<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile
     scale_site: AttnScaleSite,
     active_cap: ktir_superdsc::ktir_node::ActiveCap,
     // ⭐ THE QUERY'S EXTENT PAIR — the rung's own `(width, capacity)`, minted once at the bake and
-    // never divided back out of the graph's rows. The PREFILL arm spends it as the kernel's two
-    // extents (`NUM_TOKENS` = the graph's rows, `PADDED_QUERY_LEN` = one request's width) and as
-    // the walk's extent; the DECODE and BATCH arms read the graph's rows exactly as they did
-    // before (one row per request, so the pair's product IS the row count by construction). The
-    // agreement check below refuses a mint that does not describe the graph being lowered.
-    query_rows: ktir_superdsc::sdsc_abstract::QueryExtent,
+    // never divided back out of the graph's rows, proven against this graph by its witness
+    // ([`GraphExtent::of`]). The PREFILL arm spends it as the kernel's two extents (`NUM_TOKENS` =
+    // the graph's rows, `PADDED_QUERY_LEN` = one request's width) and as the walk's extent; the
+    // DECODE and BATCH arms read the graph's rows (one row per request, so the pair's product IS
+    // the row count by construction).
+    query_rows: GraphExtent,
     paged_rows: PagedRows,
 ) -> Result<Vec<EmittedOp<T>>, String> {
     let batch = paged_rows == PagedRows::Batch;
@@ -2387,6 +2459,7 @@ pub fn lower_attn<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile
         softmax_state: _,
         mask,
         attention,
+        operands,
     } = &node.op
     else {
         return Err(
@@ -2399,12 +2472,14 @@ pub fn lower_attn<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile
     // kv ≤ pos`) over the walk the window bounds. The op's own window reaches here at ONE
     // source — `mask.window()`, the walk's bound below and the wiring's staged tiles above —
     // and nothing else about a windowed op differs from a causal one.
-    if node.inputs.len() < 5 {
+    // The paged walk reads a resident prefix (the pools, the layout's first segment) and the
+    // step's own new rows (its last): an attention over a resident cache alone has no step to
+    // write, and no paged walk lowers it.
+    if operands.step_segment().is_none() {
         return Err(format!(
-            "triton splice: AttnDecode t{} expects 5 inputs [q, k cache, v cache, new k, new v], \
-             found {}",
+            "triton splice: AttnDecode t{} reads a resident cache alone — no step segment for \
+             the paged walk to write",
             node.output.tensor.index(),
-            node.inputs.len()
         ));
     }
     // The walk reads the step's own keys out of the pools, and the only thing that puts them there
@@ -2428,30 +2503,19 @@ pub fn lower_attn<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile
     // proven quantity and the one-stick/multi-stick question is `sticks()`, never a division.
     let hd = HeadWidth::of_whole_sticks(g.head_dim().get());
     let scale = scale_site.scale(*attention);
-    let mq = node.output.region.rows.len;
-    // ⭐ THE PAIR MEETS THE GRAPH HERE, ONCE — the mint's held product must be this graph's own row
-    // count, or the mint describes a different rung than the one being lowered. A disagreement is a
-    // REFUSAL by name (a bake bug, caught at the splice), never a silently-wrong extent: nothing
-    // downstream may divide `mq` back to a per-request width, so this is the one place the two are
-    // proven to agree.
-    if query_rows.graph_rows().get() != mq {
-        return Err(format!(
-            "triton splice: AttnDecode t{}: the graph's {} row(s) are not the extent pair's \
-             {} (per-request {} × {} request(s)) — the mint does not describe the graph it lowers",
-            node.output.tensor.index(),
-            mq,
-            query_rows.graph_rows().get(),
-            query_rows.per_request().get(),
-            query_rows.requests().get(),
-        ));
-    }
+    // ⭐ THE PAIR DESCRIBES THIS GRAPH BY ITS WITNESS — [`GraphExtent::of`] proved every
+    // attention's query rows are the pair's product, so nothing here divides `mq` back to a
+    // per-request width and nothing re-proves the agreement.
+    let query_rows = query_rows.extent();
+    let mq = query_rows.graph_rows().get();
     let kv_width = nkvh * hd.get();
     // The pools meet their law HERE, once: both planes one pool, the verified count threaded
     // to every front below (the chunk bound's eligibility, the placement's pool).
+    // The pools are the resident prefix — the layout's first segment.
     let pools = KvPools::of(
         ir,
-        &node.inputs[1],
-        &node.inputs[2],
+        &node.inputs[operands.k(0)],
+        &node.inputs[operands.v(0)],
         kv_width,
         &format!("AttnDecode t{}", node.output.tensor.index()),
     )?;
@@ -2459,7 +2523,7 @@ pub fn lower_attn<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile
     // pool's own count stays what `pools` states, which the batch's eligibility below compares a
     // chunk's gather against.
     let view = ContextPages::of_slots(positive(*valid_len, "the attention's context")?);
-    whole(ir, &node.inputs[0], mq, nqh * hd.get(), "query")?;
+    whole(ir, &node.inputs[operands.q()], mq, nqh * hd.get(), "query")?;
     whole(ir, &node.output, mq, nqh * hd.get(), "attention output")?;
     // ⭐ THE WALK'S EXTENT IS PER-REQUEST FOR A PREFILL CHUNK, THE GRAPH'S ROWS FOR THE BATCHED
     // KERNELS. The prefill kernel walks ONE request's pages — at one request the two are the same
@@ -2503,7 +2567,7 @@ pub fn lower_attn<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile
         // of at most `CORES · SchedulerBlockTokens::REFERENCE` positions, and the one config in scope that small
         // (tinyllama-1.1b, 2048) bakes no spyre decode at all (its head is untied). PORTING their
         // loop is what admits such a pool.
-        let chunking = BatchChunking::of(mq, blocks, nkvh, g.q_width(), g.head_dim().get());
+        let chunking = BatchChunking::of(mq, blocks, g.kv_heads(), g.q_width(), g.head_dim());
         if !chunk_fits_pool(&chunking, pools.pages()) {
             return Err(format!(
                 "triton splice: AttnDecode t{}: a {mq}-sequence decode walking {blocks} block(s) \
@@ -2530,10 +2594,10 @@ pub fn lower_attn<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile
             positional,
             format!("attn_s{}", node.id.index()),
             vec![
-                t(&node.inputs[0]),
+                t(&node.inputs[operands.q()]),
                 BufferId::new(tids.rep_rows),
-                t(&node.inputs[1]),
-                t(&node.inputs[2]),
+                t(&node.inputs[operands.k(0)]),
+                t(&node.inputs[operands.v(0)]),
                 BufferId::new(tids.chunk_pages),
                 BufferId::new(tids.chunk_masks),
                 t(&node.output),
@@ -2597,18 +2661,18 @@ pub fn lower_attn<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile
         // ⭐ THE WINDOW FAMILY AT THE OP'S OWN CLASS — the query row index is the graph's own rows
         // (shared), the page table and mask stack are the class's own ([`paged_window_of_class`],
         // the one law the wiring's mask-family check also reads).
-        let window = |table: u32| BufferId::new(paged_window_of_class(class, r, table));
+        let window = |table: WindowTable| BufferId::new(paged_window_of_class(class, r, table));
         let mut bindings = vec![
-            t(&node.inputs[0]),
-            window(0),
-            t(&node.inputs[1]),
-            t(&node.inputs[2]),
-            window(1),
+            t(&node.inputs[operands.q()]),
+            window(WindowTable::QueryRows),
+            t(&node.inputs[operands.k(0)]),
+            t(&node.inputs[operands.v(0)]),
+            window(WindowTable::PageTable),
         ];
         if decode {
             bindings.push(BufferId::new(tids.kv_row_pool));
         }
-        bindings.extend([window(2), t(&node.output)]);
+        bindings.extend([window(WindowTable::Mask), t(&node.output)]);
         let name = if r == 0 {
             format!("attn_s{}", node.id.index())
         } else {
@@ -2629,7 +2693,7 @@ pub fn lower_attn<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile
             },
             program,
             bindings,
-            mask: Some(window(2)),
+            mask: Some(window(WindowTable::Mask)),
             node_out_tid: None,
             answer_rows: None,
             minted: Default::default(),
@@ -2678,9 +2742,13 @@ pub fn kv_pool_format<F: scratchy_subtile::subtile_ir::RopeForm>(
             _ => None,
         })
     };
-    match (&writer.op, &writer.inputs[..]) {
+    // The K and V a writer stores — its own layout's (`KvWriterLayout`).
+    let stored = |w: scratchy_subtile::subtile_ir::KvWriterLayout| {
+        (&writer.inputs[w.k()], &writer.inputs[w.v()])
+    };
+    match (&writer.op, writer.op.kv_writer()) {
         (SubOp::RopeAppend { .. }, _) => Ok(KvPoolFormat::Fp16),
-        (SubOp::KvAppend { .. }, [k, v, _, _]) => match (quantized(k), quantized(v)) {
+        (SubOp::KvAppend { .. }, Some(w)) => match (quantized(stored(w).0), quantized(stored(w).1)) {
             (Some(ks), Some(vs)) if ks == vs => Ok(KvPoolFormat::Fp8(ks)),
             (None, None) => Ok(KvPoolFormat::Fp16),
             _ => Err(format!(
@@ -2858,42 +2926,43 @@ pub fn lower_kv_write<
     // The writer's key, value and pools, and the class's facts off the op's own attention value
     // (minted at the bridge): the head dim is the writer's own, the head count the mask class's —
     // never a division of the region's width, which is CHECKED against them below.
-    let (attention, head_dim, attn, [key, value, k_pool, v_pool]) =
-        match (&node.op, &node.inputs[..]) {
-            (
-                SubOp::RopeAppend {
-                    attention,
-                    rope,
-                    attn,
-                    ..
-                },
-                [_, _, _, v, kc, vc],
-            ) => (
-                *attention,
-                rope.head_dim(*attention),
-                *attn,
-                [&node.output, v, kc, vc],
-            ),
-            (
-                SubOp::KvAppend {
-                    attention,
-                    head_dim,
-                    attn,
-                    ..
-                },
-                [k, v, kc, vc],
-            ) => (*attention, *head_dim, *attn, [k, v, kc, vc]),
-            (op, inputs) => {
-                return Err(format!(
-                    "triton splice: lower_kv_write called on {} t{} with {} inputs — a KV writer \
-                     is a RopeAppend `[k, cos, sin, v, k cache, v cache]` or a KvAppend `[k, v, \
-                     k cache, v cache]`",
-                    op.name(),
-                    node.output.tensor.index(),
-                    inputs.len()
-                ));
-            }
-        };
+    // The K it writes is a `RopeAppend`'s own rotated output, a `KvAppend`'s K operand; its V and
+    // pools are the writer's layout's (`KvWriterLayout`).
+    use scratchy_subtile::subtile_ir::KvWriterLayout;
+    let (attention, head_dim, attn, key, w) = match &node.op {
+        SubOp::RopeAppend {
+            attention,
+            rope,
+            attn,
+            ..
+        } => (
+            *attention,
+            rope.head_dim(*attention),
+            *attn,
+            &node.output,
+            KvWriterLayout::ROPE_APPEND,
+        ),
+        SubOp::KvAppend {
+            attention,
+            head_dim,
+            attn,
+            ..
+        } => (
+            *attention,
+            *head_dim,
+            *attn,
+            &node.inputs[KvWriterLayout::KV_APPEND.k()],
+            KvWriterLayout::KV_APPEND,
+        ),
+        op => {
+            return Err(format!(
+                "triton splice: lower_kv_write called on {} t{}, which is no KV writer",
+                op.name(),
+                node.output.tensor.index(),
+            ));
+        }
+    };
+    let [value, k_pool, v_pool] = [w.v(), w.k_cache(), w.v_cache()].map(|s| &node.inputs[s]);
     let name = node.op.name();
     let g = attention.class(attn.class());
     let (hd, nkvh) = (
@@ -3060,9 +3129,14 @@ paged_count! {
     /// A paged kernel's token rows: the write's `T`, the attention's `NUM_TOKENS`, the prefill
     /// kernel's `PADDED_QUERY_LEN`.
     TokenRows,
-    /// The pages a per-sequence walk reads (`NUM_BLOCKS`, [`walk_pages`]).
-    WalkBlocks,
 }
+
+/// The pages a per-sequence walk reads (`NUM_BLOCKS`, [`walk_pages`]) — the KTIR crate's one type,
+/// which a baked ladder rung also carries.
+pub use ktir_superdsc::sdsc_abstract::WalkBlocks;
+
+/// One of a step window's three tables — the reserved tids' own type.
+pub use ktir_superdsc::reserved_tids::WindowTable;
 
 /// ⭐ A PAGED KERNEL'S COMPILE STATEMENT — its source, the spec it is compiled at, and the program
 /// it mints. The ONE statement each of the KV cache's five kernels has: production, the card leg
@@ -3606,10 +3680,12 @@ fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
                 Ok(())
             };
             // ONE tile, the whole region — `KtirFunc::matmul`'s own whole-region law
-            // (one linalg.matmul, no K loop). `M_TOTAL` names the OUTPUT TENSOR's row
-            // extent (the storage the descriptor addresses) while the store takes the
-            // `[M, N]` tile at row 0 — the prefill lm-head fold's m=S tail, whose
-            // output is the `[S, vocab]` prefix of the `[mq, vocab]` logits storage.
+            // (one linalg.matmul, no K loop). `M_TOTAL`/`N_TOTAL`/`C_START` are
+            // `matmul_window_of`'s storage-window law (see there): the out
+            // descriptor names the OUTPUT TENSOR's `[M_TOTAL, N_TOTAL]` while the
+            // store takes the `[M, N]` tile at `[0, C_START]` — the prefill lm-head
+            // fold's m=S row window, and a PAD_V or col-tiled output's column
+            // window.
             // ⛔ `N` IS THE DEVICE WIDTH — the door's own padding law, stated here so
             // the view/tile name the storage every consumer addresses: the card writes
             // `n_dev` columns (`out_width_the_weight_holds`'s staged-weight contract),
@@ -3621,8 +3697,9 @@ fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
             // spelling and the builder's logical one reach the same emit. The fp8 arm
             // stays LOGICAL: its door arm returns early through
             // `matmul_fp8_descriptors(m, k, n)` and is not pad-idempotent.
-            let (m_total, _a_total) = matmul_window_of(node, ir)?;
             let n_dev = matmul_out_width(node, ir, m, *n, k);
+            let (m_total, _a_total, n_total, c_start) =
+                matmul_window_of(node, ir, n_dev)?;
             ce("M", Val::Int(i128::from(m)))?;
             ce("K", Val::Int(i128::from(k)))?;
             ce("N", Val::Int(i128::from(n_dev)))?;
@@ -3630,6 +3707,8 @@ fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
             ce("BLOCK_K", Val::Int(i128::from(k)))?;
             ce("BLOCK_N", Val::Int(i128::from(n_dev)))?;
             ce("M_TOTAL", Val::Int(i128::from(m_total)))?;
+            ce("N_TOTAL", Val::Int(i128::from(n_total)))?;
+            ce("C_START", Val::Int(i128::from(c_start)))?;
         }
         (
             SubOp::MatmulTile {
@@ -3669,8 +3748,10 @@ fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
             // ONE tile, the whole region — and the fp8 contract REFUSES anything else
             // (`verify_canonical_fp8_matmul_kernel`: `BLOCK_K < K` and `BLOCK_N < N`
             // are refused by name; a K-looped fp8 form is a follow-on, not this row).
-            // `M_TOTAL` is the dense arm's window law (see there).
-            let (m_total, _) = matmul_window_of(node, ir)?;
+            // `M_TOTAL`/`N_TOTAL`/`C_START` are the dense arm's window law (see
+            // there), with the fp8 arm's own write width — the LOGICAL `n`, its
+            // door arm pads nothing.
+            let (m_total, _, n_total, c_start) = matmul_window_of(node, ir, *n)?;
             ce("M", Val::Int(i128::from(m)))?;
             ce("K", Val::Int(i128::from(k)))?;
             ce("N", Val::Int(i128::from(*n)))?;
@@ -3678,6 +3759,8 @@ fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
             ce("BLOCK_K", Val::Int(i128::from(k)))?;
             ce("BLOCK_N", Val::Int(i128::from(*n)))?;
             ce("M_TOTAL", Val::Int(i128::from(m_total)))?;
+            ce("N_TOTAL", Val::Int(i128::from(n_total)))?;
+            ce("C_START", Val::Int(i128::from(c_start)))?;
         }
         (SubOp::SiluMul, "silumul_fwd") => {
             // The kernel's own parameter spellings: desc_g, desc_u, desc_o, then the
@@ -3865,7 +3948,7 @@ fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
         }
         (SubOp::TanhSoftCap { cap }, "tanhsoftcap_fwd") => {
             // The kernel's own parameter spellings: desc_x, desc_o, then the constexprs
-            // M / N / BLOCK_M / BLOCK_N / CAP / N_BLOCKS / TAIL_H.
+            // M / N / BLOCK_M / BLOCK_N / CAP / N_BLOCKS / TAIL_H / N_TOTAL / C_START.
             for p in ["desc_x", "desc_o"] {
                 signature.insert(
                     p.to_string(),
@@ -3888,6 +3971,15 @@ fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
                     node.output.tensor.index()
                 ));
             }
+            // THE STORAGE WINDOW, `window_of`'s law (the same constants the silumul
+            // and elementwise families state): the descriptors name the output
+            // TENSOR's column extent while the accesses name the region's corner.
+            // The softcap reads the lm_head's output — a PAD_V logits tensor minted
+            // wider than the projection that filled it (the sampler's argmax law) —
+            // so a descriptor pitched at the region's own width mis-strides every
+            // row past row 0 (MEASURED, gemma-4 tiny-paged bundle ed46275: [32,
+            // 512] region of a [32, 4096] tensor).
+            let (n_total, c_start) = window_of(node, ir)?;
             // ROW BLOCKING, the builder's own law: three live tiles (x, the tanh's
             // operand, the result) over the VOCAB-wide logits, wider than any
             // activation — prefill rungs exceed the LX budget while decode (m=1)
@@ -3900,6 +3992,8 @@ fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
             ce("CAP", Val::Float(f64::from(*cap)))?;
             ce("N_BLOCKS", Val::Int(i128::from(n_blocks)))?;
             ce("TAIL_H", Val::Int(i128::from(tail_h)))?;
+            ce("N_TOTAL", Val::Int(i128::from(n_total)))?;
+            ce("C_START", Val::Int(i128::from(c_start)))?;
         }
         (SubOp::RmsNormUnit { eps }, "rmsnormunit_fwd") => {
             // The rmsnorm arm's constants minus the weight: desc_x, desc_o, then M /
@@ -4151,17 +4245,25 @@ fn window_of<F: scratchy_subtile::subtile_ir::RopeForm>(
     Ok((n_total, c_start))
 }
 
-/// THE MATMUL'S WINDOW FACTS — the row-0 window form the prefill lm-head fold's m=S
-/// tail states: the out descriptor names the OUTPUT TENSOR's row extent (`M_TOTAL`,
-/// the storage the layout reserved) while the store takes the `[M, N]` tile at row 0,
-/// and the activation names its own `[M, K]` window. A whole-region node answers
-/// `(out_rows, a_rows)` with `M_TOTAL = M`.
+/// THE MATMUL'S WINDOW FACTS, in BOTH axes — the storage the descriptors name vs
+/// the window the store names. Rows: the row-0 window form the prefill lm-head
+/// fold's m=S tail states — the out descriptor names the OUTPUT TENSOR's row
+/// extent (`M_TOTAL`, the storage the layout reserved) while the store takes the
+/// `[M, N]` tile at row 0, and the activation names its own `[M, K]` window.
+/// Columns: the SAME law `window_of` states for the pointwise families — the out
+/// descriptor is pitched at `N_TOTAL` (the MAX of the matmul's write width and
+/// the output tensor's own columns) and the store names the region's column
+/// corner `C_START`. A whole-region node answers `(out_rows, a_rows, write_width,
+/// 0)` with `M_TOTAL = M`, `N_TOTAL = N`.
 ///
 /// ⛔ THE ROW CORNER MUST BE 0 — the door's `base_addressed` refuses a nonzero row
 /// corner on both the activation and the output, and no matmul kernel in this family
 /// spells one. The fold's m=S tail is the `[S, vocab]` prefix of the `[mq, vocab]` logits storage, so
 /// it passes; any other row-windowed matmul is a shape to spell with a kernel, not to
 /// silently mis-address.
+/// ⛔ THE COLUMN CORNER MUST BE WHOLE STICKS — the door's `rcol` law; stated here
+/// so the splice (the emulator's producer) refuses what the door (the card's)
+/// refuses, and the two paths cannot diverge.
 /// ⭐ THE WIDTH A DENSE MATMUL'S PROGRAM STATES FOR ITS OUTPUT — the width its READERS address.
 ///
 /// The door's device width (`DeviceWidth::for_matmul`) may pad the output's stick count to fill
@@ -4169,8 +4271,8 @@ fn window_of<F: scratchy_subtile::subtile_ir::RopeForm>(
 /// what its readers read, because the program's views are row-major (the emulator runs them as
 /// stated): a reader that states the LOGICAL width over a buffer written at the padded one reads
 /// every row past the first at the wrong stride. So:
-/// - when EVERY reader is a family whose kernel states the logical width — RoPE, the attention,
-///   the norms, the elementwise and gated-activation families, a collective — the output is the
+/// - when EVERY reader is a family whose kernel states the logical width — the census
+///   [`reader_states_logical_width`] names them, ONE list consumed here — the output is the
 ///   logical width, stick-rounded;
 /// - otherwise the padded width stands: a pad-aware reader (the ScalarMul family, whose window IS
 ///   `DeviceWidth::for_pointwise` — the logits scale over the padded lm head) or one this law does
@@ -4182,6 +4284,54 @@ fn window_of<F: scratchy_subtile::subtile_ir::RopeForm>(
 /// bytes. MEASURED (the emulator gates): smollm2's one-rank prefill k/v (`[31, 192]`, 3 sticks)
 /// and granite's two-rank prefill k/v (`[31, 256]`, 4 sticks) were written at 512 and read at
 /// their logical widths — row 0 right, every later row at the wrong stride.
+///
+/// ⛔ A HOLE IN THE CENSUS IS THE PAD LAW STATED TWICE, AND IT IS NOT A STYLE DEFECT. MEASURED
+/// (gemma-4-12b-it-parity-tiny-paged, the seqs=32 decode batch rung, the numeric gate's ed46275
+/// refusal): the GLOBAL class's kv projection (n=256, read by `RmsNorm` and — `attention_k_eq_v`
+/// derives V from the K projection — `RmsNormUnit`) fell to the padded arm because `RmsNormUnit`
+/// was missing from the list. `bump_sticks_to_splittable` padded its 4 sticks to the 8-core util
+/// floor (n_dev 512), the matmul wrote 256 values at a 512 row pitch, and both norms read
+/// `D_MODEL = 256`: row 0 right, every later row over the pad zeros — invisible at one row (the
+/// solo decode rung passes), fatal to every multi-row forward. Gemma-4's sliding kv is 512 wide
+/// already, so only the global kv (256) trips the bump: the model has never worked beyond one
+/// row of a page for exactly this reason, on the card as on the emulator (one splice feeds both).
+/// ⭐ THE READER-WIDTH CENSUS — ONE statement of which consumer families read a producer
+/// matmul's output at the LOGICAL width (the region's own cols, stick-rounded at most), so the
+/// producer must not take the occupancy pad ([`matmul_out_width`] consumes this list and nothing
+/// else). Every family named here states its width from its own region in its own constexpr arm
+/// below — `RmsNorm`/`RmsNormUnit` (`D_MODEL`), `ScalarWeightMul` (`M`/`N` — "the door's own
+/// `check_pointwise_cols` law for this family"), `TanhSoftCap` (`N`), `Reshape` (both sides'
+/// TRUE region extents), `KvQuantize` (`StickExtent::new(cols)`), `Elementwise`/`SiluMul` (the
+/// logical width — the ScalarMul arm's own note), RoPE (`HeadWidth::of_whole_sticks`), the
+/// attention (its class widths), and the collectives (the `Add` row's widths). The families NOT
+/// named state a padded width themselves — `ScalarMul`'s window IS `DeviceWidth::for_pointwise`
+/// — or read a row of their own mint (the sampler's widened logits row).
+///
+/// ⛔ THIS LIST AND THE ARMS ARE READ AGAINST EACH OTHER, NEVER RESTATED: a family added to the
+/// constexpr table states its width law in its own arm, and this census is where that law meets
+/// the producer's. The gemma-4 global-kv refusal (see [`matmul_out_width`]'s doc) was a hole
+/// here — `RmsNormUnit` stated `D_MODEL = 256` while its producer padded to 512.
+fn reader_states_logical_width<F: scratchy_subtile::subtile_ir::RopeForm>(
+    op: &SubOp<F>,
+) -> bool {
+    matches!(
+        op,
+        SubOp::RopeRotate { .. }
+            | SubOp::RopeAppend { .. }
+            | SubOp::AttnDecode { .. }
+            | SubOp::RmsNorm { .. }
+            | SubOp::RmsNormUnit { .. }
+            | SubOp::Elementwise(_)
+            | SubOp::SiluMul
+            | SubOp::ScalarWeightMul
+            | SubOp::Reshape { .. }
+            | SubOp::KvQuantize { .. }
+            | SubOp::TanhSoftCap { .. }
+            | SubOp::AllReduce
+            | SubOp::AllGather { .. }
+    )
+}
+
 fn matmul_out_width<F: scratchy_subtile::subtile_ir::RopeForm>(
     node: &SubtileNode<F>,
     ir: &scratchy_subtile::subtile_ir::SubtileIR<F>,
@@ -4195,20 +4345,8 @@ fn matmul_out_width<F: scratchy_subtile::subtile_ir::RopeForm>(
         .iter()
         .filter(|r| r.inputs.iter().any(|i| i.tensor == out))
         .peekable();
-    let logical_readers = readers.peek().is_some()
-        && readers.all(|r| {
-            matches!(
-                r.op,
-                SubOp::RopeRotate { .. }
-                    | SubOp::RopeAppend { .. }
-                    | SubOp::AttnDecode { .. }
-                    | SubOp::RmsNorm { .. }
-                    | SubOp::Elementwise(_)
-                    | SubOp::SiluMul
-                    | SubOp::AllReduce
-                    | SubOp::AllGather { .. }
-            )
-        });
+    let logical_readers =
+        readers.peek().is_some() && readers.all(|r| reader_states_logical_width(&r.op));
     if logical_readers {
         n.next_multiple_of(ktir_superdsc::work::FP16_ELEMS_PER_STICK)
     } else {
@@ -4219,7 +4357,8 @@ fn matmul_out_width<F: scratchy_subtile::subtile_ir::RopeForm>(
 fn matmul_window_of<F: scratchy_subtile::subtile_ir::RopeForm>(
     node: &SubtileNode<F>,
     ir: &SubtileIR<F>,
-) -> Result<(u32, u32), String> {
+    write_width: u32,
+) -> Result<(u32, u32, u32, u32), String> {
     let out = &node.output;
     let a = &node.inputs[0];
     let out_total = ir.tensors[out.tensor.index()].rows;
@@ -4248,7 +4387,33 @@ fn matmul_window_of<F: scratchy_subtile::subtile_ir::RopeForm>(
             ir.tensors[a.tensor.index()].cols,
         ));
     }
-    Ok((out_total, a_total.unwrap_or(a.region.rows.len)))
+    // THE COLUMN WINDOW — the same storage/corner law `window_of` states for the
+    // pointwise families, with the matmul's own write width in the MAX: the kernel
+    // WRITES `write_width` columns (the dense arm's `n_dev`, pad and all; the fp8
+    // arm's logical `n`, its door arm pads nothing), so a tensor minted narrower
+    // would overflow, and a tensor minted WIDER must be pitched at its own extent
+    // or every row past row 0 lands over the wrong bytes. MEASURED
+    // (gemma-4-12b-it-parity-tiny-paged, bundle ed46275, the numeric gate's t572):
+    // the lm_head's [32, 512] region of a [32, 4096] PAD_V tensor (the sampler's
+    // argmax mint law) — right values at pitch 512 where the golden writes 4096.
+    let out_cols = ir.tensors[out.tensor.index()].cols;
+    let n_total = write_width.max(out_cols);
+    let c_start = out.region.cols.start;
+    if !c_start.is_multiple_of(ktir_superdsc::work::FP16_ELEMS_PER_STICK) {
+        return Err(format!(
+            "triton splice: matmul t{} has a column corner {c_start} that is not whole \
+             sticks — the door's `rcol` law (a sub-stick column corner has no card address) \
+             refuses it there; the splice states the same law so the emulator and the card \
+             cannot diverge",
+            out.tensor.index(),
+        ));
+    }
+    Ok((
+        out_total,
+        a_total.unwrap_or(a.region.rows.len),
+        n_total,
+        c_start,
+    ))
 }
 
 /// THE ROW-BLOCK CONSTANTS the pointwise kernels take — the builder's own blocking
@@ -4966,6 +5131,8 @@ mod production_ktir_dump {
                     ("BLOCK_K", Val::Int(2048)),
                     ("BLOCK_N", Val::Int(i128::from(n_dev))),
                     ("M_TOTAL", Val::Int(1)),
+                    ("N_TOTAL", Val::Int(i128::from(n_dev))),
+                    ("C_START", Val::Int(0)),
                 ],
             ),
             vec![1],
@@ -4992,6 +5159,8 @@ mod production_ktir_dump {
                     ("BLOCK_K", Val::Int(2048)),
                     ("BLOCK_N", Val::Int(2048)),
                     ("M_TOTAL", Val::Int(1)),
+                    ("N_TOTAL", Val::Int(2048)),
+                    ("C_START", Val::Int(0)),
                 ],
             ),
             vec![1],
@@ -5142,6 +5311,8 @@ mod production_ktir_dump {
                         ("CAP", Val::Float(30.0)),
                         ("N_BLOCKS", Val::Int(i128::from(n_blocks))),
                         ("TAIL_H", Val::Int(i128::from(tail_h))),
+                        ("N_TOTAL", Val::Int(8192)),
+                        ("C_START", Val::Int(0)),
                     ],
                 ),
                 vec![1],
@@ -5300,6 +5471,41 @@ mod production_ktir_dump {
             .unwrap_or_else(|e| panic!("{name}: {e}"));
             v.push((name, k.src, k.spec, vec![1]));
         }
+        // ── and the paged kernels at GEMMA-4-12B's two classes, the geometries a prompt chunk past
+        // its first page runs on the card: the SLIDING class (16 q heads over 8 kv heads at hd 256)
+        // and the GLOBAL class (16 q heads over ONE kv head at hd 512, a 16-query group), each a
+        // 128-row chunk walking two pages of its pool. (A decode row runs the batched kernel.) ──
+        let gemma = |nkvh: u32, hd: u32| {
+            HeadGeometry::new(
+                QueryHeads::new(16),
+                KvHeads::new(nkvh),
+                HeadDim::new(hd),
+                RotDim::new(hd),
+                BlockSize::new(SchedulerBlockTokens::REFERENCE.get()),
+            )
+        };
+        for (name, mq, nkvh, hd) in [
+            ("paged_attn_prefill_gemma4_sliding", 128u32, 8u32, 256u32),
+            ("paged_attn_prefill_gemma4_global", 128, 1, 512),
+        ] {
+            let k = paged_attn_kernel::<ktir_superdsc::superdsc_opspec::Fp16>(PagedAttnGeometry {
+                seq: if mq == 1 {
+                    PagedSequence::Decode
+                } else {
+                    PagedSequence::Prefill {
+                        padded_query_len: TokenRows::new(nz(mq)),
+                    }
+                },
+                rows: TokenRows::new(nz(mq)),
+                heads: gemma(nkvh, hd),
+                block: SchedulerBlockTokens::REFERENCE,
+                pages: ContextPages::new(nz(2048)),
+                blocks: WalkBlocks::new(nz(2)),
+                scale: AttnScale::new(1.0),
+            })
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+            v.push((name, k.src, k.spec, vec![1]));
+        }
         // ── and the PREFILL kernel at a PACKED rung's split extents (M2's S=2 shape, stated at the
         // splice level): `NUM_TOKENS` is the graph's rows (two requests of 64) while
         // `PADDED_QUERY_LEN` and the walk are ONE request's 64 rows — the two extents
@@ -5346,7 +5552,13 @@ mod production_ktir_dump {
                     heads: heads(hd),
                     block: SchedulerBlockTokens::REFERENCE,
                     pages: ContextPages::new(nz(2048)),
-                    chunking: BatchChunking::of(seqs, walk, 8, 32 * hd, hd),
+                    chunking: BatchChunking::of(
+                        seqs,
+                        walk,
+                        KvHeads::new(8),
+                        32 * hd,
+                        HeadDim::new(hd),
+                    ),
                     scale,
                 },
             )
@@ -5537,6 +5749,8 @@ mod production_ktir_dump {
             | "paged_attn_prefill_walk"
             | "paged_attn_decode_hd128"
             | "paged_attn_prefill_hd128"
+            | "paged_attn_prefill_gemma4_sliding"
+            | "paged_attn_prefill_gemma4_global"
             | "batched_decode"
             | "batched_decode_chunks"
             | "batched_decode_pair"
@@ -6105,7 +6319,13 @@ mod walk_on_the_card {
         group: u32,
         pages: u32,
     ) -> (KtirNode, BatchChunking) {
-        let c = BatchChunking::of(seqs, walk, kv_heads, kv_heads * group * hd, hd);
+        let c = BatchChunking::of(
+            seqs,
+            walk,
+            KvHeads::new(kv_heads),
+            kv_heads * group * hd,
+            HeadDim::new(hd),
+        );
         let node = batched_decode_program::<DF>(BatchedDecodeGeometry {
             rows: TokenRows::new(nz(seqs)),
             heads: HeadGeometry::new(
@@ -6251,22 +6471,25 @@ mod walk_on_the_card {
         }
     }
 
-    /// ⛔ `BatchChunking::of` IS TOTAL — `seqs` and `nkvh` both divide in it, so a zero would be a
-    /// panic inside a `const` evaluation at BAKE rather than a wrong answer a test could catch. No
-    /// producer passes zero (`ModelAttnGeometry::mint` refuses a zero kv-head count, a rung's rows
-    /// are its baked width), which is exactly why this is pinned: the invariant lives in the
-    /// callers today, so nothing but this test stops the function from dying if one ever slips.
+    /// ⛔ `BatchChunking::of` IS TOTAL over its bare counts — `seqs` divides in it, so a zero would be
+    /// a panic inside a `const` evaluation at BAKE rather than a wrong answer a test could catch.
+    /// (Its kv heads and head width are the model facts' positive types, so a zero there is no
+    /// value at all.)
     #[test]
     fn the_chunking_is_total_at_zero_counts() {
         for (seqs, blocks, nkvh, q_width, head_size) in [
             (0u32, 4u32, 8u32, 2048u32, 64u32),
-            (2, 4, 0, 2048, 64),
-            (0, 0, 0, 0, 0),
+            (0, 0, 1, 0, 64),
             (1, 0, 8, 2048, 64),
             (1, 1, 1, 0, 64),
-            (1, 1, 1, 256, 0),
         ] {
-            let c = BatchChunking::of(seqs, blocks, nkvh, q_width, head_size);
+            let c = BatchChunking::of(
+                seqs,
+                blocks,
+                KvHeads::new(nkvh),
+                q_width,
+                HeadDim::new(head_size),
+            );
             assert!(
                 c.seqs >= 1 && c.blocks_per_chunk >= 1 && c.rows_per_page >= 1,
                 "of({seqs}, {blocks}, {nkvh}) = {c:?}"
@@ -6276,8 +6499,10 @@ mod walk_on_the_card {
             assert!(c.entries() >= 1 && c.index_rows() >= 1, "{c:?}");
         }
         // And the real geometries are untouched by the clamps.
+        let granite =
+            |seqs, blocks| BatchChunking::of(seqs, blocks, KvHeads::new(8), 2048, HeadDim::new(64));
         assert_eq!(
-            BatchChunking::of(1, 128, 8, 2048, 64),
+            granite(1, 128),
             BatchChunking {
                 seqs: 1,
                 blocks_per_chunk: 32,
@@ -6285,11 +6510,7 @@ mod walk_on_the_card {
                 rows_per_page: 1
             }
         );
-        assert_eq!(
-            BatchChunking::of(2, 1, 8, 2048, 64).rows_per_page,
-            8,
-            "under the floor"
-        );
+        assert_eq!(granite(2, 1).rows_per_page, 8, "under the floor");
     }
 
     /// ⭐ A BATCH CHUNK FITS ONLY A POOL LARGER THAN IT — a chunk gathers fewer pages than the pool
@@ -6305,7 +6526,13 @@ mod walk_on_the_card {
             (32, 1, 64, 8, 4),
             (4, 64, 128, 4, 8),
         ] {
-            let c = BatchChunking::of(seqs, walk, kv_heads, kv_heads * group * hd, hd);
+            let c = BatchChunking::of(
+                seqs,
+                walk,
+                KvHeads::new(kv_heads),
+                kv_heads * group * hd,
+                HeadDim::new(hd),
+            );
             assert!(!chunk_fits_pool(&c, c.entries()), "{c:?}");
             assert!(chunk_fits_pool(&c, c.entries() + 1), "{c:?}");
         }
@@ -7960,9 +8187,9 @@ mod kv_pool_formats {
                 chunking: BatchChunking::of(
                     seqs,
                     8,
-                    heads.kv_heads().get(),
+                    heads.kv_heads(),
                     heads.q_width(),
-                    heads.head_dim().get(),
+                    heads.head_dim(),
                 ),
                 scale: AttnScale::new(1.0 / 128f32.sqrt()),
             };

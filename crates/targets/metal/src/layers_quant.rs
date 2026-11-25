@@ -8,7 +8,8 @@
 //! constructors stay here as metal-local extension traits — they `load()`
 //! against the neutral [`WeightSource`] seam so they need not name
 //! `GpuWeights`. The
-//! `e4m3_to_f32` decode (used by the NVFP4 fold) is a free fn below.
+//! `e4m3_to_f32` decode (used by the NVFP4 fold) is `scratchy_tensors::fp8`'s law,
+//! re-exported below.
 
 use anyhow::Result;
 use scratchy_layers::{Embedding, Linear, LinearLayer};
@@ -460,27 +461,11 @@ impl MetalAffineQuantOps for AffineQuantLinear {
 // Nvfp4Linear loader — NVIDIA ModelOpt NVFP4 4-bit linear (Metal-only)
 // ---------------------------------------------------------------------------
 
-/// Decode one `float8_e4m3fn` byte to `f32`. Format: 1 sign / 4 exponent
-/// (bias 7) / 3 mantissa. e4m3fn has no infinities; the only NaN is the
-/// `S.1111.111` pattern (others in the `1111` exponent are normal numbers,
-/// max magnitude 448). Used to fold the per-block NVFP4 weight scales into
-/// `f32` at load time. Mirrors `torch.float8_e4m3fn → float32`.
-pub fn e4m3_to_f32(byte: u8) -> f32 {
-    let sign = if byte & 0x80 != 0 { -1.0f32 } else { 1.0f32 };
-    let exp = ((byte >> 3) & 0x0F) as i32;
-    let mant = (byte & 0x07) as i32;
-    if exp == 0x0F && mant == 0x07 {
-        return f32::NAN;
-    }
-    let mag = if exp == 0 {
-        // Subnormal: mant * 2^(1-7) / 8 = mant * 2^(-9).
-        (mant as f32) * 2.0f32.powi(-9)
-    } else {
-        // Normal: (1 + mant/8) * 2^(exp-7).
-        (1.0 + (mant as f32) / 8.0) * 2.0f32.powi(exp - 7)
-    };
-    sign * mag
-}
+/// Decode one `float8_e4m3fn` byte to `f32` — THE LAW'S ONE STATEMENT for this tree,
+/// `scratchy_tensors::fp8` (the dtype's own crate, table-backed), re-exported here for the
+/// NVFP4 fold's load-time scale decode. This module used to carry a second arithmetic spelling
+/// of the same grid; it reads the one law now, so the two can never disagree.
+pub use scratchy_tensors::fp8::e4m3_to_f32;
 
 /// Load extension trait on the neutral [`Nvfp4Linear`].
 pub trait MetalNvfp4Ops {

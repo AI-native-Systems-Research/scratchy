@@ -592,26 +592,22 @@ mod tests {
     /// The reserved sentinels, as every real wiring's step carries them — window 0's tids in the
     /// card stagers and the placements ARE these.
     const STEP: crate::wiring::PagedStep = crate::wiring::PagedStep {
-        mask: ktir_superdsc::reserved_tids::PAGED_MASK_TID,
-        page_table: ktir_superdsc::reserved_tids::PAGED_PAGE_TABLE_TID,
-        write_rows: ktir_superdsc::reserved_tids::PAGED_WRITE_ROWS_TID,
-        query_rows: ktir_superdsc::reserved_tids::PAGED_QUERY_ROWS_TID,
-        kv_row_pool: ktir_superdsc::reserved_tids::PAGED_KV_ROW_POOL_TID,
-        rep_rows: ktir_superdsc::reserved_tids::PAGED_REP_ROWS_TID,
-        chunk_pages: ktir_superdsc::reserved_tids::PAGED_CHUNK_PAGES_TID,
-        chunk_masks: ktir_superdsc::reserved_tids::PAGED_CHUNK_MASKS_TID,
-        int32_zero: ktir_superdsc::reserved_tids::PAGED_INT32_ZERO_TID,
-        pages: 4,
+        view: crate::wiring::ContextPages::new(std::num::NonZeroU32::MIN.saturating_add(3)),
+        pages: crate::pool_pages::PoolPages::of_nonzero(
+            std::num::NonZeroU32::MIN.saturating_add(3),
+        ),
         page_slots: 4,
-        rows: 3,
-        nkvh: 2,
-        q_width: 128,
-        head_size: 64,
-        walk: 4,
+        heads: crate::wiring::HeadGeometry::new(
+            crate::wiring::QueryHeads::new(2),
+            crate::wiring::KvHeads::new(2),
+            crate::wiring::HeadDim::new(64),
+            crate::wiring::RotDim::new(64),
+            crate::wiring::BlockSize::new(16),
+        ),
+        walk: crate::paged_step::WalkBlocks::new(std::num::NonZeroU32::MIN.saturating_add(3)),
         paged_rows: crate::paged_step::PagedRows::Sequence,
-        // One request of the graph's 3 rows — the mint's own spelling, const: the pair's held
-        // product IS the `rows` above, and each `None` arm is a fixture bug the const panic
-        // names (const panic takes a literal, so the messages are).
+        // One request of the graph's 3 rows — the mint's own spelling, const: each `None` arm is
+        // a fixture bug the const panic names (const panic takes a literal, so the messages are).
         extent: match crate::wiring::QueryExtent::of_baked_rung(
             match crate::wiring::RungWidth::of_baked_rows(3) {
                 ::core::option::Option::Some(w) => w,
@@ -629,7 +625,7 @@ mod tests {
         // The fixture's op is causal — its mask states no window — and it is the tape's only
         // class, so its tids are the sentinels.
         window: None,
-        class: 0,
+        class: crate::wiring::AttnClass::FIRST,
     };
 
     fn shape() -> ForwardShape {
@@ -677,31 +673,38 @@ mod tests {
     /// card's placements hold. The index tables arrive as INTEGER words, the mask as values.
     #[test]
     fn the_paged_steps_are_the_card_steps_tables() {
-        let rows =
-            crate::paged_step::StepRows::new(3, 9, 3).expect("three rows is three rows");
+        let rows = crate::paged_step::StepRows::new(3, 9, 3).expect("three rows is three rows");
+        let crate::wiring::StepKind::Sequence(step) = STEP.kind() else {
+            panic!("the fixture is a sequence's step");
+        };
         let card = crate::paged_step::card_step_sources(
-            &STEP,
+            &step,
             &[crate::paged_step::RequestStep {
-                blocks: &[3, 1, 0],
+                blocks: &[
+                    crate::paged_step::PoolPage::of_block(2),
+                    crate::paged_step::PoolPage::of_block(0),
+                    crate::paged_step::PoolPage::NULL,
+                ],
                 rows,
             }],
         )
         .expect("staged");
         let cards = [card];
         let inp = inputs(Some(&cards));
-        for t in [STEP.page_table, STEP.write_rows, STEP.query_rows] {
+        for t in [STEP.page_table(), STEP.write_rows(), STEP.query_rows()] {
             match staged(ForwardKernel::Paged, t, &inp).expect("a table") {
                 Staged::I32(w) => assert_eq!(Some(w.as_slice()), cards[0].words(t), "t{t}"),
                 _ => panic!("t{t}: an index table staged as anything but int32 words"),
             }
         }
-        match staged(ForwardKernel::Paged, STEP.mask, &inp).expect("a mask stack") {
+        match staged(ForwardKernel::Paged, STEP.mask(), &inp).expect("a mask stack") {
             Staged::F32(v) => assert_eq!(&v[..], &cards[0].masks[0].1[..]),
             _ => panic!("a mask stack is a value tensor"),
         }
         // The pool's statics are staged at load, so the tape has no step for them.
         assert!(shape().steps().iter().all(|s| {
-            s.tensor != PlaceId::Act(STEP.kv_row_pool) && s.tensor != PlaceId::Act(STEP.int32_zero)
+            s.tensor != PlaceId::Act(STEP.kv_row_pool())
+                && s.tensor != PlaceId::Act(STEP.int32_zero())
         }));
     }
 
@@ -710,7 +713,12 @@ mod tests {
     #[test]
     fn a_paged_step_with_no_blocks_refuses_rather_than_reading_page_zero() {
         let inp = inputs(None);
-        for t in [STEP.page_table, STEP.mask, STEP.write_rows, STEP.query_rows] {
+        for t in [
+            STEP.page_table(),
+            STEP.mask(),
+            STEP.write_rows(),
+            STEP.query_rows(),
+        ] {
             match staged(ForwardKernel::Paged, t, &inp) {
                 Err(e) => assert!(e.contains("page 0 is a REAL page"), "t{t}: {e}"),
                 Ok(_) => panic!("t{t} staged with no blocks"),
@@ -735,14 +743,14 @@ mod tests {
             .map(|s| s.tensor)
             .collect();
         for t in [
-            STEP.rep_rows,
-            STEP.chunk_pages,
-            STEP.chunk_masks,
-            STEP.write_rows,
+            STEP.rep_rows(),
+            STEP.chunk_pages(),
+            STEP.chunk_masks(),
+            STEP.write_rows(),
         ] {
             assert!(tids.contains(&PlaceId::Act(t)), "t{t}");
         }
-        for t in [STEP.page_table, STEP.mask, STEP.query_rows] {
+        for t in [STEP.page_table(), STEP.mask(), STEP.query_rows()] {
             assert!(!tids.contains(&PlaceId::Act(t)), "t{t}");
         }
     }
