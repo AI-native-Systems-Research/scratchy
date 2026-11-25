@@ -29,6 +29,7 @@ members = [
     "crates/compiler/macros",
     "crates/compiler/frontend",
     "crates/compiler/subtile",
+    "crates/compiler/const-tokens",
     "crates/targets/metal",
     "crates/targets/metal/cli",
     "crates/targets/metal/compiler",
