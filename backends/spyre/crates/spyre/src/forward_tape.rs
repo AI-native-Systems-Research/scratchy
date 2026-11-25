@@ -12,19 +12,14 @@
 //! kernels and the tape are per-model facts, the launcher is per-target I/O.
 
 use crate::bundle_code::PlaceId;
-use ktir_superdsc::sdsc_abstract::StickLayout;
 use scratchy_subtile::host_tape::{KernelId, Operand, Site, Step, TensorId, Transfer};
 
 /// What a host kernel produced, in the format it is uploaded in.
 ///
-/// ⛔ THE DTYPE IS THE KERNEL'S, NOT THE CALLER'S. A per-step value table is written in the card's
-/// own fp16 by each card ([`Staged::Table`]); a constant is f32 the bind narrows; an index table and
-/// the chain's lane words are not values, and each rides the channel that carries it verbatim.
-pub enum Staged<'a> {
-    /// ⭐ A HOST KERNEL'S TABLE IN THE CARD'S OWN FORMAT — the embedding rows, the rotary tables
-    /// and the mask stack ([`CardTable`]): stated as the law of their rows, written in SEN169 at
-    /// their card layout by each card straight into its own shadow, never built as f32.
-    Table(Box<dyn CardTable + 'a>),
+/// ⛔ THE DTYPE IS THE KERNEL'S, NOT THE CALLER'S. A value tensor is built as f32 and narrowed by
+/// the bind loop; an index table and the chain's lane words are not values, and each rides the
+/// channel that carries it verbatim.
+pub enum Staged {
     /// ⭐ `Cow`, BECAUSE ONE KERNEL PRODUCES NOTHING. Every other host kernel computes its rows
     /// per forward and genuinely owns them; `Const(i)` hands back a table the macro already put
     /// in the binary, and copying it to satisfy an owned type was `2·hd²` floats per token for
@@ -125,11 +120,11 @@ pub struct ForwardInputs<'a> {
 /// ⭐ THIS IS THE WHOLE PER-MODEL FORWARD, and it does not touch a session — which is why it
 /// lives in the target crate rather than the worker. The worker's launcher is left with h2d,
 /// launch and readback.
-pub fn kernel_values<'a>(
+pub fn kernel_values(
     step: &ForwardStep,
     shape: &ForwardShape,
-    inp: &ForwardInputs<'a>,
-) -> Result<Staged<'a>, String> {
+    inp: &ForwardInputs<'_>,
+) -> Result<Staged, String> {
     // ⭐ NO `head_dim`/`rope_theta` HERE ANY MORE. The rotary kernels read BOTH
     // off each source's own `RotaryKind` — a hybrid-attention arch (gemma-4)
     // has no single head dim or θ, and the model-wide pair this used to read
@@ -151,7 +146,7 @@ pub fn kernel_values<'a>(
             )
         })?;
         if let Some((_, mask)) = card.masks.iter().find(|(m, _)| *m == tid) {
-            return Ok(Staged::Table(Box::new(mask)));
+            return Ok(Staged::F32(std::borrow::Cow::Owned(mask.clone())));
         }
         return card
             .words(tid)
@@ -231,30 +226,21 @@ pub fn kernel_values<'a>(
                 .to_cow(),
         ));
     }
-    // The layout every per-step table is staged at: the card's own, or row-major when the caller
-    // stages row-major (the two coincide at one row — see [`stick_scatter`]).
-    let layout = |cols: usize| {
-        if inp.stick_major {
-            card_layout(rows, cols)
-        } else {
-            StickLayout::flat(rows, cols)
-        }
-    };
-    Ok(Staged::Table(match step.kernel {
+    Ok(Staged::F32(std::borrow::Cow::Owned(match step.kernel {
         ForwardKernel::EmbedRow => {
-            if let Some(&tok) = inp
-                .tokens
-                .iter()
-                .take(rows)
-                .find(|&&t| inp.embed_tokens.get(t * h..(t + 1) * h).is_none())
-            {
-                return Err(format!("token {tok} is past the embedding table"));
+            let mut emb = vec![0.0f32; rows * h];
+            for (r, &tok) in inp.tokens.iter().enumerate().take(rows) {
+                let src = inp
+                    .embed_tokens
+                    .get(tok * h..(tok + 1) * h)
+                    .ok_or_else(|| format!("token {tok} is past the embedding table"))?;
+                emb[r * h..(r + 1) * h].copy_from_slice(src);
             }
-            Box::new(EmbedRows {
-                layout: layout(h),
-                table: inp.embed_tokens,
-                tokens: inp.tokens,
-            })
+            if inp.stick_major {
+                stick_scatter(rows, h, &emb)
+            } else {
+                emb
+            }
         }
         ForwardKernel::Cos(i) | ForwardKernel::Sin(i) => {
             let want_cos = matches!(step.kernel, ForwardKernel::Cos(_));
@@ -264,16 +250,28 @@ pub fn kernel_values<'a>(
                 &shape.sin_srcs
             };
             let &(_, w, kind) = srcs.get(i).ok_or_else(|| format!("no rotary source {i}"))?;
-            if inp.positions.len() < rows {
-                return Err(format!("no position for row {}", inp.positions.len()));
+            let (w, kind_hd) = (w as usize, kind.head_dim() as usize);
+            let mut col = vec![0.0f32; rows * w];
+            for r in 0..rows {
+                let pos = *inp
+                    .positions
+                    .get(r)
+                    .ok_or_else(|| format!("no position for row {r}"))?;
+                // ⭐ THE SOURCE'S OWN CLASS, not the model-wide head_dim/θ: a
+                // hybrid-attention arch (gemma-4) gives sliding and global
+                // layers different tables, and the wrong one is silent garbage.
+                let (c, sn) = crate::manifest::rope_cos_sin_kind(pos, kind);
+                col[r * w..(r + 1) * w].copy_from_slice(&tile_rotary_row(
+                    if want_cos { &c } else { &sn },
+                    w,
+                    kind_hd,
+                ));
             }
-            Box::new(RotaryRows {
-                layout: layout(w as usize),
-                positions: inp.positions,
-                kind,
-                freqs: crate::manifest::RopeFreqs::of(kind),
-                want_cos,
-            })
+            if inp.stick_major {
+                stick_scatter(rows, w, &col)
+            } else {
+                col
+            }
         }
         ForwardKernel::Paged => unreachable!("served above, where its index words stay INTEGERS"),
         ForwardKernel::Const(_) => unreachable!("served above, where it is borrowed not built"),
@@ -281,136 +279,7 @@ pub fn kernel_values<'a>(
         ForwardKernel::Decode => {
             return Err("Decode is a device step, not a host call".to_string());
         }
-    }))
-}
-
-/// ⭐ THE CARD'S LAYOUT OF A HOST-STAGED `[rows, cols]` fp16 TABLE — the one placement law every
-/// host kernel's product is laid by: stick-blocked on its columns (`StickLayout::row_blocked`, the
-/// address law of the device's own reads), except a table no wider than one stick, which the card
-/// holds row-major (`StickLayout::flat`; at exactly one stick the two are the same bytes,
-/// `row_major_is_stick_major`). [`stick_scatter`] lays f32 values by it and [`fill_card`] lays SEN
-/// bytes by it, so a gate's values and a card's bytes cannot be laid two ways.
-pub fn card_layout(rows: usize, cols: usize) -> StickLayout {
-    let blocked = StickLayout::row_blocked(rows, cols);
-    if cols <= blocked.lanes() {
-        StickLayout::flat(rows, cols)
-    } else {
-        blocked
-    }
-}
-
-/// The device elements a `layout` table spans — one past its last element's address
-/// (`rows · cols` for whole sticks).
-pub fn card_elems(layout: StickLayout) -> usize {
-    if layout.rows == 0 || layout.cols == 0 {
-        0
-    } else {
-        layout.dev_off(layout.rows - 1, layout.cols - 1) + 1
-    }
-}
-
-/// Row `r`'s contiguous runs under `layout`, one per stick of its columns: `(first column,
-/// columns, first device element)`. Every address is `layout.dev_off`'s; a stick's columns are
-/// contiguous in both layouts [`card_layout`] states.
-fn stick_runs(layout: StickLayout, r: usize) -> impl Iterator<Item = (usize, usize, usize)> {
-    let lanes = layout.lanes();
-    (0..layout.cols.div_ceil(lanes)).map(move |s| {
-        let c0 = s * lanes;
-        (c0, lanes.min(layout.cols - c0), layout.dev_off(r, c0))
-    })
-}
-
-/// ⭐ A HOST KERNEL'S PRODUCT IN THE CARD'S OWN FORMAT — a `[rows, cols]` fp16 table stated as the
-/// law of its ROWS, which [`fill_card`] writes in SEN169 at the table's card layout straight into
-/// the bytes the card stages. Each card's executor hands it the activation's own slot of ITS shadow,
-/// so a prompt chunk's millions of embedding, rotary and mask values are never built as f32, never
-/// cloned into the tape and never converted card after card.
-///
-/// `Sync`: every card of a sharded world fills the same table at once, each on its own thread.
-pub trait CardTable: Sync {
-    /// The table's `[rows, cols]`, at the layout the card stages it by ([`card_layout`]).
-    fn layout(&self) -> StickLayout;
-    /// Row `r`'s values in the card's fp16, column by column; `row.len()` is the table's `cols`.
-    fn sen_row(&self, r: usize, row: &mut [crate::sen_convert::SenF16]);
-}
-
-impl<T: CardTable + ?Sized> CardTable for &T {
-    fn layout(&self) -> StickLayout {
-        (**self).layout()
-    }
-    fn sen_row(&self, r: usize, row: &mut [crate::sen_convert::SenF16]) {
-        (**self).sen_row(r, row)
-    }
-}
-
-/// Write `table` into `dst` — its SEN169 little-endian bytes at its card layout: exactly
-/// `2 · card_elems(table.layout())` bytes.
-pub fn fill_card(table: &dyn CardTable, dst: &mut [u8]) {
-    let layout = table.layout();
-    let mut row = vec![crate::sen_convert::SenF16::default(); layout.cols];
-    let words = dst.as_chunks_mut::<2>().0;
-    for r in 0..layout.rows {
-        table.sen_row(r, &mut row);
-        for (c0, n, e0) in stick_runs(layout, r) {
-            for (d, s) in words[e0..e0 + n].iter_mut().zip(&row[c0..c0 + n]) {
-                *d = s.0.to_le_bytes();
-            }
-        }
-    }
-}
-
-/// ⭐ THE EMBED-ROW KERNEL'S TABLE — row `r` is the embedding of the token row `r` carries, a row
-/// past the tokens zero, each value narrowed once ([`crate::sen_convert::f32_to_sen`]). Minted only by
-/// [`kernel_values`], which refuses a token past the table first, so every row it reads is there.
-struct EmbedRows<'a> {
-    layout: StickLayout,
-    table: &'a [f32],
-    tokens: &'a [usize],
-}
-
-impl CardTable for EmbedRows<'_> {
-    fn layout(&self) -> StickLayout {
-        self.layout
-    }
-    fn sen_row(&self, r: usize, row: &mut [crate::sen_convert::SenF16]) {
-        let h = self.layout.cols;
-        match self.tokens.get(r) {
-            Some(&t) => crate::sen_convert::f32_to_sen_slice(&self.table[t * h..(t + 1) * h], row),
-            None => row.fill(crate::sen_convert::f32_to_sen(0.0)),
-        }
-    }
-}
-
-/// ⭐ THE ROTARY KERNEL'S TABLE — row `r` is the source class's cos (or sin) row at row `r`'s
-/// absolute position ([`crate::manifest::rope_cos_sin_kind`], the source's OWN class: a
-/// hybrid-attention arch gives sliding and global layers different tables), narrowed once per
-/// head-dim value and tiled across the source's width by [`tile_rotary_row`]. Minted only by
-/// [`kernel_values`], which refuses a row with no position first.
-struct RotaryRows<'a> {
-    layout: StickLayout,
-    positions: &'a [u32],
-    kind: crate::wiring::RotaryKind,
-    /// The class's frequencies, once per table — every row reuses them.
-    freqs: crate::manifest::RopeFreqs,
-    want_cos: bool,
-}
-
-impl CardTable for RotaryRows<'_> {
-    fn layout(&self) -> StickLayout {
-        self.layout
-    }
-    fn sen_row(&self, r: usize, row: &mut [crate::sen_convert::SenF16]) {
-        let (c, s) = self.freqs.cos_sin(self.positions[r]);
-        let hd: Vec<crate::sen_convert::SenF16> = if self.want_cos { &c } else { &s }
-            .iter()
-            .map(|&v| crate::sen_convert::f32_to_sen(v))
-            .collect();
-        row.copy_from_slice(&tile_rotary_row(
-            &hd,
-            self.layout.cols,
-            self.kind.head_dim() as usize,
-        ));
-    }
+    })))
 }
 
 /// The device's stick-scattered stage of a `[rows, width]` row-major activation:
@@ -422,14 +291,13 @@ impl CardTable for RotaryRows<'_> {
 /// prefill comment claims they agree at one row — [`stick_scatter_is_the_identity_at_one_row`]
 /// PROVES it, which is what lets one tape serve both regimes.
 ///
-/// The values are laid by [`card_layout`] — the one law [`fill_card`] lays the card's bytes by, so
-/// a gate comparing these values and a card holding those bytes read one placement.
+/// `width` must be a whole number of 64-element sticks (the caller guards; a partial stick would
+/// leave holes this cannot fill).
 pub fn stick_scatter(rows: usize, width: usize, row_major: &[f32]) -> Vec<f32> {
-    let layout = card_layout(rows, width);
-    let mut out = vec![0.0f32; card_elems(layout)];
+    let mut out = vec![0.0f32; rows * width];
     for r in 0..rows {
-        for (c0, n, e0) in stick_runs(layout, r) {
-            out[e0..e0 + n].copy_from_slice(&row_major[r * width + c0..r * width + c0 + n]);
+        for c in 0..width {
+            out[(c / 64) * (rows * 64) + r * 64 + (c % 64)] = row_major[r * width + c];
         }
     }
     out
@@ -441,10 +309,9 @@ pub fn stick_scatter(rows: usize, width: usize, row_major: &[f32]) -> Vec<f32> {
 /// `kv_dim`), and the on-card rope consumes them full-width — so the
 /// `[head_dim]` row is repeated `width / head_dim` times. This was a closure
 /// defined TWICE in the worker, once per binder; it is the rotary kernel's own
-/// rule and belongs with it. Generic over the element, so the gate's f32 table and the card's
-/// SEN169 row ([`RotaryRows`]) tile by this one rule.
-pub fn tile_rotary_row<T: Copy + Default>(row: &[T], width: usize, head_dim: usize) -> Vec<T> {
-    let mut buf = vec![T::default(); width];
+/// rule and belongs with it.
+pub fn tile_rotary_row(row: &[f32], width: usize, head_dim: usize) -> Vec<f32> {
+    let mut buf = vec![0.0f32; width];
     for r in 0..(width / head_dim) {
         buf[r * head_dim..r * head_dim + head_dim].copy_from_slice(row);
     }
@@ -762,11 +629,7 @@ mod tests {
         }
     }
 
-    fn staged<'a>(
-        kernel: ForwardKernel,
-        tid: u32,
-        inp: &ForwardInputs<'a>,
-    ) -> Result<Staged<'a>, String> {
+    fn staged(kernel: ForwardKernel, tid: u32, inp: &ForwardInputs<'_>) -> Result<Staged, String> {
         let shape = shape();
         let step = shape
             .steps()
@@ -797,100 +660,13 @@ mod tests {
             }
         }
         match staged(ForwardKernel::Paged, STEP.mask, &inp).expect("a mask stack") {
-            Staged::Table(t) => assert_eq!(filled(&*t), filled(&card.masks[0].1)),
-            _ => panic!("a mask stack is a value table in the card's own fp16"),
+            Staged::F32(v) => assert_eq!(&v[..], &card.masks[0].1[..]),
+            _ => panic!("a mask stack is a value tensor"),
         }
         // The pool's statics are staged at load, so the tape has no step for them.
         assert!(shape().steps().iter().all(|s| {
             s.tensor != PlaceId::Act(STEP.kv_row_pool) && s.tensor != PlaceId::Act(STEP.int32_zero)
         }));
-    }
-
-    /// A card table's bytes, as [`fill_card`] writes them into a shadow slot.
-    fn filled(t: &dyn CardTable) -> Vec<u8> {
-        let mut b = vec![0u8; 2 * card_elems(t.layout())];
-        fill_card(t, &mut b);
-        b
-    }
-
-    /// The narrowing the bind used to run over a host kernel's f32 table — the bytes a table filled
-    /// in the card's own format must equal.
-    fn narrowed(v: &[f32]) -> Vec<u8> {
-        let mut b = vec![0u8; 2 * v.len()];
-        crate::sen_convert::f32_to_sen_bytes(v, &mut b);
-        b
-    }
-
-    /// ⭐ THE EMBED-ROW AND ROTARY TABLES ARE THE f32 TABLES' NARROWING, BYTE FOR BYTE — each card
-    /// writes them in its own fp16 from their row laws, and the bytes are exactly what narrowing the
-    /// f32 tables the tape used to build (the rows gathered / the class's row tiled, stick-scattered)
-    /// writes: at one row and past it, a row past the tokens zero, at both staged layouts.
-    #[test]
-    fn the_host_kernels_tables_are_the_f32_tables_narrowed() {
-        let h = 128usize;
-        let embed: Vec<f32> = (0..5 * h).map(|i| (i as f32 * 0.37).sin() * 3.0).collect();
-        let tokens = [3usize, 0, 4];
-        let positions = [7u32, 8, 9];
-        for (rows, stick_major) in [(1usize, true), (3, true), (4, true), (3, false)] {
-            let sh = ForwardShape {
-                rows,
-                cos_srcs: &[(5, 128, KIND), (7, 64, KIND)],
-                sin_srcs: &[(6, 128, KIND), (8, 64, KIND)],
-                ..shape()
-            };
-            let inp = ForwardInputs {
-                hidden: h,
-                embed_tokens: &embed,
-                tokens: &tokens,
-                positions: &[positions[0], positions[1], positions[2], 10],
-                stick_major,
-                ..inputs(None)
-            };
-            let lay = |cols: usize, v: Vec<f32>| {
-                if stick_major {
-                    stick_scatter(rows, cols, &v)
-                } else {
-                    v
-                }
-            };
-            for st in sh.steps() {
-                let want: Vec<f32> = match st.kernel {
-                    ForwardKernel::EmbedRow => {
-                        let mut emb = vec![0.0f32; rows * h];
-                        for (r, &t) in tokens.iter().enumerate().take(rows) {
-                            emb[r * h..(r + 1) * h].copy_from_slice(&embed[t * h..(t + 1) * h]);
-                        }
-                        lay(h, emb)
-                    }
-                    ForwardKernel::Cos(i) | ForwardKernel::Sin(i) => {
-                        let cos = matches!(st.kernel, ForwardKernel::Cos(_));
-                        let srcs = if cos { sh.cos_srcs } else { sh.sin_srcs };
-                        let (_, w, kind) = srcs[i];
-                        let w = w as usize;
-                        let mut col = vec![0.0f32; rows * w];
-                        for r in 0..rows {
-                            let (c, s) = crate::manifest::rope_cos_sin_kind(inp.positions[r], kind);
-                            col[r * w..(r + 1) * w].copy_from_slice(&tile_rotary_row(
-                                if cos { &c } else { &s },
-                                w,
-                                kind.head_dim() as usize,
-                            ));
-                        }
-                        lay(w, col)
-                    }
-                    _ => continue,
-                };
-                match kernel_values(&st, &sh, &inp).expect("a host kernel's table") {
-                    Staged::Table(t) => assert_eq!(
-                        filled(&*t),
-                        narrowed(&want),
-                        "{:?} at {rows} row(s), stick-major {stick_major}",
-                        st.kernel
-                    ),
-                    _ => panic!("{:?} is a table in the card's own fp16", st.kernel),
-                }
-            }
-        }
     }
 
     /// ⛔⛔⛔ A PAGED STEP WITH NO BLOCKS IS A REFUSAL — asserted, because the alternative reads
