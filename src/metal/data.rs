@@ -826,7 +826,7 @@ impl Bytes {
 /// Each MLX checkpoint's weights: the `.safetensors` files scratchy and mlx-lm
 /// load, summed from the Hugging Face API (main, 2026-10-12). ollama runs its
 /// own build of the same model, named on its row.
-const WEIGHTS: [(&str, Bytes); 19] = [
+const WEIGHTS: [(&str, Bytes); 20] = [
     (
         "mlx-community/granite-3.3-2b-instruct-4bit",
         Bytes(1_425_458_043),
@@ -871,6 +871,8 @@ const WEIGHTS: [(&str, Bytes); 19] = [
         "mlx-community/Qwen2.5-3B-Instruct-4bit",
         Bytes(1_736_293_090),
     ),
+    // The MLA class's model from 2026-11-25, from the same API (main).
+    ("mlx-community/GLM-4.7-Flash-4bit", Bytes(16_852_441_819)),
 ];
 
 impl Model {
