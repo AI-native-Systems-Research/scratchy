@@ -23,257 +23,6 @@ use scratchy_target_spyre::manifest::bytes_to_f32;
 use ktir_superdsc::collective::PerRank;
 use scratchy_target_spyre::sen_convert::f32_to_f16_le;
 
-/// ⭐ ONE STEP'S HOST INPUTS — every channel a launch writes into each card's shadow, borrowed for
-/// the step:
-/// * `tables` — the host kernels' tables (embedding rows, rotary tables, the mask stack), each in
-///   the card's own fp16 ([`scratchy_target_spyre::forward_tape::CardTable`]), written by each card
-///   straight into its own slot;
-/// * `f32` — the constants, narrowed to SEN169 at the bind;
-/// * `f16` — already-IEEE-f16 bytes, as-is;
-/// * `i32` — the index tables, RAW LE words through `bind_input_raw`;
-/// * `seeds` — the chained head's seeds, the one input NOT the same on every card: rank `r` binds
-///   the words of ITS OWN vocabulary block ([`scratchy_target_spyre::forward_tape::ChainSeed::words`]).
-pub struct StepBinds<'s, 't> {
-    pub tables: &'s [(
-        scratchy_target_spyre::bundle_code::PlaceId,
-        Box<dyn scratchy_target_spyre::forward_tape::CardTable + 't>,
-    )],
-    pub f32: &'s [scratchy_target_spyre::wiring::Bind],
-    pub f16: &'s [(scratchy_target_spyre::bundle_code::PlaceId, Vec<u8>)],
-    pub i32: &'s [(scratchy_target_spyre::bundle_code::PlaceId, Vec<u8>)],
-    pub seeds: &'s [(
-        scratchy_target_spyre::bundle_code::PlaceId,
-        scratchy_target_spyre::forward_tape::ChainSeed,
-    )],
-}
-
-impl StepBinds<'static, 'static> {
-    /// A step that binds nothing — its shadow already holds every input.
-    pub const NONE: StepBinds<'static, 'static> = StepBinds {
-        tables: &[],
-        f32: &[],
-        f16: &[],
-        i32: &[],
-        seeds: &[],
-    };
-}
-
-/// ⭐ ONE STEP'S BIND VERDICT, MET BY THE WHOLE WORLD — every rank says whether its bind succeeded,
-/// and no rank starts the step unless every rank bound. A rank says it through its [`BindSeat`]
-/// and only through it: [`BindSeat::meet`] reports and waits for the world; a seat dropped without
-/// meeting — its thread failed to pin, failed to spawn, or panicked — reports a failure and waits
-/// for nothing, so no rank ever waits on a rank that left, and none starts a step another rank
-/// cannot join.
-struct BindMeeting<T: ktir_superdsc::collective::Tp> {
-    arrivals: std::sync::Mutex<Arrivals>,
-    all_in: std::sync::Condvar,
-    world: std::marker::PhantomData<T>,
-}
-
-/// How many ranks have reported, and the ranks whose bind failed.
-#[derive(Default)]
-struct Arrivals {
-    arrived: usize,
-    failed: Vec<u32>,
-}
-
-impl<T: ktir_superdsc::collective::Tp> BindMeeting<T> {
-    const RANKS: usize = <T as ktir_superdsc::collective::World>::RANKS as usize;
-
-    fn new() -> Self {
-        Self {
-            arrivals: std::sync::Mutex::new(Arrivals::default()),
-            all_in: std::sync::Condvar::new(),
-            world: std::marker::PhantomData,
-        }
-    }
-
-    /// One seat per rank of the world — the only way a rank reports.
-    fn seats(&self) -> PerRank<T, BindSeat<'_, T>> {
-        PerRank::from_fn(|rank| BindSeat {
-            meeting: self,
-            rank: rank.get(),
-            met: false,
-        })
-    }
-
-    /// Record one rank's report, waking the world when it is the last.
-    fn arrive(&self, rank: u32, bound: bool) -> std::sync::MutexGuard<'_, Arrivals> {
-        // No code panics while holding this lock, so a poisoned lock still holds a whole count.
-        let mut a = self
-            .arrivals
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        a.arrived += 1;
-        if !bound {
-            a.failed.push(rank);
-        }
-        if a.arrived == Self::RANKS {
-            self.all_in.notify_all();
-        }
-        a
-    }
-}
-
-/// A rank's place at its step's [`BindMeeting`]: met once, or reported failed when dropped.
-struct BindSeat<'m, T: ktir_superdsc::collective::Tp> {
-    meeting: &'m BindMeeting<T>,
-    rank: u32,
-    met: bool,
-}
-
-/// The error a rank whose own bind succeeded returns when another rank's did not: no card starts a
-/// step one of its cards cannot join. [`SdscRunner::each_parallel_with`] reports a failed rank's own
-/// error ahead of this one.
-#[derive(Debug)]
-struct PeerUnbound {
-    ranks: Vec<u32>,
-}
-
-impl std::fmt::Display for PeerUnbound {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "rank(s) {:?} did not bind this step, so no card starts it",
-            self.ranks
-        )
-    }
-}
-
-impl std::error::Error for PeerUnbound {}
-
-impl<T: ktir_superdsc::collective::Tp> BindSeat<'_, T> {
-    /// Report this rank's bind and wait until every rank has reported: `Ok` only if every rank
-    /// bound — this rank's own error first, else [`PeerUnbound`].
-    fn meet(mut self, bound: Result<()>) -> Result<()> {
-        self.met = true;
-        let mut a = self.meeting.arrive(self.rank, bound.is_ok());
-        while a.arrived < BindMeeting::<T>::RANKS {
-            a = self
-                .meeting
-                .all_in
-                .wait(a)
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-        }
-        // Every rank reads the same list, so each takes a copy.
-        let failed = a.failed.clone();
-        drop(a);
-        bound?;
-        if failed.is_empty() {
-            Ok(())
-        } else {
-            Err(PeerUnbound { ranks: failed }.into())
-        }
-    }
-}
-
-impl<T: ktir_superdsc::collective::Tp> Drop for BindSeat<'_, T> {
-    /// A seat that never met: its rank left before its bind was reported — a failure, which wakes
-    /// the world and waits for nothing (the spawning thread drops the seat of a rank whose thread
-    /// never started, and must not wait there for ranks it has not spawned yet).
-    fn drop(&mut self) {
-        if !self.met {
-            drop(self.meeting.arrive(self.rank, false));
-        }
-    }
-}
-
-/// ⭐ ONE CARD'S BINDS, THEN THE WORLD MEETS — every card of a step binds into its own shadow on its
-/// own thread ([`bind_rank`]), then meets the world at its [`BindSeat`], so the doorbells that
-/// follow go out together, and only if every card bound. The meeting is what keeps the cards
-/// aligned into the step's first collective: a doorbell that rang as soon as its own card bound
-/// grew the decode steps' all-reduce waits 1.305 → 1.411 M cycles a step and ITL 34.6 → 34.75 ms
-/// (granite-3.1-8b tp/4), and binding in a parallel section of its own cost as much in host time a
-/// token. Returns how long this card's own bind took.
-fn bind_then_meet<T: ktir_superdsc::collective::Tp>(
-    e: &mut Executor<'_, '_, T>,
-    b: &StepBinds<'_, '_>,
-    seat: BindSeat<'_, T>,
-) -> Result<std::time::Duration> {
-    let t = std::time::Instant::now();
-    let bound = bind_rank(e, b);
-    let took = t.elapsed();
-    seat.meet(bound)?;
-    Ok(took)
-}
-
-/// ⭐ ONE CARD'S BINDS OF A STEP, INTO ITS OWN SHADOW — the one bind body every door runs, on the
-/// card's own thread inside the step's parallel section. One body, so a new channel or a new guard
-/// cannot land on one step shape and skip the other.
-fn bind_rank<T: ktir_superdsc::collective::Tp>(
-    e: &mut Executor<'_, '_, T>,
-    b: &StepBinds<'_, '_>,
-) -> Result<()> {
-    // BIND-LOOP TIMING (SCRATCHY_SDSC_PHASE_TIME, the executor's phase-breakdown flag): the binds
-    // run BEFORE predict, so the preamble_h2d/compute/logits_d2h split cannot see them.
-    let t_bind = std::time::Instant::now();
-    // ⭐ A HOST KERNEL'S TABLE IS WRITTEN IN THE CARD'S OWN FORMAT, at its own slot — no f32 table,
-    // no clone of it, no per-card convert of one.
-    for (id, t) in b.tables {
-        e.bind_input_table(*id, &**t)?;
-    }
-    // ⭐ ONE PASS, STRAIGHT INTO THE SHADOW: f32 → SEN169 at the activation's own slot.
-    for (id, vals) in b.f32 {
-        e.bind_input_f32(*id, vals)?;
-    }
-    for (id, bytes) in b.f16 {
-        e.bind_input(*id, bytes.clone());
-    }
-    // ⛔ `bind_input_raw`, NOT `bind_input`. See `Executor::raw_ids`: the shadow write applies
-    // `ieee_to_sen_bytes` to every ordinary bind, which reads each 4-byte index entry as two fp16
-    // values and rewrites both — turning block 37 into a different, valid, arbitrary block.
-    // ⛔ AND THE PAYLOAD ARRIVES PAIRED WITH ITS PLACEMENT. `place_raw` is the only constructor of
-    // the value `bind_input_raw` takes, so the three ways a raw bind used to go wrong — a byte
-    // count that is not whole int32 entries, a payload longer than its own placement, and a name
-    // this bundle never placed (silently SKIPPED, and a skipped index reads as entry 0, a real
-    // address) — are one refusal at one door.
-    for (id, bytes) in b.i32 {
-        let bind = e.place_raw(*id, bytes.clone()).ok_or_else(|| {
-            anyhow!(
-                "bind: raw tensor '{id}' ({} B) has no placement in this bundle, does not fit the \
-                 one it has, or is not a whole number of int32 entries — a partial trailing entry \
-                 is a truncated address, an over-long bind overwrites the next tensor, and an \
-                 unplaced one would be skipped in silence (entry 0 is page 0's first block, a REAL \
-                 address)",
-                bytes.len()
-            )
-        })?;
-        e.bind_input_raw(bind);
-    }
-    for (id, seed) in b.seeds {
-        let bytes: Vec<u8> = seed
-            .words(e.tp_identity())
-            .iter()
-            .flat_map(|w| w.to_le_bytes())
-            .collect();
-        let n = bytes.len();
-        let bind = e.place_raw(*id, bytes).ok_or_else(|| {
-            anyhow!(
-                "bind: the chain seed '{id}' ({n} B) has no placement in this bundle or does not \
-                 fit the one it has — an unstaged stick gathers the wrong row"
-            )
-        })?;
-        e.bind_input_raw(bind);
-    }
-    if std::env::var_os("SCRATCHY_SDSC_PHASE_TIME").is_some() {
-        let elems: usize = b
-            .tables
-            .iter()
-            .map(|(_, t)| scratchy_target_spyre::forward_tape::card_elems(t.layout()))
-            .sum();
-        eprintln!(
-            "[sdsc-host] bind_loop={:.2} ms  rank {:?}  ({} tables, {elems} sen written; {} f32 \
-             acts, {} f16 acts)",
-            t_bind.elapsed().as_secs_f64() * 1e3,
-            e.tp_identity().map(|r| r.get()),
-            b.tables.len(),
-            b.f32.len(),
-            b.f16.len(),
-        );
-    }
-    Ok(())
-}
-
 /// What a step's caller does with its logits — the session-level spelling of [`Logits`], minus the
 /// buffer the session owns. See [`Logits`] for why this is three states and not a `bool`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -852,77 +601,37 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> SuperDscSession<'a, 'c, T> {
         name: &str,
         f: impl Fn(&mut Executor<'a, 'c, T>) -> Result<R> + Sync,
     ) -> Result<Vec<R>> {
-        self.each_parallel_with(name, PerRank::from_fn(|_| ()), |e, ()| f(e))
-    }
-
-    /// [`Self::each_parallel`], each rank handed its own value of `per_rank` — moved into the rank's
-    /// thread before the thread pins, so it is dropped on every way the thread can end: `f`
-    /// returning, the pin failing, a panic, or the thread never spawning (a [`BindSeat`] reports
-    /// its rank failed exactly then). A rank's own error is reported ahead of a [`PeerUnbound`]
-    /// another rank returned because of it.
-    fn each_parallel_with<S: Send, R: Send>(
-        &mut self,
-        name: &str,
-        per_rank: PerRank<T, S>,
-        f: impl Fn(&mut Executor<'a, 'c, T>, S) -> Result<R> + Sync,
-    ) -> Result<Vec<R>> {
         use ktir_superdsc::collective::World;
-        let results: Vec<Result<R>> = if !<T as World>::SHARDED {
-            // A world of one runs on the caller.
-            self.ranks
+        if !<T as World>::SHARDED {
+            return self.each(f);
+        }
+        let f = &f;
+        std::thread::scope(|scope| {
+            let handles = self
+                .ranks
                 .iter_mut()
-                .zip(per_rank.into_values())
-                .map(|((_, e), s)| f(e, s))
+                .map(|(r, e)| {
+                    // Named `<name>R<rank>`, so the thread's phase and placement can be read per
+                    // rank.
+                    std::thread::Builder::new()
+                        .name(format!("{name}R{}", r.get()))
+                        .spawn_scoped(scope, move || {
+                            let pinned = e
+                                .card_cpus()
+                                .pin_current_thread()
+                                .map_err(anyhow::Error::from);
+                            pinned
+                                .and_then(|()| f(e))
+                                .map_err(|err| err.context(format!("rank {}", r.get())))
+                        })
+                        .map_err(|err| anyhow!("rank {}: spawn its submit thread: {err}", r.get()))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap_or_else(|p| std::panic::resume_unwind(p)))
                 .collect()
-        } else {
-            let f = &f;
-            std::thread::scope(|scope| {
-                let handles = self
-                    .ranks
-                    .iter_mut()
-                    .zip(per_rank.into_values())
-                    .map(|((r, e), s)| {
-                        // Named `<name>R<rank>`, so the thread's phase and placement can be read
-                        // per rank.
-                        std::thread::Builder::new()
-                            .name(format!("{name}R{}", r.get()))
-                            .spawn_scoped(scope, move || {
-                                let pinned = e
-                                    .card_cpus()
-                                    .pin_current_thread()
-                                    .map_err(anyhow::Error::from);
-                                pinned
-                                    .and_then(|()| f(e, s))
-                                    .map_err(|err| err.context(format!("rank {}", r.get())))
-                            })
-                            .map_err(|err| {
-                                anyhow!("rank {}: spawn its submit thread: {err}", r.get())
-                            })
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                Ok::<_, anyhow::Error>(
-                    handles
-                        .into_iter()
-                        .map(|h| h.join().unwrap_or_else(|p| std::panic::resume_unwind(p)))
-                        .collect(),
-                )
-            })?
-        };
-        let mut out = Vec::with_capacity(results.len());
-        let mut peer_unbound = None;
-        for r in results {
-            match r {
-                Ok(v) => out.push(v),
-                Err(e) if e.downcast_ref::<PeerUnbound>().is_some() => {
-                    peer_unbound.get_or_insert(e);
-                }
-                Err(e) => return Err(e),
-            }
-        }
-        match peer_unbound {
-            Some(e) => Err(e),
-            None => Ok(out),
-        }
+        })
     }
 
     /// ⭐⭐⭐⭐⭐ WHICH BODY THE NEXT LAUNCH AT `start` WILL RUN, and what it declares — see
@@ -1077,42 +786,17 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> SuperDscSession<'a, 'c, T> {
     /// door exists to not run. Call `stage_step_acts` first: this door submits
     /// whatever the shadow holds.
     pub fn submit_step(&mut self, n_new: usize, seq_pos: usize) -> Result<()> {
-        // Nothing to bind: the shadow already holds every input.
-        self.submit_bound(&StepBinds::NONE, n_new, seq_pos)
-            .map(drop)
-    }
-
-    /// ⭐ BIND AND SUBMIT ONE PIPELINED STEP — every card writes `b` into its own shadow on its own
-    /// thread, the cards meet, then — only if every card bound — every card rings its doorbell
-    /// together ([`bind_then_meet`]), one parallel section: the step's bind costs the slowest
-    /// card's bind, not the sum of the cards' (a serial bind of the cards cost 28 ms a 512-row
-    /// prompt chunk at tp/4 against 11 at tp/1). Waits on nothing, as [`Self::submit_step`].
-    /// Returns the slowest card's bind — the bind's share of the submit span, since every doorbell
-    /// waits for it.
-    pub fn submit_bound(
-        &mut self,
-        b: &StepBinds<'_, '_>,
-        n_new: usize,
-        seq_pos: usize,
-    ) -> Result<std::time::Duration> {
         // ⭐ EVERY CARD'S DOORBELL BEFORE ANY WAIT — this door waits on nothing, so the ranks' steps
         // are all in flight together and their collectives meet on the cards.
         let t0 = std::time::Instant::now();
-        let meeting = BindMeeting::<T>::new();
-        let ranks = self.each_parallel_with("Submit", meeting.seats(), |e, seat| {
-            let bind = bind_then_meet(e, b, seat)?;
+        let at = self.each_parallel("Submit", |e| {
             e.submit_step(NewTokens(n_new as i64), SeqPos(seq_pos as i64))?;
-            Ok((bind, t0.elapsed().as_secs_f64() * 1e3))
+            Ok(t0.elapsed().as_secs_f64() * 1e3)
         })?;
         if std::env::var_os("SCRATCHY_SDSC_RB_TIME").is_some() {
-            let at: Vec<f64> = ranks.iter().map(|&(_, at)| at).collect();
             eprintln!("[sdsc-submit] step {seq_pos}: rank submits done at {at:.2?} ms");
         }
-        Ok(ranks
-            .iter()
-            .map(|&(bind, _)| bind)
-            .max()
-            .unwrap_or_default())
+        Ok(())
     }
 
     /// ⭐ #32 (A) — ENQUEUE THE STEP'S STICK READ, no drain: the D2H rides the
@@ -1206,23 +890,113 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> SuperDscSession<'a, 'c, T> {
         }
     }
 
-    /// ⭐ #32 (A) — THE BIND LOOP A STEP RUNS BEFORE ITS FORWARD, every card writing its own
-    /// shadow on its own thread ([`bind_rank`], the one bind body every door runs). The one-shot
-    /// `run_step_inner` path stages through it; a launch binds and submits in one section
-    /// ([`Self::submit_bound`], [`Self::run_bound`]).
+    /// ⭐ #32 (A) — THE BIND LOOP EVERY STEP RUNS BEFORE ITS FORWARD, PUB FOR THE
+    /// PIPELINED LOOP, which stages half a step at a time: it calls this with
+    /// step `j+1`'s acts while the device still executes step `j` (the
+    /// position-pure half, pre-fence), then stages the ONE token-dependent bind
+    /// after the fence. `submit_step` is the other half — its refill uploads
+    /// whatever the shadow holds, so the split between the two calls is where
+    /// the pipelining lives. The one-shot `run_step_inner` path composes this
+    /// same body, never a second spelling of it. The three channels are its
+    /// own: f32 narrowed to f16 at the boundary, already-f16 bytes as-is, and
+    /// RAW LE int32 through `bind_input_raw`. One body, so a new channel or a
+    /// new guard cannot land on one step shape and skip the other.
     pub fn stage_step_acts(
         &mut self,
         activations: &[scratchy_target_spyre::wiring::Bind],
         activations_f16: &[(scratchy_target_spyre::bundle_code::PlaceId, Vec<u8>)],
         activations_i32: &[(scratchy_target_spyre::bundle_code::PlaceId, Vec<u8>)],
     ) -> Result<()> {
-        let b = StepBinds {
-            f32: activations,
-            f16: activations_f16,
-            i32: activations_i32,
-            ..StepBinds::NONE
-        };
-        self.each_parallel("Bind", |e| bind_rank(e, &b)).map(drop)
+        self.stage_step_acts_seeded(activations, activations_f16, activations_i32, &[])
+    }
+
+    /// [`Self::stage_step_acts`] plus the chained head's seeds — the one host input that is NOT
+    /// the same on every card: rank `r` binds the words of ITS OWN vocabulary block
+    /// ([`scratchy_target_spyre::forward_tape::ChainSeed::words`]), the block its staged tables were built for,
+    /// by the rank its executor plays as. Raw LE u32 words, through the same verbatim channel
+    /// the index tables ride.
+    pub fn stage_step_acts_seeded(
+        &mut self,
+        activations: &[scratchy_target_spyre::wiring::Bind],
+        activations_f16: &[(scratchy_target_spyre::bundle_code::PlaceId, Vec<u8>)],
+        activations_i32: &[(scratchy_target_spyre::bundle_code::PlaceId, Vec<u8>)],
+        seeds: &[(
+            scratchy_target_spyre::bundle_code::PlaceId,
+            scratchy_target_spyre::forward_tape::ChainSeed,
+        )],
+    ) -> Result<()> {
+        // BIND-LOOP TIMING (SCRATCHY_SDSC_PHASE_TIME, the same flag as the executor's phase
+        // breakdown): this loop runs BEFORE predict, so it is invisible to the
+        // preamble_h2d/compute/logits_d2h split. For batched prefill it converts ~300k f32
+        // (embedding 63k + cos/sin 159k + cmask 63k + consts) — a real per-forward cost the TTFT
+        // budget never accounted for.
+        let t_bind = std::time::Instant::now();
+        let mut bind_elems = 0usize;
+        // ⭐ ONE PASS, STRAIGHT INTO THE SHADOW: f32 → SEN169 at the activation's own slot, the bytes
+        // `f32_to_f16_le` then the refill's `ieee_to_sen_bytes` made between them — with no IEEE-f16
+        // `Vec` per bind per step in between and no second convert pass at the refill.
+        for (id, vals) in activations {
+            bind_elems += vals.len();
+            self.each(|e| e.bind_input_f32(*id, vals))?;
+        }
+        let mut bind_f16_bytes = 0usize;
+        for (id, bytes) in activations_f16 {
+            bind_f16_bytes += bytes.len();
+            for e in self.ranks.values_mut() {
+                e.bind_input(*id, bytes.clone());
+            }
+        }
+        // ⛔ `bind_input_raw`, NOT `bind_input`. See `Executor::raw_ids`: the shadow write applies
+        // `ieee_to_sen_bytes` to every ordinary bind, which reads each 4-byte index entry as two fp16
+        // values and rewrites both — turning block 37 into a different, valid, arbitrary block.
+        // ⛔ AND THE PAYLOAD ARRIVES PAIRED WITH ITS PLACEMENT. `place_raw` is the only constructor of
+        // the value `bind_input_raw` takes, so the three ways a raw bind used to go wrong — a byte
+        // count that is not whole int32 entries, a payload longer than its own placement, and a name
+        // this bundle never placed (silently SKIPPED, and a skipped index reads as entry 0, a real
+        // address) — are one refusal at one door instead of a check here, a `bail!` in the refill loop
+        // and a `continue` nobody could see.
+        for (id, bytes) in activations_i32 {
+            for e in self.ranks.values_mut() {
+                let bind = e.place_raw(*id, bytes.clone()).ok_or_else(|| {
+                anyhow!(
+                    "bind: raw tensor '{id}' ({} B) has no placement in this bundle, does not fit \
+                     the one it has, or is not a whole number of int32 entries — a partial trailing \
+                     entry is a truncated address, an over-long bind overwrites the next tensor, and \
+                     an unplaced one would be skipped in silence (entry 0 is page 0's first block, a \
+                     REAL address)",
+                    bytes.len()
+                )
+            })?;
+                e.bind_input_raw(bind);
+            }
+        }
+        for (id, seed) in seeds {
+            for e in self.ranks.values_mut() {
+                let bytes: Vec<u8> = seed
+                    .words(e.tp_identity())
+                    .iter()
+                    .flat_map(|w| w.to_le_bytes())
+                    .collect();
+                let n = bytes.len();
+                let bind = e.place_raw(*id, bytes).ok_or_else(|| {
+                    anyhow!(
+                        "bind: the chain seed '{id}' ({n} B) has no placement in this bundle or \
+                         does not fit the one it has — an unstaged stick gathers the wrong row"
+                    )
+                })?;
+                e.bind_input_raw(bind);
+            }
+        }
+        if std::env::var_os("SCRATCHY_SDSC_PHASE_TIME").is_some() {
+            eprintln!(
+                "[sdsc-host] bind_loop={:.2} ms  ({} acts, {bind_elems} f32->sen, {} f16 acts, \
+                 {bind_f16_bytes} f16 bytes as-is)",
+                t_bind.elapsed().as_secs_f64() * 1e3,
+                activations.len(),
+                activations_f16.len(),
+            );
+        }
+        Ok(())
     }
 
     fn run_step_inner(
@@ -1242,24 +1016,9 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> SuperDscSession<'a, 'c, T> {
     }
 
     /// Run the step whatever the shadow holds — every input already staged
-    /// ([`Self::stage_step_acts`]).
+    /// ([`Self::stage_step_acts`] / [`Self::stage_step_acts_seeded`]).
     pub fn run_staged_step(
         &mut self,
-        n_new: usize,
-        seq_pos: usize,
-        logits: StepLogits,
-    ) -> Result<Option<Vec<f32>>> {
-        self.run_bound(&StepBinds::NONE, n_new, seq_pos, logits)
-    }
-
-    /// ⭐ BIND AND RUN ONE STEP — every card writes `b` into its own shadow on its own thread (a
-    /// prompt chunk's tables are millions of values a card,
-    /// [`scratchy_target_spyre::forward_tape::CardTable`]), the cards meet and — only if every
-    /// card bound — submit together ([`bind_then_meet`]), then every card's forward is finished, rank 0 reading the row back when
-    /// the step asks for it.
-    pub fn run_bound(
-        &mut self,
-        b: &StepBinds<'_, '_>,
         n_new: usize,
         seq_pos: usize,
         logits: StepLogits,
@@ -1272,11 +1031,7 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> SuperDscSession<'a, 'c, T> {
         };
         // ⭐ EVERY CARD SUBMITS BEFORE ANY CARD IS WAITED ON — a rank's collective waits on its
         // peers' sends, so the forward is in flight on all of them before the host drains one.
-        let meeting = BindMeeting::<T>::new();
-        let submitted = self.each_parallel_with("Submit", meeting.seats(), |e, seat| {
-            bind_then_meet(e, b, seat)?;
-            e.predict_submit(n_new, seq_pos, want)
-        })?;
+        let submitted = self.each_parallel("Submit", |e| e.predict_submit(n_new, seq_pos, want))?;
         let mut row = vec![0u8; self.vocab * 2];
         for ((r, e), s) in self.ranks.iter_mut().zip(submitted) {
             // Rank 0 reads the row back; every other rank's forward is drained, its read the same
@@ -1414,138 +1169,5 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> SuperDscSession<'a, 'c, T> {
             e.alias_seg_from(owner.ranks.get(r), s)?;
         }
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{BindMeeting, BindSeat, PeerUnbound};
-    use ktir_superdsc::collective::TpWorld;
-
-    type W4 = TpWorld<4>;
-
-    /// What one rank's thread did with its seat.
-    #[derive(Clone, Copy)]
-    enum Rank {
-        Bound,
-        Failed,
-        /// Dropped its seat without meeting — a pin failure on the rank's own thread.
-        Left,
-    }
-
-    /// What a rank's `meet` returned: `None` for a rank that left.
-    #[derive(Clone, Debug, PartialEq)]
-    enum Met {
-        Ok,
-        OwnError,
-        PeerUnbound(Vec<u32>),
-    }
-
-    fn met(r: anyhow::Result<()>) -> Met {
-        match r {
-            Ok(()) => Met::Ok,
-            Err(e) => match e.downcast_ref::<PeerUnbound>() {
-                Some(p) => Met::PeerUnbound(p.ranks.clone()),
-                None => Met::OwnError,
-            },
-        }
-    }
-
-    fn act(seat: BindSeat<'_, W4>, r: Rank) -> Option<Met> {
-        match r {
-            Rank::Bound => Some(met(seat.meet(Ok(())))),
-            Rank::Failed => Some(met(seat.meet(Err(anyhow::anyhow!("bind failed"))))),
-            Rank::Left => {
-                drop(seat);
-                None
-            }
-        }
-    }
-
-    /// One step's meeting, each rank on its own thread.
-    fn meet_world(ranks: [Rank; 4]) -> Vec<Option<Met>> {
-        let meeting = BindMeeting::<W4>::new();
-        let seats = meeting.seats();
-        std::thread::scope(|s| {
-            let handles: Vec<_> = seats
-                .into_values()
-                .zip(ranks)
-                .map(|(seat, r)| s.spawn(move || act(seat, r)))
-                .collect();
-            handles
-                .into_iter()
-                .map(|h| h.join().expect("a rank's thread"))
-                .collect()
-        })
-    }
-
-    #[test]
-    fn a_step_starts_when_every_card_bound() {
-        assert_eq!(meet_world([Rank::Bound; 4]), vec![Some(Met::Ok); 4]);
-    }
-
-    #[test]
-    fn one_card_s_failed_bind_starts_no_card() {
-        let unbound = || Some(Met::PeerUnbound(vec![2]));
-        assert_eq!(
-            meet_world([Rank::Bound, Rank::Bound, Rank::Failed, Rank::Bound]),
-            vec![unbound(), unbound(), Some(Met::OwnError), unbound()],
-        );
-    }
-
-    #[test]
-    fn a_card_that_leaves_wakes_the_world_and_starts_no_card() {
-        let unbound = || Some(Met::PeerUnbound(vec![1]));
-        assert_eq!(
-            meet_world([Rank::Bound, Rank::Left, Rank::Bound, Rank::Bound]),
-            vec![unbound(), None, unbound(), unbound()],
-        );
-    }
-
-    /// A spawn failure drops the seat on the SPAWNING thread, before the later ranks exist: that
-    /// drop must not wait for them, and the ranks already running must still be released.
-    #[test]
-    fn a_seat_dropped_on_the_spawning_thread_waits_for_nothing() {
-        let meeting = BindMeeting::<W4>::new();
-        let mut seats = meeting.seats().into_values();
-        let results = std::thread::scope(|s| {
-            let first: Vec<_> = (&mut seats)
-                .take(2)
-                .map(|seat| s.spawn(move || act(seat, Rank::Bound)))
-                .collect();
-            // Ranks 2 and 3 never spawn: their seats drop here, on this thread.
-            drop(seats);
-            first
-                .into_iter()
-                .map(|h| h.join().expect("a rank's thread"))
-                .collect::<Vec<_>>()
-        });
-        let unbound = || Some(Met::PeerUnbound(vec![2, 3]));
-        assert_eq!(results, vec![unbound(), unbound()]);
-    }
-
-    /// A rank whose bind panics drops its seat while unwinding: the others are released, and the
-    /// panic still reaches its joiner.
-    #[test]
-    fn a_card_whose_bind_panics_starts_no_card() {
-        let meeting = BindMeeting::<W4>::new();
-        let mut seats = meeting.seats().into_values();
-        let (panicked, others) = std::thread::scope(|s| {
-            let seat = seats.next().expect("rank 0's seat");
-            let p = s.spawn(move || {
-                let _seat = seat;
-                panic!("a bind that panics");
-            });
-            let others: Vec<_> = seats
-                .map(|seat| s.spawn(move || act(seat, Rank::Bound)))
-                .collect();
-            let others = others
-                .into_iter()
-                .map(|h| h.join().expect("a rank's thread"))
-                .collect::<Vec<_>>();
-            (p.join().is_err(), others)
-        });
-        assert!(panicked, "the panic reaches its joiner");
-        assert_eq!(others, vec![Some(Met::PeerUnbound(vec![0])); 3]);
     }
 }

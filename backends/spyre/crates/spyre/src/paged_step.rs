@@ -114,7 +114,7 @@ pub fn prove_ladder_walks(
 /// clamped it (`pos`'s own `.max(1)`, the worker's `live_of`) was defending against a value that
 /// names a broken staging, not tolerating a real one. The mint refuses it, so the count the type
 /// carries is the count the staging meant.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug)]
 pub struct StepRows {
     pub start: usize,
     pub real: std::num::NonZeroUsize,
@@ -243,75 +243,20 @@ pub fn mask_stack(step: &PagedStep, rows: &StepRows) -> Vec<f32> {
 }
 
 fn mask_stack_of(step: &PagedStep, q: usize, rows: &StepRows) -> Vec<f32> {
-    CausalStack::of(step, q, Some(*rows)).values()
-}
-
-/// ⭐ ONE REQUEST'S CAUSAL MASK STACK, AS ITS LAW — `[walk, q, page_slots]` (`q` the rows one
-/// request's stack serves), line `i · q + r` row `r`'s tile `i`, column `c` keyed by position
-/// `i · page_slots + c`: 0 where row `r` may attend it (`i · page_slots + c ≤ pos(r)`), [`MASKED`]
-/// after; an EMPTY window (`rows: None`, a packed rung's slot no request rides) attends nothing.
-///
-/// Stated as each line's ATTENDED PREFIX ([`Self::attended`]) — the one law the gate's f32 stack
-/// ([`mask_stack`], [`Self::values`]) and the card's SEN169 table
-/// ([`crate::forward_tape::CardTable`]) both read, so the card fills a prompt chunk's millions of
-/// mask values as two runs a line and no f32 stack is built for it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct CausalStack {
-    walk: usize,
-    q: usize,
-    slots: usize,
-    rows: Option<StepRows>,
-}
-
-impl CausalStack {
-    /// The stack `step` walks for `q` rows of one request (`None`: an empty window's).
-    pub fn of(step: &PagedStep, q: usize, rows: Option<StepRows>) -> CausalStack {
-        CausalStack {
-            walk: step.walk as usize,
-            q,
-            slots: step.page_slots as usize,
-            rows,
+    let slots = step.page_slots as usize;
+    let mut m = vec![MASKED; step.walk as usize * q * slots];
+    for i in 0..step.walk as usize {
+        for r in 0..q {
+            let pos = rows.pos(r);
+            let base = (i * q + r) * slots;
+            for c in 0..slots {
+                if i * slots + c <= pos {
+                    m[base + c] = 0.0;
+                }
+            }
         }
     }
-
-    fn lines(&self) -> usize {
-        self.walk * self.q
-    }
-
-    /// How many of line `line`'s leading columns its row attends — every column `c` with
-    /// `i · page_slots + c ≤ pos(r)`, which is a prefix of the line.
-    fn attended(&self, line: usize) -> usize {
-        let Some(rows) = self.rows else {
-            return 0;
-        };
-        let (i, r) = (line / self.q, line % self.q);
-        (rows.pos(r) + 1)
-            .saturating_sub(i * self.slots)
-            .min(self.slots)
-    }
-
-    /// The stack's values, row-major `[walk · q, page_slots]` — the gate's and the host's form.
-    pub fn values(&self) -> Vec<f32> {
-        let mut m = Vec::with_capacity(self.lines() * self.slots);
-        for line in 0..self.lines() {
-            let n = self.attended(line);
-            m.extend(std::iter::repeat_n(0.0, n));
-            m.extend(std::iter::repeat_n(MASKED, self.slots - n));
-        }
-        m
-    }
-}
-
-impl crate::forward_tape::CardTable for CausalStack {
-    fn layout(&self) -> ktir_superdsc::sdsc_abstract::StickLayout {
-        crate::forward_tape::card_layout(self.lines(), self.slots)
-    }
-    fn sen_row(&self, line: usize, row: &mut [crate::sen_convert::SenF16]) {
-        use crate::sen_convert::f32_to_sen;
-        let n = self.attended(line);
-        row[..n].fill(f32_to_sen(0.0));
-        row[n..].fill(f32_to_sen(MASKED));
-    }
+    m
 }
 
 /// The KV write index: one `[rows]` index per kv head, one after another — head `h` of row `r`'s
@@ -583,58 +528,22 @@ pub fn batch_sources(
 /// ([`PagedStep::card_walk_step`], `loop_fold`'s pitched index table). `kv_row_pool` and the int32
 /// zero are no step's: they are the same for every step of a pool, staged once at load
 /// ([`card_statics`]).
-/// ⭐ ONE MASK TABLE OF A CARD STEP — a prompt window's [`CausalStack`] (its law), or a decode
-/// batch's chunk masks as the `[rows, page_slots]` values [`batch_sources`] builds, row-major.
-///
-/// ⭐ THE MASK AS THE CARD READS IT is laid by [`crate::forward_tape::card_layout`]: stick-major over
-/// the whole `[rows, page_slots]` stack, row `r`'s stick `s` at stick `s · rows + r` — the layout
-/// the kernels address the stack in (a tile's second stick one plane of `rows` further on), and the
-/// reason a trip's tile is [`PagedStep::card_walk_step`] further along every plane. One stick wide,
-/// at 64-slot pages, it is the row-major stack byte for byte; at 128 slots the row-major stack read
-/// stick-major handed every odd query row the next row's masked half — MEASURED on card, granite
-/// 2b and 8b prompt-blind, the P·V rows of odd prompt positions all zero.
-#[derive(Clone, Debug, PartialEq)]
-pub enum CardMask {
-    Causal(CausalStack),
-    Values {
-        rows: usize,
-        cols: usize,
-        values: Vec<f32>,
-    },
-}
-
-impl CardMask {
-    fn logical(&self) -> (usize, usize, std::borrow::Cow<'_, [f32]>) {
-        match self {
-            CardMask::Causal(s) => (s.lines(), s.slots, std::borrow::Cow::Owned(s.values())),
-            CardMask::Values { rows, cols, values } => {
-                (*rows, *cols, std::borrow::Cow::Borrowed(values.as_slice()))
-            }
-        }
+/// ⭐ THE MASK STACK AS THE CARD READS IT — stick-major over the whole `[rows, page_slots]` stack
+/// ([`crate::forward_tape::stick_scatter`]): row `r`'s stick `s` at stick `s · rows + r`, the
+/// layout the kernels address the stack in (a tile's second stick one plane of `rows` further on),
+/// and the reason a trip's tile is [`PagedStep::card_walk_step`] further along every plane. One
+/// stick wide, at 64-slot pages, it is the row-major stack byte for byte; at 128 slots the row-major
+/// stack read stick-major handed every odd query row the next row's masked half — MEASURED on card,
+/// granite 2b and 8b prompt-blind, the P·V rows of odd prompt positions all zero.
+fn card_mask(mask: &[f32], shape: &[usize]) -> Vec<f32> {
+    let (width, rows) = match shape.split_last() {
+        Some((&w, lead)) => (w, lead.iter().product()),
+        None => (0, 0),
+    };
+    if width <= ktir_superdsc::superdsc_opspec::Df::Fp16.elems_per_stick() as usize {
+        return mask.to_vec();
     }
-
-    /// The table's values at its card layout — what the card's fp16 holds, before the narrowing.
-    pub fn card_values(&self) -> Vec<f32> {
-        let (rows, cols, v) = self.logical();
-        crate::forward_tape::stick_scatter(rows, cols, &v)
-    }
-}
-
-impl crate::forward_tape::CardTable for CardMask {
-    fn layout(&self) -> ktir_superdsc::sdsc_abstract::StickLayout {
-        match self {
-            CardMask::Causal(s) => s.layout(),
-            CardMask::Values { rows, cols, .. } => crate::forward_tape::card_layout(*rows, *cols),
-        }
-    }
-    fn sen_row(&self, r: usize, row: &mut [crate::sen_convert::SenF16]) {
-        match self {
-            CardMask::Causal(s) => s.sen_row(r, row),
-            CardMask::Values { cols, values, .. } => {
-                crate::sen_convert::f32_to_sen_slice(&values[r * cols..(r + 1) * cols], row)
-            }
-        }
-    }
+    crate::forward_tape::stick_scatter(rows, width, mask)
 }
 
 /// The single-sequence mask stack's `[walk · rows, page_slots]` shape — the one statement the host
@@ -648,7 +557,7 @@ pub struct CardSources {
     /// window at its own window tid; every other step stages exactly one. A single `(tid, values)`
     /// pair would be a second `mask` field the packed path grows around, so the list is the one
     /// spelling and a one-mask step is a one-entry list.
-    pub masks: Vec<(u32, CardMask)>,
+    pub masks: Vec<(u32, Vec<f32>)>,
     pub int32: Vec<(u32, Vec<u8>)>,
 }
 
@@ -745,15 +654,16 @@ pub fn card_step_sources(
         // THE PAGE INDEX TABLE — request `r`'s page ids one block per trip; an empty window's
         // rows stay zero.
         let mut table = vec![0u8; walk * trip];
+        // THE MASK STACK — request `r`'s stack, or the fully-masked tile of an empty window.
+        let mut mask = vec![MASKED; walk * w * slots];
         if let Some(req) = reqs.get(r) {
             for (i, &page) in req.blocks.iter().take(walk).enumerate() {
                 let at = i * trip;
                 table[at..at + 4].copy_from_slice(&(page as i32).to_le_bytes());
             }
+            let scattered = card_mask(&mask_stack_of(step, w, &req.rows), &[walk * w, slots]);
+            mask[..scattered.len()].copy_from_slice(&scattered);
         }
-        // THE MASK STACK — request `r`'s stack, or the fully-masked tile of an empty window: its law,
-        // which each card writes in its own fp16 (`CardTable`).
-        let mask = CardMask::Causal(CausalStack::of(step, w, reqs.get(r).map(|req| req.rows)));
         // THE QUERY ROW INDEX — window `r`'s consecutive rows, live or empty.
         let query = QueryRowIndex::of_request(step, r as u32).words();
         int32.push((tid(1), table));
@@ -811,13 +721,9 @@ pub fn card_batch_sources(
             }
         })
         .collect();
-    let (mask_tid, values, shape) = logical.mask;
-    let (rows, cols) = match shape.split_last() {
-        Some((&w, lead)) => (lead.iter().product(), w),
-        None => (0, 0),
-    };
+    let (mask_tid, mask, shape) = logical.mask;
     Ok(CardSources {
-        masks: vec![(mask_tid, CardMask::Values { rows, cols, values })],
+        masks: vec![(mask_tid, card_mask(&mask, &shape))],
         int32,
     })
 }
@@ -933,7 +839,6 @@ pub fn pool_of_rows(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::forward_tape::CardTable;
 
     fn nz(n: usize) -> std::num::NonZeroUsize {
         std::num::NonZeroUsize::new(n).unwrap()
@@ -1399,9 +1304,7 @@ mod tests {
             write_rows(&s, &blocks, &rows).unwrap()
         );
         assert_eq!(ints(card.words(s.query_rows).unwrap()), query_rows(&s));
-        assert_eq!(card.masks.len(), 1);
-        assert_eq!(card.masks[0].0, s.mask);
-        assert_eq!(card.masks[0].1.card_values(), mask_stack(&s, &rows));
+        assert_eq!(card.masks, vec![(s.mask, mask_stack(&s, &rows))]);
         assert!(
             card.words(s.kv_row_pool).is_none() && card.words(s.int32_zero).is_none(),
             "the pool's statics are staged at load, never per step"
@@ -1434,7 +1337,7 @@ mod tests {
         )
         .unwrap();
         let (n, w) = ((s.walk * s.rows) as usize, s.page_slots as usize);
-        let mask = card.masks[0].1.card_values();
+        let mask = &card.masks[0].1;
         assert_eq!(mask.len(), logical.len());
         for r in 0..n {
             for c in 0..w {
@@ -1445,7 +1348,7 @@ mod tests {
                 );
             }
         }
-        assert_ne!(mask, logical, "two sticks a row: not the row-major bytes");
+        assert_ne!(mask, &logical, "two sticks a row: not the row-major bytes");
         let b = PagedStep {
             page_slots: 128,
             ..batch()
@@ -1455,9 +1358,7 @@ mod tests {
             pos: 133,
         }];
         let (_, want, shape) = batch_sources(&b, &seqs).unwrap().mask;
-        let got = card_batch_sources(&b, &seqs).unwrap().masks[0]
-            .1
-            .card_values();
+        let got = &card_batch_sources(&b, &seqs).unwrap().masks[0].1;
         let n = shape[0];
         for r in 0..n {
             for c in 0..w {
@@ -1507,52 +1408,7 @@ mod tests {
             let (_, w, _) = logical.int32.iter().find(|(x, ..)| *x == t).unwrap();
             assert_eq!(card.words(t).unwrap(), w.as_slice());
         }
-        assert_eq!(card.masks[0].1.card_values(), logical.mask.1);
-    }
-
-    /// ⭐ THE CARD'S MASK BYTES ARE THE VALUES' NARROWING, BYTE FOR BYTE — each card fills its mask
-    /// from the table's law ([`crate::forward_tape::fill_card`]), and those SEN169 bytes are exactly
-    /// what narrowing the card-layout values would write (`f32_to_sen_bytes`, the bind's own
-    /// narrowing): a prompt window's causal stack at one and at two sticks a row, an empty window's,
-    /// and a decode batch's values.
-    #[test]
-    fn a_card_mask_fills_the_bytes_its_values_narrow_to() {
-        let bytes_of = |m: &CardMask| {
-            let mut got = vec![0u8; 2 * crate::forward_tape::card_elems(m.layout())];
-            crate::forward_tape::fill_card(m, &mut got);
-            let v = m.card_values();
-            let mut want = vec![0u8; 2 * v.len()];
-            crate::sen_convert::f32_to_sen_bytes(&v, &mut want);
-            (got, want)
-        };
-        for slots in [4u32, 128] {
-            let s = PagedStep {
-                page_slots: slots,
-                ..step()
-            };
-            let rows = StepRows {
-                start: 5,
-                real: nz(2),
-            };
-            for m in [
-                CardMask::Causal(CausalStack::of(&s, s.rows as usize, Some(rows))),
-                CardMask::Causal(CausalStack::of(&s, s.rows as usize, None)),
-            ] {
-                let (got, want) = bytes_of(&m);
-                assert_eq!(got, want, "{slots} slots: {m:?}");
-            }
-        }
-        let b = PagedStep {
-            page_slots: 128,
-            ..batch()
-        };
-        let seqs = [BatchSeq {
-            blocks: &[2, 3],
-            pos: 133,
-        }];
-        let m = &card_batch_sources(&b, &seqs).unwrap().masks[0].1;
-        let (got, want) = bytes_of(m);
-        assert_eq!(got, want, "a decode batch's chunk masks");
+        assert_eq!(card.masks[0].1, logical.mask.1);
     }
 
     /// The pool's statics: page `p`'s `nkvh` folded-cache rows in the first words of its run, and
@@ -1612,8 +1468,7 @@ mod tests {
             };
             for (mask_tid, mask) in &card.masks {
                 assert!(
-                    crate::forward_tape::card_elems(mask.layout()) as u64 * 2
-                        <= size(*mask_tid, crate::wiring::CardSeat::Step),
+                    mask.len() as u64 * 2 <= size(*mask_tid, crate::wiring::CardSeat::Step),
                     "t{mask_tid}"
                 );
             }
@@ -1783,7 +1638,7 @@ mod tests {
                 .masks
                 .iter()
                 .find(|(t, _)| *t == wtid(r, 2))
-                .map(|(_, m)| m.card_values())
+                .map(|(_, m)| m.clone())
                 .unwrap();
             assert_eq!(got.len(), 4 * 3 * slots, "window {r}'s stack");
             assert_eq!(&got[..], &want[..], "request {r}");
@@ -1841,10 +1696,7 @@ mod tests {
             assert!(words.len() as u64 <= size(*tid), "t{tid}");
         }
         for (tid, mask) in &card.masks {
-            assert!(
-                crate::forward_tape::card_elems(mask.layout()) as u64 * 2 <= size(*tid),
-                "t{tid}"
-            );
+            assert!(mask.len() as u64 * 2 <= size(*tid), "t{tid}");
         }
     }
 
@@ -1886,7 +1738,7 @@ mod tests {
             .masks
             .iter()
             .find(|(t, _)| *t == wtid(1, 2))
-            .map(|(_, m)| m.card_values())
+            .map(|(_, m)| m.clone())
             .unwrap();
         assert_eq!(empty_mask.len(), 4 * 3 * 4);
         assert!(
@@ -1923,8 +1775,7 @@ mod tests {
             "the live window's page table is the one-request law's"
         );
         assert_eq!(
-            card.masks[0].1.card_values(),
-            solo.masks[0].1.card_values(),
+            &card.masks[0].1, &solo.masks[0].1,
             "the live window's mask is the one-request law's"
         );
         assert_eq!(
