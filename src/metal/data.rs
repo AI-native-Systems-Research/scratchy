@@ -680,6 +680,11 @@ pub struct TaskCell {
     pub task_prefill_joules: Option<Vec<Option<f64>>>,
     #[serde(default)]
     pub task_decode_joules: Option<Vec<Option<f64>>>,
+    /// Each request's tokens after its first: what its TPOT divides its decode time by (`bench
+    /// serve`'s `task_decode`), so its decode joules read per token over the same tokens. None where
+    /// it timed no decode, and for a cell from before it was recorded.
+    #[serde(default)]
+    pub decode_tokens: Option<Vec<Option<u64>>>,
     #[serde(default)]
     pub tpots_ms: Option<Vec<Option<f64>>>,
     /// When the run this cell was borrowed from was made: a quick run's rival numbers, from the
@@ -803,6 +808,7 @@ impl TaskCell {
             task_joules: cut(&self.task_joules, n),
             task_prefill_joules: cut(&self.task_prefill_joules, n),
             task_decode_joules: cut(&self.task_decode_joules, n),
+            decode_tokens: cut(&self.decode_tokens, n),
             ..self.clone()
         })
     }

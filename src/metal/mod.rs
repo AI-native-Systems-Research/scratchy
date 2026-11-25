@@ -3337,20 +3337,21 @@ mod tests {
         assert!(html.contains("×0.90 vs oMLX"), "cut off, and still scored");
     }
 
-    /// The decode square pairs TPOT with each request's DECODE joules, and the prefill square TTFT
-    /// with its PREFILL joules: an engine that burns its energy at prefill does not look
-    /// inefficient at decode. Without phase joules (a run from before they were measured), those
-    /// squares say so.
+    /// The decode square is one decoded token's energy-delay product: TPOT × each request's DECODE
+    /// joules per decoded token, so neither the prefill's energy nor the answer's length moves it.
+    /// The prefill square pairs TTFT with PREFILL joules. Without phase joules (a run from before
+    /// they were measured), those squares say so.
     #[test]
-    fn a_decode_square_pairs_tpot_with_decode_joules_only() {
-        // scratchy decodes at 10 ms a token on 1 J of decode, oMLX at 20 ms on 2 J: TPOT × decode
-        // J 10 against 40, x4.00. Its prefill burns 50 J against oMLX's 5: with whole-request
-        // joules the decode square would read 10×51 against 20×7, x0.27.
+    fn a_decode_square_is_one_decoded_tokens_energy_delay_product() {
+        // scratchy decodes at 10 ms a token, 1 J over 20 tokens; oMLX at 20 ms, 2 J over 10:
+        // 10 × 0.05 against 20 × 0.2, x8.00. Per request instead of per token it would read 10
+        // against 40, x4.00 (the longer answer penalized); with the whole request's joules (a 50 J
+        // prefill against 5 J) 10×51 against 20×7, x0.27.
         let shape = |runs: &mut [Run], phases: bool| {
             let m = &mut runs[0].models[0];
-            for (cells, tpot, prefill, decode) in [
-                (m.tasks.as_mut(), 10.0, 50.0, 1.0),
-                (m.tasks_omlx.as_mut(), 20.0, 5.0, 2.0),
+            for (cells, tpot, prefill, decode, tokens) in [
+                (m.tasks.as_mut(), 10.0, 50.0, 1.0, 20),
+                (m.tasks_omlx.as_mut(), 20.0, 5.0, 2.0, 10),
             ] {
                 for c in cells.into_iter().flatten().filter(|c| c.workload == "rag") {
                     scored(c);
@@ -3360,6 +3361,7 @@ mod tests {
                     c.task_joules = Some(vec![Some(prefill + decode); n]);
                     c.task_prefill_joules = phases.then(|| vec![Some(prefill); n]);
                     c.task_decode_joules = phases.then(|| vec![Some(decode); n]);
+                    c.decode_tokens = phases.then(|| vec![Some(tokens); n]);
                 }
             }
             let machines = super::index(runs);
@@ -3371,12 +3373,16 @@ mod tests {
             .find("id=\"rag-summary-performance-efficiency-scale\"")
             .expect("the Performance-Efficiency map")];
         assert!(
-            pe.contains("×4.00 vs oMLX"),
-            "TPOT × decode joules, 10 against 40"
+            pe.contains("×8.00 vs oMLX"),
+            "TPOT × decode joules a token, 0.5 against 4"
+        );
+        assert!(
+            !pe.contains("×4.00 vs oMLX"),
+            "not per request: the answer's length is out"
         );
         assert!(
             !pe.contains("×0.27 vs oMLX"),
-            "not TPOT × the whole request's joules"
+            "not the whole request's joules"
         );
         let html = shape(&mut runs, false);
         assert!(

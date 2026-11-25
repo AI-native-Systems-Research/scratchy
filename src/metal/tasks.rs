@@ -775,6 +775,7 @@ mod tests {
             task_joules: None,
             task_prefill_joules: None,
             task_decode_joules: None,
+            decode_tokens: None,
             borrowed_from: None,
             energy: None,
             spec_decode: None,

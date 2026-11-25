@@ -79,13 +79,13 @@ pub fn time_joules_per_right_in(
     timing: RequestTiming,
     at: usize,
 ) -> Option<f64> {
-    let (prompts, joules, right, times) = (
+    let energy = joules(c, timing)?;
+    let (prompts, right, times) = (
         c.prompt_tokens.as_deref()?,
-        joules(c, timing)?,
         c.task_right.as_deref()?,
         values(c, timing)?,
     );
-    let costs: Vec<f64> = (prompts.iter().zip(joules).zip(right).zip(times))
+    let costs: Vec<f64> = (prompts.iter().zip(&energy).zip(right).zip(times))
         .filter(|(((p, _), r), _)| p.is_some_and(|p| bucket(buckets, p) == at) && **r == Some(true))
         .filter_map(|(((_, j), _), t)| Some((*t)? * (*j)?))
         .collect();
@@ -111,14 +111,25 @@ fn values(c: &TaskCell, timing: RequestTiming) -> Option<&[Option<f64>]> {
     }
 }
 
-/// The energy each request spent over the span `timing` times, in the order sent: its prefill
-/// joules for TTFT (up to its first token), its decode joules for TPOT (after it), its whole
-/// joules for end-to-end. The one pairing of a time with its energy every figure reads.
-pub fn joules(c: &TaskCell, timing: RequestTiming) -> Option<&[Option<f64>]> {
+/// Each request's energy in the unit `timing` times it in, in the order sent: its prefill joules
+/// for TTFT (up to its first token), its decode joules per decoded token for TPOT (TPOT is a time
+/// per token, so its energy is per token too, over the same `decode_tokens`), its whole joules
+/// for end-to-end. The one pairing of a time with its energy every figure reads.
+pub fn joules(c: &TaskCell, timing: RequestTiming) -> Option<Vec<Option<f64>>> {
     match timing {
-        RequestTiming::Ttft => c.task_prefill_joules.as_deref(),
-        RequestTiming::Tpot => c.task_decode_joules.as_deref(),
-        RequestTiming::E2el => c.task_joules.as_deref(),
+        RequestTiming::Ttft => c.task_prefill_joules.clone(),
+        RequestTiming::Tpot => {
+            let (j, n) = (
+                c.task_decode_joules.as_deref()?,
+                c.decode_tokens.as_deref()?,
+            );
+            Some(
+                (j.iter().zip(n))
+                    .map(|(j, n)| Some((*j)? / (*n).filter(|&n| n > 0)? as f64))
+                    .collect(),
+            )
+        }
+        RequestTiming::E2el => c.task_joules.clone(),
     }
 }
 
