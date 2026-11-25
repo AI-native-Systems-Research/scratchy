@@ -1248,9 +1248,12 @@ impl SimpleBlockTracker {
     }
 
     /// ⭐ GROW BEFORE EVICTING — the next pop would evict a cached block: map a granule instead
-    /// while the budget has room for one, or while a snapshot unit is older than that block (one
-    /// LRU over both kinds of cached state). A cached block is evicted only when it is the oldest
-    /// thing there is to give up.
+    /// while the headroom has room for one. Past it, KV evicts its own oldest cached block: to
+    /// grow its CACHE it never takes a snapshot's memory. That trade (one LRU over both kinds)
+    /// crossed kinds on about every other eviction of a cache that turns over, each crossing an
+    /// unmap that can stall the server for seconds. Live KV still does, when no cached block can
+    /// give it a block ([`Self::make_room_for_kv`]), so the context a server can serve is the
+    /// whole budget's, as before.
     fn grow_before_evicting(&mut self) {
         let front = loop {
             match self.free_queue.front() {
@@ -1270,29 +1273,8 @@ impl SimpleBlockTracker {
         let Some(g) = rec.memory.unmapped_granules().next() else {
             return;
         };
-        let need = rec.memory.granule_bytes(g);
-        if rec.memory.headroom() < need {
-            let Some(front) = front else {
-                return;
-            };
-            let age = rec.block_age[front];
-            // Only if the units older than the block free enough: releasing one for nothing
-            // would throw a snapshot away and evict the block all the same.
-            let mut older: Vec<(usize, u64)> = (rec.memory.mapped_units())
-                .filter_map(|u| rec.snapshots.age_of(rec.memory.slots_of(u)).map(|a| (u, a)))
-                .filter(|&(_, a)| a < age)
-                .collect();
-            older.sort_by_key(|&(u, a)| (a, u));
-            let reach = older.len() as u64 * rec.memory.unit_bytes() + rec.memory.headroom();
-            if reach < need {
-                return;
-            }
-            for (u, _) in older {
-                if rec.memory.headroom() >= need {
-                    break;
-                }
-                rec.release_unit(u);
-            }
+        if rec.memory.headroom() < rec.memory.granule_bytes(g) {
+            return;
         }
         self.map_granule(g);
     }
@@ -8472,9 +8454,11 @@ mod tests {
         );
     }
 
+    /// KV grows its cache only out of the headroom: past it, a fresh allocation evicts KV's own
+    /// cached blocks, whatever a snapshot's age — an older snapshot stays, and no memory moves.
     #[test]
-    fn a_cached_block_outlives_an_older_snapshot_and_gives_way_to_a_newer_one() {
-        // The snapshot is older than a's cached blocks: c's granule comes out of the snapshot.
+    fn kv_evicts_its_own_cached_blocks_rather_than_take_an_older_snapshots_memory() {
+        // The snapshot is older than a's cached blocks: c still evicts a's, and the snapshot stays.
         let mut t = shared();
         assert_eq!(t.reserve_snapshot(9, 16, "w"), Some(0));
         t.new_step_starts();
@@ -8484,18 +8468,12 @@ mod tests {
         t.new_step_starts();
         assert_eq!(
             alloc(&mut t, &prompt_blocks("c", 4, 2)),
-            Some(vec![4, 5, 6, 7])
+            Some(vec![3, 2, 1, 0]),
+            "a's blocks, tail first"
         );
-        let ops = t.take_shared_memory_ops();
-        assert_eq!(
-            (ops.release_snapshots, ops.map_kv),
-            (vec![SnapshotUnit(0)], vec![KvGranule(1)])
-        );
-        assert_eq!(
-            KVCacheManagerOps::num_cached_blocks(&t),
-            4,
-            "a's blocks stay cached"
-        );
+        assert!(t.take_shared_memory_ops().is_empty(), "no memory moved");
+        assert_eq!(KVCacheManagerOps::num_cached_blocks(&t), 0);
+        assert!(holds_snapshot(&t, 9), "the older snapshot stays");
 
         // The snapshot is newer: c evicts a's cached blocks and the snapshot stays.
         let mut t = shared();
