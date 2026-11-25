@@ -41,9 +41,9 @@ use scratchy_subtile::lower::{
     AffineInt4, ArchOp, ExpertQuant, GemmWeight, InputRef, LoweringInput, OpDesc,
 };
 use scratchy_subtile::subtile_ir::{
-    AttnLayout, AttnMask, DraftConvStage, EwKind, ExpertBody, ExpertBundle, ExpertProj, GainConvention,
-    GatedAct, NumExperts, RopeFormTag, RouterBundle, RowScale, SharedExpertBound, SourceShape,
-    SubOp, TopK,
+    AttnLayout, AttnMask, DraftConvStage, EwKind, ExpertBody, ExpertBundle, ExpertProj,
+    GainConvention, GatedAct, NumExperts, RopeFormTag, RouterBundle, RowScale, SharedExpertBound,
+    SourceShape, SubOp, TopK,
 };
 
 use crate::classified::{ExternKind, OpKind, UnrollIndex};
@@ -1345,12 +1345,13 @@ pub fn lower_decode_to_wavefront(
                 // The query and its target's resident cache alone — one segment, by the one
                 // assembly.
                 let (operands, attn_inputs) =
-                    AttnLayout::assemble(q, [(InputRef::Ext(pk), InputRef::Ext(pv))], None)
-                        .ok_or(BridgeError::MalformedOp {
+                    AttnLayout::assemble(q, [(InputRef::Ext(pk), InputRef::Ext(pv))], None).ok_or(
+                        BridgeError::MalformedOp {
                             tile,
                             op: node.op,
                             detail: "the shared attention's operands are no attention layout",
-                        })?;
+                        },
+                    )?;
                 let idx = bx.push_op(
                     SubOp::attn_decode(attention, bx.prefix_len, mask, operands),
                     attn_inputs,

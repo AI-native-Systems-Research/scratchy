@@ -1818,7 +1818,10 @@ impl Recording<'_> {
         let q = self.colour(self.step_arg(rotate, 0)?)?;
         // The writer's K and V, by its own layout.
         let w = scratchy_subtile::subtile_ir::KvWriterLayout::ROPE_APPEND;
-        let (k_op, v_op) = (self.step_arg(i, w.k() as u8)?, self.step_arg(i, w.v() as u8)?);
+        let (k_op, v_op) = (
+            self.step_arg(i, w.k() as u8)?,
+            self.step_arg(i, w.v() as u8)?,
+        );
         let (k, v) = (self.colour(k_op)?, self.colour(v_op)?);
         let (k_off, k_linear) = self.kv_offset(i, k_op, layer)?;
         let (v_off, v_linear) = self.kv_offset(i, v_op, layer)?;

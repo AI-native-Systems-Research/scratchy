@@ -235,7 +235,17 @@ mod tests {
     /// round trip is idempotent (a stored row re-encoded is the same byte).
     #[test]
     fn the_saturating_store_stays_finite_and_settles() {
-        for v in [0.0, 1.0, 447.99, 448.0, 463.99, 464.0, 1e9, f32::INFINITY, -1e9] {
+        for v in [
+            0.0,
+            1.0,
+            447.99,
+            448.0,
+            463.99,
+            464.0,
+            1e9,
+            f32::INFINITY,
+            -1e9,
+        ] {
             let b = super::e4m3_saturating_encode(v);
             assert!(!super::e4m3_to_f32(b).is_nan(), "v = {v:e} -> {b:#04x}");
             assert_eq!(super::e4m3_saturating_encode(super::e4m3_to_f32(b)), b);

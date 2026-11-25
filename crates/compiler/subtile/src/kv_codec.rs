@@ -1000,7 +1000,8 @@ mod tests {
         assert_eq!(ins(8), [Op(6), Op(7), writer.inputs[4], writer.inputs[5]]);
         assert_eq!(ins(9)[3], Op(8), "the attention reads the writer");
         assert_eq!(
-            ins(9)[4], Op(7),
+            ins(9)[4],
+            Op(7),
             "the attention's new V reads the V quantize the writer stored"
         );
         assert!(
@@ -1057,7 +1058,8 @@ mod tests {
         assert_eq!(ins(7), [Op(5), Op(6), Ext(7), Ext(8)]);
         assert_eq!(ins(8)[3], Op(7));
         assert_eq!(
-            ins(8)[4], Op(6),
+            ins(8)[4],
+            Op(6),
             "the attention's new V reads the V quantize the writer stored"
         );
     }

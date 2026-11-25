@@ -4133,7 +4133,9 @@ pub fn eval_node<F: RopeForm>(
         }
         // KvAppend writes K as projected: the identity on K; its V input +
         // the paged-cache write are GPU-only.
-        SubOp::KvAppend { .. } => gather(&node.inputs[KvWriterLayout::KV_APPEND.k()], graph, bufs).0,
+        SubOp::KvAppend { .. } => {
+            gather(&node.inputs[KvWriterLayout::KV_APPEND.k()], graph, bufs).0
+        }
         // RopeAppend's host eval is rotation only (identical to RopeRotate);
         // its V input + the paged-cache write are GPU-only.
         SubOp::RopeRotate { head_dim, .. } => rope_eval(node, graph, bufs, head_dim.get()),
