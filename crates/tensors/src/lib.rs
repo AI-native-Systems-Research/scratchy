@@ -15,6 +15,7 @@ pub mod device_allocator;
 pub mod dtype;
 pub mod lowering_dtype;
 pub mod owned_tensor;
+pub mod paged_kv_layout;
 pub mod positive;
 pub mod raw_mem;
 pub mod rotary_facts;
