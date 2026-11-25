@@ -1064,9 +1064,10 @@ fn summary_map(
                 if ours.energy.is_none() || theirs.energy.is_none() {
                     return Err("no energy on one side".into());
                 }
-                // Each request's own time times its own joules, summed, over the right answers
-                // ([`buckets::time_joules_per_right_in`]): one request's numbers in every product.
-                // A run that kept no joules a request has none to multiply, so no square.
+                // What a right answer typically cost: the median, over the correctly answered
+                // requests, of each one's own time times its own joules
+                // ([`buckets::time_joules_per_right_in`]). A run that kept no joules a request has
+                // none to multiply, so no square.
                 if ours.task_joules.is_none() || theirs.task_joules.is_none() {
                     return Err("a side kept no joules a request".into());
                 }

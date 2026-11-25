@@ -66,13 +66,12 @@ pub fn bucketed(c: &TaskCell) -> bool {
         .is_some_and(|p| p.iter().any(Option::is_some))
 }
 
-/// A cell's time × joules a correct answer in bucket `at` of `buckets`, for `timing`: each
-/// request's own time times its own joules (integrated over its own send-to-last-token window,
-/// `cell_energy.per_request`), summed over the bucket's requests that have both, over how many of
-/// those were right. Each product is one request's — never a median of times times a mean of
-/// energy. A request missing either (a failed one; a one-token answer, which has no TPOT) is in
-/// neither the sum nor the count. None where the cell kept no joules a request, no prompt counts
-/// or no scores, or none counted was right.
+/// What a right answer typically cost in bucket `at` of `buckets`, for `timing`: the median, over
+/// the bucket's correctly answered requests, of each one's own time times its own joules
+/// (integrated over its own send-to-last-token window, `cell_energy.per_request`). Every number is
+/// one request's: no sum, no count of right answers divided into a total. A request missing its
+/// time or its joules (a one-token answer has no TPOT) is not counted. None where the cell kept no
+/// joules a request, no prompt counts or no scores, or no request there was right.
 pub fn time_joules_per_right_in(
     c: &TaskCell,
     buckets: Buckets,
@@ -85,13 +84,11 @@ pub fn time_joules_per_right_in(
         c.task_right.as_deref()?,
         values(c, timing)?,
     );
-    let (spent, rights) = (prompts.iter().zip(joules).zip(right).zip(times))
-        .filter(|(((p, _), _), _)| p.is_some_and(|p| bucket(buckets, p) == at))
-        .filter_map(|(((_, j), r), t)| Some(((*t)? * (*j)?, *r == Some(true))))
-        .fold((0.0, 0u32), |(spent, rights), (tj, right)| {
-            (spent + tj, rights + u32::from(right))
-        });
-    (rights > 0).then(|| spent / f64::from(rights))
+    let costs: Vec<f64> = (prompts.iter().zip(joules).zip(right).zip(times))
+        .filter(|(((p, _), r), _)| p.is_some_and(|p| bucket(buckets, p) == at) && **r == Some(true))
+        .filter_map(|(((_, j), _), t)| Some((*t)? * (*j)?))
+        .collect();
+    median(costs)
 }
 
 /// How many of a cell's requests in bucket `at` of `buckets` were right: what its joules a
@@ -117,26 +114,25 @@ fn values(c: &TaskCell, timing: RequestTiming) -> Option<&[Option<f64>]> {
 mod tests {
     use super::*;
 
-    /// A bucket's time × joules a correct answer: each request's own time times its own joules,
-    /// summed, over how many of those requests were right — a wrong one's product counted too; a
-    /// request missing its time or its joules in neither; none where none counted was right, or the
-    /// cell kept no joules a request.
+    /// What a right answer typically cost in a bucket: the median, over its correctly answered
+    /// requests, of each one's own time times its own joules — a wrong answer's not counted, nor a
+    /// right one missing its time; none where none was right, or the cell kept no joules a request.
     #[test]
-    fn a_buckets_time_joules_per_correct_answer_multiplies_each_request_first() {
+    fn a_buckets_cost_of_a_right_answer_is_the_median_of_each_ones_own_product() {
         let mut c: TaskCell = serde_json::from_value(serde_json::json!({
             "workload": "rag", "conc": 2,
-            "prompt_tokens": [2000, 2000, 2000, 2000, 3000],
-            "task_right": [true, false, true, true, false],
-            "task_joules": [4.0, 6.0, 2.0, 5.0, 3.0],
-            "e2els_ms": [100.0, 300.0, 1000.0, null, 200.0],
+            "prompt_tokens": [2000, 2000, 2000, 2000, 2000, 3000],
+            "task_right": [true, false, true, true, true, false],
+            "task_joules": [4.0, 6.0, 2.0, 5.0, 1.0, 3.0],
+            "e2els_ms": [100.0, 300.0, 1000.0, null, 5000.0, 200.0],
         }))
         .unwrap();
-        // 4×100 + 6×300 + 2×1000 = 4,200 over the 2 right of the three counted. (The median
-        // time times the joules a right answer would give 300 × 17/3 = 1,700.)
+        // The right answers with a time: 4×100, 2×1000, 1×5000 — the median is 2,000. The wrong
+        // one's 6×300 and the untimed right one are not counted.
         assert_eq!(
             time_joules_per_right_in(&c, MUSIQUE, RequestTiming::E2el, 0),
-            Some(2100.0),
-            "each request's own product"
+            Some(2000.0),
+            "each right answer's own product, the median of them"
         );
         assert_eq!(
             time_joules_per_right_in(&c, MUSIQUE, RequestTiming::E2el, 3),
