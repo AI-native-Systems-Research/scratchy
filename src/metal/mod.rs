@@ -3249,7 +3249,7 @@ mod tests {
         assert!(!html.contains("vs oMLX</strong>"), "no square has a ratio");
     }
 
-    /// The summary map's 2u and 4u rows are E2E × J/right: in a bucket, the median end-to-end
+    /// The summary map's 2u and 4u rows are E2E × J: in a bucket, the median end-to-end
     /// time of its requests times the joules they took over how many were right, scratchy against
     /// its rival. A cell whose answers were forced was not scored, so has none; a run that kept
     /// no joules a request reads each cell's whole, and says so.
@@ -3287,7 +3287,7 @@ mod tests {
         };
         let mut runs = fixtures(&[REQUESTS_FIXTURE]);
         let html = shape(&mut runs, false, true);
-        assert!(html.contains("E2E × J/right"));
+        assert!(html.contains("E2E × J"));
         // The Raw Performance map beside it: the same squares, the time alone, 1000 ms against 500, x0.50.
         assert!(
             html.contains("End-to-end Latency · "),
@@ -3310,7 +3310,7 @@ mod tests {
         let html = shape(&mut runs, true, true);
         assert!(html.contains("answers forced to a length, so not scored"));
         // No joules a request: nothing to multiply each request's time by, so no
-        // Performance-Efficiency square, and it says so (the Raw Performance map still compares
+        // Energy-Delay Product square, and it says so (the Raw Performance map still compares
         // the times).
         let html = shape(&mut runs, false, false);
         assert!(html.contains("a side kept no joules a request"));
@@ -3370,8 +3370,8 @@ mod tests {
         let mut runs = fixtures(&[REQUESTS_FIXTURE]);
         let html = shape(&mut runs, true);
         let pe = &html[..html
-            .find("id=\"rag-summary-performance-efficiency-scale\"")
-            .expect("the Performance-Efficiency map")];
+            .find("id=\"rag-summary-energy-delay-product-scale\"")
+            .expect("the Energy-Delay Product map")];
         assert!(
             pe.contains("×8.00 vs oMLX"),
             "TPOT × decode joules a token, 0.5 against 4"
@@ -3451,7 +3451,7 @@ mod tests {
         let machines = super::index(&runs);
         let html = render(super::datasets::section("rag", &machines, &machines));
         let map = &html[..html
-            .find("id=\"rag-summary-performance-efficiency-scale\"")
+            .find("id=\"rag-summary-energy-delay-product-scale\"")
             .expect("the summary map")];
         assert!(map.contains(">Sliding window<"), "the class, as a column");
         assert!(!map.contains(">granite-4.2-3b<"), "not a column of its own");
@@ -3486,9 +3486,9 @@ mod tests {
         }
         let machines = super::index(&runs);
         let html = render(super::datasets::section("rag", &machines, &machines));
-        // The summary's first map, Performance-Efficiency: one model's squares, 4 rows by 4 buckets.
+        // The summary's first map, Energy-Delay Product: one model's squares, 4 rows by 4 buckets.
         let map = &html[..html
-            .find("id=\"rag-summary-performance-efficiency-scale\"")
+            .find("id=\"rag-summary-energy-delay-product-scale\"")
             .expect("the summary map")];
         assert_eq!(
             map.matches("width: 2.25rem; height: 2.25rem").count(),
@@ -4198,8 +4198,8 @@ mod tests {
         }
         let machines = super::index(&runs);
         let html = render(super::datasets::section("rag", &machines, &machines));
-        // A map a scale, Performance-Efficiency and Raw Performance, a tab each, each its own ratio scale.
-        for scale in ["performance-efficiency", "raw-performance"] {
+        // A map a scale, Energy-Delay Product and Raw Performance, a tab each, each its own ratio scale.
+        for scale in ["energy-delay-product", "raw-performance"] {
             assert!(
                 html.contains(&format!("id=\"rag-summary-{scale}-scale\"")),
                 "its own ratio scale: {scale}"

@@ -334,7 +334,7 @@ fn dataset_summary(
                     for scale in Scale::ALL {
                         ContentPanel { id: format!("{id}-summary-{}", slug(scale.title())), shown: scale == Scale::ALL[0],
                             Stack { gap: 4,
-                                p { style: "contain: inline-size", "{scale.legend()}" }
+                                {scale.legend()}
                                 {summary_map(dataset, id, ran, machines, &summary_columns, scale)}
                             }
                         }
@@ -1050,7 +1050,7 @@ fn summary_map(
         }
         let r = match scale {
             Scale::Performance => tasks::times(ta, tt, true).ok_or("no time on one side")?,
-            Scale::PerformanceEfficiency => {
+            Scale::EnergyDelay => {
                 if ours.timed_answers || theirs.timed_answers {
                     return Err("answers forced to a length, so not scored".into());
                 }
@@ -1117,7 +1117,7 @@ fn summary_map(
                         };
                         let joules = match scale {
                             Scale::Performance => String::new(),
-                            Scale::PerformanceEfficiency => {
+                            Scale::EnergyDelay => {
                                 let n = |c: Option<&&TaskCell>| {
                                     c.map_or(0, |c| buckets::rights_in(c, bs, b))
                                 };
@@ -1243,39 +1243,62 @@ struct Row {
 #[derive(Clone, Copy, PartialEq)]
 struct Measure(RequestTiming);
 
-/// How a summary map compares its rows' times: each times the joules a correct answer took, the
-/// one normalization every row shares (Performance-Efficiency, the first tab), or alone (Raw
+/// How a summary map compares its rows' times: each request's energy-delay product, its time times
+/// its energy over that time (Energy-Delay Product, the first tab), or the time alone (Raw
 /// Performance). Smaller is better on both.
 #[derive(Clone, Copy, PartialEq)]
 enum Scale {
-    PerformanceEfficiency,
+    EnergyDelay,
     Performance,
 }
 
+/// Where the energy-delay product is defined: the paper that introduced it, and the one that
+/// carried it to general-purpose processors.
+const EDP_SOURCES: [(&str, &str); 2] = [
+    (
+        "Horowitz, Indermaur and Gonzalez (1994)",
+        "https://doi.org/10.1109/LPE.1994.573184",
+    ),
+    (
+        "Gonzalez and Horowitz (1996)",
+        "https://doi.org/10.1109/4.535411",
+    ),
+];
+
 impl Scale {
     /// The tabs' order: the first is shown.
-    const ALL: [Scale; 2] = [Scale::PerformanceEfficiency, Scale::Performance];
+    const ALL: [Scale; 2] = [Scale::EnergyDelay, Scale::Performance];
 
     /// Its tab label, which also names its panel.
     fn title(self) -> &'static str {
         match self {
-            Scale::PerformanceEfficiency => "Performance-Efficiency",
+            Scale::EnergyDelay => "Energy-Delay Product",
             Scale::Performance => "Raw Performance",
         }
     }
 
-    /// Its tab's legend: what the rows and the squares mean under it.
-    fn legend(self) -> &'static str {
+    /// Its tab's legend: what its squares compare.
+    fn legend(self) -> Element {
         match self {
-            Scale::PerformanceEfficiency => {
-                "This heat map takes into account raw performance, energy consumption, and \
-                 accuracy. It compares scratchy relative to oMLX using that combined metric."
-            }
-            Scale::Performance => {
-                "This heat map takes into account raw performance, measured by Prefill (i.e. TTFT) \
-                 and Decode (i.e. TPOT) for single-user workloads, and by end-to-end latency (E2EL) \
-                 for multi-user workloads (2u, 4u)."
-            }
+            Scale::EnergyDelay => rsx! {
+                p { style: "contain: inline-size",
+                    "The energy-delay product (EDP) is a request's time × the energy it spent over \
+                     that time, so waiting longer and burning more energy both raise it; smaller is \
+                     better ("
+                    a { href: EDP_SOURCES[0].1, "{EDP_SOURCES[0].0}" }
+                    "; "
+                    a { href: EDP_SOURCES[1].1, "{EDP_SOURCES[1].0}" }
+                    "). Each square compares the median EDP of scratchy's correctly answered \
+                     requests against oMLX's."
+                }
+            },
+            Scale::Performance => rsx! {
+                p { style: "contain: inline-size",
+                    "This heat map takes into account raw performance, measured by Prefill (i.e. \
+                     TTFT) and Decode (i.e. TPOT) for single-user workloads, and by end-to-end \
+                     latency (E2EL) for multi-user workloads (2u, 4u)."
+                }
+            },
         }
     }
 
@@ -1285,9 +1308,9 @@ impl Scale {
             (Scale::Performance, RequestTiming::Ttft) => "Prefill",
             (Scale::Performance, RequestTiming::Tpot) => "Decode",
             (Scale::Performance, RequestTiming::E2el) => "End-to-end Latency",
-            (Scale::PerformanceEfficiency, RequestTiming::Ttft) => "TTFT × J/right",
-            (Scale::PerformanceEfficiency, RequestTiming::Tpot) => "TPOT × J/right",
-            (Scale::PerformanceEfficiency, RequestTiming::E2el) => "E2E × J/right",
+            (Scale::EnergyDelay, RequestTiming::Ttft) => "TTFT × prefill J",
+            (Scale::EnergyDelay, RequestTiming::Tpot) => "TPOT × decode J/token",
+            (Scale::EnergyDelay, RequestTiming::E2el) => "E2E × J",
         }
     }
 
@@ -1303,16 +1326,18 @@ impl Scale {
             (Scale::Performance, RequestTiming::E2el) => {
                 "End-to-end time with that many users at once: send to last token."
             }
-            (Scale::PerformanceEfficiency, RequestTiming::Ttft) => {
-                "Time to first token times joules per correct answer, with 1 user. Smaller is better."
+            (Scale::EnergyDelay, RequestTiming::Ttft) => {
+                "The prefill's energy-delay product with 1 user: a right answer's time to first \
+                 token times the joules it spent before it, the median of them. Smaller is better."
             }
-            (Scale::PerformanceEfficiency, RequestTiming::Tpot) => {
-                "Time per output token times joules per correct answer, with 1 user. Smaller is \
+            (Scale::EnergyDelay, RequestTiming::Tpot) => {
+                "One decoded token's energy-delay product with 1 user: a right answer's time per \
+                 output token times its decode joules per token, the median of them. Smaller is \
                  better."
             }
-            (Scale::PerformanceEfficiency, RequestTiming::E2el) => {
-                "End-to-end time (send to last token) times joules per correct answer, with that \
-                 many users at once. Smaller is better."
+            (Scale::EnergyDelay, RequestTiming::E2el) => {
+                "A request's energy-delay product with that many users at once: a right answer's \
+                 send-to-last-token time times its joules, the median of them. Smaller is better."
             }
         }
     }
