@@ -1868,7 +1868,24 @@ fn ran_to_cap(
 /// after the first. None where the whole answer came in one chunk, which has no interval to time:
 /// a short answer a drafting engine sends at once read as 0 ms, which no decode is (#1212).
 fn task_tpot(r: &RequestResult, tokens: usize) -> Option<f64> {
-    (tokens > 1 && r.chunks > 1).then(|| (r.e2el - r.ttft) / (tokens - 1) as f64)
+    task_decode(r, tokens).map(|d| d.tpot)
+}
+
+/// A request's decode, as its TPOT reads it: the tokens after its first, and the time each took.
+/// The one statement of what TPOT divides by, so a per-token figure of the decode (its energy per
+/// token, `decode_tokens` in a task cell) divides by the same tokens.
+struct Decode {
+    tokens: usize,
+    tpot: f64,
+}
+
+/// A request of `tokens` answer tokens' decode: None for an answer of one token, or one that
+/// arrived in one chunk, which time no decode.
+fn task_decode(r: &RequestResult, tokens: usize) -> Option<Decode> {
+    (tokens > 1 && r.chunks > 1).then(|| Decode {
+        tokens: tokens - 1,
+        tpot: (r.e2el - r.ttft) / (tokens - 1) as f64,
+    })
 }
 
 /// An answer's tokens: the server's usage count, or counted from its text where it sent none (a
@@ -2117,12 +2134,22 @@ fn add_task_requests(
             .map(|r| r.prompt_tokens.filter(|_| r.success))
             .collect::<Vec<_>>()
     );
+    // Each request's decode: its TPOT, and the tokens TPOT divides its decode time by, so its
+    // decode energy can be read per token over the same tokens.
+    let decodes: Vec<Option<Decode>> = (results.iter())
+        .map(|r| {
+            let n = answer_tokens(r, count_tokens);
+            r.success.then(|| task_decode(r, n)).flatten()
+        })
+        .collect();
     json["tpots_ms"] = serde_json::json!(
-        (results.iter())
-            .map(|r| {
-                let n = answer_tokens(r, count_tokens);
-                r.success.then(|| task_tpot(r, n)).flatten().map(ms)
-            })
+        (decodes.iter())
+            .map(|d| d.as_ref().map(|d| ms(d.tpot)))
+            .collect::<Vec<_>>()
+    );
+    json["decode_tokens"] = serde_json::json!(
+        (decodes.iter())
+            .map(|d| d.as_ref().map(|d| d.tokens))
             .collect::<Vec<_>>()
     );
 }
@@ -2553,6 +2580,11 @@ mod tests {
         assert_eq!(
             j["tpots_ms"],
             serde_json::json!([100.0, 100.0, null, null, null])
+        );
+        // The tokens each TPOT divides its decode time by: 5 and 3 answer tokens, after the first.
+        assert_eq!(
+            j["decode_tokens"],
+            serde_json::json!([4, 2, null, null, null])
         );
     }
 

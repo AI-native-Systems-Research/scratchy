@@ -131,11 +131,25 @@ nothing is self-reported.
 - **`power`** — whole-run energy, from the workspace's own
   [`scratchy-power-sampler`](../crates/targets/metal/power-sampler) binary: Apple's
   IOReport energy counters (no root, no third-party tool),
-  sampled at 1 Hz from before the first build to after the last server is
-  down, so the number covers everything the run cost — the same window for
-  every engine. Reported per rail (`cpu_j`, `gpu_j`, `ane_j`) and as their
+  sampled at 10 Hz (every 100 ms) from before the first build to after the last
+  server is down, so the number covers everything the run cost — the same window
+  for every engine. Reported per rail (`cpu_j`, `gpu_j`, `ane_j`) and as their
   sum (`soc_j`, `soc_wh`, `soc_avg_w`, `soc_peak_w`): CPU + GPU + ANE, the
-  rails every reader has. DRAM and display are not in it. On macOS 27 it reads
+  rails every reader has. DRAM and display are not in it. 100 ms because a
+  request's prefill and decode each last about a second: a 1 s sample straddles
+  them, and a 10 ms one often reads zero on an idle GPU (one counter step).
+- **`task_joules`, `task_prefill_joules`, `task_decode_joules`** — a task cell's
+  energy request by request (`scripts/cell_energy.py`): each 100 ms sample's
+  joules shared among the requests in flight over it, by the time each was in
+  flight in it. Where no two requests were in flight at once (a 1-user cell),
+  each request's joules also split at its first token into prefill and decode
+  joules: measured, since every joule a sample holds is one request's one phase.
+  Where requests overlap, a step's energy is its whole batch's (one request's
+  prompt tokens beside another's decode tokens), which no counter splits, so
+  there is no phase split, rather than a share by tokens or time.
+- **`decode_tokens`** — each request's tokens after its first: what its TPOT
+  divides its decode time by (`bench serve`'s one `task_decode`), so its decode
+  joules read per token over the same tokens. On macOS 27 it reads
   the CLPC counters (cumulative nJ, per-chip-driver ids), because there the
   "Energy Model" group's `CPU Energy` channel reads 0 under load; on every
   other release it reads the "Energy Model" group's `CPU Energy`, `GPU Energy`
