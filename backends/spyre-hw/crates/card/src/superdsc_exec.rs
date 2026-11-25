@@ -742,6 +742,12 @@ struct RbOpCycles {
     label: String,
 }
 
+/// One launch of [`Timers::rb_seq`]: ((rung length, op index), label).
+type RbLaunch = ((usize, usize), String);
+
+/// One card's [`Timers::rb_seq`]: a launch, or a collective's send or wait (`None`, no op's).
+type RbSeq = Vec<Option<RbLaunch>>;
+
 /// Accumulators the timing modes write into. Process-wide, like the C++ statics.
 #[derive(Default)]
 struct Timers {
@@ -778,12 +784,19 @@ struct Timers {
     /// Cumulative `rb_cbs` at the last periodic report — the count jumps a whole forward at a
     /// time (~162 CBs), so a plain `is_multiple_of` would skip its own thresholds and never fire.
     rb_reported: u64,
-    /// `SCRATCHY_SDSC_RB_TIME`'s launch sequence: one entry per compute launch this forward, in
-    /// launch order — ((rung length, op index), label). Lives here, not on the executor, because
-    /// the launch loop holds `self` immutably across the stream reference. Cleared at the start of
-    /// every `predict` and zipped against the telemetry ring's id-sorted op entries (compute CBs
-    /// minus the DMA crossings) after the step's synchronize; see [`rb_attribute`].
-    rb_seq: Vec<((usize, usize), String)>,
+    /// `SCRATCHY_SDSC_RB_TIME`'s launch sequence: one entry per compute-pipeline CB this forward,
+    /// in launch order — EVERY CB a site stages ([`cb_plan::site_cbs`]), so the entries are the
+    /// CBs the telemetry ring completes. A launch is `Some(((rung length, op index), label))`; a
+    /// collective's send or wait in front of its consume is `None`: it completes as a compute CB
+    /// of its own (no exec), and it is no op's. ONE SEQUENCE PER CARD, keyed by the card's
+    /// telemetry source (`CardRuntime::telemetry_key`, the key its ring drains by): every rank of
+    /// a sharded world launches in this one process, and a single list interleaved all four
+    /// ranks' launches and handed them to whichever rank drained first. Lives here, not on the
+    /// executor, because the launch loop holds `self` immutably across the stream reference.
+    /// Cleared at the start of every `predict` and zipped against the telemetry ring's id-sorted
+    /// op entries (compute CBs minus the DMA crossings) after the step's synchronize; see
+    /// [`rb_attribute`].
+    rb_seq: BTreeMap<usize, RbSeq>,
     forwards: i64,
     // ── #603 PR2 2c — the replay player's own decomposition. Recorded
     // UNCONDITIONALLY (a handful of Instants and counters per STEP, not per
@@ -2127,14 +2140,41 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
     /// `bind_input(f32_to_f16_le(vals))` and the refill's `ieee_to_sen_bytes` produce between them,
     /// without the IEEE-f16 buffer in between or the refill's second convert pass. Re-bound every
     /// step, and the refill sends its range every step, exactly like [`Self::bind_input`]: only
-    /// WHERE the conversion happens moves.
-    ///
-    /// The placement checks the refill makes for a `bound` activation are made here instead, where
-    /// the write happens: a name this bundle never placed is skipped (as the refill skips it), and a
-    /// bind longer than its own placement, or past its segment's shadow, is refused.
+    /// WHERE the conversion happens moves. The write is [`Self::write_activation`]'s.
     pub fn bind_input_f32(&mut self, id: bundle::PlaceId, vals: &[f32]) -> Result<()> {
+        self.write_activation(id, vals.len() as u64 * 2, |dst| {
+            sen_convert::f32_to_sen_bytes(vals, dst)
+        })
+    }
+
+    /// ⭐ Bind a HOST KERNEL'S TABLE IN THE CARD'S OWN FORMAT — the table writes its SEN169 bytes at
+    /// its card layout straight into the activation's own slot of THIS card's shadow
+    /// ([`scratchy_target_spyre::forward_tape::fill_card`]): no f32 buffer, no per-card convert of
+    /// one. The same door as [`Self::bind_input_f32`] — one placement law for both.
+    pub fn bind_input_table(
+        &mut self,
+        id: bundle::PlaceId,
+        table: &dyn scratchy_target_spyre::forward_tape::CardTable,
+    ) -> Result<()> {
+        let elems = scratchy_target_spyre::forward_tape::card_elems(table.layout());
+        self.write_activation(id, elems as u64 * 2, |dst| {
+            scratchy_target_spyre::forward_tape::fill_card(table, dst)
+        })
+    }
+
+    /// THE ONE SHADOW WRITE OF A PER-STEP fp16 ACTIVATION — `len` SEN169 bytes `write` lays at the
+    /// activation's own slot, re-sent by every step's refill. The placement checks the refill makes
+    /// for a `bound` activation are made here, where the write happens: a name this bundle never
+    /// placed is skipped (as the refill skips it), and a bind longer than its own placement, or past
+    /// its segment's shadow, is refused.
+    fn write_activation(
+        &mut self,
+        id: bundle::PlaceId,
+        len: u64,
+        write: impl FnOnce(&mut [u8]),
+    ) -> Result<()> {
         if !self.prepared {
-            bail!("bind_input_f32('{id}') before prepare — the shadow is sized at prepare");
+            bail!("bind '{id}' before prepare — the shadow is sized at prepare");
         }
         // A RESIDENT WEIGHT is never re-sent by a step (the refill skips it), so a per-step bind of
         // one writes nothing — as before, where the refill skipped its `bound` entry.
@@ -2147,7 +2187,6 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
         let Some(seg) = SegIdx::checked(p.segment as i64) else {
             return Ok(());
         };
-        let len = vals.len() as u64 * 2;
         if len > p.size {
             bail!(
                 "bind: activation '{id}' binds {len} B into a {} B placement (seg{} off {}) — \
@@ -2173,7 +2212,7 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
             })?
             .get_mut(off as usize..(off + len) as usize)
             .ok_or_else(|| anyhow!("bind: activation '{id}' overflows seg{}", segi))?;
-        sen_convert::f32_to_sen_bytes(vals, dst);
+        write(dst);
         self.raw_ids.remove(&id);
         self.keyed.remove(&id);
         self.bound.remove(&id);
@@ -3851,19 +3890,28 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
                     }
                 }
 
-                if d.rb_time {
-                    // The launch sequence the post-synchronize drain zips against: entry i is the
-                    // i-th compute CB of this forward in submission order, keyed by (rung length,
-                    // op index) so prefix/body/suffix op numbers cannot average into each other.
-                    // Recorded before the collect branch so a batched rung's ops land here in the
-                    // same submission order its single doorbell emits them in.
-                    timers().rb_seq.push(((ops.len(), oi), op.label()));
-                }
-
                 // ⭐ THIS SITE'S CONTROL BLOCKS — the launch, and in front of a collective's consume
                 // its send and its wait — staged by `cb_plan::site_cbs`, the one function the
                 // replay canvas stages through too.
                 let cbs = cb_plan::site_cbs(op.site_tp(), site.batched_compute())?;
+                if d.rb_time {
+                    // The launch sequence the post-synchronize drain zips against: entry i is the
+                    // i-th compute CB of this forward in submission order — one per CB `cbs`
+                    // stages, so a collective's sends and waits keep the zip 1:1 under TP. A launch
+                    // is keyed by (rung length, op index) so prefix/body/suffix op numbers cannot
+                    // average into each other. Recorded before the collect branch so a batched
+                    // rung's CBs land here in the same submission order its single doorbell emits.
+                    let mut t = timers();
+                    let seq = t.rb_seq.entry(self.card.telemetry_key()).or_default();
+                    for cb in &cbs {
+                        seq.push(match cb {
+                            BatchedCb::Compute(_) | BatchedCb::Consume(_) => {
+                                Some(((ops.len(), oi), op.label()))
+                            }
+                            BatchedCb::Send(_) | BatchedCb::Wait { .. } => None,
+                        });
+                    }
+                }
                 if collect {
                     // STAGE, DON'T SUBMIT — the rung pays one doorbell at its end. The item OWNS
                     // its handles because the shifted bases and `ta` borrows above are rep-local.
@@ -4532,7 +4580,10 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
     /// order. This is the attribution `group_time`/`prefix_time` pay ~11% of decode to estimate,
     /// read for free instead.
     fn rb_attribute(&mut self) {
-        let seq = std::mem::take(&mut timers().rb_seq);
+        let seq = timers()
+            .rb_seq
+            .remove(&self.card.telemetry_key())
+            .unwrap_or_default();
         let mut entries = flex_rs::rb_telemetry::drain_source(self.card.telemetry_key());
         let mut t = timers();
         t.rb_steps += 1;
@@ -4697,23 +4748,30 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
         let zipped: Vec<_> = entries.iter().zip(seq).collect();
         if t.rb_steps <= 3 {
             let n = zipped.len();
-            for (i, (e, ((rung, oi), label))) in zipped
+            for (i, (e, launch)) in zipped
                 .iter()
                 .enumerate()
                 .filter(|(i, _)| *i < 20 || *i + 8 >= n)
             {
+                let at = match launch {
+                    Some(((rung, oi), label)) => format!("op ({rung},{oi})  {label}"),
+                    None => "collective send/wait".to_string(),
+                };
                 eprintln!(
-                    "[sdsc-rbtime] fwd {} op ({rung},{oi}) rec {i} id {} slots {:?} power {}  {}",
+                    "[sdsc-rbtime] fwd {} rec {i} id {} slots {:?} power {}  {at}",
                     t.rb_steps,
                     e.id,
                     e.rb.timestamps(),
                     e.rb.power(),
-                    label
                 );
             }
         }
         let mut new_cbs = 0u64;
-        for (e, ((rung, oi), label)) in zipped {
+        // A collective's send or wait is no op's: its CB kept the zip aligned and is billed nowhere.
+        for (e, ((rung, oi), label)) in zipped
+            .into_iter()
+            .filter_map(|(e, launch)| launch.map(|l| (e, l)))
+        {
             let acc = t.rb_cycles.entry((rung, oi)).or_default();
             acc.cycles.add_compute(e.rb);
             new_cbs += 1;
@@ -4754,7 +4812,7 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
         if d.rb_time {
             let _ = flex_rs::rb_telemetry::drain_source(self.card.telemetry_key());
         }
-        timers().rb_seq.clear();
+        timers().rb_seq.remove(&self.card.telemetry_key());
 
         // The stream is PERSISTENT: the scheduler retires each op's fence from its per-stream
         // deque the moment that fence resolves (SchedulerState::retire_fence), so nothing
