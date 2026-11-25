@@ -405,7 +405,7 @@ impl HostShadow {
     /// boot-send and keep their exact window sizes.
     fn staging(bytes: u64) -> Result<Self, HostBufError> {
         Ok(HostShadow::Host(HostBuf::zeroed(
-            staging_extent(bytes) as usize,
+            staging_extent(bytes) as usize
         )?))
     }
 
@@ -3100,8 +3100,12 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
             // rounded prefix walks inside it (a raw-sized region stops the walk one page
             // short; `DevAddr::alloc`'s own granularity is not this law).
             self.seg_addr[i] = Some(
-                DevAddr::alloc(self.card, ByteSize(staging_extent(bytes)), MemoryType::Tensor)
-                    .map_err(|e| anyhow!("prepare: seg{i} alloc of {bytes} B failed: {e}"))?,
+                DevAddr::alloc(
+                    self.card,
+                    ByteSize(staging_extent(bytes)),
+                    MemoryType::Tensor,
+                )
+                .map_err(|e| anyhow!("prepare: seg{i} alloc of {bytes} B failed: {e}"))?,
             );
         }
         // ⭐ AND ONE REGION PER EXTRA WEIGHT BANK, immediately after the weight segment's own —
@@ -3122,8 +3126,12 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
             let bytes = hold.alloc_bytes(self.weight_bank_bytes[b]);
             // ⭐ The weight banks' DEVICE TWIN of the same law — see the segment loop above.
             self.weight_bank_addr[b] = Some(
-                DevAddr::alloc(self.card, ByteSize(staging_extent(bytes)), MemoryType::Tensor)
-                    .map_err(|e| {
+                DevAddr::alloc(
+                    self.card,
+                    ByteSize(staging_extent(bytes)),
+                    MemoryType::Tensor,
+                )
+                .map_err(|e| {
                     anyhow!(
                         "prepare: weight bank {} alloc of {bytes} B failed: {e}",
                         b + 1
@@ -6970,7 +6978,11 @@ mod tests {
     fn a_staging_shadow_admits_the_page_rounded_boot_send() {
         // The bake's own number, half a page past the last whole one.
         let seg = 17_035_401_216usize;
-        assert_eq!(seg % (HOST_PAGE / 2), 0, "the fixture's premise: 2 KiB-aligned");
+        assert_eq!(
+            seg % (HOST_PAGE / 2),
+            0,
+            "the fixture's premise: 2 KiB-aligned"
+        );
         assert_eq!(seg % HOST_PAGE, HOST_PAGE / 2, "…but not 4 KiB-aligned");
         let shadow = HostShadow::staging(seg as u64).expect("mmap of the shadow");
         let shadow = shadow.host().expect("a staging shadow is host-owned");
@@ -6985,11 +6997,7 @@ mod tests {
         // slice `send_prefix_and_fill` takes — exists in the shadow, and the walk that
         // covers the region reaches past it.
         for staged in [seg - 1, seg, shadow.len()] {
-            let send = staged
-                .min(shadow.len())
-                .min(region)
-                .div_ceil(HOST_PAGE)
-                * HOST_PAGE;
+            let send = staged.min(shadow.len()).min(region).div_ceil(HOST_PAGE) * HOST_PAGE;
             assert!(
                 shadow.get(..send).is_some(),
                 "a {staged} B staged prefix of a {} B shadow must cover its {send} B page-rounded send",

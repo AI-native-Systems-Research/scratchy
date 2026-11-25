@@ -112,7 +112,11 @@ fn slice_form(m: MatM, k: MatK, n: MatN, slice: MatN, col_start: u32) -> Op {
 /// this file rather than silently pinning a different op.
 #[test]
 fn the_whole_form_is_the_refused_op() {
-    let op = whole_form(MatM::of_token_rows(M), MatK::of_in_features(K), MatN::of_out_features(N));
+    let op = whole_form(
+        MatM::of_token_rows(M),
+        MatK::of_in_features(K),
+        MatN::of_out_features(N),
+    );
     // ⛔ THE OVER-LINE FORM TAKES THE TRIPS — time > 1, and the trips sum to the
     // whole vocabulary across the per-core extent.
     assert!(
@@ -159,10 +163,7 @@ fn the_whole_form_is_the_refused_op() {
     eprintln!(
         "M7 HEAD: {} trips, N_.out_ {}, per-core ss_ {{in: {}, out: {}}} — per-trip slab \
          {per_trip} B",
-        op.time,
-        dsc.N_.out_,
-        dsc.dataStageParam_["0"].ss_.in_,
-        dsc.dataStageParam_["0"].ss_.out_,
+        op.time, dsc.N_.out_, dsc.dataStageParam_["0"].ss_.in_, dsc.dataStageParam_["0"].ss_.out_,
     );
 }
 
@@ -170,7 +171,11 @@ fn the_whole_form_is_the_refused_op() {
 /// ONE descriptor, no trips, byte-identical to the form that has always shipped.
 #[test]
 fn the_one_row_head_stays_whole_dxp() {
-    let op = whole_form(MatM::of_token_rows(1), MatK::of_in_features(K), MatN::of_out_features(N));
+    let op = whole_form(
+        MatM::of_token_rows(1),
+        MatK::of_in_features(K),
+        MatN::of_out_features(N),
+    );
     assert_eq!(
         op.time, 1,
         "the one-row 12b head (62.9 MB/core) is inside the envelope — whole-dxp"
@@ -203,7 +208,11 @@ fn the_granite_head_stays_whole_dxp() {
 /// (176.2 MB/core, refused) — takes the trips.
 #[test]
 fn the_31b_two_row_head_takes_the_trips() {
-    let op = whole_form(MatM::of_token_rows(2), MatK::of_in_features(5376), MatN::of_out_features(N));
+    let op = whole_form(
+        MatM::of_token_rows(2),
+        MatK::of_in_features(5376),
+        MatN::of_out_features(N),
+    );
     assert!(
         op.time > 1,
         "the 31b two-row head (176.2 MB/core) is past the envelope — trips"

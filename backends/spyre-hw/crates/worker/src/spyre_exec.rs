@@ -442,8 +442,7 @@ impl Worker for SpyreWorker {
                 };
                 let SendnnSession::SuperDsc(sb) = &mut model.session;
                 let (group, tail) = rest.split_at(seats);
-                let picks =
-                    superdsc_forward_packed(&sh, &mut sb.packed, rung, group, input_batch)?;
+                let picks = superdsc_forward_packed(&sh, &mut sb.packed, rung, group, input_batch)?;
                 for (t, pick) in group.iter().zip(picks) {
                     order.push(t.id.clone());
                     sampled.push(pick);
@@ -630,8 +629,7 @@ impl Worker for SpyreWorker {
                 //
                 // ⭐ ONE RECORD PER LIVE ROW, in slot order — its pages and position, its request's
                 // draw and (churned) its seed — so no law or seed can describe another row.
-                let mut churned_rows: Vec<crate::card::forward::DecodeRow<'_, usize>> =
-                    Vec::new();
+                let mut churned_rows: Vec<crate::card::forward::DecodeRow<'_, usize>> = Vec::new();
                 let mut stable_rows: Vec<crate::card::forward::DecodeRow<'_, ()>> = Vec::new();
                 for ((id, start), b) in decode_ids.iter().zip(&blocks) {
                     let req = requests

@@ -62,9 +62,8 @@ pub(crate) fn forward_chunk(
     // of zero rows, or one wider than the rung the bundle baked. (The sendnn paged prefill
     // runs the WHOLE prompt in one forward, so its only other cap is the prefix capacity,
     // checked below.)
-    let law = scratchy_target_spyre::paged_step::StepRows::new(rows, start, n).ok_or_else(|| {
-        werr(format!("forward_chunk: n={n} not in 1..={rows}"))
-    })?;
+    let law = scratchy_target_spyre::paged_step::StepRows::new(rows, start, n)
+        .ok_or_else(|| werr(format!("forward_chunk: n={n} not in 1..={rows}")))?;
 
     // Build this pass's DYNAMIC sources (the static weights stay resident in the
     // session — no per-forward weight marshal). Embedding gather + per-position
@@ -223,7 +222,9 @@ pub(crate) fn forward_chunk(
     // so a tid already staged is not staged again.
     {
         if b.paged.is_empty() {
-            return Err(werr("this bundle states no paged step — its attention has no pools"));
+            return Err(werr(
+                "this bundle states no paged step — its attention has no pools",
+            ));
         }
         let rows = law;
         let mut int32: Vec<(usize, Vec<u8>, scratchy_tensors::DType, Vec<usize>)> = Vec::new();
@@ -232,12 +233,7 @@ pub(crate) fn forward_chunk(
                 .map_err(|e| werr(format!("request {id}: paged step: {e}")))?;
             for (tid, bytes, shape) in srcs.int32 {
                 if !int32.iter().any(|(t, ..)| *t == tid as usize) {
-                    int32.push((
-                        tid as usize,
-                        bytes,
-                        scratchy_tensors::DType::I32,
-                        shape,
-                    ));
+                    int32.push((tid as usize, bytes, scratchy_tensors::DType::I32, shape));
                 }
             }
             // Every mask the step stages — one per window on a packed rung (the request's own

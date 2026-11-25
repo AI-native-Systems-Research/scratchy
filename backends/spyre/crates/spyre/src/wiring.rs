@@ -3214,7 +3214,6 @@ mod constant_tape_tests {
         );
     }
 
-
     /// The staged pad lanes spell the sampler's all-NaN answer (#666): an all-NaN row's one-hot
     /// falls on a pad lane, whose `ginc`, `binc` and `linc` read back idx = `ginc·4096 + binc·64 +
     /// linc` — `sample_sentinel`, the host reference's answer, past the vocab (the readback's

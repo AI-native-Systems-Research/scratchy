@@ -10,7 +10,12 @@
 use ktir_superdsc::work_division::{DimRole, IterDim, SplitDomain, WorkDivision};
 
 fn dim(name: &'static str, extent: u32, role: DimRole, domain: SplitDomain) -> IterDim {
-    IterDim { name, extent, role, domain }
+    IterDim {
+        name,
+        extent,
+        role,
+        domain,
+    }
 }
 
 /// `13_batchmatmul`: the scores contraction `[8, 256, 256] @ [8, 256, 128]`, one op over
@@ -23,7 +28,12 @@ fn the_batchmatmul_split_is_torch_spyres() {
     let dims = [
         dim("y", 8, DimRole::Output, SplitDomain::Any),
         dim("x", 2, DimRole::Output, SplitDomain::Any),
-        dim("mb", 128, DimRole::Output, SplitDomain::StageSlabs { slab_rows: 64 }),
+        dim(
+            "mb",
+            128,
+            DimRole::Output,
+            SplitDomain::StageSlabs { slab_rows: 64 },
+        ),
         dim("out", 128, DimRole::Output, SplitDomain::Whole),
         dim("in", 256, DimRole::Reduction, SplitDomain::Whole),
     ];
@@ -51,7 +61,11 @@ fn the_elementwise_split_takes_the_anchor_s_commitment() {
     ];
     // The contraction committed query:2 and block:1; block:1 is the identity and drops.
     let d = WorkDivision::law(&dims, &[("y", 2)], 32).expect("the add divides");
-    assert_eq!(d.split_of("y"), 2, "the anchor's committed query split, ungrown");
+    assert_eq!(
+        d.split_of("y"),
+        2,
+        "the anchor's committed query split, ungrown"
+    );
     assert_eq!(d.split_of("mb"), 8, "the kv heads fill the free budget");
     assert_eq!(d.split_of("x"), 2, "the group dim fills the rest");
     assert_eq!(d.split_of("i"), 1, "the block dim stays whole");

@@ -1942,16 +1942,15 @@ impl SpyreWorker {
                         // ladder — its width is the prefill wiring's own `m_cap`, the shape the
                         // embed activation was staged at, from the wiring and not from the
                         // placement bytes).
-                        let prefill_m = g0
-                            .anchor_rung()
-                            .map_or_else(
-                                || {
-                                    wirings.prefill.as_ref().map_or(0, |p| {
-                                        p.tensor_shapes[p.embed_src as usize].0 as usize
-                                    })
-                                },
-                                |(rm, _)| *rm as usize,
-                            );
+                        let prefill_m = g0.anchor_rung().map_or_else(
+                            || {
+                                wirings
+                                    .prefill
+                                    .as_ref()
+                                    .map_or(0, |p| p.tensor_shapes[p.embed_src as usize].0 as usize)
+                            },
+                            |(rm, _)| *rm as usize,
+                        );
                         // OWNS ITS WEIGHTS ON PURPOSE — do NOT switch this to `new_borrowing`.
                         // This session is allocated BEFORE the decode session, so its 2.6 GB seg1
                         // reservation is what places decode's own weight region. Making it borrow (a

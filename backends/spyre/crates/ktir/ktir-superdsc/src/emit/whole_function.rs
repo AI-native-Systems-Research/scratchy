@@ -1344,12 +1344,7 @@ impl<'a> HeadMajorCopies<'a> {
                 "a head-major relayout between t{} `[{}, {}]` and t{} `[{}, {}]` over the pair's \
                  own geometry ({a} heads of {b} rows, {sticks} sticks a head): a region's frame \
                  disagrees with the typed geometry",
-                block.tid,
-                block.v_rows,
-                block.v_cols,
-                heads.tid,
-                heads.v_rows,
-                heads.v_cols,
+                block.tid, block.v_rows, block.v_cols, heads.tid, heads.v_rows, heads.v_cols,
             ));
         }
         Ok(Self {
@@ -5152,15 +5147,12 @@ fn lower_function_folded<T: crate::collective::Tp>(
                     }
                     Some(layout) if sticks > 1 => {
                         let tid = mint_inter(k, layout, floor, res);
-                        let dst =
-                            stick_major_region(tid, geom.heads * geom.rows, sticks, layout);
-                        out.extend(
-                            HeadMajorCopies::of(&source, &dst, geom, sticks)?.to_heads(
-                                f.name,
-                                sym_id_base,
-                                layout,
-                            )?,
-                        );
+                        let dst = stick_major_region(tid, geom.heads * geom.rows, sticks, layout);
+                        out.extend(HeadMajorCopies::of(&source, &dst, geom, sticks)?.to_heads(
+                            f.name,
+                            sym_id_base,
+                            layout,
+                        )?);
                         Region {
                             is_out: false,
                             ..dst
@@ -5686,12 +5678,8 @@ fn lower_function_folded<T: crate::collective::Tp>(
                                 }
                             } else if sticks > 1 {
                                 let tid = mint_inter(k, layout, floor, res);
-                                let dst = stick_major_region(
-                                    tid,
-                                    geom.heads * geom.rows,
-                                    sticks,
-                                    layout,
-                                );
+                                let dst =
+                                    stick_major_region(tid, geom.heads * geom.rows, sticks, layout);
                                 out.extend(
                                     HeadMajorCopies::of(&stick_rows()?, &dst, geom, sticks)?
                                         .to_heads(f.name, sym_id_base, layout)?,
@@ -6135,19 +6123,12 @@ fn lower_function_folded<T: crate::collective::Tp>(
                         // heads·sticks·stick]` — the frame its result is read in (the
                         // reshape half's frame is the head-major side; the two arms' frames
                         // are each the frame their OWN op's result is read in).
-                        let dst = stick_major_region(
-                            tid,
-                            geom.rows,
-                            geom.heads * sticks,
+                        let dst = stick_major_region(tid, geom.rows, geom.heads * sticks, layout);
+                        out.extend(HeadMajorCopies::of(&dst, &source, geom, sticks)?.to_block(
+                            f.name,
+                            sym_id_base,
                             layout,
-                        );
-                        out.extend(
-                            HeadMajorCopies::of(&dst, &source, geom, sticks)?.to_block(
-                                f.name,
-                                sym_id_base,
-                                layout,
-                            )?,
-                        );
+                        )?);
                         Region {
                             is_out: false,
                             ..dst
@@ -7626,8 +7607,7 @@ fn lower_function_folded<T: crate::collective::Tp>(
                     activation: super::lower_ktir_to_superdsc::BatchFrame::Flat,
                 } if heads_inner => {
                     let (a, w) = (per_op[0], per_op[1]);
-                    let Some(geom) = head_geom
-                    else {
+                    let Some(geom) = head_geom else {
                         return err(format!(
                             "{}: a contraction of t{} `[{}, {}]` under the query-row-major plan, \
                              whose query rows were never laid out so",
@@ -7664,18 +7644,17 @@ fn lower_function_folded<T: crate::collective::Tp>(
                     // ⭐ THE EXPANSION'S GEOMETRY IS A TYPED FACT, verified against the kernel's
                     // own frame by the sealed constructor — a source that is not `batch` blocks
                     // of `block_rows` rows (the W²-producing mis-statement) refuses at bake.
-                    let blocks =
-                        crate::ir::bridge::tiled_op_sdsc_op::ExpandedBlocks::of(
-                            batch,
-                            heads / batch,
-                            block_rows,
-                            w.v_cols,
-                            w.v_rows,
-                            w.v_cols,
-                        )
-                        .map_err(|message| Error {
-                            message: format!("{}: {message}", f.name),
-                        })?;
+                    let blocks = crate::ir::bridge::tiled_op_sdsc_op::ExpandedBlocks::of(
+                        batch,
+                        heads / batch,
+                        block_rows,
+                        w.v_cols,
+                        w.v_rows,
+                        w.v_cols,
+                    )
+                    .map_err(|message| Error {
+                        message: format!("{}: {message}", f.name),
+                    })?;
                     out.extend(
                         crate::ir::bridge::tiled_op_sdsc_op::assemble_expand_blocks(
                             &format!("expand_o{tid}"),
@@ -7727,9 +7706,16 @@ fn lower_function_folded<T: crate::collective::Tp>(
                     // `m` rows, both stated here (the program's batch, the activation's rows
                     // over it) — so the copies VALIDATE the regions against it instead of
                     // dividing the head count out of `a.v_rows` again.
-                    let copies =
-                        HeadMajorCopies::of(&blocks, &a, HeadGeometry { heads: batch, rows: m }, sticks)?
-                            .to_block(f.name, sym_id_base, layout)?;
+                    let copies = HeadMajorCopies::of(
+                        &blocks,
+                        &a,
+                        HeadGeometry {
+                            heads: batch,
+                            rows: m,
+                        },
+                        sticks,
+                    )?
+                    .to_block(f.name, sym_id_base, layout)?;
                     // ⭐ AN ACTIVATION THE WALK'S BODY DOES NOT DEFINE IS LAID OUT ONCE, BEFORE THE
                     // WALK. The body relaunches once per page, so the decode query's copies — the
                     // same bytes on every trip — would run once per page; they go ahead of the

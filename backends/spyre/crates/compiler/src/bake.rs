@@ -584,16 +584,17 @@ fn emit_superdsc_wiring(
                 scratchy_target_spyre::paged_step::PagedRows::Batch => {
                     vec![p.chunk_masks()]
                 }
-                scratchy_target_spyre::paged_step::PagedRows::Sequence => (0
-                    ..p.extent.requests().get())
-                    .map(|r| {
-                        scratchy_triton_splice::paged_window_of_class(
-                            p.class.index(),
-                            r,
-                            scratchy_triton_splice::WindowTable::Mask,
-                        )
-                    })
-                    .collect(),
+                scratchy_target_spyre::paged_step::PagedRows::Sequence => {
+                    (0..p.extent.requests().get())
+                        .map(|r| {
+                            scratchy_triton_splice::paged_window_of_class(
+                                p.class.index(),
+                                r,
+                                scratchy_triton_splice::WindowTable::Mask,
+                            )
+                        })
+                        .collect()
+                }
             })
             .collect();
         let pk: std::collections::HashMap<u32, u64> = lwd
@@ -3449,7 +3450,10 @@ pub(crate) fn dump_wavefront_mega(
             // ⭐ A PACKED PREFIX RUNG'S OWN CELL — keyed by the pair, never a overwrite of the solo
             // prefill slot: a packed rung's wiring is numbered by its own graph's tensor ids
             // (lowered at `width · seqs` rows), so it cannot ride the solo prefill wiring.
-            PackedPrefill { width: u32, seqs: u32 },
+            PackedPrefill {
+                width: u32,
+                seqs: u32,
+            },
         }
         // `prefill_mq`: Some(mq) marks the PREFILL path AND carries the rung's PER-REQUEST width —
         // one request's query rows, NOT the graph's (a packed rung's graph is `mq · prefill_seqs`

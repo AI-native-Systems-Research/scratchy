@@ -47,7 +47,6 @@ pub(crate) struct SubmittedDecode {
     )>,
 }
 
-
 /// ⭐ #32 (E) — THE OVERLAP PROBE'S PROCESS-WIDE STATE, in the same idiom
 /// `step_segs` states the reason for: the submit half's borrows (the session,
 /// `Shared`, the launcher) cannot thread a worker field, and the lock is
@@ -202,10 +201,7 @@ impl LaunchRows<'_> {
     fn last_pos(&self) -> usize {
         match self {
             LaunchRows::Sequence { rows, .. } => rows.end() - 1,
-            LaunchRows::Batch(rows) => (0..rows.len())
-                .map(|i| rows.seq(i).pos)
-                .max()
-                .unwrap_or(0),
+            LaunchRows::Batch(rows) => (0..rows.len()).map(|i| rows.seq(i).pos).max().unwrap_or(0),
             // The deepest position ANY request reaches — the body the session selects must
             // walk to every request's keys, not one of them.
             LaunchRows::Packed { reqs, .. } => {
@@ -632,7 +628,11 @@ impl LaunchEnd for Middle {
         // A discarded suffix answers no row: the step's own `None`.
         pf.stage_step_acts_seeded(&acts, &[], &acts_i32, &seeds)
             .and_then(|()| pf.run_staged_step(mq, seq_pos, StepLogits::Discarded))
-            .map_err(|e| werr(format!("superdsc prefill run_step (mq={mq}, at={seq_pos}): {e}")))?;
+            .map_err(|e| {
+                werr(format!(
+                    "superdsc prefill run_step (mq={mq}, at={seq_pos}): {e}"
+                ))
+            })?;
         Ok(())
     }
 }
@@ -654,7 +654,11 @@ impl LaunchEnd for Final {
         } = staged;
         pf.stage_step_acts_seeded(&acts, &[], &acts_i32, &seeds)
             .and_then(|()| pf.run_staged_step(mq, seq_pos, StepLogits::LeftOnDevice))
-            .map_err(|e| werr(format!("superdsc prefill run_step (mq={mq}, at={seq_pos}): {e}")))?;
+            .map_err(|e| {
+                werr(format!(
+                    "superdsc prefill run_step (mq={mq}, at={seq_pos}): {e}"
+                ))
+            })?;
         // The prompt-final width is the launch's one typed width — the mint's verbatim prompt
         // case, the same value the staging block bound the seat's rows at.
         let picked = read_sampled_tokens(pf, seat, seat_width, b.result_id as u32, vocab)?;
@@ -1016,7 +1020,6 @@ impl<'a> BoundLaws<'a> {
         &self.laws
     }
 }
-
 
 /// ⭐ THE SEAT BINDS EVERY LAUNCH STAGES — the seat's per-step operands at
 /// their baked offsets, one law per baked row. Spelled so the greedy law is
@@ -1757,7 +1760,11 @@ mod pad_clamp_tests {
 
     /// A fixture's live laws — row `s` runs `draws[s]` at `steps[s]`, one value per row.
     fn live_laws<'a>(draws: &[Option<&'a SampledDraw>], steps: &[u32]) -> Vec<RowLaw<'a>> {
-        assert_eq!(draws.len(), steps.len(), "a fixture states one step per draw");
+        assert_eq!(
+            draws.len(),
+            steps.len(),
+            "a fixture states one step per draw"
+        );
         draws
             .iter()
             .zip(steps)

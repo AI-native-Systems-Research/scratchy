@@ -472,7 +472,11 @@ fn abba_loaded(
         for side in ["A", "B", "B", "A"] {
             let ex = if side == "A" { &mut a } else { &mut b };
             let d = ex.exec.launch_timed()?;
-            writeln!(stdout, "TIME-SAMPLE side={side} round={r} ns={}", d.as_nanos())?;
+            writeln!(
+                stdout,
+                "TIME-SAMPLE side={side} round={r} ns={}",
+                d.as_nanos()
+            )?;
             stdout.flush()?;
         }
     }

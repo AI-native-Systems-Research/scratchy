@@ -583,7 +583,11 @@ pub fn is_prefill_lm_head_tail<F: scratchy_subtile::subtile_ir::RopeForm>(
 pub fn lm_head_tail<F: scratchy_subtile::subtile_ir::RopeForm>(
     ir: &SubtileIR<F>,
 ) -> Option<Vec<scratchy_subtile::subtile_ir::SubtileId>> {
-    let mut t = match ir.nodes.iter().find(|n| matches!(n.op, SubOp::Sample { .. })) {
+    let mut t = match ir
+        .nodes
+        .iter()
+        .find(|n| matches!(n.op, SubOp::Sample { .. }))
+    {
         Some(draw) => {
             draw.inputs
                 .get(scratchy_subtile::subtile_ir::SAMPLE_LOGITS_INPUT)?
@@ -2006,8 +2010,7 @@ impl PagedStepTids {
         // region's BASE slot (class 0 lives on the sentinels, so no slot is wasted).
         let slot = |table: usize| {
             ktir_superdsc::reserved_tids::paged_step_class_tid(
-                (class as u32 - 1)
-                    * ktir_superdsc::reserved_tids::PAGED_STEP_CLASS_STRIDE
+                (class as u32 - 1) * ktir_superdsc::reserved_tids::PAGED_STEP_CLASS_STRIDE
                     + table as u32,
             )
         };
@@ -2043,7 +2046,8 @@ impl PagedStepTids {
     /// sentinels and the window region), so this answers for every class a model can state without
     /// enumerating, or bounding, the classes.
     pub fn is_walked_source(tid: u32) -> bool {
-        let class = ktir_superdsc::reserved_tids::paged_step_class_of(tid).map_or(0, |c| c as usize);
+        let class =
+            ktir_superdsc::reserved_tids::paged_step_class_of(tid).map_or(0, |c| c as usize);
         Self::walked_sources(class).contains(&tid)
     }
 }
@@ -2078,7 +2082,9 @@ pub fn paged_window_of_class(class: usize, window: u32, table: WindowTable) -> u
         (c, w, WindowTable::PageTable) => {
             paged_step_class_window_tid(c as u32, w, ClassWindowTable::PageTable)
         }
-        (c, w, WindowTable::Mask) => paged_step_class_window_tid(c as u32, w, ClassWindowTable::Mask),
+        (c, w, WindowTable::Mask) => {
+            paged_step_class_window_tid(c as u32, w, ClassWindowTable::Mask)
+        }
     }
 }
 
@@ -2771,7 +2777,8 @@ pub fn kv_pool_format<F: scratchy_subtile::subtile_ir::RopeForm>(
     };
     match (&writer.op, writer.op.kv_writer()) {
         (SubOp::RopeAppend { .. }, _) => Ok(KvPoolFormat::Fp16),
-        (SubOp::KvAppend { .. }, Some(w)) => match (quantized(stored(w).0), quantized(stored(w).1)) {
+        (SubOp::KvAppend { .. }, Some(w)) => match (quantized(stored(w).0), quantized(stored(w).1))
+        {
             (Some(ks), Some(vs)) if ks == vs => Ok(KvPoolFormat::Fp8(ks)),
             (None, None) => Ok(KvPoolFormat::Fp16),
             _ => Err(format!(
@@ -3053,9 +3060,10 @@ pub fn lower_kv_write<
                         ..
                     },
                 ..
-            } if *producer_node_idx == idx => {
-                Some((mask.window(), attention.class(mask.class()).kv_heads().get()))
-            }
+            } if *producer_node_idx == idx => Some((
+                mask.window(),
+                attention.class(mask.class()).kv_heads().get(),
+            )),
             _ => None,
         })
         .next()
@@ -3721,8 +3729,7 @@ fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
             // stays LOGICAL: its door arm returns early through
             // `matmul_fp8_descriptors(m, k, n)` and is not pad-idempotent.
             let n_dev = matmul_out_width(node, ir, m, *n, k);
-            let (m_total, _a_total, n_total, c_start) =
-                matmul_window_of(node, ir, n_dev)?;
+            let (m_total, _a_total, n_total, c_start) = matmul_window_of(node, ir, n_dev)?;
             ce("M", Val::Int(i128::from(m)))?;
             ce("K", Val::Int(i128::from(k)))?;
             ce("N", Val::Int(i128::from(n_dev)))?;
@@ -4334,9 +4341,7 @@ fn window_of<F: scratchy_subtile::subtile_ir::RopeForm>(
 /// constexpr table states its width law in its own arm, and this census is where that law meets
 /// the producer's. The gemma-4 global-kv refusal (see [`matmul_out_width`]'s doc) was a hole
 /// here — `RmsNormUnit` stated `D_MODEL = 256` while its producer padded to 512.
-fn reader_states_logical_width<F: scratchy_subtile::subtile_ir::RopeForm>(
-    op: &SubOp<F>,
-) -> bool {
+fn reader_states_logical_width<F: scratchy_subtile::subtile_ir::RopeForm>(op: &SubOp<F>) -> bool {
     matches!(
         op,
         SubOp::RopeRotate { .. }

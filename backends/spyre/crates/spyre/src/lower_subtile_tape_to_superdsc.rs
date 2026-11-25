@@ -186,13 +186,13 @@ const _: () = assert!(bundle::MAX_SEGMENT_BYTES == SEGMENT_SIZE);
 // numbers to bind anything at all. Re-exported so every path in the tree resolves unchanged.
 pub use ktir_superdsc::reserved_tids::{
     ATTN_CAUSAL_TID, ATTN_MASK_TID, ATTN_SCALE_TID, ATTN_ZERO_TID, FP8_INV448_TID, FP8_NEG448_TID,
-    FP8_POS448_TID, IDENTITY_TID, KCT_RESIDENT_BASE, KV_BLOCK_INDEX_TID, LAST_HIDDEN_TID,
-    NEW_V_PROBE_TID, ONES_REDUCE_TID, OPROJ_HEADMAJOR_BASE, PAGED_WRITE_ROWS_TID, RESERVED_REGIONS,
-    RESERVED_REGIONS_ARE_DISJOINT, RMS_HALF_TID, RMS_INVCOLS_TID, RMS_RSQRT_PROBE_TID,
-    RMS_SEED_TID, RMS_VAR_PROBE_TID, ROPE_P_TID, SCALARMUL_SCALE_BASE, SEL_HEADMAJOR_TID,
-    SEL_KV_HEADMAJOR_TID, SELT_HEADMAJOR_TID, SENTINELS_ARE_INSIDE_THEIR_REGION, KernelTableFamily,
-    Region, TidRegion, identity_class_tid, kct_resident_tid, oproj_headmajor_tid,
-    rope_p_class_hds, rope_p_class_tid, scalarmul_scale_tid,
+    FP8_POS448_TID, IDENTITY_TID, KCT_RESIDENT_BASE, KV_BLOCK_INDEX_TID, KernelTableFamily,
+    LAST_HIDDEN_TID, NEW_V_PROBE_TID, ONES_REDUCE_TID, OPROJ_HEADMAJOR_BASE, PAGED_WRITE_ROWS_TID,
+    RESERVED_REGIONS, RESERVED_REGIONS_ARE_DISJOINT, RMS_HALF_TID, RMS_INVCOLS_TID,
+    RMS_RSQRT_PROBE_TID, RMS_SEED_TID, RMS_VAR_PROBE_TID, ROPE_P_TID, Region, SCALARMUL_SCALE_BASE,
+    SEL_HEADMAJOR_TID, SEL_KV_HEADMAJOR_TID, SELT_HEADMAJOR_TID, SENTINELS_ARE_INSIDE_THEIR_REGION,
+    TidRegion, identity_class_tid, kct_resident_tid, oproj_headmajor_tid, rope_p_class_hds,
+    rope_p_class_tid, scalarmul_scale_tid,
 };
 
 // ⭐⭐⭐ THE MEMORY PLAN LIVES IN `ktir_superdsc::placement` — `SegRole`, `TensorPlacement`,
@@ -780,14 +780,14 @@ impl KernelTableClasses {
                     .iter()
                     .filter_map(|n| n.op.rope_head_dim().map(|d| d.get())),
             ),
-            attn: ktir_superdsc::reserved_tids::rope_p_class_hds(ir.nodes.iter().filter_map(
-                |n| match &n.op {
+            attn: ktir_superdsc::reserved_tids::rope_p_class_hds(ir.nodes.iter().filter_map(|n| {
+                match &n.op {
                     SubOp::AttnDecode {
                         mask, attention, ..
                     } => Some(attention.class(mask.class()).head_dim().get()),
                     _ => None,
-                },
-            )),
+                }
+            })),
         }
     }
 }
@@ -4075,9 +4075,8 @@ fn teacher_forced_walk<F: RopeForm>(
                     // A folded tail rides a prefill rung, which always states the packed
                     // frame (a decode bundle never folds — the judge's own `folded` set is
                     // empty there).
-                    let (w, requests) = packed.expect(
-                        "a folded tail tid outside a prefill rung's packed frame",
-                    );
+                    let (w, requests) =
+                        packed.expect("a folded tail tid outside a prefill rung's packed frame");
                     let answers = folded_answer_rows(w, requests, real);
                     // ⭐ THE PRODUCT'S OWN FRAME — a folded tid's product is
                     // framed by the rows its OWN tensor declares: a
@@ -4108,11 +4107,7 @@ fn teacher_forced_walk<F: RopeForm>(
                         if r >= e_avail {
                             break;
                         }
-                        let at = if s_framed {
-                            r
-                        } else {
-                            answers[r] as usize
-                        };
+                        let at = if s_framed { r } else { answers[r] as usize };
                         e_sel.extend_from_slice(&e_region[r * rcols..][..rcols]);
                         let tf_at = at.min(tf_rows.saturating_sub(1));
                         tf_sel.extend_from_slice(&tf_out[tf_at * rcols..][..rcols]);
@@ -4165,8 +4160,7 @@ fn teacher_forced_walk<F: RopeForm>(
                             );
                             let g = w * reqs;
                             let framed = ir.tensors[node.output.tensor.index()].rows == g
-                                && region.rows
-                                    == scratchy_subtile::subtile_ir::Range::new(0, g);
+                                && region.rows == scratchy_subtile::subtile_ir::Range::new(0, g);
                             if !framed || reqs == 1 {
                                 // The PREFIX law as it has always read (at one
                                 // request the framed law IS that prefix): the
@@ -4278,7 +4272,15 @@ pub fn write_eval_golden<F: RopeForm>(
     let view = staged.view();
     // No packed frame: the DBG oracle states the whole graph's law at one
     // sequence, as it always has.
-    let bufs = eval_golden_buffers(ir, staged_rope, &view, None, None, &|tid| tid as usize, None);
+    let bufs = eval_golden_buffers(
+        ir,
+        staged_rope,
+        &view,
+        None,
+        None,
+        &|tid| tid as usize,
+        None,
+    );
     // The scales manifest's skip set — the same folded-node predicate the walk used.
     let scalarmul_folds = crate::lower_subtile_tape_to_ktir::scalar_mul_weight_folds(ir);
     let folded_node = |id: scratchy_subtile::subtile_ir::SubtileId| {
@@ -4779,9 +4781,8 @@ fn stage_gate_probe<T: ktir_superdsc::collective::Tp, F: RopeForm>(
                 // request the merge is the one law's own bytes.
                 let mut pool: Vec<f32> = Vec::new();
                 for b in &req_blocks {
-                    let laid =
-                        crate::paged_step::pool_of_rows(p, *hd, b, &vals, step_rows.start())
-                            .map_err(|e| format!("the gate's pool t{tid}: {e}"))?;
+                    let laid = crate::paged_step::pool_of_rows(p, *hd, b, &vals, step_rows.start())
+                        .map_err(|e| format!("the gate's pool t{tid}: {e}"))?;
                     if pool.len() < laid.len() {
                         pool.resize(laid.len(), 0.0);
                     }
@@ -5451,8 +5452,15 @@ pub fn numeric_gate<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     // (pointer-swapped per node, restored before return). The golden's rows below `real` are
     // clamp-invariant (a row's own position is its index while it is real), so ONE golden
     // serves both the full-rows probe and the pad probe below.
-    let mut eval_bufs =
-        eval_golden_buffers(ir, &staged_rope, &view, covering, None, &|tid| tid as usize, packed);
+    let mut eval_bufs = eval_golden_buffers(
+        ir,
+        &staged_rope,
+        &view,
+        covering,
+        None,
+        &|tid| tid as usize,
+        packed,
+    );
     let GateWorst {
         local_clean: worst_local_clean,
         local_fp8: worst_local_fp8,
@@ -5956,7 +5964,10 @@ fn judge_gate_run<F: RopeForm>(
     // restored (every compare below and the walk read the root's own rows,
     // never the window). Prefill only: a decode bundle never folds, and at
     // one request the relocation is the law as it has always read.
-    if let Some(sample) = ir.nodes.iter().find(|n| matches!(n.op, SubOp::Sample { .. }))
+    if let Some(sample) = ir
+        .nodes
+        .iter()
+        .find(|n| matches!(n.op, SubOp::Sample { .. }))
         && let Some(&logits_in) = sample.inputs.first()
         && folded.contains(&(logits_in.tensor.index() as u64))
         && ir.tensors[logits_in.tensor.index()].rows as usize == graph_rows
@@ -9906,10 +9917,7 @@ mod tests {
     /// was luck, not this test.
     #[test]
     fn the_declared_bases_are_the_regions_bases() {
-        assert_eq!(
-            SCALARMUL_SCALE_BASE,
-            Region::ScalarmulScale.tids().base
-        );
+        assert_eq!(SCALARMUL_SCALE_BASE, Region::ScalarmulScale.tids().base);
         assert_eq!(KCT_RESIDENT_BASE, Region::KctResident.tids().base);
         // ⭐ AND THE TWO DOORS THAT SHARE A NEIGHBOURHOOD MUST NOT MEET. This is the assertion the
         // positional form could not make: it compares two INDEPENDENTLY derived tids rather than one
@@ -9939,7 +9947,10 @@ mod tests {
         for r in RESERVED_REGIONS {
             assert_eq!(r.at(r.slots - 1), r.floor(), "{:?}", r.name);
         }
-        assert_eq!(scalarmul_scale_tid(99), Region::ScalarmulScale.tids().floor());
+        assert_eq!(
+            scalarmul_scale_tid(99),
+            Region::ScalarmulScale.tids().floor()
+        );
     }
 
     /// ⭐⭐⭐ THE ARGUMENT ORDER OF `for_output` IS LOAD-BEARING, AND THIS IS THE MODEL THAT PROVES

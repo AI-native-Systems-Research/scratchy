@@ -137,15 +137,15 @@ impl WorkDivision {
         committed: &[(&'static str, u32)],
         max_cores: u32,
     ) -> Result<WorkDivision, String> {
-        let mut splits: BTreeMap<&'static str, u32> =
-            dims.iter().map(|d| (d.name, 1)).collect();
+        let mut splits: BTreeMap<&'static str, u32> = dims.iter().map(|d| (d.name, 1)).collect();
         let mut cores_used = 1u32;
 
         // ── Pass 1: the committed splits are mandatory. ─────────────────────
         for (name, split) in committed {
-            let dim = dims.iter().find(|d| d.name == *name).ok_or_else(|| {
-                format!("work division: committed split of unknown dim {name}")
-            })?;
+            let dim = dims
+                .iter()
+                .find(|d| d.name == *name)
+                .ok_or_else(|| format!("work division: committed split of unknown dim {name}"))?;
             if *split == 1 {
                 continue;
             }
@@ -177,16 +177,9 @@ impl WorkDivision {
         //           dim the group's anchor committed is the GROUP's: this op
         //           takes its split and does not grow it — ownership is keyed
         //           by split count, so the group's ops cannot disagree. ─────
-        let committed_of = |name: &str| {
-            committed
-                .iter()
-                .find(|(n, _)| *n == name)
-                .map(|&(_, s)| s)
-        };
-        let mut output_order: Vec<&IterDim> = dims
-            .iter()
-            .filter(|d| d.role == DimRole::Output)
-            .collect();
+        let committed_of = |name: &str| committed.iter().find(|(n, _)| *n == name).map(|&(_, s)| s);
+        let mut output_order: Vec<&IterDim> =
+            dims.iter().filter(|d| d.role == DimRole::Output).collect();
         output_order.sort_by_key(|d| std::cmp::Reverse(d.extent));
         for dim in output_order {
             if cores_used >= max_cores || committed_of(dim.name).is_some() {
@@ -218,9 +211,13 @@ impl WorkDivision {
             if let Some((dim, split)) = best {
                 cores_used = cores_used / splits[dim.name] * split;
                 splits.insert(dim.name, split);
-            }        }
+            }
+        }
 
-        Ok(WorkDivision { splits, cores: cores_used })
+        Ok(WorkDivision {
+            splits,
+            cores: cores_used,
+        })
     }
 
     /// The split count of one dim (1 = whole).

@@ -57,7 +57,7 @@ use crate::reserved_tids::{LAST_HIDDEN_TID, scalarmul_scale_tid};
 use crate::sdsc_abstract::{KernelTag, Stk};
 use crate::sdsc_abstract::{MatK, MatM, MatN};
 use crate::superdsc_opspec::{
-    DataFormat, Df, Fp16, Fp32, Fp8, ItDim, SdscFoldSet, SenUint32, StickExtent,
+    DataFormat, Df, Fp8, Fp16, Fp32, ItDim, SdscFoldSet, SenUint32, StickExtent,
 };
 use crate::work::{CoreSplit, DeviceWidth, FP16_ELEMS_PER_STICK};
 use ktir_core::affine::AffineExpr;
@@ -10135,7 +10135,9 @@ mod batch_transpose_tests {
         let layout = BundleLayout::default();
         layout
             .lx_division
-            .set(Some(crate::placement::WalkDivision::HeadsInner { chunks: 4 }));
+            .set(Some(crate::placement::WalkDivision::HeadsInner {
+                chunks: 4,
+            }));
         // Both sides declared to the layout — the 2-D door mints the whole-buffer window.
         layout.synth(crate::place::SynthId::Act(5), &[64, 128]);
         layout.synth(crate::place::SynthId::Act(6), &[128, 64]);

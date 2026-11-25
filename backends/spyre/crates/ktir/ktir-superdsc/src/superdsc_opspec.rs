@@ -5368,7 +5368,11 @@ mod tests {
             df: Df::Fp16,
         };
         let plan3 = WorkPlan::divide(
-            &[dim("mb", 8, false), dim("out", 64, true), dim("y", 128, false)],
+            &[
+                dim("mb", 8, false),
+                dim("out", 64, true),
+                dim("y", 128, false),
+            ],
             crate::device_gen::whole(),
             crate::work::EwDivision::Law.splitter(),
         )
@@ -5393,19 +5397,35 @@ mod tests {
         // the collapsed dim's read is the vendor's reduced-dim law.
         let rows = [
             // The rmsnorm gamma / vocab-wide x·gamma (`EwOperand`'s mb_broadcast arm).
-            row("gamma", [Scale::RedNonStick, Scale::Active, Scale::Active], ["mb", "out", "y"]),
+            row(
+                "gamma",
+                [Scale::RedNonStick, Scale::Active, Scale::Active],
+                ["mb", "out", "y"],
+            ),
             // The merged source's vendor reduced-dim row (the spray dim, stride-0 read).
-            row("merged", [Scale::RedNonStick, Scale::Active, Scale::Active], ["mb", "out", "y"]),
+            row(
+                "merged",
+                [Scale::RedNonStick, Scale::Active, Scale::Active],
+                ["mb", "out", "y"],
+            ),
             // `EwOperand`'s y-broadcast arm (the tanhsoftcap cap's form).
-            row("y_bcast", [Scale::Active, Scale::Active, Scale::RedNonStick], ["mb", "out", "y"]),
+            row(
+                "y_bcast",
+                [Scale::Active, Scale::Active, Scale::RedNonStick],
+                ["mb", "out", "y"],
+            ),
             // The sprayed source in the `[mb, y, out]` order.
-            row("sprayed", [Scale::Active, Scale::RedNonStick, Scale::Active], ["mb", "y", "out"]),
+            row(
+                "sprayed",
+                [Scale::Active, Scale::RedNonStick, Scale::Active],
+                ["mb", "y", "out"],
+            ),
             // The fused-epilogue route: the marker set AFTER construction (`set_scale_for_dim`).
             {
                 let mut fused = row("fused", [Scale::Active; 3], ["mb", "out", "y"]);
                 fused.set_scale_for_dim("mb", Scale::RedNonStick);
                 fused
-            }
+            },
         ];
         for leg in &rows {
             assert!(

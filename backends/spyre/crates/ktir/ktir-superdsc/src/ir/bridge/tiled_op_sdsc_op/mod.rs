@@ -42,12 +42,12 @@ pub use matmul::{
 pub use pointwise::{
     BandAt, ExpandedBlocks, GatheredWords, IndexSelectPage, LandingOp, PageGatherRows,
     ScatterCopySpec, StickBands, StickPermute, StickPermuteSpec, StickRuns, Widens,
-    assemble_expand_blocks, assemble_gather_copy, assemble_index_select,
-    assemble_page_gather_copy, assemble_pointwise_broadcast_off_from_tile,
-    assemble_pointwise_seeded_from_tile, assemble_scatter_copy, assemble_stick_bands,
-    assemble_stick_permute, assemble_stick_runs_copy, gather_copy_opspec, index_select_opspec,
-    page_gather_copy_opspec, pointwise_broadcast_opspec_from_tile, pointwise_opspec_from_tile,
-    scatter_copy_opspec, stick_bands_opspec, stick_permute_opspec, stick_runs_chunks,
+    assemble_expand_blocks, assemble_gather_copy, assemble_index_select, assemble_page_gather_copy,
+    assemble_pointwise_broadcast_off_from_tile, assemble_pointwise_seeded_from_tile,
+    assemble_scatter_copy, assemble_stick_bands, assemble_stick_permute, assemble_stick_runs_copy,
+    gather_copy_opspec, index_select_opspec, page_gather_copy_opspec,
+    pointwise_broadcast_opspec_from_tile, pointwise_opspec_from_tile, scatter_copy_opspec,
+    stick_bands_opspec, stick_permute_opspec, stick_runs_chunks,
 };
 pub use reduce::{
     ReduceDivided, ReduceDivision, ReduceOffSpec, ReduceSplit, ScalingExtent, assemble_reduce,

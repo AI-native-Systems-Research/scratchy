@@ -158,7 +158,8 @@ pub(crate) fn scalar_mul_weight_folds<F: RopeForm>(
             continue;
         };
         // The matmul's weight is its LAST operand, and a matmul has at least two.
-        let (SubOp::MatmulTile { .. }, [_, .., target]) = (&producer.op, producer.inputs.as_slice())
+        let (SubOp::MatmulTile { .. }, [_, .., target]) =
+            (&producer.op, producer.inputs.as_slice())
         else {
             continue;
         };
@@ -538,10 +539,7 @@ fn embed_row_gather_emitted<T: ktir_superdsc::collective::Tp, F: RopeForm>(
         "embed_row_gather",
         node,
         ir,
-        ktir_superdsc::ktir_node::Program::EmbedRowGather {
-            k: entries,
-            hidden,
-        },
+        ktir_superdsc::ktir_node::Program::EmbedRowGather { k: entries, hidden },
     )?;
     Ok(ktir_only(k))
 }

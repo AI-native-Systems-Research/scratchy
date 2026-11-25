@@ -859,7 +859,13 @@ pub fn request_sources(
     rows: &StepRows,
 ) -> Result<StepSources, PagedStepError> {
     match step.kind() {
-        StepKind::Sequence(step) => step_sources(&step, &[RequestStep { blocks, rows: *rows }]),
+        StepKind::Sequence(step) => step_sources(
+            &step,
+            &[RequestStep {
+                blocks,
+                rows: *rows,
+            }],
+        ),
         StepKind::Batch(step) if rows.real.get() == 1 => batch_sources(
             &step,
             &[BatchSeq {
@@ -1380,12 +1386,13 @@ mod tests {
             )
         };
         let tbl = |src: &StepSources, tid: u32| -> Vec<i32> {
-            ints(&src
-                .int32
-                .iter()
-                .find(|(t, ..)| *t == tid)
-                .expect("staged")
-                .1)
+            ints(
+                &src.int32
+                    .iter()
+                    .find(|(t, ..)| *t == tid)
+                    .expect("staged")
+                    .1,
+            )
         };
         fn mask_at(src: &StepSources, tid: u32) -> (&[f32], &[usize]) {
             let (.., m, shape) = src.masks.iter().find(|(t, ..)| *t == tid).expect("staged");
@@ -1393,20 +1400,38 @@ mod tests {
         }
         // Each request's window stages ITS OWN page table, query rows and mask stack, at its
         // own tids — request 1's query rows are its window's rows `3..6` of the graph.
-        assert_eq!(tbl(&src, wt(0, W::PageTable)), page_table(&s, &a, &ra).unwrap());
-        assert_eq!(tbl(&src, wt(1, W::PageTable)), page_table(&s, &b, &rb).unwrap());
+        assert_eq!(
+            tbl(&src, wt(0, W::PageTable)),
+            page_table(&s, &a, &ra).unwrap()
+        );
+        assert_eq!(
+            tbl(&src, wt(1, W::PageTable)),
+            page_table(&s, &b, &rb).unwrap()
+        );
         assert_eq!(tbl(&src, wt(0, W::QueryRows)), (0..3).collect::<Vec<i32>>());
         assert_eq!(tbl(&src, wt(1, W::QueryRows)), (3..6).collect::<Vec<i32>>());
         let (ma, sa) = mask_at(&src, wt(0, W::Mask));
         assert_eq!(sa, &[4 * 3, 4], "one window's rows, the walk's trips");
         assert_eq!(ma, mask_stack_of(&s, 3, &ra).as_slice());
-        assert_eq!(mask_at(&src, wt(1, W::Mask)).0, mask_stack_of(&s, 3, &rb).as_slice());
+        assert_eq!(
+            mask_at(&src, wt(1, W::Mask)).0,
+            mask_stack_of(&s, 3, &rb).as_slice()
+        );
         // Window 0's three tables are the SOLO rung's own bytes — the identity at one
         // request, on the same request's launch.
         let alone = step_sources(&seq(step()), &[req(&a, ra)]).expect("stages");
-        assert_eq!(tbl(&src, wt(0, W::PageTable)), tbl(&alone, wt(0, W::PageTable)));
-        assert_eq!(tbl(&src, wt(0, W::QueryRows)), tbl(&alone, wt(0, W::QueryRows)));
-        assert_eq!(mask_at(&src, wt(0, W::Mask)).0, mask_at(&alone, wt(0, W::Mask)).0);
+        assert_eq!(
+            tbl(&src, wt(0, W::PageTable)),
+            tbl(&alone, wt(0, W::PageTable))
+        );
+        assert_eq!(
+            tbl(&src, wt(0, W::QueryRows)),
+            tbl(&alone, wt(0, W::QueryRows))
+        );
+        assert_eq!(
+            mask_at(&src, wt(0, W::Mask)).0,
+            mask_at(&alone, wt(0, W::Mask)).0
+        );
         // The write index: head-major, each head's rows the requests' in order —
         // `nkvh · requests · width` entries, row `r·w + j` at request `r`'s cache row.
         let w = tbl(&src, s.write_rows());
@@ -1448,18 +1473,26 @@ mod tests {
             )
         };
         let tbl = |tid: u32| -> Vec<i32> {
-            ints(&src
-                .int32
-                .iter()
-                .find(|(t, ..)| *t == tid)
-                .expect("staged")
-                .1)
+            ints(
+                &src.int32
+                    .iter()
+                    .find(|(t, ..)| *t == tid)
+                    .expect("staged")
+                    .1,
+            )
         };
         assert_eq!(tbl(wt(1, W::PageTable)), vec![0; 4 * INT32_ELEMS_PER_STICK]);
         assert_eq!(tbl(wt(1, W::QueryRows)), (3..6).collect::<Vec<i32>>());
-        let (.., m, shape) = src.masks.iter().find(|(t, ..)| *t == wt(1, W::Mask)).expect("staged");
+        let (.., m, shape) = src
+            .masks
+            .iter()
+            .find(|(t, ..)| *t == wt(1, W::Mask))
+            .expect("staged");
         assert_eq!(shape, &[4 * 3, 4]);
-        assert!(m.iter().all(|&v| v == MASKED), "the empty window is fully masked");
+        assert!(
+            m.iter().all(|&v| v == MASKED),
+            "the empty window is fully masked"
+        );
         // The write index: the live request's rows at its cache rows, the empty slot's at
         // the null slot's own.
         let w = tbl(s.write_rows());
@@ -1473,11 +1506,13 @@ mod tests {
         assert!(step_sources(&seq(s), &[]).is_err());
         let (b, c, d) = (pages(&[1]), pages(&[2]), pages(&[3]));
         let rb = StepRows::new(3, 0, 1).unwrap();
-        assert!(step_sources(
-            &seq(s),
-            &[req(&a, ra), req(&b, rb), req(&c, rb), req(&d, rb)]
-        )
-        .is_err());
+        assert!(
+            step_sources(
+                &seq(s),
+                &[req(&a, ra), req(&b, rb), req(&c, rb), req(&d, rb)]
+            )
+            .is_err()
+        );
     }
 
     /// ⭐ A WINDOWED STEP'S ADMISSION IS ITS SPAN, NOT ITS END — a step whose end is far past a
@@ -2043,7 +2078,11 @@ mod tests {
                 .unwrap()
         };
         for r in 0..2u32 {
-            assert_eq!(size(wtid(r, W::PageTable)), 4 * 3 * 128, "window {r}'s page table");
+            assert_eq!(
+                size(wtid(r, W::PageTable)),
+                4 * 3 * 128,
+                "window {r}'s page table"
+            );
             assert_eq!(
                 size(wtid(r, W::Mask)),
                 (4 * 3 * 4 * 2) as u64,

@@ -166,12 +166,7 @@ impl BundleMeta {
     /// capacity.
     pub(crate) fn reach(&self) -> usize {
         #[cfg(not(feature = "spyre-hw"))]
-        if let Some(r) = self
-            .paged
-            .iter()
-            .map(|p| p.reach())
-            .max()
-        {
+        if let Some(r) = self.paged.iter().map(|p| p.reach()).max() {
             return r;
         }
         self.capacity
