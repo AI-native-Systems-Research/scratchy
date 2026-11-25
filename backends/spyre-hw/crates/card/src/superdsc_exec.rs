@@ -4,8 +4,8 @@
 //! The SuperDSC emitter produces a dxp device bundle (one device program per launch group + the
 //! placement manifest). This module runs it DIRECTLY on the AIU through [`crate::runtime`]: the
 //! program, the packed weights and the paged KV pool are allocated ONCE in [`Executor::prepare`]
-//! and live on-card; each [`Executor::predict`] DMAs only the (small) activations in and the
-//! logits out — weights and KV are NEVER re-uploaded. That residency is the whole perf point.
+//! and live on-card; each step ([`Executor::submit_step`]) DMAs only the (small) activations in
+//! and its pick out — weights and KV are NEVER re-uploaded. That residency is the whole perf point.
 //!
 //! fp16 is the device-native SEN169 (`senfp169`), not IEEE fp16: every 2-byte element converts
 //! IEEE→sen on H2D and sen→IEEE on D2H ([`scratchy_target_spyre::sen_convert`]).
@@ -30,7 +30,7 @@ use tracing::{debug, info};
 use crate::cb_plan;
 use crate::runtime::{
     BatchedCb, ByteOffset, ByteSize, CardRuntime, ComputeWireBatch, DevAddr, H2dPin, HwError,
-    PeerLink, Stream,
+    PeerLink, ReadPeek, ReadSignal, Stream,
 };
 use scratchy_target_spyre::allocator::HostBytes;
 use scratchy_target_spyre::bundle_code::{
@@ -453,6 +453,54 @@ pub(crate) struct LaunchWhere {
     pub(crate) requests: fold_plan::Requests,
 }
 
+/// ⭐ ONE SUBMITTED FORWARD'S LANDING ON ITS CARD ([`Executor::submit_step`]) — total over every
+/// forward, so nothing about it can be refused: a forward that put work on the card carries the
+/// latch its last submission armed, and one whose every list is empty put nothing there and has
+/// landed by that fact.
+pub enum ForwardLanding {
+    /// The latch the forward's last submission carries; it fires when the card retires the
+    /// forward (the launch stream is in order, so the whole forward with it).
+    Queued(ReadSignal),
+    /// The forward launched nothing — nothing of it is on the card.
+    Nothing,
+}
+
+impl ForwardLanding {
+    /// A read-only view for whoever asks whether the card still owes this forward work — the
+    /// in-flight probe. The waiter stays here ([`Executor::settle_peer_pick`]).
+    pub fn peek(&self) -> ForwardPeek {
+        match self {
+            ForwardLanding::Queued(s) => ForwardPeek::Queued(s.peek_handle()),
+            ForwardLanding::Nothing => ForwardPeek::Nothing,
+        }
+    }
+
+    /// Park until the forward has retired; `dead` is [`ReadSignal::wait_or`]'s error escape.
+    /// `true` once retired, `false` when the stream died underneath it.
+    fn wait_or(&self, dead: impl Fn() -> bool) -> bool {
+        match self {
+            ForwardLanding::Queued(s) => s.wait_or(dead),
+            ForwardLanding::Nothing => true,
+        }
+    }
+}
+
+/// [`ForwardLanding`]'s read-only view — its whole surface is [`Self::landed`].
+pub enum ForwardPeek {
+    Queued(ReadPeek),
+    Nothing,
+}
+
+impl ForwardPeek {
+    /// Has the card retired the forward?
+    pub fn landed(&self) -> bool {
+        match self {
+            ForwardPeek::Queued(p) => p.fired(),
+            ForwardPeek::Nothing => true,
+        }
+    }
+}
+
 /// One rung launch staged for the rung's single doorbell. `launch_ops_inner` collects these across
 /// its whole (op, request, rep) loop and flushes once at the end
 /// ([`crate::runtime::Stream::submit_batch`] — the vendor's multi-CB branch). The site context
@@ -872,6 +920,13 @@ impl<T: ktir_superdsc::collective::Tp> Drop for OpProg<T> {
 
 impl<T: ktir_superdsc::collective::Tp> Drop for Executor<'_, '_, T> {
     fn drop(&mut self) {
+        // ⭐ THE SESSION'S HOST BYTES OUTLIVE ITS IN-FLIGHT WORK. Its steps ride the card's launch
+        // stream, which is not this session's to destroy, and a step still on it reads this
+        // session's shadow at device time (the preamble H2D) or lands in its read ring (the pick's
+        // D2H) — so the drop waits the stream out before those buffers are unmapped and freed. A
+        // stream that took a device error is not waited (its synchronize rethrows instead); that
+        // error is the step's that met it, surfaced there.
+        let _ = self.card.launches().synchronize();
         for a in &mut self.seg_addr {
             std::mem::forget(a.take());
         }
@@ -1284,9 +1339,13 @@ pub struct Executor<'a, 'c, T: ktir_superdsc::collective::Tp> {
     body_rungs: Vec<(SweptCols, Vec<Ops<T>>)>,
 
     // ── Device state ──
+    // ⭐ NO STREAM OF ITS OWN. Every step this session runs rides its card's ONE launch stream
+    // ([`CardRuntime::launches`], through [`Self::launches`]), so its steps and every other
+    // session's on the card run in the order the host submitted them; its load-time uploads ride
+    // a load stream of [`Self::prepare`]'s own, drained before prepare returns.
+    //
     // ⛔ The `DevAddr`s below are leaked at shutdown by `impl Drop for Executor` — see the note on
     // `impl Drop for OpProg` for the abort that forced it.
-    stream: Option<Stream<'a>>,
     seg_addr: [Option<DevAddr>; NUM_SEGMENTS],
     /// ⭐ THE WEIGHT SEGMENT'S EXTRA BANKS — regions, host shadows and extents for banks `1..N`,
     /// index `b - 1`. Bank 0 IS `seg_addr[SEG_WEIGHT]` / `seg_host[SEG_WEIGHT]`, so these three are
@@ -1528,10 +1587,9 @@ impl DeferredRead {
     }
 }
 
-/// The timers and H2D accounting of a step's FORWARD HALF — everything upstream of the
-/// readback that [`Executor::predict`] (logits D2H) shares, held in one struct so the
-/// step's tails print from the
-/// SAME numbers and cannot drift on anything the step did before its readback.
+/// The timers and H2D accounting of a step's FORWARD HALF — the refill, the launch, and the
+/// drains a one-card `SCRATCHY_SDSC_PHASE_TIME` run takes around it — held in one struct so the
+/// step's phase line ([`Executor::submit_step`]) prints from the same numbers the forward took.
 struct ForwardHalf {
     t_stream0: Instant,
     t0: Instant,
@@ -1742,7 +1800,6 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
             body_ops: Vec::new(),
             suffix_ops: Vec::new(),
             body_rungs: Vec::new(),
-            stream: None,
             seg_addr: [const { None }; NUM_SEGMENTS],
             // ⭐ THE WEIGHT BANKS, STRAIGHT FROM THE BAKED LAYOUT — the bundle decided how many
             // regions its weights need at cargo-build; nothing here chooses. Empty (one bank) for
@@ -2248,7 +2305,7 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
         }
         self.bind_input_keyed(id, key, bytes)?;
         let (_, sent) = self.refill_activations(Diag::get())?;
-        self.stream_ref()?
+        self.launches()
             .synchronize()
             .map_err(|e| anyhow!("stage_keyed('{id}'): sync: {e}"))?;
         Ok(sent)
@@ -3032,34 +3089,28 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
             *from = Instant::now();
         };
 
-        // A DEDICATED created stream (not the default), and PERSISTENT for the session: the
-        // scheduler retires each op's fence from its per-stream deque at completion
-        // (SchedulerState::retire_fence), so the deques hold only in-flight fences instead of
-        // one entry per launch forever. Unbounded, not large per step — ~200 launches per
-        // decode step (202 measured on 2b fp8) is tens of KB/forward, but a session stream
-        // never dies, so it accumulates for its whole life (the old per-forward
-        // recreate-and-destroy workaround papered over exactly this; the PR1 gate run retired
-        // 331,220 fences over 1,570 forwards with RSS flat to the kB). The resident
-        // program/weight/KV allocations live on the runtime, not the stream.
-        self.stream = Some(
-            Stream::create(self.card)
-                .map_err(|e| anyhow!("prepare: could not create a stream: {e}"))?,
-        );
+        // ⭐ THE LOAD STREAM — this prepare's own, for the session's one-time uploads (programs,
+        // weights, the device fills), drained and destroyed before prepare returns. NOT the card's
+        // launch stream: a ladder prepares its sessions in parallel, and their uploads queued on
+        // the one stream every step rides would serialize the wave behind each other's DMAs. The
+        // drain below is what orders them before this session's first step on the launch stream.
+        let load = Stream::create(self.card)
+            .map_err(|e| anyhow!("prepare: could not create the load stream: {e}"))?;
         lap("stream-create", &mut t0);
 
         // ── Programs. Each op's device binary gets its OWN Program-segment alloc + H2D ONCE; they
         //    all SHARE the resident tensor segments below. ──
         {
-            self.alloc_ops_at(ListSel::Prefix)?;
+            self.alloc_ops_at(ListSel::Prefix, &load)?;
             for c in 0..self.body_ops.len() {
-                self.alloc_ops_at(ListSel::Body(c))?;
+                self.alloc_ops_at(ListSel::Body(c), &load)?;
             }
             for i in 0..self.body_rungs.len() {
                 for c in 0..self.body_rungs[i].1.len() {
-                    self.alloc_ops_at(ListSel::Rung(i, c))?;
+                    self.alloc_ops_at(ListSel::Rung(i, c), &load)?;
                 }
             }
-            self.alloc_ops_at(ListSel::Suffix)?;
+            self.alloc_ops_at(ListSel::Suffix, &load)?;
         }
         lap("program-h2d", &mut t0);
 
@@ -3214,7 +3265,7 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
             if reserve_only && is_resident_seg(i) {
                 continue;
             }
-            let (stream, addr) = (self.stream_ref()?, self.seg_addr[i].as_ref().unwrap());
+            let (stream, addr) = (&load, self.seg_addr[i].as_ref().unwrap());
             let host_owned = self.host_owned_seg(i);
             if !host_owned {
                 fill_zero_walk(stream, addr, &format!("prepare: seg{i} zero fill"))?;
@@ -3253,7 +3304,7 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
         if self.stages_weights() {
             for b in 0..self.weight_bank_bytes.len() {
                 let (stream, addr) = (
-                    self.stream_ref()?,
+                    &load,
                     self.weight_bank_addr[b]
                         .as_ref()
                         .ok_or_else(|| anyhow!("prepare: weight bank {} has no region", b + 1))?,
@@ -3279,18 +3330,16 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
         // A borrowed pool is the owner's, already filled and holding live KV; a reserve-only
         // session is about to be aliased — the same pass the segment loop gives seg2.
         if !self.seg_borrowed[SEG_KV.get()] && !reserve_only {
-            let stream = self.stream_ref()?;
             for (b, addr) in self.kv_bank_addr.iter().enumerate() {
                 fill_zero_walk(
-                    stream,
+                    &load,
                     addr,
                     &format!("prepare: KV bank {} zero fill", b + 1),
                 )?;
             }
         }
         lap("tensor-h2d", &mut t0);
-        self.stream_ref()?
-            .synchronize()
+        load.synchronize()
             .map_err(|e| anyhow!("prepare: sync: {e}"))?;
         lap("sync", &mut t0);
         // ⭐ THE PINS RETIRE HERE — and would on any earlier exit too: the sync above waited
@@ -3299,6 +3348,9 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
         // refused one, or an unwind. Dropping here (rather than at scope end) simply unpins
         // before the ladder runs on.
         drop(pinned);
+        // The load stream goes with them: drained above, so its destroy waits on nothing, and
+        // every step of this session rides the card's launch stream from here on.
+        drop(load);
         self.prepared = true;
 
         // ── RECLAIM host memory that is DEAD after prepare (~2× the model in host RSS otherwise).
@@ -3358,14 +3410,15 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
         Ok(())
     }
 
-    fn stream_ref(&self) -> Result<&Stream<'a>> {
-        self.stream
-            .as_ref()
-            .ok_or_else(|| anyhow!("no stream — prepare was not called"))
+    /// The card's one launch stream ([`CardRuntime::launches`]) — every step this session runs,
+    /// and every door it opens after prepare, rides it.
+    fn launches(&self) -> &Stream<'a> {
+        self.card.launches()
     }
 
-    /// Give every op in one list its own Program-segment allocation and upload its device binary.
-    fn alloc_ops_at(&mut self, sel: ListSel) -> Result<()> {
+    /// Give every op in one list its own Program-segment allocation and upload its device binary
+    /// on `load`, [`Self::prepare`]'s load stream.
+    fn alloc_ops_at(&mut self, sel: ListSel, load: &Stream<'a>) -> Result<()> {
         // The list is taken out so the stream (also `&self`) can be borrowed alongside it.
         let mut ops = std::mem::take(self.list_mut(sel));
         // Heap copies of any `.rodata`-backed program bytes, kept alive until the async H2Ds have
@@ -3473,8 +3526,7 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
                     .ok_or_else(|| anyhow!("program window at {head} B unaddressable"))?;
                 crossings[1] += t.elapsed();
                 let t = Instant::now();
-                self.stream_ref()?
-                    .h2d(staged, &dst)
+                load.h2d(staged, &dst)
                     .map_err(|e| anyhow!("program H2D: {e}"))?;
                 crossings[2] += t.elapsed();
                 op.addr = Some(addr);
@@ -3484,8 +3536,7 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
             // load, so this sync costs nothing per step.
             if !pinnable.is_empty() {
                 let t = Instant::now();
-                self.stream_ref()?
-                    .synchronize()
+                load.synchronize()
                     .map_err(|e| anyhow!("program H2D sync: {e}"))?;
                 crossings[3] += t.elapsed();
             }
@@ -3675,15 +3726,16 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
     /// applied to every op (zero for prefix/suffix; `v·stride` for body layer v). Tensors stay
     /// resident — a producer op's output and the consumer's input resolve to the SAME
     /// segment+offset (one global placement per tensor), so threading is automatic.
-    fn launch_ops(
+    ///
+    /// `where_` is the launch row's own ([`Self::forward_rows`]): the per-segment offsets (zero for
+    /// prefix/suffix, the layer's weight shift for a body launch), the weight bank backing
+    /// positional slot 1, the KV region backing slot 2. `land` is the forward's landing when this
+    /// list is the forward's last ([`Self::launch_forward`]): the list's last submission arms it.
+    fn launch_list(
         &mut self,
         sel: ListSel,
-        byte_off: [u64; NUM_SEGMENTS],
-        // ⭐ WHICH WEIGHT BANK backs positional slot 1 for these launches. 0 for every unbanked
-        // bundle, which is what makes banking invisible to every model whose weights fit one region.
-        weight_bank: usize,
-        // ⭐ WHICH KV REGION backs positional slot 2 — the launch row's own layer region.
-        kv_bank: KvBank,
+        where_: LaunchWhere,
+        land: Option<&ReadSignal>,
     ) -> Result<()> {
         let d = Diag::get();
         // The list is taken out so `&self` stays free for the stream and the fold state; every op
@@ -3691,23 +3743,18 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
         // runs once per forward per REQUEST, so anything written back through it is state one
         // request leaves for the next.
         let ops = std::mem::take(self.list_mut(sel));
-        let r = self.launch_ops_inner(
-            &ops,
-            LaunchWhere {
-                byte_off,
-                weight_bank,
-                kv_bank,
-                // One request — the count a packed prefill launch states is a later law's; every
-                // launch today serves one, and the span law is inert at one.
-                requests: fold_plan::Requests::default(),
-            },
-            d,
-        );
+        let r = self.launch_ops_inner(&ops, where_, d, land);
         *self.list_mut(sel) = ops;
         r
     }
 
-    fn launch_ops_inner(&mut self, ops: &Ops<T>, where_: LaunchWhere, d: &Diag) -> Result<()> {
+    fn launch_ops_inner(
+        &mut self,
+        ops: &Ops<T>,
+        where_: LaunchWhere,
+        d: &Diag,
+        land: Option<&ReadSignal>,
+    ) -> Result<()> {
         // `weight_bank` is read only inside `cb_plan::launch_site`, through `where_`.
         let byte_off = where_.byte_off;
         // 🛑 THE DRAIN AT THE START IS WHAT MAKES THE LADDER MEAN ANYTHING. A launch is async and
@@ -3716,7 +3763,7 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
         // exactly the ops the rung adds — so every rung after the first read the SAME number, and
         // one came out NEGATIVE. Draining first costs one settle per layer instead of one per group.
         if d.prefix_time {
-            let _ = self.stream_ref()?.synchronize();
+            let _ = self.launches().synchronize();
         }
         let px0 = Instant::now();
         let px_target: Option<usize> = (d.prefix_time && !ops.is_empty()).then(|| {
@@ -3761,8 +3808,11 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
             while at < seq.len() && seq[at].op == oi {
                 let l = seq[at];
                 at += 1;
+                // The list's last launch carries the forward's landing when it submits on its own
+                // (the per-op paths below); the batched path arms it on the rung's one flush.
+                let arm = if at == seq.len() { land } else { None };
                 let (request, rep) = (l.request, l.rep);
-                let stream = self.stream_ref()?;
+                let stream = self.launches();
                 // ⭐ ONE (op, relaunch)'S ARITHMETIC, SINGLE-SOURCED. The request and walk shifts,
                 //    the shifted tensor bases, the weight bank, the program and the bootstrap are
                 //    `cb_plan::launch_site` — the submit walk below, the diag printers it feeds, and
@@ -3886,17 +3936,11 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
                         let mut t = timers();
                         t.prep_ms += (st0 - gt0).as_secs_f64() * 1e3;
                     }
-                } else if op.collective.is_some() {
-                    // A COLLECTIVE IS ONE SUBMISSION even off the batched path: its send, wait and
-                    // consume ride one doorbell, in order, so no diag mode can split them.
-                    stream.submit_batch(&cbs, barrier).map_err(fault)?;
                 } else if d.submit_time {
                     // `submit` is the enqueue alone: no synchronize on purpose — a drain would make
                     // this measure the very pipeline it is trying to leave undisturbed.
                     let st0 = Instant::now();
-                    stream
-                        .compute(prog, &ta, "", bootstrap, &[], barrier)
-                        .map_err(fault)?;
+                    stream.submit_batch(&cbs, barrier, arm).map_err(fault)?;
                     let st1 = Instant::now();
                     let mut t = timers();
                     t.submit_ms += (st1 - st0).as_secs_f64() * 1e3;
@@ -3906,14 +3950,12 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
                         t.host_fence_launches += 1;
                     }
                 } else {
-                    // Match torch-spyre's JobPlanStepCompute EXACTLY: kernel_name="" (NOT the mlir
-                    // path) — it runs the resident dxp binary via its binary address, and passing
-                    // the mlir path may route flex down a different (seed-only) path for the SFP
-                    // transcendental while the matmul tolerates it. The same "" at the diag probes
-                    // above and inside the rung flush's `compute_batch` / the CB render door.
-                    stream
-                        .compute(prog, &ta, "", bootstrap, &[], barrier)
-                        .map_err(fault)?;
+                    // ONE SUBMISSION PER SITE off the batched path, through the one compute door:
+                    // a plain launch is a list of one (kernel_name="", matching torch-spyre's
+                    // JobPlanStepCompute — the resident dxp binary runs by its bootstrap address),
+                    // and a collective's send, wait and consume ride one doorbell, in order, so no
+                    // diag mode can split them.
+                    stream.submit_batch(&cbs, barrier, arm).map_err(fault)?;
                 }
 
                 // DEFAULT-OFF: skipping the per-group drain removes the ~868-ops/layer
@@ -3940,7 +3982,7 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
 
             if Some(oi) == px_target {
                 // AFTER every rep of this group, so a fold's whole pass count lands in one rung.
-                let _ = self.stream_ref()?.synchronize();
+                let _ = self.launches().synchronize();
                 let mut t = timers();
                 let e = t
                     .prefix_ms
@@ -3979,9 +4021,11 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
                     p.item
                 })
                 .collect();
-            let stream = self.stream_ref()?;
+            let stream = self.launches();
             let st0 = Instant::now();
-            let r = stream.submit_batch(&items, batch_barrier);
+            // The flush is the list's last submission, so it carries the forward's landing when
+            // this list ends the forward.
+            let r = stream.submit_batch(&items, batch_barrier, land);
             let st1 = Instant::now();
             if let Err(e) = r {
                 // ⛔ EVERY FAULTING LAUNCH NAMES ITS OWN AIM — the flush's refusal must too.
@@ -4212,9 +4256,7 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
         let stick =
             usize::try_from(scratchy_target_spyre::lower_subtile_tape_to_superdsc::STICK_BYTES)
                 .expect("STICK_BYTES fits usize");
-        let Ok(stream) = self.stream_ref() else {
-            return "progimg: no stream — nothing to read back".to_string();
-        };
+        let stream = self.launches();
         // ⛔ READ WHERE THE IMAGE WAS PUT, not where the allocation starts — `alloc_ops_at` places it
         // at dxp's declared prologue, so a base-relative readback would diff the prologue against the
         // image and call every such program corrupt.
@@ -4306,7 +4348,7 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
     /// index where nz collapses to 0 (or max → inf) IS the divergence. seg1 (weights, ~2.6 GB) is
     /// deliberately SKIPPED: static across the pass and already ruled out.
     fn optrace(&mut self, oi: usize) -> Result<()> {
-        let _ = self.stream_ref()?.synchronize();
+        let _ = self.launches().synchronize();
         let mut line = format!("[optrace] op[{oi}]");
         for i in [0usize, 2, 3, 4, 5, 6] {
             let seg = SegIdx::checked(i as i64).expect("literal < NUM_SEGMENTS");
@@ -4411,7 +4453,7 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
                 snap: std::collections::HashMap::new(),
             });
         }
-        let _ = self.stream_ref()?.synchronize();
+        let _ = self.launches().synchronize();
         // D2H every segment a placement can live in — `read_seg`'s own rule: this tool exists to
         // see the bytes the ops COMPUTE (the intermediates above all), which are device-only slots,
         // so every segment with a region materializes its shadow first. An aliased segment's
@@ -4731,38 +4773,38 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
         }
     }
 
-    /// The shared FORWARD HALF of a step: the prepared/source gates, the RB window reset, the
-    /// activation refill, and the replay-or-launch decision — extracted from `predict`, so
-    /// the refill law, the replay gate and
-    /// the launch are ONE behavior the readback rides, never a copy. `suffix` is
-    /// [`SuffixLaunch::Skipped`] only for a forward whose logits are discarded ([`Logits`]).
+    /// The FORWARD HALF of a step ([`Self::submit_step`]'s body): the prepared/source gates, the
+    /// RB window reset, the activation refill, and the replay-or-launch decision — the refill
+    /// law, the replay gate and the launch are ONE behavior every step rides, never a copy.
+    /// `suffix` is [`SuffixLaunch::Skipped`] only for a forward whose pick nobody reads.
+    ///
+    /// Returns the forward's LANDING beside its timers: the latch its last submission arms
+    /// ([`Self::launch_forward`]), which fires when the card has retired the forward.
     fn forward_half(
         &mut self,
         n_new: NewTokens,
         seq_pos: SeqPos,
         suffix: SuffixLaunch,
         d: &Diag,
-    ) -> Result<ForwardHalf> {
+    ) -> Result<(ForwardHalf, ForwardLanding)> {
         if !self.prepared {
-            bail!("predict before prepare");
+            bail!("submit_step before prepare");
         }
         self.require_sources_filled()?;
 
-        // RB timing: start the forward's window empty. The previous forward drained its own
-        // entries at its synchronize; what is left in the ring now is pre-forward history
-        // (prepare's weight uploads belong to no op), and the launch sequence starts at zero.
+        // RB timing: start the forward's window empty. What is left in the ring now is
+        // pre-forward history (prepare's weight uploads belong to no op), and the launch sequence
+        // starts at zero.
         if d.rb_time {
             let _ = flex_rs::rb_telemetry::drain_source(self.card.telemetry_key());
         }
         timers().rb_seq.clear();
 
-        // The stream is PERSISTENT: the scheduler retires each op's fence from its per-stream
-        // deque the moment that fence resolves (SchedulerState::retire_fence), so nothing
-        // per-forward accumulates on it and the old recreate-to-drain-every-forward workaround
-        // is gone. The previous forward already synchronized before returning (the trailing
-        // `synchronize` below waits out every op, H2Ds included), so dropping the recreate's
-        // implicit destroy-sync changes no ordering; the resident weight/KV/program
-        // allocations live on the runtime either way.
+        // The launch stream is the CARD'S, persistent for the process: the scheduler retires each
+        // op's fence from its per-stream deque the moment that fence resolves
+        // (SchedulerState::retire_fence), so nothing per-forward accumulates on it. Nothing here
+        // waits on the forward before this one — it may still be on the card, this session's or
+        // another's; the refill's own quiet point is the one wait the shadow law asks for.
         let t_stream0 = Instant::now();
         let t0 = t_stream0;
         let (h2d_note, h2d_bytes) = self.refill_activations(d)?;
@@ -4773,7 +4815,7 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
         // tp/2 prefill). The phase split of a sharded step is the finish side's alone.
         let sharded = <T as ktir_superdsc::collective::World>::SHARDED;
         if d.phase_time && !sharded {
-            let _ = self.stream_ref()?.synchronize();
+            let _ = self.launches().synchronize();
         }
         let t1 = Instant::now();
 
@@ -4785,40 +4827,40 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
         // own other refusals (batched fold, instruments) and hands back `None` for
         // the walk.
         // The player's images all carry the suffix, so a forward that skips it takes the walk.
-        let replayed = n_new.0 == 1
-            && suffix == SuffixLaunch::Launched
-            && self.try_replay_forward(seq_pos)?.is_some();
-        if !replayed {
-            self.launch_forward(seq_pos, suffix)?;
-        }
+        let replayed = if n_new.0 == 1 && suffix == SuffixLaunch::Launched {
+            self.try_replay_forward(seq_pos)?
+        } else {
+            None
+        };
+        let landed = match replayed {
+            Some(landed) => landed,
+            None => self.launch_forward(seq_pos, suffix)?,
+        };
 
         if d.phase_time && !sharded {
-            let _ = self.stream_ref()?.synchronize();
+            let _ = self.launches().synchronize();
         }
         let t2 = Instant::now();
-        Ok(ForwardHalf {
-            t_stream0,
-            t0,
-            t0b,
-            t1,
-            t2,
-            h2d_note,
-            h2d_bytes,
-        })
+        Ok((
+            ForwardHalf {
+                t_stream0,
+                t0,
+                t0b,
+                t1,
+                t2,
+                h2d_note,
+                h2d_bytes,
+            },
+            landed,
+        ))
     }
 
-    /// The `[sdsc-phase]` block both readback tails print — one renderer, parameterized only by
-    /// WHICH readback ran (`"logits"` / `"idx"`), so the token step's line set cannot drift from
-    /// the logits step's. The rbgap and phase harnesses grep these lines.
-    fn print_step_phase(
-        half: &ForwardHalf,
-        d2h_name: &str,
-        d2h_seg: i64,
-        d2h_bytes: u64,
-        t2b: Instant,
-        t3: Instant,
-        n_new: i64,
-    ) {
+    /// The `[sdsc-phase]` block of one submitted forward (`SCRATCHY_SDSC_PHASE_TIME`): the refill's
+    /// enqueue and, on a one-card world, the drains `forward_half` takes around the launch — so
+    /// `compute` is the forward's own device time there. A sharded world drains nothing
+    /// mid-submit, so its `compute` is the host's submit time alone. The rbgap and phase harnesses
+    /// grep these lines.
+    fn print_forward_phase(half: &ForwardHalf, n_new: i64) {
         let ms = |a: Instant, b: Instant| (b - a).as_secs_f64() * 1e3;
         let ForwardHalf {
             t_stream0,
@@ -4830,15 +4872,11 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
             h2d_bytes,
         } = half;
         eprintln!(
-            "[sdsc-phase] stream_recreate={:.2}  preamble_h2d={:.2}  compute={:.2}  \
-             {d2h_name}_d2h={:.2}  predict_total={:.2} ms  (n_new={})\n\
-             [sdsc-phase]   h2d: {}KB over{} | enqueue={:.2} sync={:.2}\n\
-             [sdsc-phase]   d2h: seg{} {}KB | enqueue={:.2} sync={:.2}",
-            ms(*t_stream0, *t0),
+            "[sdsc-phase] preamble_h2d={:.2}  compute={:.2}  submit_total={:.2} ms  (n_new={})\n\
+             [sdsc-phase]   h2d: {}KB over{} | enqueue={:.2} sync={:.2}",
             ms(*t0, *t1),
             ms(*t1, *t2),
-            ms(*t2, t3),
-            ms(*t_stream0, t3),
+            ms(*t_stream0, *t2),
             n_new,
             h2d_bytes >> 10,
             if h2d_note.is_empty() {
@@ -4848,29 +4886,18 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
             },
             ms(*t0, *t0b),
             ms(*t0b, *t1),
-            d2h_seg,
-            d2h_bytes >> 10,
-            ms(*t2, t2b),
-            ms(t2b, t3),
         );
     }
 
-    /// The shared post-readback tail: RB attribution and the one-shot flex-leak probe — the
-    /// two things every step does after its synchronize, extracted with `forward_half` so the
-    /// token step keeps them by construction rather than by copy.
-    fn step_epilogue(&mut self, d: &Diag) {
-        if d.rb_time {
-            self.rb_attribute();
-        }
-
-        // FLEX-LEAK PROBE (one-shot): after the N-th forward, tear the stream + the whole runtime
-        // down. This BREAKS the session (no re-prepare) — measure, then stop the serve.
+    /// The FLEX-LEAK PROBE (one-shot, `SCRATCHY_SDSC_RESET_PROBE`): after the N-th submitted
+    /// forward, tear the whole runtime down — its streams, the card's launch stream among them.
+    /// This BREAKS the card (no re-prepare) — measure, then stop the serve.
+    fn leak_probe(&mut self, d: &Diag) {
         if let Some(n) = d.reset_probe {
             let mut t = timers();
             t.forwards += 1;
             if t.forwards == n {
                 let before = vmrss_kb();
-                self.stream = None;
                 let _ = self.card.reset();
                 let after = vmrss_kb();
                 eprintln!(
@@ -4881,142 +4908,47 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
         }
     }
 
-    /// Run ONE forward over `n_new` NEW positions appended at `[seq_pos..seq_pos+n_new)`: refill
-    /// the bound activations, launch prefix → body×iters → suffix, and copy the logits row back.
-    /// `logits` says what the caller does with this forward's logits ([`Logits`]): a prompt chunk
-    /// whose logits nobody reads skips the suffix and the read-back both.
-    pub fn predict(&mut self, n_new: NewTokens, seq_pos: SeqPos, logits: Logits<'_>) -> Result<()> {
-        let want = LogitsRead::of(&logits);
-        let submitted = self.predict_submit(n_new, seq_pos, want)?;
-        self.predict_finish(submitted, logits)
-    }
-
-    /// ⭐ THE SUBMIT HALF OF [`Self::predict`]: the forward and, when its logits are read back, the
-    /// logits D2H behind it on the compute pipeline — enqueued, nothing waited on. A forward that
-    /// spans several cards (a sharded world's ranks, whose collectives wait on each other's sends)
-    /// submits on EVERY card before it waits on any, so no card's wait can stall a peer's send;
-    /// [`Self::predict_finish`] is the wait. One card is the same two halves back to back.
-    pub fn predict_submit(
-        &mut self,
-        n_new: NewTokens,
-        seq_pos: SeqPos,
-        want: LogitsRead,
-    ) -> Result<PredictSubmitted> {
-        let suffix = match want {
-            LogitsRead::Discarded => SuffixLaunch::Skipped,
-            LogitsRead::ReadBack | LogitsRead::LeftOnDevice => SuffixLaunch::Launched,
-        };
-        let d = Diag::get();
-        let n_new = NewTokens(n_new.0.max(1));
-        let half = self.forward_half(n_new, seq_pos, suffix, d)?;
-
-        // ── D2H the logits' segment, sen→IEEE the logits slice at its baked offset. ──
-        // Skipped entirely when the caller wants no logits: only the LAST prefill chunk asks for
-        // them (the prefill suffix runs its lm-head tail at m=1 over the chunk's last row), so every
-        // earlier chunk would transfer ~3 MB of untouched memory (~1.7 ms at the measured DMA rate).
-        //
-        // NOTE the read is at the logits placement's offset with NO row indexing — exactly right for
-        // the folded tail, which writes ONE [1,vocab] row at offset 0 whatever `n_new` is, and
-        // unchanged for decode (n_new=1).
-        let lp = self
-            .places
-            .get(&self.logits_id)
-            .cloned()
-            .ok_or_else(|| anyhow!("logits tensor {} has no placement", self.logits_id))?;
-        let (mut d2h_seg, mut d2h_bytes) = (-1i64, 0u64);
-        if want == LogitsRead::ReadBack {
-            let seg = SegIdx::checked(lp.segment as i64)
-                .ok_or_else(|| anyhow!("logits segment {} out of range", lp.segment))?;
-            // The shadow the readback lands in must cover the window below (and the multi-chunk
-            // fallback reads the WHOLE region): the mirrored shadow is sized to the segment's
-            // placements, so grow it to the region's padded extent first.
-            self.mirror_seg_shadow(seg)?;
-            d2h_seg = lp.segment as i64;
-            let addr = self.seg_addr[seg.get()].as_ref().unwrap();
-            let tot = addr.total_size().as_u64();
-            // ⭐ THE LOGITS **PLACEMENT**, NOT ITS SEGMENT'S ALLOCATION — `d2h_bytes =
-            // addr.total_size()` copied the WHOLE region every token to obtain one [1,vocab] row.
-            //
-            // ⛔ THAT COST WAS INVISIBLE BECAUSE IT IS NOT WRITTEN DOWN ANYWHERE: it is whatever
-            // else the layout happens to pack into the logits segment. Today that is nothing (~102
-            // KB, so the whole-region read was ~the row), which is exactly why a whole-region read
-            // survived review. But it is what disqualified seg4 as the weight-tail spill slot in
-            // `spill_weight_tail`: a 419 MB tenant there would have cost ~240 ms PER TOKEN, with
-            // nothing about the placement looking wrong. Reading the PLACEMENT makes the transfer a
-            // property of the logits row (vocab × 2 B) instead of a property of the segment's other
-            // tenants, so no future packing decision can put bytes on this critical path.
-            //
-            // Two facts make the window safe, and both are guarded at cargo-build in
-            // `audit_layout_addresses` rather than trusted here:
-            //   * `lp.offset % 128 == 0` — a chunk offset is written in flits, and flex's
-            //     `each_chunk_128_byte_aligned` rejects an unaligned one.
-            //   * `lp.offset + lp.size <= segment_bytes[seg]` — and `segment_bytes` is an align128
-            //     accumulation, so rounding the LENGTH up to a flit stays inside the region. The
-            //     round-up is not optional: `Flits::from_bytes` TRUNCATES (`>> 7`), so a length that
-            //     is not a multiple of 128 would transfer a short row and lose the tail logits.
-            // The destination is the SAME `[lp.offset, …)` window of the shadow the sen→IEEE convert
-            // below reads from, so the row lands where the caller already looks for it.
-            //
-            // ⭐ AND ONLY THE ROW THE CONVERT BELOW READS. The convert takes `vocab` elements at
-            // `lp.offset` — the folded tail's one `[1, vocab]` row — but a prefill rung's logits
-            // PLACEMENT is `[rows, vocab]` wide: 25.6 MB at granite-2b's 256-row rung, read back to
-            // convert 100 KB of it (15.1 ms on a fresh session, 3.6 ms warm, measured). The window
-            // is the row, so the bytes converted are the same bytes; decode's placement already is
-            // one row, so it is unchanged.
-            let lo = lp.offset;
-            let row = (self.vocab.0 as u64 * 2).min(lp.size);
-            let len =
-                scratchy_target_spyre::lower_subtile_tape_to_superdsc::align128(row).min(tot - lo);
-            // A multi-chunk region has no addressable sub-window (`chunk0` fails); fall back to the
-            // whole-region read, which is what this always did.
-            let win = (len < tot)
-                .then(|| addr.window(ByteOffset(lo), ByteSize(len)))
-                .flatten();
-            let (src, a, b) = match win.as_ref() {
-                Some(w) => (w, lo, lo + len),
-                None => (addr, 0, tot),
-            };
-            d2h_bytes = b - a;
-            // The mirror grew the shadow to the whole region above (the multi-chunk fallback
-            // reads all of it), and the window is clamped to `tot`, so the slice is in range;
-            // the let-else is the shadow type's price — the logits segment is host-owned by
-            // the role statement, so this arm is a consistency refusal, not an expectation.
-            let host = {
-                let HostShadow::Host(v) = &mut self.seg_host[seg.get()] else {
-                    bail!("predict: the logits segment {} is DEVICE-ONLY", seg.get());
-                };
-                &mut v[a as usize..b as usize]
-            };
-            // ON THE COMPUTE PIPELINE (#544): the logits readback is the LAST op of every
-            // step, right after the step's COMPUTE ops. Riding ASYNC_DMAO, its switch
-            // barrier drained the COMPUTE deque — the readback submission HOST-BLOCKED until
-            // the whole step's compute work completed. On COMPUTE the barrier drains the
-            // (empty) DMA deques instead, the readback submits immediately, and the queue's
-            // FIFO — readback CB behind the step's compute CBs on the same queue — carries
-            // the ordering the host-side wait used to.
-            self.stream
-                .as_ref()
-                .unwrap()
-                .d2h_on_compute(host, src)
-                .map_err(|e| anyhow!("logits D2H: {e}"))?;
+    /// ⭐ PARK ON ONE LATCH OF THIS CARD'S LAUNCH STREAM — the one wait every fence here takes
+    /// (a read's landing, a peer's forward). `wait` parks on the latch with the stream's death as
+    /// its escape ([`ReadSignal::wait_or`]). A latch that never fired because the stream died
+    /// underneath it surfaces the stream's deferred error through the synchronize (which does not
+    /// wait a dead stream, it rethrows); if that returns anyway, what the latch guarded never
+    /// happened, and nothing may be handed back as if it had.
+    fn park_on_latch(
+        &self,
+        wait: impl FnOnce(&dyn Fn() -> bool) -> bool,
+        what: impl std::fmt::Display,
+    ) -> Result<()> {
+        let dead = || self.launches().is_dead();
+        if wait(&dead) {
+            return Ok(());
         }
-        Ok(PredictSubmitted {
-            half,
-            want,
-            n_new,
-            d2h_seg,
-            d2h_bytes,
-            t2b: Instant::now(),
-        })
+        self.launches()
+            .synchronize()
+            .map_err(|e| anyhow!("{what}: sync: {e}"))?;
+        bail!("{what}: the stream died before it landed");
     }
 
-    /// ⭐ A PEER RANK'S HALF OF THE LOOP'S ONE FENCE — what a sharded step's non-lead card does when
-    /// the lead's stick read lands: take its shadow's quiet point ([`Self::quiet_shadow`], the same
-    /// door every shadow writer passes through), and nothing else. Its stream holds the step the
-    /// pipelined loop already submitted behind this one, so a whole-stream synchronize here would
-    /// fence that step too and serialize the pipeline; the collectives tie the peer's progress to
-    /// the lead's, so the lead's landed read is the step's end on every card that matters.
-    pub fn settle_peer_step(&mut self) -> Result<()> {
+    /// ⭐ A PEER RANK'S HALF OF A PICK'S COLLECT — what a sharded step's non-lead card does when
+    /// the lead's stick read lands: wait its own `forward` of that step out, take its shadow's
+    /// quiet point ([`Self::quiet_shadow`], the same door every shadow writer passes through), and
+    /// nothing else. Its stream may hold the step the pipelined loop already submitted behind
+    /// this one, so a whole-stream synchronize here would fence that step too and serialize the
+    /// pipeline; the forward's own latch waits this step and nothing behind it.
+    ///
+    /// Why the forward and not only the shadow: a forward submitted after the collect starts its
+    /// first collective in the receive window's cut, and a forward that ends on the cut the next
+    /// one starts on would otherwise let a fast rank's first send of the next forward land in a
+    /// slow peer's cut while that peer still consumes this forward's last collective there. Every
+    /// card retiring the forward at the collect closes that boundary whatever the cuts. It costs
+    /// nothing in the pipelined cadence: the peers' collectives tie them to the lead, so the
+    /// forward retires on every card with the lead's read, and the step queued behind it keeps
+    /// running through the wait.
+    pub fn settle_peer_pick(&mut self, forward: &ForwardLanding) -> Result<()> {
+        self.park_on_latch(
+            |dead| forward.wait_or(dead),
+            "the forward of a pick on a peer card",
+        )?;
         self.quiet_shadow()?;
         // A peer's RB records — whatever of its steps has completed (`[sdsc-rbkind]`).
         if Diag::get().rb_time {
@@ -5025,87 +4957,42 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
         Ok(())
     }
 
-    /// ⭐ THE WAIT HALF OF [`Self::predict`]: drain this card's stream, then convert the logits row
-    /// into `logits` when the submit read it back. `logits` must be the read the submit was asked
-    /// for — a mismatch is refused, never a silent skip.
-    pub fn predict_finish(&mut self, s: PredictSubmitted, logits: Logits<'_>) -> Result<()> {
-        if LogitsRead::of(&logits) != s.want {
-            bail!(
-                "predict_finish: the forward was submitted for {:?} and finished for {:?}",
-                s.want,
-                LogitsRead::of(&logits)
-            );
-        }
-        let d = Diag::get();
-        self.stream_ref()?
-            .synchronize()
-            .map_err(|e| anyhow!("predict: sync: {e}"))?;
-
-        if d.phase_time {
-            let t3 = Instant::now();
-            Self::print_step_phase(
-                &s.half,
-                "logits",
-                s.d2h_seg,
-                s.d2h_bytes,
-                s.t2b,
-                t3,
-                s.n_new.0,
-            );
-            let ms = |a: Instant, b: Instant| (b - a).as_secs_f64() * 1e3;
-            report_phase_timers(ms(s.half.t1, s.half.t2));
-        }
-
-        if let Logits::ReadBack(out) = logits {
-            let lp = self
-                .places
-                .get(&self.logits_id)
-                .ok_or_else(|| anyhow!("logits tensor {} has no placement", self.logits_id))?;
-            let seg = SegIdx::checked(lp.segment as i64)
-                .ok_or_else(|| anyhow!("logits segment {} out of range", lp.segment))?;
-            let elems = self.vocab.0.min(out.len() / 2);
-            // The submit half materialized this shadow for its readback window; the convert
-            // reads inside that same window. A device-only logits segment would mean the two
-            // halves of the read disagree with the role statement — refuse, never convert
-            // nothing.
-            let src = self.seg_host[seg.get()]
-                .host()
-                .and_then(|h| h.get(lp.offset as usize..))
-                .ok_or_else(|| {
-                    anyhow!(
-                        "predict_finish: the logits segment {} holds no host shadow",
-                        seg.get()
-                    )
-                })?;
-            sen_convert::sen_to_ieee_bytes(&src[..elems * 2], &mut out[..elems * 2]);
-        }
-
-        self.step_epilogue(d);
-        Ok(())
-    }
-
-    /// ⭐ #32 (A) — THE PIPELINED DECODE STEP'S SUBMIT HALF: one one-token
-    /// forward with NO trailing drain. `predict`'s readback tail runs a
-    /// full-stream synchronize after every step — the FIRST of the two
-    /// per-step drains the pipelined loop deletes (the second is
-    /// `read_tensor_raw`'s own, split into `defer_read_tensor_raw` +
-    /// `finish_deferred_read_raw`). The loop's ONE fence per step — taken
-    /// after its prep-ahead, inside the finish half — is what waits this
-    /// submission (and the stick D2H enqueued behind it) out. Everything
-    /// else is `predict`'s own one-token path BY CONSTRUCTION, not by copy:
-    /// the same `forward_half` (the same refill, the same ONE doorbell, the
-    /// same accounting), reached through the same private body `predict`
-    /// runs for `Logits::LeftOnDevice`.
+    /// ⭐ THE PIPELINED STEP'S SUBMIT HALF — EVERY STEP'S: a decode step, every chunk of a prompt,
+    /// a wave of tails. One forward with NO trailing drain: the refill, the forward's launches on
+    /// the card's one launch stream ([`Self::launches`]), and the host returns. Nothing here waits
+    /// on the card — not on this session's previous step, not on another session's: the stream's
+    /// order is the device's, so a step submitted behind another runs behind it. The one host wait
+    /// on the whole path is a pick's read ([`Self::finish_deferred_read_with`]), taken where the
+    /// token is needed; the refill's quiet point ([`Self::quiet_shadow`]) is the shadow law's, and
+    /// it waits an H2D, never a forward.
     ///
-    /// The step's epilogue (RB attribution, the leak probe) does not ride
-    /// this door: both bodies are Diag-gated, and every Diag instrument
-    /// disqualifies a forward from the emitted-row regime by the seat's
-    /// own `is_quiet` gate — on this path they have no reachable input.
-    /// Stated here rather than silently dropped.
-    pub fn submit_step(&mut self, n_new: NewTokens, seq_pos: SeqPos) -> Result<()> {
+    /// `suffix` is the caller's: [`SuffixLaunch::Launched`] for a step whose pick it will defer and
+    /// read, [`SuffixLaunch::Skipped`] for one whose pick nobody reads. It is the only step door:
+    /// the forward's whole body is `forward_half` (the refill, the doorbells, the accounting).
+    ///
+    /// Returns the forward's [`ForwardLanding`]: its latch fires when the card has retired this
+    /// forward, so the caller can ask whether the card still owes it work (a latch read through
+    /// [`ForwardLanding::peek`]) and a pick's collect can retire it on every card
+    /// ([`Self::settle_peer_pick`]).
+    ///
+    /// The Diag instruments that report per forward report here, after the submit: the phase
+    /// line and the submit/prefix/RB timer reports (`SCRATCHY_SDSC_PHASE_TIME`), and the leak
+    /// probe (`SCRATCHY_SDSC_RESET_PROBE`). RB attribution rides the pick's collect
+    /// ([`Self::finish_deferred_read_with`]), where the forward's records have landed.
+    pub fn submit_step(
+        &mut self,
+        n_new: NewTokens,
+        seq_pos: SeqPos,
+        suffix: SuffixLaunch,
+    ) -> Result<ForwardLanding> {
         let d = Diag::get();
-        let _half = self.forward_half(n_new, seq_pos, SuffixLaunch::Launched, d)?;
-        Ok(())
+        let (half, landed) = self.forward_half(n_new, seq_pos, suffix, d)?;
+        if d.phase_time {
+            Self::print_forward_phase(&half, n_new.0);
+            report_phase_timers((half.t2 - half.t1).as_secs_f64() * 1e3);
+        }
+        self.leak_probe(d);
+        Ok(landed)
     }
 
     /// ⭐ #32 — THE SHADOW'S QUIET POINT, TAKEN BY EVERY DOOR THAT WRITES IT.
@@ -5134,32 +5021,18 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
     /// any refill exists to arm a latch, so they are exempt by construction
     /// (and the first refill re-sends every per-step range regardless).
     ///
-    /// The dead arm is the same escape [`Self::finish_deferred_read_raw`]
-    /// runs: a failed op never fires its callback, the latch's timeout tick
-    /// hands the park back, the synchronize below rethrows the stream's
-    /// deferred error, and a stream that died is REFUSED rather than written
-    /// past.
+    /// The dead arm is the one escape every fence here runs
+    /// ([`Self::park_on_latch`]): a failed op never fires its callback, the
+    /// latch's timeout tick hands the park back, the synchronize rethrows the
+    /// stream's deferred error, and a stream that died is REFUSED rather than
+    /// written past — an in-flight H2D may still read the bytes.
     fn quiet_shadow(&mut self) -> Result<()> {
+        // The take is the one mutable touch, sequenced before the park's
+        // immutable borrow of `self`.
         let Some(h2d) = self.last_h2d.take() else {
             return Ok(()); // nothing was ever enqueued — nothing to wait
         };
-        let quiet = {
-            // Scoped: `dead` borrows `self` immutably for the park, and the
-            // take above was the one mutable touch — sequenced first, the two
-            // never overlap.
-            let dead = || self.stream_ref().map(|s| s.is_dead()).unwrap_or(true);
-            h2d.wait_or(dead)
-        };
-        if !quiet {
-            self.stream_ref()?
-                .synchronize()
-                .map_err(|e| anyhow!("shadow quiet point: sync: {e}"))?;
-            bail!(
-                "the stream died before the shadow went quiet — refusing to write bytes an \
-                 in-flight H2D may still read"
-            );
-        }
-        Ok(())
+        self.park_on_latch(|dead| h2d.wait_or(dead), "shadow quiet point")
     }
 
     /// Refill per-step ACTIVATIONS into their segment's host staging at the baked offset
@@ -5359,7 +5232,7 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
             if d.phase_time {
                 note.push_str(&format!(" seg{i}={}KB", sent >> 10));
             }
-            let stream = self.stream.as_ref().unwrap();
+            let stream = self.card.launches();
             // ON THE COMPUTE PIPELINE (#544): the preamble is the FIRST op of every step with
             // the step's COMPUTE ops right behind it. Riding ASYNC_DMAI made the compute
             // submission HOST-BLOCK on the preamble's fence (its switch barrier drained the
@@ -5410,74 +5283,102 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
         Ok((note, total))
     }
 
-    /// The forward itself: prefix → body×iters → suffix (rolled), or the single body. `suffix` is
-    /// [`SuffixLaunch::Skipped`] only for a forward whose logits are discarded ([`Logits`]).
-    fn launch_forward(&mut self, seq_pos: SeqPos, suffix: SuffixLaunch) -> Result<()> {
-        let zero = [0u64; NUM_SEGMENTS];
-        let Some(rolled) = self.rolled.as_ref() else {
-            // Not rolled: one body over the whole model.
-            // ⭐ THE SAME DOOR THE HOST ASKS THROUGH — [`Executor::step_body`], from the same write slot.
-            // Two call sites here and one on the host, all three taking `seq_pos` and nothing else, so
-            // the body the host staged for IS the body launched.
-            let sel = self.step_body(seq_pos)?.sel;
-            // UNROLLED: one body over the whole model (class 0 — an unrolled bundle has no class
-            // split), and an unrolled bundle has no layer boundary to bank on — its weights are one
-            // region by construction (`bank_weight_segment` refuses to bank without layer classes),
-            // so bank 0 is the only bank there is.
-            let ls = self.list_sel_for(sel, 0);
-            return self.launch_ops(ls, zero, 0, KvBank::BASE);
-        };
-        let pre_bank = rolled.prefix_weight_bank;
-        let suf_bank = rolled.suffix_weight_bank;
-
-        self.launch_ops(ListSel::Prefix, zero, pre_bank, KvBank::BASE)?;
-
-        // sk_bucket ladder: pick this token's decode body rung by its KV length (valid_len =
-        // seq_pos+1 — positions [0..seq_pos] are filled, including the token just written to KV
-        // before attention). The same rung serves every layer this step; only the swept extents
-        // differ, and the resident KV is shared.
+    /// The forward itself: prefix → body×iters → suffix (rolled), or the single body — the rows
+    /// [`Self::forward_rows`] states, launched in order. `suffix` is [`SuffixLaunch::Skipped`]
+    /// only for a forward whose pick nobody reads.
+    ///
+    /// ⭐ THE FORWARD'S LANDING rides its LAST row: that list's last submission arms the latch, so
+    /// it fires once the card has retired the whole forward (the stream is in order). A forward
+    /// whose rows are all empty put nothing on the card, and its landing says so
+    /// ([`ForwardLanding::Nothing`]) — nothing of it is in flight, so it has landed.
+    fn launch_forward(&mut self, seq_pos: SeqPos, suffix: SuffixLaunch) -> Result<ForwardLanding> {
+        // ⭐ THE SAME DOOR THE HOST ASKS THROUGH — [`Executor::step_body`], from the same write
+        // slot. One call site here and one on the host, both taking `seq_pos` and nothing else, so
+        // the body the host staged for IS the body launched.
         let sel = self.step_body(seq_pos)?.sel;
-        // ⭐⭐ THE LAUNCH TABLE IS THE WHOLE PER-LAYER ARITHMETIC. One row per layer, in true layer
-        // order, each naming its body's CLASS, its weight shift and its own KV region — no
-        // `v·stride`, no `v / layers_per_bank`, no class base to add. The bake PROVED every row
-        // against the placements that were baked (see the launch-table guard in
-        // `lower_subtile_tape_to_ktir`), so this loop cannot disagree with the layout: it reads
-        // the table the layout was checked against.
-        //
-        // A class-split model runs its bodies OUT of tape order here — the table is TRUE ORDER
-        // (sorted by absolute layer id), which a single-class roll degenerates to
-        // `[(0,0), (0,1), …]`: the sequence the `for v in 0..iters` loop used to run.
-        // COPIED OUT before the loop: each launch takes `&mut self`, so the table cannot be
-        // borrowed out of `self.rolled` across them. It is one small row per layer — the copy
-        // is the table's bytes, not a graph.
-        let launches: Vec<_> = self
-            .rolled
-            .as_ref()
-            .expect("checked above")
-            .launches
-            .clone();
-        for l in launches {
-            let mut off = [0u64; NUM_SEGMENTS];
-            off[SEG_WEIGHT.get()] = l.w_off;
-            let ls = self.list_sel_for(sel, l.body as usize);
-            self.launch_ops(ls, off, l.w_bank as usize, l.kv_bank)?;
+        let rows = self.forward_rows(sel, suffix);
+        let Some((&(last, last_where), lead)) = rows.split_last() else {
+            return Ok(ForwardLanding::Nothing);
+        };
+        for &(ls, where_) in lead {
+            self.launch_list(ls, where_, None)?;
         }
-        // NO HOST ROUTING: the loop-carried residual + the body→suffix seam thread IN-PLACE via
-        // emitter placement aliasing (hidden_out/suffix_in aliased onto hidden_in's resident
-        // buffer). No D2H/memcpy/H2D — the residual lives on-device across iterations.
-        //
-        // ⭐ A DISCARDED FORWARD STOPS HERE. The suffix (final norm → lm-head → logits scaling) only
-        // READS the residual the last layer left in that shared buffer and writes the suffix's own
-        // tensors, which only the logits read-back consumes: the KV every later chunk attends was
-        // written by the bodies above. MEASURED (granite-2b fp16, RB_TIME): 2.73 ms per prompt
-        // chunk at 512 rows, 2.11 at 256, run on every chunk though only the last chunk's logits
-        // are ever sampled — 53 ms of a ~10k prompt's 20 chunks.
-        match suffix {
-            SuffixLaunch::Launched => {
-                self.launch_ops(ListSel::Suffix, zero, suf_bank, KvBank::BASE)
+        let landing = ReadSignal::new();
+        self.launch_list(last, last_where, Some(&landing))?;
+        Ok(ForwardLanding::Queued(landing))
+    }
+
+    /// ⭐ ONE FORWARD'S LAUNCH ROWS, IN ORDER — the one statement of what a forward launches, read
+    /// by the walk ([`Self::launch_forward`]) and by the replay image's derivation
+    /// ([`Self::derive_step_image`]), so the image is the walk's own sequence by construction.
+    /// Each row is a list and where it lands; a list with no ops launches nothing and is no row.
+    fn forward_rows(&self, sel: BodySel, suffix: SuffixLaunch) -> Vec<(ListSel, LaunchWhere)> {
+        let zero = [0u64; NUM_SEGMENTS];
+        let row = |byte_off, weight_bank, kv_bank| LaunchWhere {
+            byte_off,
+            weight_bank,
+            kv_bank,
+            // One request — the count a packed prefill launch states is a later law's; every
+            // launch today serves one, and the span law is inert at one.
+            requests: fold_plan::Requests::default(),
+        };
+        let mut rows: Vec<(ListSel, LaunchWhere)> = Vec::new();
+        match self.rolled.as_ref() {
+            Some(r) => {
+                rows.push((
+                    ListSel::Prefix,
+                    row(zero, r.prefix_weight_bank, KvBank::BASE),
+                ));
+                // sk_bucket ladder: `sel` is this step's body rung, picked by its KV length
+                // (valid_len = seq_pos+1 — positions [0..seq_pos] are filled, including the token
+                // just written to KV before attention). The same rung serves every layer this
+                // step; only the swept extents differ, and the resident KV is shared.
+                //
+                // ⭐⭐ THE LAUNCH TABLE IS THE WHOLE PER-LAYER ARITHMETIC. One row per layer, in
+                // true layer order, each naming its body's CLASS, its weight shift and its own KV
+                // region — no `v·stride`, no `v / layers_per_bank`, no class base to add. The bake
+                // PROVED every row against the placements that were baked (see the launch-table
+                // guard in `lower_subtile_tape_to_ktir`), so this cannot disagree with the layout:
+                // it reads the table the layout was checked against.
+                //
+                // A class-split model runs its bodies OUT of tape order here — the table is TRUE
+                // ORDER (sorted by absolute layer id), which a single-class roll degenerates to
+                // `[(0,0), (0,1), …]`: the sequence the `for v in 0..iters` loop used to run.
+                for l in r.launches.iter() {
+                    let mut off = zero;
+                    off[SEG_WEIGHT.get()] = l.w_off;
+                    rows.push((
+                        self.list_sel_for(sel, l.body as usize),
+                        row(off, l.w_bank as usize, l.kv_bank),
+                    ));
+                }
+                // NO HOST ROUTING: the loop-carried residual + the body→suffix seam thread
+                // IN-PLACE via emitter placement aliasing (hidden_out/suffix_in aliased onto
+                // hidden_in's resident buffer). No D2H/memcpy/H2D — the residual lives on-device
+                // across iterations.
+                //
+                // ⭐ A FORWARD WHOSE PICK NOBODY READS STOPS AT THE BODIES. The suffix (final norm
+                // → lm-head → the minted sampler) only READS the residual the last layer left in
+                // that shared buffer and writes the suffix's own tensors, which only the pick's
+                // read consumes: the KV every later chunk attends was written by the bodies above.
+                // MEASURED (granite-2b fp16, RB_TIME): 2.73 ms per prompt chunk at 512 rows, 2.11
+                // at 256, run on every chunk though only the last chunk's pick is ever read — 53 ms
+                // of a ~10k prompt's 20 chunks.
+                if suffix == SuffixLaunch::Launched {
+                    rows.push((
+                        ListSel::Suffix,
+                        row(zero, r.suffix_weight_bank, KvBank::BASE),
+                    ));
+                }
             }
-            SuffixLaunch::Skipped => Ok(()),
+            // UNROLLED: one body over the whole model (class 0 — an unrolled bundle has no class
+            // split), and an unrolled bundle has no layer boundary to bank on — its weights are
+            // one region by construction (`bank_weight_segment` refuses to bank without layer
+            // classes), so bank 0 is the only bank there is.
+            None => rows.push((self.list_sel_for(sel, 0), row(zero, 0, KvBank::BASE))),
         }
+        rows.retain(|(ls, _)| !self.list(*ls).is_empty());
+        rows
     }
 
     // ──────────────────────────────────────────────────────────────────────────────────────────
@@ -5498,7 +5399,10 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
     /// instrument is on ([`Diag::is_quiet`] — each one reads walk state). There
     /// is no other path and no toggle: the production configuration is the
     /// player.
-    fn try_replay_forward(&mut self, seq_pos: SeqPos) -> Result<Option<()>> {
+    ///
+    /// A replayed step lands the way a walked one does: the canvas is the step's one submission,
+    /// so it carries the forward's landing ([`Self::launch_forward`]).
+    fn try_replay_forward(&mut self, seq_pos: SeqPos) -> Result<Option<ForwardLanding>> {
         if !Diag::get().is_quiet() {
             return Ok(None);
         }
@@ -5523,10 +5427,11 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
                 }
             }),
         };
-        let stream = self.stream_ref()?;
+        let stream = self.launches();
         let t1 = Instant::now();
         let cbs = image.data.canvas.len();
-        let r = stream.compute_wires(batch, image.barrier());
+        let landing = ReadSignal::new();
+        let r = stream.compute_wires(batch, image.barrier(), Some(&landing));
         let t2 = Instant::now();
         if let Err(e) = r {
             // The image itself was proven at derivation (per-row gates); a refused submit here is
@@ -5551,73 +5456,21 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
         if t.replay_steps == 1 || t.replay_steps.is_multiple_of(256) {
             report_replay(&t);
         }
-        Ok(Some(()))
+        Ok(Some(ForwardLanding::Queued(landing)))
     }
 
     /// Derive one step image at its first use — the row sequence is
     /// EXACTLY `launch_forward`'s (that is the merge's one law: the step's
-    /// CBs, in the order the walk would submit them), each row rendered from
-    /// the walk's own enumeration at its own `where_`, concatenated into one canvas.
+    /// CBs, in the order the walk would submit them): the rows are
+    /// [`Self::forward_rows`]' own, with the suffix every image carries, each
+    /// rendered from the walk's own enumeration at its own `where_`,
+    /// concatenated into one canvas.
     fn derive_step_image(&self, sel: BodySel) -> Result<StepImage> {
-        let stream = self.stream_ref()?;
-        // (list, where) per launch row, mirroring `launch_forward` arm by arm. An empty list
-        // launches nothing in the walk (its flush stages zero CBs), so it contributes no row here.
-        let mut specs: Vec<(ListSel, LaunchWhere)> = Vec::new();
-        let zero = [0u64; NUM_SEGMENTS];
-        match self.rolled.as_ref() {
-            Some(r) => {
-                specs.push((
-                    ListSel::Prefix,
-                    LaunchWhere {
-                        byte_off: zero,
-                        weight_bank: r.prefix_weight_bank,
-                        kv_bank: KvBank::BASE,
-                        requests: fold_plan::Requests::default(),
-                    },
-                ));
-                for l in r.launches.clone() {
-                    let mut off = [0u64; NUM_SEGMENTS];
-                    off[SEG_WEIGHT.get()] = l.w_off;
-                    specs.push((
-                        self.list_sel_for(sel, l.body as usize),
-                        LaunchWhere {
-                            byte_off: off,
-                            weight_bank: l.w_bank as usize,
-                            kv_bank: l.kv_bank,
-                            requests: fold_plan::Requests::default(),
-                        },
-                    ));
-                }
-                specs.push((
-                    ListSel::Suffix,
-                    LaunchWhere {
-                        byte_off: zero,
-                        weight_bank: r.suffix_weight_bank,
-                        kv_bank: KvBank::BASE,
-                        requests: fold_plan::Requests::default(),
-                    },
-                ));
-            }
-            None => {
-                // Unrolled: one body over the whole model, bank 0, no seams.
-                specs.push((
-                    self.list_sel_for(sel, 0),
-                    LaunchWhere {
-                        byte_off: zero,
-                        weight_bank: 0,
-                        kv_bank: KvBank::BASE,
-                        requests: fold_plan::Requests::default(),
-                    },
-                ));
-            }
-        }
+        let stream = self.launches();
         let mut row_canvases: Vec<cb_plan::WalkCanvas> = Vec::new();
         let mut rows = 0usize;
-        for (ls, where_) in specs {
+        for (ls, where_) in self.forward_rows(sel, SuffixLaunch::Launched) {
             let ops = self.list(ls);
-            if ops.is_empty() {
-                continue;
-            }
             row_canvases.push(cb_plan::WalkCanvas::of_walk(
                 ops,
                 &cb_plan::SegTables {
@@ -5664,8 +5517,17 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
             Some(r) => (ListSel::Prefix, r.prefix_weight_bank),
             None => (ListSel::Body(0), 0),
         };
-        self.launch_ops(sel, zero, bank, KvBank::BASE)?;
-        self.stream_ref()?
+        self.launch_list(
+            sel,
+            LaunchWhere {
+                byte_off: zero,
+                weight_bank: bank,
+                kv_bank: KvBank::BASE,
+                requests: fold_plan::Requests::default(),
+            },
+            None,
+        )?;
+        self.launches()
             .synchronize()
             .map_err(|e| anyhow!("run_prefix_only sync: {e}"))
     }
@@ -5682,8 +5544,9 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
             return Ok(false);
         }
         self.refill_activations(Diag::get())?;
-        self.launch_forward(SeqPos(0), SuffixLaunch::Launched)?;
-        self.stream_ref()?
+        // The selftest waits the whole stream below, so the forward's landing has no reader.
+        let _landed = self.launch_forward(SeqPos(0), SuffixLaunch::Launched)?;
+        self.launches()
             .synchronize()
             .map_err(|e| anyhow!("run_full sync: {e}"))?;
         Ok(true)
@@ -5713,19 +5576,17 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
             .ok_or_else(|| anyhow!("seg{i} has no region"))?
             .total_size()
             .as_u64();
-        // The shadow, the region and the stream are three disjoint fields of `self`; splitting the
-        // borrow here is what lets the DMA write into a real `&mut [u8]` instead of a pointer
-        // conjured from a shared reference.
+        // The shadow, the region and the card (whose launch stream carries the read) are three
+        // disjoint fields of `self`; splitting the borrow here is what lets the DMA write into a
+        // real `&mut [u8]` instead of a pointer conjured from a shared reference.
         let Executor {
             seg_addr,
             seg_host,
-            stream,
+            card,
             ..
         } = self;
         let addr = seg_addr[i].as_ref().expect("checked above");
-        let stream = stream
-            .as_ref()
-            .ok_or_else(|| anyhow!("no stream — prepare was not called"))?;
+        let stream = card.launches();
         let Some(shadow) = seg_host[i].host_buf_mut() else {
             bail!(
                 "read seg{i}: DEVICE-ONLY — no host mirror to read into. A read door that wants \
@@ -5843,7 +5704,7 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
     /// clamps: to `cap_bytes`, and to what the transfer actually brought back.
     ///
     /// ⭐ THE TRANSFER IS THE PLACEMENT'S OWN WINDOW, never its segment's
-    /// allocation — the same law [`Self::predict`] states for the row: this
+    /// allocation — the same law the logits row's read always took: this
     /// sits on the TOKEN critical path (the answer re-point's whole point is
     /// that the ~100 KB row readback collapses to the stick's own bytes), and
     /// a whole-segment D2H would price the token by whatever else the segment
@@ -5987,9 +5848,8 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
             (&mut v[a as usize..b as usize], None)
         };
         let done = self
-            .stream
-            .as_ref()
-            .ok_or_else(|| anyhow!("no stream — prepare was not called"))?
+            .card
+            .launches()
             .d2h_on_compute_signaled(host, src)
             .map_err(|e| anyhow!("read_tensor_raw({id}) D2H: {e}"))?;
         Ok(DeferredRead {
@@ -6033,8 +5893,9 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
     /// whole-stream wait did by the SAME door: a failed op never fires its
     /// user callback (the stream records a deferred error and goes
     /// sticky-shutdown, `make_completion_callback`'s Err arm), so the signal's
-    /// timeout tick hands the park back and the synchronize below — which does
-    /// not wait a dead stream, it rethrows — carries the root cause out.
+    /// timeout tick hands the park back and the synchronize
+    /// ([`Self::park_on_latch`]) — which does not wait a dead stream, it
+    /// rethrows — carries the root cause out.
     ///
     /// ⭐ ZERO-ALLOC: the landed window is handed to `f` BY BORROW, in place —
     /// the ring slot's own bytes, or the shadow window's — and the slot is
@@ -6051,26 +5912,14 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
         read: &DeferredRead,
         f: impl FnOnce(&[u8]) -> R,
     ) -> Result<R> {
-        // The read's own landing, scoped so `dead`'s immutable borrow of `self`
-        // ends before the quiet point's mutable half begins.
-        let landed = {
-            let dead = || self.stream_ref().map(|s| s.is_dead()).unwrap_or(true);
-            read.done.wait_or(dead)
-        };
-        if !landed {
-            self.stream_ref()?
-                .synchronize()
-                .map_err(|e| anyhow!("read_tensor_raw({}) sync: {e}", read.id))?;
-            // A dead stream's synchronize rethrows its deferred error; if it
-            // returned anyway, the transfer never landed and the bytes below
-            // would be a lie — refuse rather than slice them. The ring slot is
-            // deliberately NOT returned on this path: only its own signal (or
-            // teardown) walks a slot back.
-            bail!(
-                "read_tensor_raw({}): the stream died before this read landed — no bytes to slice",
-                read.id
-            );
-        }
+        // The read's own landing. A dead stream's transfer never landed and the
+        // bytes below would be a lie — refused rather than sliced. The ring slot
+        // is deliberately NOT returned on that path: only its own signal (or
+        // teardown) walks a slot back.
+        self.park_on_latch(
+            |dead| read.done.wait_or(dead),
+            format_args!("read_tensor_raw({})", read.id),
+        )?;
         // And the shadow half — the shared door. In the drained cadence the
         // latch has fired (or was never armed); this is where the drain
         // HANDS the quiet point to the next writer by taking it.
@@ -6161,7 +6010,7 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
         }
         // The window size only sets how many fill control blocks the walk submits (each is a
         // fixed enqueue cost on both host and device); no host buffer rides the fill.
-        let stream = self.stream_ref()?;
+        let stream = self.launches();
         fill_zero_walk(stream, addr, &format!("zero fill (seg{i})"))?;
         stream
             .synchronize()
@@ -6246,7 +6095,7 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
         let win = addr
             .window(ByteOffset(0), ByteSize(data.len() as u64))
             .ok_or_else(|| anyhow!("seg{i} window 0..{} unaddressable", data.len()))?;
-        let stream = self.stream_ref()?;
+        let stream = self.launches();
         stream
             .h2d(
                 self.seg_host[i]
@@ -6466,60 +6315,16 @@ enum ListSel {
     Rung(usize, usize),
 }
 
-/// ⭐ WHAT A FORWARD'S CALLER DOES WITH ITS LOGITS — the one fact that decides both whether the suffix
-/// runs and whether its row comes back, so the two cannot be asked separately and disagree.
-///
-/// ⛔ THREE STATES, NOT A `bool`. A decode batch passes no host buffer and still READS the logits: it
-/// pulls the whole `[rows, vocab]` tensor itself afterwards (`read_tensor`), because the read-back here
-/// converts one row. "No buffer" therefore cannot mean "skip the suffix" — only [`Logits::Discarded`]
-/// does, and only a caller that never looks at the tensor can name it.
-pub enum Logits<'a> {
-    /// The suffix runs and its `[1, vocab]` row is converted into this buffer — decode, and a prompt's
-    /// last chunk.
-    ReadBack(&'a mut [u8]),
-    /// The suffix runs and its output stays on the device for the caller to read itself — a decode
-    /// batch's `[rows, vocab]` logits.
-    LeftOnDevice,
-    /// Nobody reads this forward's logits — every prompt chunk but the last — so the suffix (final
-    /// norm → lm-head → logits scaling) is not launched at all.
-    Discarded,
-}
-
-/// What a forward's submit half reads back — [`Logits`] without the buffer, which only the wait
-/// half ([`Executor::predict_finish`]) holds.
+/// Whether a forward launches its suffix (final norm → lm-head → the minted sampler) — the one
+/// fact that differs between a forward whose pick somebody reads and one whose pick nobody does.
+/// [`Executor::submit_step`] takes it from its caller.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum LogitsRead {
-    ReadBack,
-    LeftOnDevice,
-    Discarded,
-}
-
-impl LogitsRead {
-    /// The read `logits` asks for.
-    pub fn of(logits: &Logits<'_>) -> Self {
-        match logits {
-            Logits::ReadBack(_) => Self::ReadBack,
-            Logits::LeftOnDevice => Self::LeftOnDevice,
-            Logits::Discarded => Self::Discarded,
-        }
-    }
-}
-
-/// One forward submitted by [`Executor::predict_submit`] and not yet waited on — the token
-/// [`Executor::predict_finish`] consumes. Not `Clone`: a submission is finished once.
-pub struct PredictSubmitted {
-    half: ForwardHalf,
-    want: LogitsRead,
-    n_new: NewTokens,
-    d2h_seg: i64,
-    d2h_bytes: u64,
-    t2b: Instant,
-}
-
-/// Whether [`Executor::launch_forward`] launches the suffix — read off [`Logits`] in one place.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum SuffixLaunch {
+pub enum SuffixLaunch {
+    /// The suffix runs: the forward picks (a decode step, a prompt's final chunk, a wave that
+    /// finishes a prompt).
     Launched,
+    /// The suffix is not launched: nobody reads this forward's pick (a prompt chunk that does not
+    /// finish its prompt) — the KV every later chunk attends is the bodies' work, already done.
     Skipped,
 }
 

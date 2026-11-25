@@ -2611,6 +2611,38 @@ pub fn lower_subtile_tape_to_ktir<T: ktir_superdsc::collective::Tp, F: RopeForm>
     // machine routes ops to the prefix until the first OpenLoop flips it, so only the
     // suffix's start (the pre-pass below reads it) is named here.
     let suffix_start = loops[loops.len() - 1].0.end + 1;
+    // ⛔ A FORWARD THAT STOPS BEFORE ITS SUFFIX ENDS ON A WHOLE CUT CYCLE. A prompt chunk whose pick
+    // nobody reads launches the prefix and the bodies only, and the card runs the next forward
+    // behind it with no collect between them; that forward's first collective takes
+    // `WindowCut::of_collective(0)` ([`window_cut`]: a forward's collectives take their cuts in its
+    // own order). The two-cut law ([`ktir_superdsc::collective::WindowCut`]) holds across that
+    // boundary only if the next cut after the stopped forward's last collective IS that cut — so
+    // the collectives before the suffix are a whole number of cut cycles, or this program does not
+    // build. Only a prompt chunk's forward (rows that are not requests) stops early: a decode step
+    // always runs its suffix (its launch picks by type), and its prefix carries the on-card
+    // embedding row gather, so its own count is not this law's. The count is in `ir`'s order, the
+    // order [`window_cut`] numbers collectives in: every collective ahead of the suffix's first
+    // node (the tensor-parallel pass mints collectives into `ir`, not into the tape, so the tape's
+    // suffix names none of them).
+    if !rows_are_requests {
+        let first_suffix_node = instrs[suffix_start..].iter().find_map(|i| match i {
+            Instr::Compute { node, .. } => Some(*node),
+            _ => None,
+        });
+        let before_suffix = ir
+            .nodes
+            .iter()
+            .take_while(|n| Some(n.id) != first_suffix_node)
+            .filter(|n| matches!(n.op, SubOp::AllReduce | SubOp::AllGather { .. }))
+            .count();
+        assert!(
+            ktir_superdsc::collective::WindowCut::of_collective(before_suffix)
+                == ktir_superdsc::collective::WindowCut::of_collective(0),
+            "a forward stopped before its suffix carries {before_suffix} collective(s) — not a \
+             whole number of receive-window cut cycles, so the next forward's first send would \
+             land in the cut its last collective is still read from"
+        );
+    }
     // ⛔ `iters` per body, from the loop bounds — NOT the count of instrs in the range.
     debug_assert_eq!(loops.len(), per_layer_ext.len()); // one map per sibling loop, by construction
     // ── The walk: prefix, each body, suffix, with per-segment lowering context ──

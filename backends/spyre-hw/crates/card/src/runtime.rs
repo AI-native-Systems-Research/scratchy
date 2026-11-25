@@ -93,6 +93,16 @@ pub struct CardRuntime<'a, T: ktir_superdsc::collective::Tp> {
     cpus: CardCpus,
     memory: CardMemory,
     rt: Arc<RuntimeContext<'a>>,
+    /// ⭐ THE CARD'S ONE LAUNCH STREAM — the ordering domain of everything this card runs. Every
+    /// session's step rides it: the preamble H2D, the forward's launches, the pick's read. A stream
+    /// is in order and a cross-stream order costs the host a drain (flex-rs's event signal parks
+    /// the caller until the signaling stream is empty), so the card's work is ONE stream, and the
+    /// device runs it in the order the host submitted it: a prompt's chunks — each on its own
+    /// rung's session — and the decode steps around them queue back to back, with no host wait at a
+    /// session switch, a chunk boundary or an engine step's end. Load-time images go up on a
+    /// session's own load stream ([`crate::superdsc_exec::Executor::prepare`]), which is drained
+    /// before that session's first step is submitted here.
+    launches: Stream<'a>,
     /// This card's p2p link, when it runs one rank of a sharded world — set once, by
     /// [`link_peers`]. A card's `XSEG` entries point at one window's slots, so the card holds at
     /// most one link for its life.
@@ -175,13 +185,27 @@ impl<'a, T: ktir_superdsc::collective::Tp> CardRuntime<'a, T> {
         .map_err(BringUpError::Scheduler)?;
 
         let rt = RuntimeContext::create(DeviceId(i64::from(index)), scheduler, allocator);
+        let launches = Stream::open(
+            &rt,
+            RuntimeStreamPriority::Normal,
+            RuntimeStreamMode::StrictOrdering,
+            false,
+        )
+        .map_err(BringUpError::LaunchStream)?;
         Ok(Self {
             card,
             cpus,
             memory,
             rt,
+            launches,
             link: std::sync::OnceLock::new(),
         })
+    }
+
+    /// This card's one launch stream (see the field's law) — every step of every session on this
+    /// card is submitted here.
+    pub fn launches(&self) -> &Stream<'a> {
+        &self.launches
     }
 
     /// The senlib card this runtime drives — borrowed for the card's own `'a`, not refcounted.
@@ -802,6 +826,8 @@ pub enum BringUpError {
     Placement(PlacementError),
     /// The bring-up thread could not be run on the card's NUMA node.
     Pin(PinError),
+    /// `RuntimeContext::create_stream` refused the card's launch stream.
+    LaunchStream(RuntimeContextError),
 }
 
 impl fmt::Display for BringUpError {
@@ -813,6 +839,7 @@ impl fmt::Display for BringUpError {
             Self::Scheduler(e) => write!(f, "{e}"),
             Self::Placement(e) => write!(f, "card NUMA placement: {e}"),
             Self::Pin(e) => write!(f, "bring-up thread: {e}"),
+            Self::LaunchStream(e) => write!(f, "the card's launch stream: {e}"),
         }
     }
 }
@@ -1011,14 +1038,23 @@ impl<'a> Stream<'a> {
         mode: RuntimeStreamMode,
         track_hazards: bool,
     ) -> Result<Stream<'a>, HwError> {
+        Self::open(&card.rt, priority, mode, track_hazards).map_err(HwError::StreamCreate)
+    }
+
+    /// The one body every stream creation runs — [`Self::create_with`]'s, and the card's own
+    /// launch stream's at bring-up ([`CardRuntime::launches`]), which exists before its
+    /// `CardRuntime` does.
+    fn open(
+        rt: &Arc<RuntimeContext<'a>>,
+        priority: RuntimeStreamPriority,
+        mode: RuntimeStreamMode,
+        track_hazards: bool,
+    ) -> Result<Stream<'a>, RuntimeContextError> {
         // A poisoned lock still serializes (nothing is protected but the CALL), so recover rather than
         // panic: a panic here would turn one thread's failure into the whole load's.
         let _serialize = STREAM_CREATE.lock().unwrap_or_else(|e| e.into_inner());
-        let rt = card.rt.clone();
-        let id = rt
-            .create_stream(priority, mode, track_hazards)
-            .map_err(HwError::StreamCreate)?;
-        Ok(Stream { rt, id })
+        let id = rt.create_stream(priority, mode, track_hazards)?;
+        Ok(Stream { rt: rt.clone(), id })
     }
 
     /// The live `RuntimeStream` this handle names. `Err(StreamGone)` after the stream was destroyed
@@ -1382,57 +1418,34 @@ impl<'a> Stream<'a> {
             .map_err(HwError::Stream)
     }
 
-    /// One ComputeOnDevice launch (async). `tensor_allocs` is POSITIONAL — entry i backs the
-    /// program's logical segment i.
-    pub fn compute(
-        &self,
-        prog: &DevAddr,
-        tensor_allocs: &[&DevAddr],
-        kernel_name: &str,
-        bootstrap_offset: u64,
-        tensor_byte_offsets: &[u64],
-        pipeline_barrier: bool,
-    ) -> Result<(), HwError> {
-        let stream = self.live()?;
-        let allocs: Vec<Arc<CompositeAddress>> =
-            tensor_allocs.iter().map(|a| a.0.clone()).collect();
-        let tbo: Vec<ByteOffset> = tensor_byte_offsets.iter().map(|o| ByteOffset(*o)).collect();
-        let params = ComputeParams::new(
-            prog.0.clone(),
-            allocs,
-            KernelName(kernel_name.to_owned()),
-            BootstrapOffset(bootstrap_offset),
-            tbo,
-        )
-        .with_pipeline_barrier(pipeline_barrier);
-        stream.launch_compute(params, None).map_err(HwError::Stream)
-    }
-
     /// N compute launches as ONE submission — one doorbell for the whole list (the vendor's
     /// multi-CB branch; see `flex_rs::stream::RuntimeStream::launch_compute_batch` for the
     /// semantics, including why `pipeline_barrier` is the OR of what the caller would have
-    /// passed per op). Device-side order is the list order, same as N `compute` calls.
+    /// passed per op). Device-side order is the list order. A single launch is a list of one:
+    /// this is the only compute door, so a launch's shape is stated once.
     ///
     /// ⛔ THE ITEMS OWN THEIR HANDLES. A batch outlives the loop that builds it (the whole
     /// rung is collected, then flushed once), and that loop's shifted bases and `&DevAddr`
     /// borrows are loop-local — so an item carries `DevAddr` clones (descriptor refcounts,
     /// see [`DevAddr`]'s Clone note) rather than borrows.
     ///
-    /// `kernel_name` and `tensor_byte_offsets` are not per-item parameters: the only caller
-    /// of this door launches exactly the shape `compute` launches at its every call site —
-    /// `kernel_name=""` and no tensor byte offsets, matching torch-spyre's
-    /// JobPlanStepCompute (the resident binary runs by its bootstrap address; dxp does not
-    /// apply `tensor_byte_offsets` to per-op addresses). Widening this to a general batch
-    /// door means growing [`BatchedCompute`], not a new method.
+    /// `kernel_name` and `tensor_byte_offsets` are not per-item parameters: every launch takes
+    /// `kernel_name=""` and no tensor byte offsets, matching torch-spyre's JobPlanStepCompute
+    /// (the resident binary runs by its bootstrap address; dxp does not apply
+    /// `tensor_byte_offsets` to per-op addresses). Widening this to a general batch door means
+    /// growing [`BatchedCompute`], not a new method.
+    ///
+    /// `land` — see [`Self::submit_batch`].
     fn compute_batch<'l>(
         &self,
         launches: impl Iterator<Item = &'l BatchedCompute>,
         pipeline_barrier: bool,
+        land: Option<&ReadSignal>,
     ) -> Result<(), HwError> {
         let stream = self.live()?;
         let params: Vec<ComputeParams> = launches.map(BatchedCompute::params).collect();
         stream
-            .launch_compute_batch(params, pipeline_barrier, None)
+            .launch_compute_batch(params, pipeline_barrier, land.map(ReadSignal::arm))
             .map_err(HwError::Stream)
     }
 
@@ -1495,7 +1508,20 @@ impl<'a> Stream<'a> {
     /// control blocks is rendered through [`Self::render_batch`] and submitted as wires
     /// ([`Self::compute_wires`]) with the leased tags stamped on, so the sends, waits and consumes
     /// ride the same FIFO as the compute that produces and consumes their bytes.
-    pub fn submit_batch(&self, items: &[BatchedCb], pipeline_barrier: bool) -> Result<(), HwError> {
+    ///
+    /// ⭐ `land` — THE SUBMISSION'S LANDING: `Some` arms that latch as this submission's own
+    /// completion hook (the per-op callback the signaled DMA doors arm), so it fires when the
+    /// batch's last CB has retired on the card. A forward arms its LAST submission with it
+    /// (`Executor::launch_forward`): the host can then ask whether the card still owes that
+    /// forward's work — a latch read, never a wait. `None` leaves the submission silent. Every
+    /// compute door takes the same parameter ([`Self::compute_wires`]), so a forward's landing is
+    /// armed the same way whichever door its last submission rides.
+    pub fn submit_batch(
+        &self,
+        items: &[BatchedCb],
+        pipeline_barrier: bool,
+        land: Option<&ReadSignal>,
+    ) -> Result<(), HwError> {
         if items.iter().all(|i| matches!(i, BatchedCb::Compute(_))) {
             return self.compute_batch(
                 items.iter().filter_map(|i| match i {
@@ -1503,6 +1529,7 @@ impl<'a> Stream<'a> {
                     _ => None,
                 }),
                 pipeline_barrier,
+                land,
             );
         }
         let canvas = Arc::new(self.render_batch(items, 0)?);
@@ -1516,6 +1543,7 @@ impl<'a> Stream<'a> {
                 }),
             },
             pipeline_barrier,
+            land,
         )
     }
 
@@ -1529,14 +1557,17 @@ impl<'a> Stream<'a> {
     /// host fences), one fence, one capacity gate, in-flight accounting per
     /// CB — so the step is ordered on the ring exactly as its per-rung
     /// `compute_batch` calls were, with the same CBs in the same order.
+    ///
+    /// `land` — see [`Self::submit_batch`].
     pub fn compute_wires(
         &self,
         batch: ComputeWireBatch,
         pipeline_barrier: bool,
+        land: Option<&ReadSignal>,
     ) -> Result<(), HwError> {
         let stream = self.live()?;
         stream
-            .launch_compute_wires(batch, pipeline_barrier, None)
+            .launch_compute_wires(batch, pipeline_barrier, land.map(ReadSignal::arm))
             .map_err(HwError::Stream)
     }
 }
@@ -1659,8 +1690,7 @@ pub use flex_rs::numa::WorldCpus;
 
 /// One compute launch of a [`Stream::submit_batch`] list — the owned handles one compute launch
 /// needs. The handles are owned (not borrowed) because a batch outlives the loop that
-/// builds it; see `compute_batch`'s ⛔ note. Field semantics match [`Stream::compute`]'s
-/// parameters of the same names.
+/// builds it; see `compute_batch`'s ⛔ note.
 pub struct BatchedCompute {
     /// The program allocation (segment 7) the bootstrap offset is relative to.
     pub prog: DevAddr,

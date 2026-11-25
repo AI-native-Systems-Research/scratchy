@@ -668,8 +668,9 @@ impl Worker for SpyreWorker {
                 // ⭐ THE ONE DECODE PATH, SUBMITTED: every row is a different request and every row
                 // is sampled ON THE CARD by the rung's minted sampler; the idx stick's raw D2H is
                 // enqueued and comes back through the SAME collect door whether this schedule
-                // defers it to the drain or collects it right here.
-                let sub = match run_card_launch(
+                // defers it to the drain or collects it right here. A decode step PICKS by its type
+                // ([`Picks`]): the launch cannot come back without its deferred read.
+                let sub = run_card_launch::<Picks>(
                     rows_in,
                     &sh,
                     sess,
@@ -683,19 +684,9 @@ impl Worker for SpyreWorker {
                         } else {
                             ktir_superdsc::sdsc_abstract::SeedSource::OnCard
                         },
-                        want_logits: LogitsWanted::PerRequestDeferred,
                         laws: SeatLaws::Batch { draws: &draws },
                     },
-                )? {
-                    BatchOut::Deferred(sub) => sub,
-                    BatchOut::Done(_) => {
-                        return Err(werr(
-                            "decode: the rung finished in-call — the deferred arm is the only \
-                             decode path"
-                                .to_string(),
-                        ));
-                    }
-                };
+                )?;
                 // ⭐ #32 (c4) — THE STEP IS SUBMITTED; its collect is QUEUED, not run. Everything
                 // the drain needs rides in `InFlightDecode` — per live row, in `decode_ids` order,
                 // the request, its position and the launch slot its token lands in.

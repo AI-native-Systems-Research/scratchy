@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
-//! #32 tuning, step 1 — WHERE ONE PIPELINED DECODE STEP'S HOST TIME GOES, AND HOW
-//! DEEP THE PIPELINE ACTUALLY IS.
+//! #32 tuning, step 1 — WHERE ONE PIPELINED STEP'S HOST TIME GOES, AND HOW DEEP THE
+//! PIPELINE ACTUALLY IS — for every kind of step a target submits ([`StepKind`]): a
+//! decode step and a prompt's chunk, each its own table.
 //!
-//! The submit half of a pipelined decode step (`run_prefill_batch`'s deferred decode
-//! arm) clocks its host segments and flushes them here, one lock per step: the act bind
-//! (keyed causal bind + act diff + seed build), the submit doorbell, the stick D2H
-//! defer, the j+1 staging, and the whole submit body, so the residual (total − the
-//! four) is visible. The collect half (`collect_decode_tokens`) clocks the fence wait
-//! and the pick decode the same way. And the depth row — the ruling's own demand —
-//! counts the submissions outstanding at each submit: ≥ 2 there is the ONLY evidence
-//! the pipeline is real, and 1 everywhere is the measurement that proved it never was.
+//! The submit half of a pipelined step clocks its host segments and flushes them here,
+//! one lock per step: the act bind (the shadow writes, with the shadow's own quiet
+//! point), the submit doorbell, the pick's D2H defer (a step that picks), the j+1
+//! staging, and the whole submit body, so the residual (total − the four) is visible.
+//! The collect half clocks the fence wait and the pick decode the same way. And the
+//! depth row — the ruling's own demand — counts the submissions in flight at each
+//! submit: ≥ 2 there is the ONLY evidence the pipeline is real, and 1 everywhere is
+//! the measurement that proved it never was.
 //!
 //! ⛔ AN INSTRUMENT MAY PRINT; IT MUST NOT COST. Accumulation is unconditional
 //! — a few `Instant` reads and one uncontended mutex lock against a ~24 ms
@@ -29,10 +30,43 @@
 use std::sync::Mutex;
 use std::time::Duration;
 
+/// WHAT A STEP IS — the table a record lands in. A prompt's chunks and the decode steps
+/// around them ride one pipeline, and each kind's segments are its own story (a chunk's
+/// bind is a whole chunk's shadow writes, a decode step's a few rows'), so each kind is
+/// its own table and no mean mixes the two.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum StepKind {
+    /// One chunk of a prompt (or one wave of prompt tails).
+    PromptChunk,
+    /// One decode step (a batch of one generated token per live request).
+    Decode,
+}
+
+impl StepKind {
+    /// Every kind, in the order the table prints them.
+    const ALL: [StepKind; 2] = [StepKind::PromptChunk, StepKind::Decode];
+
+    /// The kind's slot in the per-kind accumulators.
+    const fn slot(self) -> usize {
+        match self {
+            StepKind::PromptChunk => 0,
+            StepKind::Decode => 1,
+        }
+    }
+
+    /// How the table names a kind's steps.
+    const fn plural(self) -> &'static str {
+        match self {
+            StepKind::PromptChunk => "pipelined prompt chunk(s)",
+            StepKind::Decode => "pipelined decode step(s)",
+        }
+    }
+}
+
 /// One step's SUBMIT-half segments, clocked by the pipelined loop and flushed here in
 /// one lock, with the pipeline depth at the submit. `stage` is `None` on a batch's
-/// last step (nothing to stage) — absent from that segment's mean, never a recorded
-/// zero.
+/// last step (nothing to stage), and `defer` on a step that picks nothing (nothing to
+/// read back) — absent from that segment's mean, never a recorded zero.
 ///
 /// `pub`, like the module's whole surface, and for a reason the tree states:
 /// `record_submit`'s only caller is a target's worker crate, which a build may not
@@ -41,24 +75,27 @@ use std::time::Duration;
 /// type in every feature combination, which is the law this instrument is built
 /// under: no cfg, no allow, nothing dead.
 pub struct SubmitSegs {
+    /// Which table this step lands in.
+    pub kind: StepKind,
     pub bind: Duration,
     pub submit: Duration,
-    pub defer: Duration,
+    pub defer: Option<Duration>,
     pub stage: Option<Duration>,
     pub total: Duration,
-    /// Submissions outstanding at this submit — the in-flight depth, THIS step
-    /// included. The row that proves or refutes the pipeline: 1 everywhere is
-    /// serial with a fence's name on it; ≥ 2 is steps genuinely in flight.
+    /// Submissions in flight as this step starts queuing on the card — the depth,
+    /// THIS step included, of every kind: a decode step queued behind a prompt chunk
+    /// counts it. The row that proves or refutes the pipeline: 1 everywhere is serial
+    /// with a fence's name on it; ≥ 2 is steps genuinely in flight.
     pub depth: usize,
-    /// ⭐ #32 (E) — CARD BUSY AT SUBMIT: the PREVIOUS step's stick read had
-    /// NOT yet landed when this step's submit work began (a non-blocking
-    /// peek of the prior read's completion signal). The overlap fraction —
-    /// the depth row's honest twin: depth counted 1.99 even in the build
-    /// whose whole-stream fence idled the card at every submit (the
-    /// executor's pre-schedule inflated the count without device overlap),
-    /// while this row reads `false` exactly when the card had nothing left
-    /// to execute. `false` on the first step ever submitted (no prior read
-    /// exists — nothing was in flight).
+    /// ⭐ #32 (E) — CARD BUSY AS THE STEP QUEUES: the card had NOT yet retired the
+    /// work ahead of this step when this step's first control block was about to
+    /// join the stream (a non-blocking read of the earlier submissions' completion
+    /// latches) — so this step queued before the card ran dry and runs back to back
+    /// behind that work. The overlap fraction — the depth row's honest twin: depth
+    /// counted 1.99 even in the build whose whole-stream fence idled the card at
+    /// every submit (the executor's pre-schedule inflated the count without device
+    /// overlap), while this row reads `false` exactly when the card had nothing left
+    /// to execute. `false` on the first step ever submitted (nothing was in flight).
     pub busy: bool,
 }
 
@@ -67,6 +104,8 @@ pub struct SubmitSegs {
 /// an artifact) and the pick decode. Recorded where the reads are fenced, which under
 /// deferral is a later drain, not the submitting step's own call.
 pub struct CollectSegs {
+    /// Which table this collect lands in — its step's.
+    pub kind: StepKind,
     pub fence: Duration,
     pub pick: Duration,
 }
@@ -179,21 +218,39 @@ impl Stats {
     };
 }
 
-fn stats() -> std::sync::MutexGuard<'static, Stats> {
-    static S: Mutex<Stats> = Mutex::new(Stats::ZERO);
+/// One accumulator set per [`StepKind`], indexed by [`StepKind::slot`].
+fn stats() -> std::sync::MutexGuard<'static, [Stats; 2]> {
+    static S: Mutex<[Stats; 2]> = Mutex::new([Stats::ZERO, Stats::ZERO]);
     S.lock()
         .expect("step_segs: the probe's own lock, never held across a panic")
 }
 
-/// Flush one step's submit-half segments. Called once per pipelined step, after the
-/// stick read is deferred. (`pub` for the reason `SubmitSegs`'s own doc states — the
-/// cfg-gated caller must not make this dead code in a plain clippy leg.)
+/// Flush one step's submit-half segments. Called once per pipelined step, after its
+/// doorbell (and its pick's defer, when it picks). (`pub` for the reason `SubmitSegs`'s
+/// own doc states — the cfg-gated caller must not make this dead code in a plain clippy
+/// leg.)
 pub fn record_submit(s: SubmitSegs) {
-    let mut t = stats();
+    // ⭐ ONE LINE PER STEP, at `debug` under its own `step_segs` target — the table's facts, step
+    // by step, for a driver that prints no table (`serve`): `RUST_LOG=info,step_segs=debug`
+    // streams every submission's kind, depth and busy bit and turns nothing else on.
+    tracing::debug!(
+        target: "step_segs",
+        "[step-seg] {:?} depth={} busy={} bind={:.3} submit={:.3} total={:.3} ms",
+        s.kind,
+        s.depth,
+        s.busy,
+        s.bind.as_secs_f64() * 1e3,
+        s.submit.as_secs_f64() * 1e3,
+        s.total.as_secs_f64() * 1e3,
+    );
+    let mut all = stats();
+    let t = &mut all[s.kind.slot()];
     t.steps += 1;
     t.bind.add(s.bind);
     t.submit.add(s.submit);
-    t.defer.add(s.defer);
+    if let Some(d) = s.defer {
+        t.defer.add(d);
+    }
     if let Some(d) = s.stage {
         t.stage.add(d);
     }
@@ -205,30 +262,43 @@ pub fn record_submit(s: SubmitSegs) {
 /// Flush one step's collect-half segments — the fence and the pick decode, recorded
 /// where the reads are fenced (the sync composition, or a drain under deferral).
 pub fn record_collect(s: CollectSegs) {
-    let mut t = stats();
+    let mut all = stats();
+    let t = &mut all[s.kind.slot()];
     t.fence.add(s.fence);
     t.pick.add(s.pick);
 }
 
-/// The accumulated per-segment table, for the CLI to print under `--bench`.
-/// `None` when no step ever recorded — the answer every backend that records no steps
-/// and every non-decode run must give, by type, not by empty string.
+/// The accumulated per-segment tables, one per [`StepKind`] that recorded a step, for the
+/// CLI to print under `--bench`. `None` when no step ever recorded — the answer every
+/// backend that records no steps must give, by type, not by empty string.
 pub fn step_segment_table() -> Option<String> {
-    let t = stats();
-    if t.steps == 0 {
-        return None;
-    }
+    let all = stats();
+    let tables: Vec<String> = StepKind::ALL
+        .iter()
+        .map(|&k| (k, &all[k.slot()]))
+        .filter(|(_, t)| t.steps > 0)
+        .map(|(k, t)| kind_table(k, t))
+        .collect();
+    (!tables.is_empty()).then(|| tables.concat())
+}
+
+/// One kind's table: every segment row, then the depth and busy rows.
+fn kind_table(kind: StepKind, t: &Stats) -> String {
     let mut out = format!(
-        "[step-segs] {} pipelined decode step(s): host time per segment \
-         (mean / max / total, ms)\n",
-        t.steps
+        "[step-segs] {} {}: host time per segment (mean / max / total, ms)\n",
+        t.steps,
+        kind.plural()
     );
     let rows = [
-        ("bind", "keyed causal bind + act diff + seed build", &t.bind),
+        (
+            "bind",
+            "the shadow writes (with the shadow's quiet point)",
+            &t.bind,
+        ),
         ("submit", "submit_step (the doorbell + refill)", &t.submit),
         (
             "defer",
-            "stick D2H defer (the enqueue, ring slot)",
+            "the pick's D2H defer (the enqueue, ring slot)",
             &t.defer,
         ),
         (
@@ -260,7 +330,7 @@ pub fn step_segment_table() -> Option<String> {
         ));
     }
     // ⭐ THE DEPTH ROW — the ruling's own demand: the pipeline's proof or its
-    // refutation, in submits-outstanding at each submit. The distribution prints
+    // refutation, in submissions in flight as each step queues. The distribution prints
     // whole (a mostly-1 pipeline with one lucky 2 says so), and ≥ 2 is the only
     // line any claim of pipelining may stand on.
     let dist = t
@@ -273,22 +343,81 @@ pub fn step_segment_table() -> Option<String> {
         .collect::<Vec<_>>()
         .join(" ");
     out.push_str(&format!(
-        "[step-segs]   depth  (submissions outstanding at each submit): mean {:>5.2}, max {}, \
+        "[step-segs]   depth  (submissions in flight as each step queues): mean {:>5.2}, max {}, \
          distribution {}\n",
         t.depth.sum as f64 / t.depth.n.max(1) as f64,
         t.depth.max,
         dist,
     ));
     // ⭐ #32 (E) — THE BUSY ROW, the depth row's honest twin: the fraction of
-    // submits that began with the previous step's read still un-landed (the
-    // card owed work). ~100% is real overlap; ~0% is a serial pipeline
-    // wearing depth-2's clothes — the pre-schedule can inflate the depth row,
-    // never this one.
+    // steps that queued with the card still owing earlier work (its completion
+    // latches un-fired). ~100% is real overlap — every step queued before the card
+    // ran dry; ~0% is a serial pipeline wearing depth-2's clothes — the
+    // pre-schedule can inflate the depth row, never this one.
     out.push_str(&format!(
-        "[step-segs]   busy   (card owed the previous read at submit): {}/{} = {:.0}%\n",
+        "[step-segs]   busy   (card owed earlier work as the step queued): {}/{} = {:.0}%\n",
         t.busy.busy,
         t.busy.n,
         100.0 * t.busy.busy as f64 / t.busy.n.max(1) as f64,
     ));
-    Some(out)
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// ⭐ EVERY KIND IS ITS OWN TABLE: a prompt's chunks and the decode steps around them ride one
+    /// pipeline, and each kind's rows count its own steps alone — its depth distribution, its busy
+    /// fraction, and a defer row that counts only the steps that deferred a pick (a chunk that
+    /// picks nothing is absent from it, never a recorded zero). The only test in this binary that
+    /// records, so the process-wide accumulators hold exactly these steps.
+    #[test]
+    fn each_step_kind_is_its_own_table() {
+        let ms = Duration::from_millis;
+        for (kind, depth, busy, defer) in [
+            (StepKind::PromptChunk, 1, false, None),
+            (StepKind::PromptChunk, 2, true, None),
+            (StepKind::PromptChunk, 2, true, Some(ms(1))),
+            (StepKind::Decode, 2, true, Some(ms(1))),
+        ] {
+            record_submit(SubmitSegs {
+                kind,
+                bind: ms(2),
+                submit: ms(3),
+                defer,
+                stage: None,
+                total: ms(6),
+                depth,
+                busy,
+            });
+        }
+        record_collect(CollectSegs {
+            kind: StepKind::Decode,
+            fence: ms(30),
+            pick: ms(0),
+        });
+        let table = step_segment_table().expect("steps were recorded");
+        let (chunks, decode) = table
+            .split_once("[step-segs] 1 pipelined decode step(s)")
+            .expect("the decode table follows the chunk table");
+        assert!(
+            chunks.starts_with("[step-segs] 3 pipelined prompt chunk(s)"),
+            "{table}"
+        );
+        assert!(chunks.contains("distribution 1:1 2:2"), "{table}");
+        assert!(chunks.contains("2/3 = 67%"), "{table}");
+        let defer = chunks
+            .lines()
+            .find(|l| l.contains("the pick's D2H defer"))
+            .expect("the chunk table states its defer row");
+        assert!(defer.ends_with("over 1 step(s)"), "{defer}");
+        assert!(decode.contains("distribution 2:1"), "{table}");
+        assert!(decode.contains("1/1 = 100%"), "{table}");
+        let fence = decode
+            .lines()
+            .find(|l| l.contains("THE fence"))
+            .expect("the decode table states its fence row");
+        assert!(fence.ends_with("over 1 step(s)"), "{fence}");
+    }
 }

@@ -73,10 +73,6 @@ impl LogitsGeom {
     // refusal and the rung's own log line.
 }
 
-/// What a forward should hand back from its lm-head tail. An enum rather than a `bool` because the
-/// per-request case CANNOT be served without the tensor's geometry — see [`LogitsGeom`] — and a bare
-/// `want_logits: true` gave no place to put it, which is exactly how the batched path came to slice
-/// one row's worth and hand it to eight requests.
 /// One rung of the batched-decode ladder: a bundle baked for exactly `seqs` requests, aliasing the
 /// one-request decode session's weights and page pool.
 // ⛔ `sendnn`-ONLY, restored from 8bd5c755b. My branch was cut BEFORE that commit added
@@ -116,22 +112,6 @@ pub(crate) enum RungId {
 pub(crate) struct DecodeSeat<'a> {
     pub(crate) seqs: ktir_superdsc::sdsc_abstract::RungWidth,
     pub(crate) sess: &'a mut SuperDscSession,
-}
-
-pub(crate) enum LogitsWanted {
-    /// Nothing — every prompt chunk but the final one, which launches no suffix and reads
-    /// nothing back.
-    None,
-    /// The FINAL prompt chunk: its suffix runs, the rung's own minted sampler picks the
-    /// first generated token on the card from the folded lm-head row, and the idx stick
-    /// is read back exactly like a decode launch's.
-    LastRow,
-    /// A DECODE BATCH: one row per request, every row a different request. The
-    /// rung's sampler picks every token on the card; the idx stick's raw read is
-    /// deferred and comes back through the one collect door
-    /// (`collect_decode_tokens`) — in-call when the schedule cannot defer, from
-    /// the drain when it can. There is no synchronous decode arm.
-    PerRequestDeferred,
 }
 
 /// The sendnn session type. ONE variant: the dxp-compiled SuperDSC bundle is the only thing that
