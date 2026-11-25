@@ -3309,11 +3309,12 @@ mod tests {
         // Forced answers: not scored, no ratio.
         let html = shape(&mut runs, true, true);
         assert!(html.contains("answers forced to a length, so not scored"));
-        // No joules a request: each cell's whole, 36 J x 500 ms against 20 x 1000, x0.90, and
-        // said so.
+        // No joules a request: nothing to multiply each request's time by, so no
+        // Performance-Efficiency square, and it says so (the Raw Performance map still compares
+        // the times).
         let html = shape(&mut runs, false, false);
-        assert!(html.contains("each cell&#39;s whole: a side kept no joules a request"));
-        assert!(html.contains("×0.90 vs oMLX"));
+        assert!(html.contains("a side kept no joules a request"));
+        assert!(!html.contains("×0.90 vs oMLX"));
         // A cell the power log missed part of has no energy: no ratio, and its squares say why,
         // not that its run kept no joules a request.
         shape(&mut runs, false, true);
@@ -3324,7 +3325,7 @@ mod tests {
         let machines = super::index(&runs);
         let html = render(super::datasets::section("rag", &machines, &machines));
         assert!(html.contains("no energy on one side"));
-        assert!(!html.contains("each cell&#39;s whole"));
+        assert!(!html.contains("a side kept no joules a request"));
         // A cell's answers cut off at the length limit, every one, are still its answers: its
         // accuracy, and so its joules a correct answer, stand.
         shape(&mut runs, false, true);

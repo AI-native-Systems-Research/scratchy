@@ -1064,18 +1064,16 @@ fn summary_map(
                 if ours.energy.is_none() || theirs.energy.is_none() {
                     return Err("no energy on one side".into());
                 }
-                // The one normalization every row shares: joules a correct answer (each request's
-                // joules integrated over its own send-to-last-token window), in the bucket where
-                // the run kept joules a request, else over each cell's whole.
-                let (ja, jt) = match (ours.task_joules.as_ref(), theirs.task_joules.as_ref()) {
-                    (Some(_), Some(_)) => (
-                        buckets::joules_per_right_in(ours, bs, b),
-                        buckets::joules_per_right_in(theirs, bs, b),
-                    ),
-                    _ => (tasks::per_right(ours), tasks::per_right(theirs)),
-                };
-                let times_j = |t: Option<f64>, j: Option<f64>| t.zip(j).map(|(t, j)| t * j);
-                let (a, t) = (times_j(ta, ja), times_j(tt, jt));
+                // Each request's own time times its own joules, summed, over the right answers
+                // ([`buckets::time_joules_per_right_in`]): one request's numbers in every product.
+                // A run that kept no joules a request has none to multiply, so no square.
+                if ours.task_joules.is_none() || theirs.task_joules.is_none() {
+                    return Err("a side kept no joules a request".into());
+                }
+                let (a, t) = (
+                    buckets::time_joules_per_right_in(ours, bs, timing, b),
+                    buckets::time_joules_per_right_in(theirs, bs, timing, b),
+                );
                 tasks::times(a, t, true).ok_or("no right answer on one side")?
             }
         };
@@ -1099,26 +1097,20 @@ fn summary_map(
                     let got = ratio(p.as_ref(), row, b);
                     // How many requests each side's median is over, or right answers its joules a
                     // correct answer: a cell sends few, so a square of one or two can turn on a
-                    // single answer, and says so. A square read from each cell's whole, a side
-                    // having no joules a request, says that.
+                    // single answer, and says so.
                     let over = p.as_ref().and_then(|p| {
                         let (ours, theirs) = (p.ours.get(&row.users), p.theirs.get(&row.users));
                         let Measure(timing) = row.measure;
                         let timed = |c: Option<&&TaskCell>| {
                             c.map_or(0, |c| buckets::in_bucket(c, bs, timing, b).len())
                         };
-                        let kept =
-                            |c: Option<&&TaskCell>| c.is_some_and(|c| c.task_joules.is_some());
-                        let joules = match (scale, kept(ours) && kept(theirs)) {
-                            (Scale::Performance, _) => String::new(),
-                            (Scale::PerformanceEfficiency, true) => {
+                        let joules = match scale {
+                            Scale::Performance => String::new(),
+                            Scale::PerformanceEfficiency => {
                                 let n = |c: Option<&&TaskCell>| {
                                     c.map_or(0, |c| buckets::rights_in(c, bs, b))
                                 };
                                 format!("; {} and {} right answers", n(ours), n(theirs))
-                            }
-                            (Scale::PerformanceEfficiency, false) => {
-                                "; each cell's whole: a side kept no joules a request".into()
                             }
                         };
                         let (a, t) = (timed(ours), timed(theirs));
