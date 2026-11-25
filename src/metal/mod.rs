@@ -3337,6 +3337,55 @@ mod tests {
         assert!(html.contains("×0.90 vs oMLX"), "cut off, and still scored");
     }
 
+    /// The decode square pairs TPOT with each request's DECODE joules, and the prefill square TTFT
+    /// with its PREFILL joules: an engine that burns its energy at prefill does not look
+    /// inefficient at decode. Without phase joules (a run from before they were measured), those
+    /// squares say so.
+    #[test]
+    fn a_decode_square_pairs_tpot_with_decode_joules_only() {
+        // scratchy decodes at 10 ms a token on 1 J of decode, oMLX at 20 ms on 2 J: TPOT × decode
+        // J 10 against 40, x4.00. Its prefill burns 50 J against oMLX's 5: with whole-request
+        // joules the decode square would read 10×51 against 20×7, x0.27.
+        let shape = |runs: &mut [Run], phases: bool| {
+            let m = &mut runs[0].models[0];
+            for (cells, tpot, prefill, decode) in [
+                (m.tasks.as_mut(), 10.0, 50.0, 1.0),
+                (m.tasks_omlx.as_mut(), 20.0, 5.0, 2.0),
+            ] {
+                for c in cells.into_iter().flatten().filter(|c| c.workload == "rag") {
+                    scored(c);
+                    let n = c.ttfts_ms.as_ref().map_or(0, Vec::len);
+                    c.prompt_tokens = Some(vec![Some(2700); n]);
+                    c.tpots_ms = Some(vec![Some(tpot); n]);
+                    c.task_joules = Some(vec![Some(prefill + decode); n]);
+                    c.task_prefill_joules = phases.then(|| vec![Some(prefill); n]);
+                    c.task_decode_joules = phases.then(|| vec![Some(decode); n]);
+                }
+            }
+            let machines = super::index(runs);
+            render(super::datasets::section("rag", &machines, &machines))
+        };
+        let mut runs = fixtures(&[REQUESTS_FIXTURE]);
+        let html = shape(&mut runs, true);
+        let pe = &html[..html
+            .find("id=\"rag-summary-performance-efficiency-scale\"")
+            .expect("the Performance-Efficiency map")];
+        assert!(
+            pe.contains("×4.00 vs oMLX"),
+            "TPOT × decode joules, 10 against 40"
+        );
+        assert!(
+            !pe.contains("×0.27 vs oMLX"),
+            "not TPOT × the whole request's joules"
+        );
+        let html = shape(&mut runs, false);
+        assert!(
+            html.contains("a side kept no decode joules"),
+            "no phase joules, said so"
+        );
+        assert!(html.contains("a side kept no prefill joules"));
+    }
+
     /// A section reads each model's newest run that measured its dataset, the runs a newer one
     /// replaced too: the grid from an older grid run, MuSiQue from the newer MuSiQue-only one, and
     /// the grid's section says which run it is from.

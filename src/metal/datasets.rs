@@ -1065,11 +1065,21 @@ fn summary_map(
                     return Err("no energy on one side".into());
                 }
                 // What a right answer typically cost: the median, over the correctly answered
-                // requests, of each one's own time times its own joules
-                // ([`buckets::time_joules_per_right_in`]). A run that kept no joules a request has
-                // none to multiply, so no square.
-                if ours.task_joules.is_none() || theirs.task_joules.is_none() {
-                    return Err("a side kept no joules a request".into());
+                // requests, of each one's own time times its own energy over that time's span
+                // ([`buckets::time_joules_per_right_in`], [`buckets::joules`]). A side that kept
+                // no such energy has none to multiply, so no square, and the square says which.
+                if buckets::joules(ours, timing).is_none()
+                    || buckets::joules(theirs, timing).is_none()
+                {
+                    return Err(match timing {
+                        RequestTiming::E2el => "a side kept no joules a request".into(),
+                        RequestTiming::Ttft => "a side kept no prefill joules: measured where \
+                            requests run one at a time, by runs from 100 ms power sampling on"
+                            .into(),
+                        RequestTiming::Tpot => "a side kept no decode joules: measured where \
+                            requests run one at a time, by runs from 100 ms power sampling on"
+                            .into(),
+                    });
                 }
                 let (a, t) = (
                     buckets::time_joules_per_right_in(ours, bs, timing, b),

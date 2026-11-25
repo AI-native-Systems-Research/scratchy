@@ -773,6 +773,8 @@ mod tests {
             task_right: None,
             task_share: None,
             task_joules: None,
+            task_prefill_joules: None,
+            task_decode_joules: None,
             borrowed_from: None,
             energy: None,
             spec_decode: None,

@@ -67,11 +67,12 @@ pub fn bucketed(c: &TaskCell) -> bool {
 }
 
 /// What a right answer typically cost in bucket `at` of `buckets`, for `timing`: the median, over
-/// the bucket's correctly answered requests, of each one's own time times its own joules
-/// (integrated over its own send-to-last-token window, `cell_energy.per_request`). Every number is
-/// one request's: no sum, no count of right answers divided into a total. A request missing its
-/// time or its joules (a one-token answer has no TPOT) is not counted. None where the cell kept no
-/// joules a request, no prompt counts or no scores, or no request there was right.
+/// the bucket's correctly answered requests, of each one's own time times its own energy over that
+/// time's span ([`joules`]: prefill joules for TTFT, decode joules for TPOT, the whole request's
+/// for end-to-end). Every number is one request's: no sum, no count of right answers divided into
+/// a total. A request missing its time or its energy (a one-token answer has no TPOT) is not
+/// counted. None where the cell kept no such energy, no prompt counts or no scores, or no request
+/// there was right.
 pub fn time_joules_per_right_in(
     c: &TaskCell,
     buckets: Buckets,
@@ -80,7 +81,7 @@ pub fn time_joules_per_right_in(
 ) -> Option<f64> {
     let (prompts, joules, right, times) = (
         c.prompt_tokens.as_deref()?,
-        c.task_joules.as_deref()?,
+        joules(c, timing)?,
         c.task_right.as_deref()?,
         values(c, timing)?,
     );
@@ -107,6 +108,17 @@ fn values(c: &TaskCell, timing: RequestTiming) -> Option<&[Option<f64>]> {
         RequestTiming::Ttft => c.ttfts_ms.as_deref(),
         RequestTiming::Tpot => c.tpots_ms.as_deref(),
         RequestTiming::E2el => c.e2els_ms.as_deref(),
+    }
+}
+
+/// The energy each request spent over the span `timing` times, in the order sent: its prefill
+/// joules for TTFT (up to its first token), its decode joules for TPOT (after it), its whole
+/// joules for end-to-end. The one pairing of a time with its energy every figure reads.
+pub fn joules(c: &TaskCell, timing: RequestTiming) -> Option<&[Option<f64>]> {
+    match timing {
+        RequestTiming::Ttft => c.task_prefill_joules.as_deref(),
+        RequestTiming::Tpot => c.task_decode_joules.as_deref(),
+        RequestTiming::E2el => c.task_joules.as_deref(),
     }
 }
 

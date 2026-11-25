@@ -672,6 +672,14 @@ pub struct TaskCell {
     /// to its joules. None for a request that failed, and for a cell from before it was recorded.
     #[serde(default)]
     pub task_joules: Option<Vec<Option<f64>>>,
+    /// Each request's joules before its first token, and after it (`cell_energy.py` `per_phase`):
+    /// measured only where the cell's requests ran one at a time, so a sample's joules are one
+    /// request's one phase. None for a request that failed, for a cell whose requests overlapped,
+    /// and for a cell from before they were recorded.
+    #[serde(default)]
+    pub task_prefill_joules: Option<Vec<Option<f64>>>,
+    #[serde(default)]
+    pub task_decode_joules: Option<Vec<Option<f64>>>,
     #[serde(default)]
     pub tpots_ms: Option<Vec<Option<f64>>>,
     /// When the run this cell was borrowed from was made: a quick run's rival numbers, from the
@@ -793,6 +801,8 @@ impl TaskCell {
             task_groups: groups,
             task_right: right,
             task_joules: cut(&self.task_joules, n),
+            task_prefill_joules: cut(&self.task_prefill_joules, n),
+            task_decode_joules: cut(&self.task_decode_joules, n),
             ..self.clone()
         })
     }
