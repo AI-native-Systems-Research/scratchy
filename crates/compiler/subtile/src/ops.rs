@@ -22,7 +22,8 @@
 //! - The pattern is a real match pattern, so an elementwise kind (`Elementwise(EwKind::Silu)`) is
 //!   a row in its own right rather than a special case the consumer has to unpack.
 //! - `arity` is a closure-form predicate over the operand count (the binder is declared IN the
-//!   row so macro hygiene ties it to the body).
+//!   row so macro hygiene ties it to the body), or `[operands f]`: exactly the count the op's own
+//!   field `f` states (`f.arity()`, e.g. an expert bank's [`crate::lower::ExpertWeight::arity`]).
 //! - `cols` is one of (bracketed so it stays one macro token tree):
 //!   - `[in0]` — shape-preserving: output width = `inputs[0]` width;
 //!   - `[in1]` — output width = `inputs[1]` width (GDN's z operand);
@@ -280,7 +281,7 @@ macro_rules! for_each_subop {
             // derive. ExpertUnsort restores TOKEN order from pair rows.
             ExpertSort [SubOp::ExpertSort { .. }] arity = (|n| n == 2), cols = [pairs in0 k],
                 rows = [m], gemm_w = [none], tp = [whole];
-            ExpertMatmul [SubOp::ExpertMatmul { .. }] arity = (|n| n == 3 || n == 4), cols = [pairs n k],
+            ExpertMatmul [SubOp::ExpertMatmul { .. }] arity = [operands weight], cols = [pairs n k],
                 rows = [m], gemm_w = [in 2], tp = [whole];
             ExpertGatedAct [SubOp::ExpertGatedAct { .. }] arity = (|n| n == 2), cols = [in0],
                 rows = [m], gemm_w = [none], tp = [whole];
@@ -363,6 +364,27 @@ macro_rules! __out_cols_body {
     };
 }
 
+// ── Derived: operand arity ──────────────────────────────────────────
+// `(|n| …)` is a predicate over the count; `[operands f]` is the count the op's own field `f`
+// states, its pattern binding `f` as `[scale f]`'s does for the row count.
+macro_rules! __arity_pat {
+    ($kind:ident, $pat:pat, [operands $f:ident]) => {
+        $crate::subtile_ir::SubOp::$kind { $f, .. }
+    };
+    ($kind:ident, $pat:pat, $ar:tt) => {
+        $pat
+    };
+}
+macro_rules! __arity_body {
+    ($n:ident, (|$an:ident| $e:expr)) => {{
+        let $an = $n;
+        $e
+    }};
+    ($n:ident, [operands $f:ident]) => {
+        $n == $f.arity()
+    };
+}
+
 // ── Derived: output rows ────────────────────────────────────────────
 // The same shape of derivation as `out_cols`, over the `rows` class. The two classes:
 // - `[in0]` — the op preserves its operand 0's row count (the row scale a per-head Reshape
@@ -441,14 +463,14 @@ macro_rules! __tp_body {
 }
 
 macro_rules! __derive_registry {
-    ($( $kind:ident [$pat:pat] arity = (|$an:ident| $arity:expr), cols = $cols:tt,
+    ($( $kind:ident [$pat:pat] arity = $ar:tt, cols = $cols:tt,
         rows = $rows:tt, gemm_w = $gw:tt, tp = $tp:tt; )*
-     @expansion $( $ek:ident [$ep:pat] arity = (|$ean:ident| $ea:expr), cols = $ec:tt,
+     @expansion $( $ek:ident [$ep:pat] arity = $ear:tt, cols = $ec:tt,
         rows = $erc:tt, gemm_w = $egw:tt, tp = $etp:tt; )*) => {
         __derive_registry! {
-            $( $kind [$pat] arity = (|$an| $arity), cols = $cols, rows = $rows, gemm_w = $gw,
+            $( $kind [$pat] arity = $ar, cols = $cols, rows = $rows, gemm_w = $gw,
                 tp = $tp; )*
-            $( $ek [$ep] arity = (|$ean| $ea), cols = $ec, rows = $erc, gemm_w = $egw,
+            $( $ek [$ep] arity = $ear, cols = $ec, rows = $erc, gemm_w = $egw,
                 tp = $etp; )*
         }
 
@@ -461,7 +483,7 @@ macro_rules! __derive_registry {
             };
         }
     };
-    ($( $kind:ident [$pat:pat] arity = (|$an:ident| $arity:expr), cols = $cols:tt,
+    ($( $kind:ident [$pat:pat] arity = $ar:tt, cols = $cols:tt,
         rows = $rows:tt, gemm_w = $gw:tt, tp = $tp:tt; )*) => {
         /// An op without its fields: how a declared target table names an op. Derived from the
         /// registry, so no table keeps a parallel list.
@@ -494,7 +516,7 @@ macro_rules! __derive_registry {
             pub fn arity_ok(&self, n_operands: usize) -> bool {
                 use $crate::subtile_ir::{EwKind, SubOp};
                 match self {
-                    $( $pat => { let $an = n_operands; $arity } )*
+                    $( __arity_pat!($kind, $pat, $ar) => __arity_body!(n_operands, $ar), )*
                 }
             }
 

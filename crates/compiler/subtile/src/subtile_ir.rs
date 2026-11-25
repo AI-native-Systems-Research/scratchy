@@ -1614,7 +1614,7 @@ pub enum SubOp<F: RopeForm = NeoX, S: OpStage = Tiled> {
         bundle: ExpertBundle,
     },
     /// One projection of each pair's expert, `n` wide. `inputs` = `[rows, routing, experts]`,
-    /// with a 4th, the bank's scale source, for an affine or fp8 bank ([`crate::lower::ExpertWeight`]).
+    /// then the bank's scale source when it has one ([`crate::lower::ExpertWeight::has_scale`]).
     ExpertMatmul {
         proj: ExpertProj,
         n: u32,

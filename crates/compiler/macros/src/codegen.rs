@@ -9780,9 +9780,9 @@ mod fingerprint_tests {
 
     /// The shared lowering states an expert bank in the format the checkpoint stores it, with no
     /// target's answer in it: a bf16 bank (Qwen3.6's `moe_block`, Gemma 4's SwitchGLU) lowers to
-    /// dense expert matmuls reading rows, pairs and the weight alone; an fp8 bank to fp8 ones and
-    /// an MLX-affine bank to affine ones, each binding its scale as operand 3. Read as anything
-    /// else, a bank's bytes would be taken for another format's.
+    /// dense expert matmuls, an fp8 bank to fp8 ones and an MLX-affine bank to affine ones, each
+    /// binding the operands its format states (the registry's arity, `ExpertWeight::arity`). Read
+    /// as anything else, a bank's bytes would be taken for another format's.
     #[test]
     fn an_expert_bank_lowers_in_the_format_its_checkpoint_stores() {
         use crate::to_wavefront::{KvPool, PrefixCapacity, lower_decode_to_wavefront};
@@ -9801,12 +9801,9 @@ mod fingerprint_tests {
                     .unwrap_or_else(|| panic!("{stem}: the declared {preset} preset was refused"))
             };
             for (model, want) in [
-                (config_of(arch, stem), (ExpertWeight::Dense, 3)),
-                (
-                    variant("fp8-dynamic-per-channel"),
-                    (ExpertWeight::Fp8Dynamic, 4),
-                ),
-                (variant(mlx), (affine, 4)),
+                (config_of(arch, stem), ExpertWeight::Dense),
+                (variant("fp8-dynamic-per-channel"), ExpertWeight::Fp8Dynamic),
+                (variant(mlx), affine),
             ] {
                 let ast = crate::draft_capture::insert(&dsl_of(arch));
                 let (_, fuf, inferred) = crate::fixtures::inferred_fuf_of_ast(arch, &model, &ast);
@@ -9833,14 +9830,15 @@ mod fingerprint_tests {
                     lower_decode_to_wavefront(&fuf, &inferred, &bounds, &bridge, prefix, 1)
                         .unwrap_or_else(|e| panic!("{}: {e}", model.source_stem));
                 let banks: Vec<_> = (lowered.input.ops.iter())
-                    .filter_map(|o| match o.op {
-                        SubOp::ExpertMatmul { weight, .. } => Some((weight, o.inputs.len())),
-                        _ => None,
-                    })
+                    .filter(|o| matches!(o.op, SubOp::ExpertMatmul { .. }))
                     .collect();
                 assert!(!banks.is_empty(), "{}: no expert matmul", model.source_stem);
-                for bank in banks {
-                    assert_eq!(bank, want, "{}", model.source_stem);
+                for o in banks {
+                    let stem = &model.source_stem;
+                    let format =
+                        matches!(o.op, SubOp::ExpertMatmul { weight, .. } if weight == want);
+                    assert!(format, "{stem}: {:?}, want {want:?}", o.op);
+                    assert!(o.op.arity_ok(o.inputs.len()), "{stem}: {:?}", o.inputs);
                 }
             }
         }

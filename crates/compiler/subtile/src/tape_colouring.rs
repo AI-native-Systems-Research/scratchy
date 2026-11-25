@@ -1007,7 +1007,7 @@ mod tests {
                     bundle,
                 },
                 1,
-                vec![Op(5), Op(5), Ext(2)],
+                vec![Op(5), Op(5), Ext(2), Ext(2)],
             ),
             op(combine, 1, vec![Op(6), Op(4)]),
         ];

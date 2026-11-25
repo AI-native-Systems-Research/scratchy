@@ -155,7 +155,7 @@ pub enum Refused {
 
 impl StepRefusal {
     /// Whether metal has no kernel for the model ([`Refused::NonAffineExperts`]): the canonical
-    /// gets no steps, as for the shared tape's own `NoKernel`, rather than failing the build.
+    /// gets no steps and bakes no variants, rather than failing the build.
     pub fn is_no_kernel(&self) -> bool {
         matches!(self.why, Refused::NonAffineExperts)
     }

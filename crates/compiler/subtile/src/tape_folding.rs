@@ -1764,6 +1764,13 @@ mod tests {
     use InputRef::{Ext, Op};
     use scratchy_ir::model_facts::HeadDim;
 
+    /// An affine expert bank's operands: its fused bundle binds the scale as the same source as
+    /// the weight (operand 2), as the bridge's `moe_block` does.
+    fn affine_operands(mut inputs: Vec<InputRef>) -> Vec<InputRef> {
+        inputs.push(inputs[2]);
+        inputs
+    }
+
     /// A neutral kernel identity per fold.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum Kern {
@@ -2145,7 +2152,7 @@ mod tests {
                     bundle,
                 },
                 m,
-                inputs,
+                affine_operands(inputs),
             )
         };
         let dense = SubOp::MatmulTile {
@@ -2223,7 +2230,7 @@ mod tests {
                     weight,
                     bundle,
                 };
-                op(m, rows, inputs)
+                op(m, rows, affine_operands(inputs))
             };
             let sort = SubOp::ExpertSort { experts, k, bundle };
             let combine = SubOp::ExpertCombine {
@@ -2614,7 +2621,7 @@ mod tests {
                     bundle,
                 },
                 1,
-                inputs,
+                affine_operands(inputs),
             )
         };
         let ops = |gate_read_again: bool| {
@@ -2688,7 +2695,7 @@ mod tests {
                     bundle,
                 },
                 1,
-                inputs,
+                affine_operands(inputs),
             )
         };
         let ops = |fc1_read_again: bool| {

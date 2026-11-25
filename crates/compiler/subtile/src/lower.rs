@@ -166,15 +166,29 @@ impl ExpertQuant {
 /// a quantized one (or the reverse).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExpertWeight {
-    /// Dense bf16 experts, the checkpoint's own tensors. `inputs` = `[rows, routing, bundle]`:
-    /// no scale operand.
+    /// Dense bf16 experts, the checkpoint's own tensors.
     Dense,
     /// MLX-affine packed experts, as the checkpoint declares them.
     Affine(ExpertQuant),
     /// compressed-tensors fp8-dynamic experts ([`GemmWeight::Fp8Dynamic`]'s counterpart): each
-    /// expert's per-channel fp8 weight and its `weight_scale`. `inputs` = `[rows, routing, bundle,
-    /// scale]`, the scale bound as an affine bank's.
+    /// expert's per-channel fp8 weight and its `weight_scale`.
     Fp8Dynamic,
+}
+
+impl ExpertWeight {
+    /// Whether the bank has a scale source: its `ExpertMatmul` reads `[rows, routing, bundle]`
+    /// and, when it does, the scale as a 4th operand ([`Self::arity`]).
+    pub const fn has_scale(self) -> bool {
+        match self {
+            Self::Dense => false,
+            Self::Affine(_) | Self::Fp8Dynamic => true,
+        }
+    }
+
+    /// The operand count of the bank's [`SubOp::ExpertMatmul`] (the op registry's arity).
+    pub const fn arity(self) -> usize {
+        3 + self.has_scale() as usize
+    }
 }
 
 /// An op as the front end states it: THE op vocabulary [`SubOp`] at its [`Arch`] stage, before
