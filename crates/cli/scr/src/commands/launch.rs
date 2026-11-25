@@ -611,7 +611,7 @@ pub async fn run_launch_claude(args: LaunchClaudeArgs) -> Result<()> {
     }
 
     // Only forward an explicit --tool-call-parser; when unset the served engine
-    // auto-selects one from the model family in `initialize_stack`
+    // auto-selects one from the chat template in `initialize_stack`
     // (scratchy_serving_api::tool_parser::detect_tool_parser).
     let tool_parser = args.tool_call_parser.clone();
 

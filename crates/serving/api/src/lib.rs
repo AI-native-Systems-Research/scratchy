@@ -46,3 +46,4 @@ pub mod server;
 pub mod signal;
 pub mod spans;
 pub mod tool_parser;
+pub mod wire_format;

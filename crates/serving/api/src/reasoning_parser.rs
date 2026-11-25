@@ -1193,37 +1193,11 @@ pub fn get_reasoning_parser(
     }
 }
 
-/// Auto-select a reasoning parser from the model's **canonical architecture**
-/// (`config.json` `model_type` / `architectures`), not its name/path. Only
-/// architectures with a known reasoning format get a parser; everything else
-/// gets `None` so their output is left untouched as content.
-///
-/// Caveat: `<think>` reasoning can be a finetune trait rather than an arch one
-/// (e.g. R1 *distills* keep their base arch, `qwen2`/`llama`), so those aren't
-/// auto-detected here and would need an explicit `--reasoning-parser`.
-pub fn detect_reasoning_parser(arch: &str) -> Option<&'static str> {
-    let a = arch.to_lowercase();
-    if a.contains("gpt_oss") || a.contains("gpt-oss") || a.contains("gptoss") {
-        Some("gpt_oss")
-    } else if a.contains("gemma4") {
-        // Gemma 4 (dense, MoE, and `-unified` ports) wraps reasoning in
-        // `<|channel>thought … <channel|>` channels.
-        Some("gemma4")
-    } else if a.contains("deepseek") {
-        // deepseek_v3 / R1 emit `<think>…</think>`.
-        Some("deepseek_r1")
-    } else if a.contains("granite_4_2") {
-        // Granite 4.2 (the first granite with an untied lm_head — see
-        // `model_arch` in init.rs) thinks in ` MudThink… MudThinkEnd`, Qwen3's
-        // tokens, so it reuses the Qwen3 parser.
-        Some("qwen3")
-    } else if a.contains("qwen3") || a.contains("qwq") || a.contains("nemotron_h") {
-        // Nemotron-H's template opens `<think>\n` in the prompt (`</think>` closed
-        // there when thinking is off), Qwen3.5's convention.
-        Some("qwen3")
-    } else {
-        None
-    }
+/// The reasoning parser the model's chat template selects, by the template's own markers
+/// ([`crate::wire_format`]), as a name [`get_reasoning_parser`] takes. `None` without a
+/// template, or for one that renders no thinking a parser reads: pass `--reasoning-parser` then.
+pub fn detect_reasoning_parser(template: Option<&str>) -> Option<&'static str> {
+    crate::wire_format::wire_formats(template).reasoning
 }
 
 // ---------------------------------------------------------------------------
@@ -2162,25 +2136,16 @@ mod gpt_oss_tests {
     }
 
     #[test]
-    fn detects_by_model_id() {
-        // Keyed on model_type / architecture.
-        assert_eq!(detect_reasoning_parser("gpt_oss"), Some("gpt_oss"));
-        assert_eq!(detect_reasoning_parser("qwen3"), Some("qwen3"));
-        assert_eq!(detect_reasoning_parser("qwen3_5_moe"), Some("qwen3"));
-        assert_eq!(detect_reasoning_parser("nemotron_h"), Some("qwen3"));
-        assert_eq!(detect_reasoning_parser("deepseek_v3"), Some("deepseek_r1"));
-        // Gemma 4's thought channels (`<|channel>thought … <channel|>`),
-        // dense and MoE alike.
-        assert_eq!(detect_reasoning_parser("gemma4"), Some("gemma4"));
-        assert_eq!(detect_reasoning_parser("gemma4_moe"), Some("gemma4"));
-        assert_eq!(detect_reasoning_parser("gemma4_unified"), Some("gemma4"));
-        // Granite 4.2 (untied lm_head) thinks; ≤4.1 does not.
-        assert_eq!(detect_reasoning_parser("granite_4_2"), Some("qwen3"));
-        assert_eq!(detect_reasoning_parser("granite"), None);
-        // Architectures with no known reasoning format get no parser.
-        assert_eq!(detect_reasoning_parser("gemma3"), None);
-        assert_eq!(detect_reasoning_parser("llama"), None);
-        assert_eq!(detect_reasoning_parser("qwen2"), None);
+    fn detects_from_the_template() {
+        let think =
+            "{%- set reasoning_content = content.split('</think>')[0].split('<think>')[-1] %}";
+        assert_eq!(detect_reasoning_parser(Some(think)), Some("qwen3"));
+        assert_eq!(
+            detect_reasoning_parser(Some("{%- if '<|channel|>analysis' in m %}")),
+            Some("gpt_oss")
+        );
+        assert_eq!(detect_reasoning_parser(Some("{{ messages }}")), None);
+        assert_eq!(detect_reasoning_parser(None), None);
     }
 }
 

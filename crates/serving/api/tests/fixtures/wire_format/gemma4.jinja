@@ -1,0 +1,4 @@
+{%- set function = tool_call['function'] -%}
+{{- '<|tool_call>call:' + function['name'] + '{' -}}
+{%- for part in text.split('<channel|>') -%}
+    {%- if '<|channel>' in part -%}
