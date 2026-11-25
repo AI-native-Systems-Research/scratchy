@@ -512,7 +512,7 @@ pub(crate) fn run_card_launch(
                 .as_ref()
                 .is_some_and(|s| !s.fired());
             let t_submit = std::time::Instant::now();
-            pf.submit_bound(&binds, mq, seq_pos).map_err(|e| {
+            let bind = pf.submit_bound(&binds, mq, seq_pos).map_err(|e| {
                 werr(format!(
                     "superdsc decode bind+submit (mq={mq}, at={seq_pos}): {e}"
                 ))
@@ -536,10 +536,10 @@ pub(crate) fn run_card_launch(
             *PRIOR_READ.lock().expect("the overlap probe's own lock") = Some(read.signal());
             scratchy_serving_worker::step_segs::record_submit(
                 scratchy_serving_worker::step_segs::SubmitSegs {
-                    // The cards' binds run inside `submit_bound`, ahead of its doorbells, so they
-                    // are part of the submit span: no separate host bind precedes it.
-                    bind: std::time::Duration::ZERO,
-                    submit: t_defer.duration_since(t_submit),
+                    // The cards' binds run inside `submit_bound`, ahead of its doorbells: the
+                    // slowest card's is the bind row, and the rest of the span is the submit.
+                    bind,
+                    submit: t_defer.duration_since(t_submit).saturating_sub(bind),
                     defer: t_stage.duration_since(t_defer),
                     stage: None,
                     total: t_submit.elapsed(),
