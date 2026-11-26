@@ -433,9 +433,9 @@ fn body_dies_at(
         }
     }
     // Highest body index at which each value is used — operands, plus the
-    // attributes that NAME values (`iter_var`/`iter_args`/…). Those used to be
-    // recognized by a leading `%` on a string, which both over-matched (a literal
-    // that happened to start with `%`) and under-matched.
+    // attributes that NAME values (`iter_var`/`iter_args`/…). Those are not
+    // recognized by a leading `%` on a string, which would both over-match (a literal
+    // that happens to start with `%`) and under-match.
     let mut last_use: HashMap<Ssa, usize> = HashMap::new();
     for (i, op) in ops.iter().enumerate() {
         for &operand in op.operands {

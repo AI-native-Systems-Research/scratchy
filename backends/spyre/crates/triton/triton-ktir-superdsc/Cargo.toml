@@ -18,9 +18,9 @@ publish = false
 [dependencies]
 # Our KTIR, and `handoff::lower` which already produces their `IRFunction`.
 triton-ktir = { path = "../triton-ktir" }
-# THEIRS IS NOW OURS. This edge used to be the vendored copy under `../vendor/`; the
-# re-host reverses the arrow: scratchy main owns `ktir-superdsc` (triton-spyre re-vendored
-# from this tree at `ec18ac1da`, local delta zero), so the adapter depends on the crates
+# THEIRS IS OURS. This edge is not a vendored copy under `../vendor/`: scratchy main
+# owns `ktir-superdsc` (triton-spyre re-vendors it from this tree, at `ec18ac1da` with
+# local delta zero), so the adapter depends on the crates
 # in their one true home. See backends/spyre/crates/triton/PROVENANCE.md.
 ktir-superdsc = { path = "../../ktir/ktir-superdsc" }
 ktir-core = { path = "../../ktir/ktir-core" }

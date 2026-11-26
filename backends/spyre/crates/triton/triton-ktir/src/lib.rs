@@ -98,10 +98,10 @@
 //!
 //! NOT DONE, stated plainly rather than left to be discovered:
 //!
-//! * **The KTIR -> SuperDSC leg is no longer ours.** scratchy's `ktir_to_superdsc`
-//!   walks `ktir_core::ir` directly, and our text-reading `triton-superdsc-lower` is
-//!   superseded -- so the 35 text sites in it are NOT work to do, they are work that
-//!   was deleted. What replaces it is emitting `ktir_core` values at our boundary.
+//! * **The KTIR -> SuperDSC leg is not ours.** scratchy's `ktir_to_superdsc`
+//!   walks `ktir_core::ir` directly, in place of our text-reading
+//!   `triton-superdsc-lower` -- so the 35 text sites in it are NOT work to do. What
+//!   this crate owes instead is emitting `ktir_core` values at our boundary.
 //!   [`consumer`] measures how far that is, per fixture, and the answer is gated on
 //!   the next bullet: `ktir_core::OpKind` has no `tt.*` variants, so our stage-1
 //!   output is not merely unsupported by their walker but UNREPRESENTABLE in their

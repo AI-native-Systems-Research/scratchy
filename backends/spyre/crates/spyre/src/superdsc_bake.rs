@@ -1921,9 +1921,9 @@ impl BakeQueue {
 
 /// ⭐ ONE QUEUE FOR THE WHOLE EMIT.
 ///
-/// The queue used to be created and drained per BUNDLE, which put a join barrier at every bundle
-/// boundary: the compile width could never exceed one bundle's group count, and each boundary wound
-/// down to a single running `dxp_standalone` before the next wound up. Across a 27-bundle ladder that
+/// A queue created and drained per BUNDLE puts a join barrier at every bundle
+/// boundary: the compile width can never exceed one bundle's group count, and each boundary winds
+/// down to a single running `dxp_standalone` before the next winds up. Across a 27-bundle ladder that
 /// is 27 serialisation points, and it shows up exactly as "sometimes 8, sometimes 3, sometimes 1".
 ///
 /// Process-wide, so group N of bundle 3 compiles while bundle 4 is being written.

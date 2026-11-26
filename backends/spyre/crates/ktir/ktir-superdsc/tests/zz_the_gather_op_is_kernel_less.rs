@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 //! ⭐⭐⭐⭐⭐ THE GATHER'S OP IS **KERNEL-LESS** — THE SHAPE WE SHIP — AND THE CARD IS WHY.
 //!
-//! ⭐ SUPERSEDED IN PART 2026-10-09: the one-matmul card probe (`/tmp/prefill-m1-probe-report.md`)
+//! ⭐ ONE EXCEPTION, FROM THE 2026-10-09 ONE-MATMUL CARD PROBE, which
 //! root-caused the two refusals below to `calculateFlopPerByte`'s CHUNK-PARAM EXPLORATION path only
 //! — a vendor ordering gap (the transfer users it demands are created only AFTER
 //! `addChunkDataStage`) — and ESCAPED them for ONE shape: the TOKEN-PLANE form (entries on `mb`,
 //! one position each — the prefill-m>1 per-expert batched matmul), with
 //! `DISABLE_ABOVE_LX_CHUNK_EXPLORE=1` at bake and the index spelled `indexTensorType_ "index"`
 //! (the wall-#8 law: the vendor's idx2addr conversion computes the addresses, zeroes the value
-//! start, and flips the type to ADDRESS itself). That form now
+//! start, and flips the type to ADDRESS itself). That form
 //! EMITS, pinned by `zz_the_token_plane_gathered_matmul_is_the_probe_form.rs`. The refusals below
 //! remain the true record for every OTHER gathered-KERNEL shape — including the paged-KV forms
 //! this file pins the refusal of — and this file's copy-op laws are untouched: the KERNEL-less

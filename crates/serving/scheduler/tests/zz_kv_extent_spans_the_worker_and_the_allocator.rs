@@ -146,9 +146,9 @@ fn no_block_past_the_cacheable_prefix_can_ever_be_hit() {
 /// → the worker's `host` slice) — which is where to look next, instead of at the arithmetic again.
 #[test]
 fn a_shallow_request_under_a_deep_step_reach_holds_blocks_for_the_reach() {
-    // ⛔ `sharing_one_write_slot()` IS THE POINT: the tracker used to infer this from `set_kv_pool_reach`
-    // having been called, and this very test reproduced the card's failure on the host when that inference
-    // was removed — `[step-reach] asked=798 applied=0`. The capability is DECLARED now.
+    // ⛔ `sharing_one_write_slot()` IS THE POINT: the tracker does not infer this from `set_kv_pool_reach`
+    // having been called, and without the declaration this very test reproduces the card's failure on the
+    // host — `[step-reach] asked=798 applied=0`. The capability is DECLARED.
     let mut t = SimpleBlockTracker::with_caching(64, KvBlockTokens::new(BLOCK).expect("BLOCK > 0"))
         .sharing_one_write_slot();
     t.set_kv_pool_reach(KvSlotSpan::new(697));

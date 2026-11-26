@@ -134,11 +134,11 @@ fn a_whole_page_plane_is_a_hole_free_bijection_for_every_plane_at_both_head_dims
 
 /// The pin dxp derives `skip_addr` from, over the WHOLE `nkvh` x `hd` grid.
 ///
-/// ⭐ THE EVENNESS IS NOT HERE ANY MORE, AND ITS ABSENCE IS THE POINT. `PagePlaneExtent::pin_is_even` was
-/// a runtime `bool` that `PageScratch::of_pass` branched on, and its test sat inside an
-/// hd-multiple-of-64 loop — so it asserted its own premise and could never fail. The pin is `hd` sticks
+/// ⭐ THE EVENNESS IS NOT HERE, AND ITS ABSENCE IS THE POINT. A `PagePlaneExtent::pin_is_even` as
+/// a runtime `bool` for `PageScratch::of_pass` to branch on, tested inside an
+/// hd-multiple-of-64 loop, asserts its own premise and can never fail. The pin is `hd` sticks
 /// and `of_pool` admits only whole multiples of `POOL_STICK`, so "the pin is even" is a statement about
-/// the STICK, and it now lives where a statement about a constant belongs: a module-level
+/// the STICK, and it lives where a statement about a constant belongs: a module-level
 /// `const _: () = assert!(POOL_STICK.is_multiple_of(2), ..)` in `sdsc_abstract`, which is a
 /// required-const context and therefore actually evaluates.
 #[test]
@@ -373,7 +373,7 @@ fn the_plane_head_corner_is_the_pools_own_addr_at_both_head_dims() {
 }
 
 /// THE ENTRY COUNT, which is the measured cause of the rung-8 corruption — swept over the WHOLE
-/// `nkvh` x `hd` x `mq` grid, because every part of it used to be checked at one point of that grid.
+/// `nkvh` x `hd` x `mq` grid, because a check at one point of that grid says nothing about the rest.
 ///
 /// ⭐ AND THE CUT IS THE INVARIANT, NOT THE OP COUNT. A request's run is `blocks()` entries and an op may
 /// name `entries_per_op()` of them; the ops of one request are contiguous index STICKS and contiguous

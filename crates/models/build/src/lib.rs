@@ -114,8 +114,8 @@ pub struct Built {
     pub inspected: Vec<String>,
 }
 
-/// The emitted code roots its own items at `crate::` (each arch used to be its
-/// own crate, so `crate::__gpu` / `crate::<Model>` meant "this arch's root").
+/// The emitted code roots its own items at `crate::` (it is written as if each
+/// arch were its own crate, so `crate::__gpu` / `crate::<Model>` means "this arch's root").
 /// In the consolidated crate every arch lives under `pub mod <mod>`, so rewrite
 /// every path-root `crate ::` → `crate :: <mod> ::`. Leaves `pub(crate)` (a
 /// `crate` not followed by `::`), absolute `::foo` paths and the crate-root modules every arch

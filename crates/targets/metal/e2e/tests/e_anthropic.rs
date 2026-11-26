@@ -335,11 +335,11 @@ async fn test_anthropic_empty_messages() {
 // Usage: prompt + cached token accounting (issue #298, epic #158)
 //
 // `/v1/messages` is the only endpoint Claude Code uses, and it is the endpoint
-// the benchmark measures. Two things used to be unreportable from it:
+// the benchmark measures. Two things it must report, and can easily lose:
 //
-//   - the prefix-cache hit, dropped in the Anthropic conversion; and
+//   - the prefix-cache hit, which the Anthropic conversion can drop; and
 //   - on a STREAMING request, the prompt length at all — `message_start`
-//     emitted a literal `"input_tokens": 0`.
+//     must not emit a literal `"input_tokens": 0`.
 //
 // Anthropic's input fields are disjoint (`input_tokens` is the UNCACHED
 // remainder, so `input_tokens + cache_read_input_tokens` is the whole prompt),

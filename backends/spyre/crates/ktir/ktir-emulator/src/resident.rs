@@ -1185,9 +1185,9 @@ impl ResidentExecutor {
     /// program does not reference) are skipped — the caller can hand the whole
     /// weight set.
     ///
-    /// The key used to be a SPELLING of the id (`t<id>` / `%t<id>` / `%t<id>_ptr` /
-    /// bare `<id>`) that `tensor_id_of_key` parsed straight back to the number the
-    /// caller had formatted a line earlier. Both sides hold the id; the seam
+    /// The key is the id, not a SPELLING of it (`t<id>` / `%t<id>` / `%t<id>_ptr` /
+    /// bare `<id>`) for a `tensor_id_of_key` to parse straight back to the number the
+    /// caller formatted a line earlier. Both sides hold the id; the seam
     /// carries it.
     ///
     /// [`Arg::TensorBytes`] takes the f32-free byte path ([`set_source_bytes`]) —
@@ -1387,7 +1387,7 @@ impl ResidentExecutor {
                     // Bind every pointer arg to its resident stick, and collect
                     // the boundary OUTPUTs to read back (so intermediates flow via
                     // HBM, not host). The arg -> tensor mapping travels with the
-                    // segment; it used to be parsed out of the argument's name.
+                    // segment; it is not parsed out of the argument's name.
                     let mut input_ptrs: Vec<(Ssa, Value)> = Vec::with_capacity(fs.args.len());
                     for &(arg, tid) in &fs.args {
                         let s = *self
@@ -2108,8 +2108,8 @@ fn rewrite_last_token_func<'a>(
         .map(|(&name, _)| name)
         .collect();
 
-    // ⭐ THE ROW CONSTANT IS MINTED, NOT SPELLED. It used to be the invented NAME
-    // `%lt_last_row_<m-1>`, unique only because nothing else happened to spell it.
+    // ⭐ THE ROW CONSTANT IS MINTED, NOT SPELLED. An invented NAME like
+    // `%lt_last_row_<m-1>` is unique only because nothing else happens to spell it.
     // A fresh id above every id the function already binds cannot collide.
     let row_const = Ssa(max_ssa(ops) + 1);
 

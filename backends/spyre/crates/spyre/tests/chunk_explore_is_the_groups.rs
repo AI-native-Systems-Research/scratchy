@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 //! ⭐⭐⭐ WHETHER dxp's CHUNK-PARAMETER EXPLORER RUNS IS THE GROUP'S, AND ONLY ONE SHAPE TURNS IT OFF.
 //!
-//! `DISABLE_ABOVE_LX_CHUNK_EXPLORE=1` used to be set on every `dxp_standalone` child, because the
+//! `DISABLE_ABOVE_LX_CHUNK_EXPLORE=1` is not set on every `dxp_standalone` child, even though the
 //! token-plane gathered expert gemm (gemma-4's MoE, `GatherIndex::of_expert_planes`) only schedules
-//! with the explorer off. Every other group then compiled without the LX chunking the explorer picks.
+//! with the explorer off: every other group would then compile without the LX chunking the explorer picks.
 //! MEASURED, granite-3.1-2b fp16, knob dropped vs set on every group: TTFT 18100.6 → 8846.3 ms at a
 //! 35300-token prompt; granite-3.1-8b fp16 decode at 10,086 tokens: ITL p50 305.9 → 233.1 ms. Same
 //! descriptors both ways.

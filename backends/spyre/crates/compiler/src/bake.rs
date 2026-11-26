@@ -1415,8 +1415,8 @@ fn cow_u8s(v: &[u8]) -> proc_macro2::TokenStream {
 /// cannot drift from the type it is a value of.
 /// One [`bundle::SynthRole`] as tokens.
 ///
-/// ⛔ AN EXHAUSTIVE MATCH, NOT A STRING. A synthetic's role used to be a name SUFFIX
-/// (`format!("{out}_rot")`) built at the emit site and matched at the consume site. Here the
+/// ⛔ AN EXHAUSTIVE MATCH, NOT A STRING. A synthetic's role is not a name SUFFIX
+/// (`format!("{out}_rot")`) built at the emit site and matched at the consume site: the
 /// bake holds the value and the macro emits the value; adding a role breaks THIS match at build
 /// time, which is the whole reason it is an enum.
 fn synth_role_tokens(

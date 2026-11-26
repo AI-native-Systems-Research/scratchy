@@ -1,0 +1,4 @@
+# The exceptions the purity skill itself names, and nothing else: P4's three (the config.json
+# registry lookup, the one loader door, operational failures) and P2's user-approved staging LUT.
+# Each entry names the item's path, its rule, and who approved it. A new kind of exception is a
+# change to the skill first.
