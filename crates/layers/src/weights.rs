@@ -34,6 +34,9 @@ fn safetensors_dtype(dtype: safetensors::Dtype) -> Result<DType> {
         safetensors::Dtype::U32 => Ok(DType::U32),
         safetensors::Dtype::I32 => Ok(DType::I32),
         safetensors::Dtype::U8 => Ok(DType::U8),
+        // A bool is a byte a value (0 or 1) on disk: P-EAGLE's drafters carry `t2d`, their vocab
+        // map, as one.
+        safetensors::Dtype::BOOL => Ok(DType::U8),
         safetensors::Dtype::F8_E4M3 => Ok(DType::Fp8E4m3),
         other => bail!("unsupported safetensors dtype: {:?}", other),
     }
