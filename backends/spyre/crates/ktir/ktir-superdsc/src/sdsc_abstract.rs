@@ -859,8 +859,8 @@ impl OperandPlacement {
     /// THE HEAD-MAJOR ROW LAW: head `h`, REQUEST `request` of a `[nqh*mq, width]` shared buffer framed
     /// by [`HeadRequestRow`], pitch that law's own head pitch: the chunk's `mq` rows.
     ///
-    /// ⭐ `request` IS THE LAW'S OWN MINOR COORDINATE, and it used to be a hardcoded `0` — right only
-    /// because every op swept a head's whole `mq` rows and the request rode inside the block. The
+    /// ⭐ `request` IS THE LAW'S OWN MINOR COORDINATE, not a hardcoded `0` — which is right only when
+    /// every op sweeps a head's whole `mq` rows and the request rides inside the block. The
     /// collapsed fold's per-request legs compute ONE row, so they name which, through the same law that
     /// the mask's own validity rows are staged by (`HeadRequestRow::of(h, r, mq) = h*mq + r`).
     pub fn of_head_major_rows(
@@ -898,7 +898,7 @@ impl OperandPlacement {
     /// The placed base offset — for the operand slots that take a bare [`crate::addr::DevOff`]
     /// (the forms with no pitch of their own to declare).
     /// Device offset of this nest — read by the SDSC lowering, which
-    /// now lives in the spyre target crate.
+    /// lives in the spyre target crate.
     pub(crate) const fn off(self) -> crate::addr::DevOff {
         self.off
     }
@@ -2257,17 +2257,17 @@ pub enum LayoutError {
 
 /// A typed device-tensor handle: an emitter name + the ONE [`StickLayout`], with KIND in the type.
 /// Threaded BY VALUE producer→consumer so two ops cannot hold divergent layouts for the same tensor;
-/// a leaf helper that requires kind `K'` accepts only `&Stk<K'>`, so handing a `RowScalar` reduce
-/// output to a matmul-A (which needs `RowBlocked`) does NOT type-check. `dev_off` is reachable only
+/// a leaf helper that requires kind `K'` accepts only `&Stk<K'>`, so handing a `Kernel` handle to a
+/// matmul-A (which needs `RowBlocked`) does NOT type-check. `dev_off` is reachable only
 /// through the handle's layout. The row count lives in `layout.m()` as a RUNTIME field — there is no
 /// M type parameter, so decode/prefill stay ONE code path (symbolic continuous-batching expressible).
 ///
-/// KIND guard — a `RowScalar` reduce-output handed to a matmul-A does not type-check:
-/// ```compile_fail
+/// KIND guard — a `Kernel` handle handed to a matmul-A does not type-check:
+/// ```compile_fail,E0308
 /// use ktir_superdsc::sdsc_abstract::*;
 /// fn matmul_a(_: &Stk<RowBlockedTag>) {}
-/// let recip = Stk::<RowScalarTag>::new("t1", StickLayout::row_scalar(8)).unwrap();
-/// matmul_a(&recip); // E0308: expected RowBlockedTag, found RowScalarTag
+/// let w = Stk::<KernelTag>::new("t1", StickLayout::kernel(2048, 16)).unwrap();
+/// matmul_a(&w); // E0308: expected RowBlockedTag, found KernelTag
 /// ```
 /// Correct usage compiles and the layout travels with the handle:
 /// ```
@@ -2327,9 +2327,9 @@ impl Stk<KernelTag> {
     }
 }
 
-/// (The Kᵀ/V producer-offset free fns that used to live here — `kcache_kt_write_offset` /
-/// `vcache_write_offset` — were the last raw-`hd: usize` doors in the pool's orbit. They were
-/// thin wrappers over [`StickLayout::kernel`]`..dev_off(..)`; the pool's own
+/// (No Kᵀ/V producer-offset free fns here: a `kcache_kt_write_offset` / `vcache_write_offset`
+/// would be a raw-`hd: usize` door in the pool's orbit, a thin wrapper over
+/// [`StickLayout::kernel`]`..dev_off(..)`; the pool's own
 /// [`PagedKvPool::kt_write_off`] / [`PagedKvPool::v_write_off`] are the typed doors, and the
 /// layout tests state the address law through `StickLayout` directly.)
 /// THE RoPE ROTATE-HALF PERMUTATION MATRIX ENTRY `P[inn][o]` for a head of width `hd` (even). RoPE
@@ -2579,9 +2579,9 @@ impl SlotCount {
 /// but because the fold sweep is BLOCKED at exactly one stick of score columns (the attention
 /// emitter's card-proven form, matching torch-spyre's own kv-block tiling of the online-softmax
 /// recurrence), and a resident slot is one score column. Same value as [`Lanes::FP16`], different
-/// law: the lane count is the machine's, this is the sweep's blocking. (The blocking used to be
-/// justified as a hardware reduce-MAX limit past one stick of columns — an attribution the
-/// template's own DDL refutes; see [`crate::emit::lower_ktir_to_superdsc::reduce`]'s law doc.)
+/// law: the lane count is the machine's, this is the sweep's blocking. (The blocking is NOT a
+/// hardware reduce-MAX limit past one stick of columns — the template's own DDL refutes that
+/// attribution; see [`crate::emit::lower_ktir_to_superdsc::reduce`]'s law doc.)
 ///
 /// The index is two coordinates at once, aligned by construction: the KV window's first slot
 /// ([`Self::first_slot`]) and the prefix-mask SLAB whose columns are those slots
@@ -2596,7 +2596,7 @@ impl SlotWindow {
     pub const SLOTS: WindowSlots = WindowSlots;
 
     /// How many windows `swept` slots hold — the `active_cap / 64` division, where the 64 is THIS
-    /// window's slot count, not the lane count it used to be spelled as. The answer is the typed
+    /// window's slot count, not the lane count it shares a value with. The answer is the typed
     /// [`WindowCount`], never a bare number.
     pub const fn count_in(swept: SlotCount) -> WindowCount {
         WindowCount(swept.get() / WindowSlots::SLOTS)
@@ -3081,18 +3081,18 @@ impl BlockTable {
                     next_host += 1;
                     pages.push(PhysPage(p));
                 }
-                // ⛔⛔⛔ THE HOST'S BLOCKS RAN OUT: REFUSE. THIS USED TO BE THE BATCHED HOLE.
+                // ⛔⛔⛔ THE HOST'S BLOCKS RAN OUT: REFUSE. THIS IS WHERE THE BATCHED HOLE WOULD BE.
                 //
-                // A page holding a key — including the write page — came from the worker's own reserve here,
-                // a run of pages keyed by a per-request `KvRow`. That was the LAST request concept below the
-                // host, and it is gone: the scheduler allocates `own pages + 1` so the write page is always
-                // one of the host's own blocks (`4ef84be5`, measured at 0 firings across 30 gate runs on
-                // hd=64 AND hd=128 before this arm was deleted).
+                // A page holding a key — including the write page — never comes from a worker-owned reserve
+                // here (a run of pages keyed by a per-request `KvRow`, a request concept below the host): the
+                // scheduler allocates `own pages + 1` so the write page is always one of the host's own blocks
+                // (`4ef84be5`, measured at 0 firings of a reserve arm across 30 gate runs on hd=64 AND
+                // hd=128).
                 //
-                // So arriving here now means the host granted fewer blocks than this row's logical pages need,
+                // So arriving here means the host granted fewer blocks than this row's logical pages need,
                 // which is a DISAGREEMENT between the scheduler's allocation and the launch's page count — and
-                // the only safe answer is a refusal. Serving it from a private page would be the old
-                // behaviour: correct output, and a per-request row kept alive to produce it.
+                // the only safe answer is a refusal. Serving it from a private page would give correct output,
+                // and keep a per-request row alive to produce it.
                 None => return None,
             }
         }
@@ -3265,11 +3265,11 @@ impl ContextPages {
 
 /// ⭐⭐⭐ THE PAGES THE RUN **DECLARED** IT NEEDS — `--max-model-len` × `--max-num-seqs`, in pages.
 ///
-/// 🛑 **THE POOL USED TO BE SIZED BY A CONSTANT, AND THAT MADE EVERY CAPACITY ARGUMENT CIRCULAR.**
-/// `DEFAULT_POOL_BUDGET_BYTES = 8 GiB` decided the page count, the page count decided how deep a request
-/// could go, and when a request died at `request needs 769 positions but its share is 3 page(s)` the answer
-/// was to re-cut the same 8 GiB differently. The user's objection was exact: *"we size the pools based on
-/// the command line max-seq-len and other such parameters."* A pool sized by a constant cannot be asked
+/// 🛑 **A POOL SIZED BY A CONSTANT MAKES EVERY CAPACITY ARGUMENT CIRCULAR.** With a fixed
+/// `DEFAULT_POOL_BUDGET_BYTES = 8 GiB`, the budget decides the page count, the page count decides how deep a
+/// request can go, and when a request dies at `request needs 769 positions but its share is 3 page(s)` the
+/// only answer is to re-cut the same 8 GiB differently. The pools are sized from the command line: the
+/// max sequence length and other such parameters. A pool sized by a constant cannot be asked
 /// whether it is big enough for what was requested — there is nothing to compare it to.
 ///
 /// So the demand comes from the DECLARATION, and the budget is checked AGAINST it:
@@ -3280,7 +3280,7 @@ impl ContextPages {
 /// ⭐ AND IT INCLUDES THE RESERVE, via [`PoolPartition::reserve`] rather than its own copy of that
 /// arithmetic. A pool sized to `context * rows` exactly is a pool that cannot be split — the reserve comes
 /// off the top, so `of_pool` returns `None` and the run refuses at load having asked for precisely what it
-/// then could not fund. That reserve is now ONE shared scratch page rather than `rows * 2 + 1`, since the
+/// then could not fund. That reserve is ONE shared scratch page rather than `rows * 2 + 1`, since the
 /// host owns every page a batched launch writes.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct PoolDemand {
@@ -4173,8 +4173,8 @@ pub struct MaskPassGrid {
 }
 
 impl MaskPassGrid {
-    // ⛔ NO CONSTRUCTOR HERE, ON PURPOSE. `new(pages, rows)` used to be `pub`, and it is what let the
-    // worker hand in `max(req.pages().len())` while the shim divided by its own ceiling. The single door
+    // ⛔ NO CONSTRUCTOR HERE, ON PURPOSE. A `pub` `new(pages, rows)` would let the worker hand in
+    // `max(req.pages().len())` while the shim divides by its own ceiling. The single door
     // is `FoldPages::grid`, and a private `new` would still be a door for anything later added to this
     // module — so the fields are built there and nowhere else.
     /// Pages ONE row holds — the per-row share of a striped pool.
@@ -4249,9 +4249,9 @@ impl DeclaredFold {
 /// ⭐ THE PREFIX MASK'S SHAPE — ONE value that both the emitter's READ and the worker's STAGING derive
 /// from, so they cannot disagree.
 ///
-/// ⛔ THEY USED TO BE COMPUTED TWICE, from different inputs, in different crates: the emitter built
-/// `Nest::new(["row","feat"], [rows, cap]).slab(b)` from the baked `cap`, and the worker built a buffer
-/// from `(nqh, page_slots, cap)` with its own idea of how many blocks there are. Nothing forced the two
+/// ⛔ COMPUTED TWICE, from different inputs, in different crates — the emitter building
+/// `Nest::new(["row","feat"], [rows, cap]).slab(b)` from the baked `cap`, and the worker building a buffer
+/// from `(nqh, page_slots, cap)` with its own idea of how many blocks there are — nothing forces the two
 /// to describe the same bytes, and an additive mask fails SILENTLY in the dangerous direction: bytes
 /// the worker never staged read as ZERO, and zero is VALID, so a row attends whatever the pool holds.
 /// `mask_laws.rs` could pin the staging and the emitter could still read somewhere else.
@@ -4924,10 +4924,8 @@ const _: () = {
 // must not be able to exceed it. A pass past the last block reads bytes the host never staged; they are
 // ZERO, and zero is VALID in an additive mask, so the row attends whatever the pool holds.
 //
-// ⛔⛔ THE NUMBERS THAT USED TO BE HERE WERE STALE, AND THEY COST A CORRECT CONCLUSION ITS RETRACTION.
-// This block asserted, as MEASURED, that the width-4 mask segment is "~1.6 MB" and therefore that
-// `32 passes = 2,097,152 B` OVERFLOWS it — which is exactly the failing decode geometry, so it reads as a
-// diagnosis. It is not one. The `[mask-cap]` instrument resolves the placement by TID from THE RUNG'S OWN
+// ⛔⛔ THE WIDTH-4 MASK SEGMENT IS NOT "~1.6 MB", AND `32 passes = 2,097,152 B` DOES NOT OVERFLOW IT.
+// That claim matches the failing decode geometry exactly, so it reads as a diagnosis. It is not one. The `[mask-cap]` instrument resolves the placement by TID from THE RUNG'S OWN
 // bundle, keyed by `seqs` (the batch width — NOT `sk_bucket_rungs`, which is keyed by `active_cap`; see
 // `bundle_code::LadderRung` on the ladders sharing one name), and on granite-3.1-8b fp8 hd=128 it
 // reads:
@@ -4943,7 +4941,7 @@ const _: () = {
 // in this block; the placement moves with the derived page ceiling, the rung ladder and the mask shape,
 // and a number written here outlives all three.
 //
-// 🛑 AND THIS CANNOT BE SATISFIED BY A HAND-PICKED CONST, WHICH IS WHAT IT USED TO BE. Pages come
+// 🛑 AND THIS CANNOT BE SATISFIED BY A HAND-PICKED CONST. Pages come
 // from a FREE LIST (`f5e26a3e`), so ONE REQUEST MAY DRAW THE WHOLE POOL: `pages_per_row` is bounded
 // only by `pool_pages`, a runtime number, while the mask segment is baked. The product is therefore
 // UNBOUNDED against a FIXED reservation — the geometry can express a batch the bundle cannot serve,
@@ -5427,9 +5425,9 @@ impl PagedKvPool {
     /// ⛔⛔⛔ EVERY PREFIX RUNG THE LADDER ASKED FOR MUST HAVE BAKED. This is the bake's proof, and the macro
     /// panics on it.
     ///
-    /// A prefix rung that does not lower used to be logged and skipped. The host then runs the chunk on the
-    /// next wider rung that did bake (`prefix_rung_for` over what was built), so the build stays green and
-    /// every tail that rung was for pays the wider width. Nothing says so: the log line is build-script
+    /// A prefix rung that does not lower must not be logged and skipped. The host would then run the chunk on
+    /// the next wider rung that did bake (`prefix_rung_for` over what was built), so the build stays green and
+    /// every tail that rung was for pays the wider width. Nothing would say so: the log line is build-script
     /// stderr, which cargo swallows on a successful build. MEASURED, the cost of the one rung this ladder
     /// adds: without the page rung, granite-3.1-2b's ~2k-token prompt ran its 52-row tail on the window,
     /// 460 ms against 384.
@@ -5520,8 +5518,8 @@ impl PagedKvPool {
     // 32 = the widest rung of `BATCH_RUNGS`, and it costs NOTHING against the pool the flat layout
     // defaulted to. There the default was `8 pages * widest_rung` = 256 pages, each 31.5 MB at
     // granite-3.1-2b, because a run had to be cut per row; here it is 8 pages of `32 * 31.5 MB`. Same
-    // 8 GB, same 2048 positions per request, same 32 concurrent requests — the bytes moved from the
-    // page count to the page.
+    // 8 GB, same 2048 positions per request, same 32 concurrent requests — the bytes sit in the page,
+    // not the page count.
     //
     // ⛔ `ROWS` IS GONE. A page used to hold `ROWS = 32` REQUESTS side by side, which is what taught the
     // device what a request is: every address carried a request term, the head stride was `ROWS` request
@@ -5659,9 +5657,8 @@ impl PagedKvPool {
     /// division of labour the physical page already had.
     /// ELEMENTS IN ONE KV HEAD'S BLOCK of a plane — `hd * POOL_PAGE_SLOTS`, the whole of one head's page.
     ///
-    /// This replaced `block_index(kvh) = kvh * ROWS` and `request_stride`. The head stride used to be
-    /// `ROWS` request strides; it is now simply a head's own footprint, so there is no second quantity to
-    /// drift against.
+    /// Not `block_index(kvh) = kvh * ROWS` with a `request_stride`: the head stride is simply a head's own
+    /// footprint, never `ROWS` request strides, so there is no second quantity to drift against.
     /// ⭐ HOW MANY SLOTS A PREFILL CHUNK STARTING AT `start` MAY CLAIM — the room left in its window.
     ///
     /// A chunk's cache write is cut into one part per PAGE, each part resolving its own page through the
@@ -5989,11 +5986,11 @@ impl PassStride {
 /// ⭐⭐⭐⭐⭐ THE GATHER'S INDEX TABLE FOR ONE LAUNCH — one entry per (launch row, logical page), laid out
 /// **A FLAT ARRAY OVER THE GATHER-COPY OP'S OWN `mb` ROWS**, one block of them per fold pass.
 ///
-/// ⛔⛔⛔ THE "ONE 32-ENTRY STICK PER ROW" LAW THIS FUNCTION USED TO IMPLEMENT DOES NOT APPLY HERE, AND
+/// ⛔⛔⛔ THE "ONE 32-ENTRY STICK PER ROW" LAW DOES NOT APPLY HERE, AND
 /// REUSING IT MIS-STRIDES THE TABLE. That law was derived for the MATMUL kernel as the gathered
 /// operand, whose index dims were the value's two pinned axes `["out","mb"] = [256, 8]` — paged on
 /// `out`, so `mb` was a SECOND index axis and dxp rounded the inner (paged) extent up to a whole
-/// 32-entry stick per `mb` row. The gather now lives on the KERNEL-LESS copy op
+/// 32-entry stick per `mb` row. The gather is on the KERNEL-LESS copy op
 /// ([`crate::ir::bridge::tiled_op_sdsc_op::gather_copy_opspec`] — deeptools cannot schedule a gather on
 /// an op that has a KERNEL, measured twice on the card), whose gather dim is `mb` with NO second pinned
 /// axis. `IndirectAccess::pins` therefore yields ONE entry, the index is rank-1 `["mb"]`, and
@@ -6064,9 +6061,9 @@ pub fn gather_index_table(
             let phys = *table.get(p).unwrap_or(&last);
             for kvh in 0..scratch.nkvh().get() {
                 for b in 0..scratch.windows() {
-                    // ⭐ ONE COMPOSITION, INSIDE THE TYPE. The `phys * per_page + block` arithmetic that
-                    // used to be spelled here — and whose three terms all have plausible wrong siblings
-                    // — is now [`GatherEntry::of_page_block`]'s and nothing else's.
+                    // ⭐ ONE COMPOSITION, INSIDE THE TYPE. The `phys * per_page + block` arithmetic —
+                    // whose three terms all have plausible wrong siblings — is not spelled here: it is
+                    // [`GatherEntry::of_page_block`]'s and nothing else's.
                     out[p * stride + scratch.row_of(kvh, b, r)? as usize] =
                         GatherEntry::of_page_block(
                             entries_per_page,
@@ -6543,9 +6540,9 @@ impl PageScratch {
     /// ⛔⛔⛔⛔⛔ **AND A REFUSAL HERE IS A BUILD FAILURE, NOT A FALLBACK.** The emitter door
     /// (`lower_ktir_to_superdsc`'s `kv_block_index`) `expect`s this for every bundle whose rows ARE
     /// requests, and `#[forward]` runs the emitter at macro expansion — so a geometry this cannot
-    /// express fails the compile with the quantity named. It used to be `.is_some()` feeding a
-    /// `zip`, which silently emitted the ungathered bundle: that is how an hd=128 build passed its
-    /// gate while gathering nothing.
+    /// express fails the compile with the quantity named. Not `.is_some()` feeding a `zip`, which
+    /// silently emits the ungathered bundle: that lets an hd=128 build pass its gate while gathering
+    /// nothing.
     ///
     /// ⭐⭐⭐⭐⭐ **THE ONE-SLAB PRECONDITION IS GONE, AND THE CAUSE IT WAS STANDING IN FOR WAS NOT IN
     /// THIS TYPE AT ALL.** What this door refused was `slabs() != 1`, on the card evidence that hd=128
@@ -8792,13 +8789,13 @@ impl PoolRows {
     /// THE ADMISSION WIDTH FOR A RUN THAT WILL ADMIT AT MOST `want` REQUESTS — the SMALLEST rung that
     /// holds them, not the widest the ladder bakes.
     ///
-    /// 🛑 THIS USED TO BE A DEPTH-VS-WIDTH TRADE (`widest_reaching`), and that trade existed ONLY because
-    /// the pool was striped: bytes were `rows * pages_per_row * page_stride`, so buying concurrency cost
-    /// every request context, and a fixed budget had to choose. `TARGET_POSITIONS_PER_ROW` was the depth it
-    /// bought first. With pages on a free list there is nothing to trade for CAPACITY — one request can
-    /// reach the whole pool whatever `rows` is — so this returned `WIDEST`, full stop.
+    /// 🛑 THIS IS NOT A DEPTH-VS-WIDTH TRADE (a `widest_reaching`): that trade exists ONLY for a striped
+    /// pool, whose bytes are `rows * pages_per_row * page_stride`, so buying concurrency costs every
+    /// request context and a fixed budget has to choose. With pages on a free list there is nothing to
+    /// trade for CAPACITY — one request can reach the whole pool whatever `rows` is — so returning
+    /// `WIDEST`, full stop, looks right.
     ///
-    /// ⛔⛔ THAT WAS TRUE OF CAPACITY AND FALSE OF THE RESERVE, WHICH IS WHAT MADE IT COSTLY.
+    /// ⛔⛔ THAT IS TRUE OF CAPACITY AND FALSE OF THE RESERVE, WHICH IS WHAT MAKES `WIDEST` COSTLY.
     /// `PoolPartition::of_pool` holds back `rows * HOLE_PAGES_PER_ROW + 1` pages, because each row of a
     /// LAUNCH writes its masked hole into a page the host was never told exists. At `WIDEST` = 32 that is
     /// 65 of a 136-page pool — the host is offered 71 — **whatever the run will actually admit.** A run
@@ -8969,9 +8966,9 @@ impl SlotMap {
         }
         // DENSE: live `i` runs in slot `i`.
         //
-        // ⛔ AND EVERY SLOT PAST THE LIVE COUNT IS `Padding`, NOT `0`. It used to be
-        // `if s < live { s } else { 0 }`, so "slot 3 is padding" and "slot 3 runs live request 0" were the
-        // SAME VALUE, and every consumer had to re-derive the difference from `s < map.live()`.
+        // ⛔ AND EVERY SLOT PAST THE LIVE COUNT IS `Padding`, NOT `0`. Under
+        // `if s < live { s } else { 0 }`, "slot 3 is padding" and "slot 3 runs live request 0" would be the
+        // SAME VALUE, and every consumer would have to re-derive the difference from `s < map.live()`.
         //
         // ⭐ WHAT THE TYPE BUYS: what a padding slot borrows is a DECISION each consumer makes out loud,
         // per input, instead of getting `0` for free. The worker's launch borrows live 0's PAGE MAP for

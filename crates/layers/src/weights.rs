@@ -402,7 +402,7 @@ impl TensorRefs {
     }
 }
 
-/// `name` moved from under `from_prefix` to under `as_prefix`: `<from_prefix>.<suffix>` becomes
+/// `name` relocated from under `from_prefix` to under `as_prefix`: `<from_prefix>.<suffix>` becomes
 /// `<as_prefix>.<suffix>`, or `<suffix>` for the empty `as_prefix` (the top level). `None` when
 /// `name` is not under `from_prefix`.
 fn relocated(name: &str, from_prefix: &str, as_prefix: &str) -> Option<String> {

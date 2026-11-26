@@ -336,16 +336,16 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
         // ROPE. THE GRID IS ONE WORK ITEM PER TOKEN POSITION -- `vec![N_TOK]` -- and it is ONE
         // DIMENSION, not two.
         //
-        // ⛔⛔⛔ IT USED TO BE `vec![4, 32]` / `vec![4, 8]`, AND THAT WAS A SILENT WRONG ANSWER THE
-        // MOMENT THE KERNEL BECAME TOKEN-MAJOR. The old kernel took `start_m = program_id(0)` over
-        // `N_TOK / BLOCK_M` blocks and `off_h = program_id(1)` over the heads, so a 2-D grid was its
-        // launch contract. The token-major kernel reads `pos = tl.program_id(0)` ALONE and puts all
+        // ⛔⛔⛔ NOT A FIXED `vec![4, 32]` / `vec![4, 8]`: THAT GIVES A SILENT WRONG ANSWER FOR A
+        // TOKEN-MAJOR KERNEL. A 2-D grid is the launch contract of a kernel taking
+        // `start_m = program_id(0)` over `N_TOK / BLOCK_M` blocks and `off_h = program_id(1)` over the
+        // heads. This token-major kernel reads `pos = tl.program_id(0)` ALONE and puts all
         // `H` heads of a position in one `[H, HALF]` tile, so there is no head axis to launch: with
-        // `vec![4, 32]` the head axis became 32 REDUNDANT LAUNCHES of the same work and `pos` only
-        // ever reached 0..4 of 256 positions -- 252 positions never written, and it BAKED, because
+        // `vec![4, 32]` the head axis becomes 32 REDUNDANT LAUNCHES of the same work and `pos` only
+        // ever reaches 0..4 of 256 positions -- 252 positions never written, and it BAKES, because
         // nothing downstream compares a grid against the extent a kernel indexes.
         //
-        // `H` still separates the two configurations, but now only through the plane width
+        // `H` still separates the two configurations, but only through the plane width
         // (`H * HEAD_DIM`), which is exactly what `drive_rope` cross-checks against the output view.
         "rope_q32" => (
             spec("rope", "rope_fwd", ROPE, &rope_ce(32)),

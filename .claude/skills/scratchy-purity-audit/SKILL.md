@@ -208,6 +208,7 @@ Anything else, including a second checkpoint check outside that one door, is a v
 
 ### P11. Lock and comment hygiene
 Report these as one grouped line after the rules above.
+Enforced by the `p11_*` lints in `lints/scratchy-purity` (`scripts/purity.sh`); a finding there is the verdict.
 - No `#[allow]` anywhere: not at a site, and not in a `[lints]` table. Find the design the lint doesn't flag. (Main's `[lints]` tables only declare check-cfg.)
 - No escape-hatch constructors (`from_untyped`, `conflated_with_*`, a `pub` raw constructor on a checked type).
 - No weakened tests or ratchets ("did the number get smaller?").
@@ -219,6 +220,7 @@ Report these as one grouped line after the rules above.
   That applies to `Cargo.toml` comments too.
 
 ### P12. Proper tests: in-tree Rust, never standing in for a type
+Enforced, for a `compile_fail` doctest that names no error code, by the `p12_*` lints in `lints/scratchy-purity` (`scripts/purity.sh`); a finding there is the verdict.
 - A test is never written where a type could carry the fact (the ranking at the top of §1).
 - Type proofs are `compile_fail` doctests that name their error code. Only nightly rustdoc checks the code (stable ignores it), so they're proved by the nightly run.
 - No out-of-tree gate pipelines (Python or shell comparers, tape dumpers, ad-hoc gate scripts): "we are a rust project; we need proper tests".

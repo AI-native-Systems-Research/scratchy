@@ -1,4 +1,3 @@
 // SPDX-License-Identifier: Apache-2.0
-//! MOVED to `crate::tape::targets` — pure target-profile data; this
-//! shim keeps existing paths compiling during the transition.
+//! Re-exports `crate::tape::targets`, the pure target-profile data.
 pub use crate::tape::targets::*;

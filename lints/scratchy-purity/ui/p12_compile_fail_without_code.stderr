@@ -1,0 +1,27 @@
+error: P12: a compile_fail doctest without an error code passes for any error; name the code it proves, e.g. compile_fail,E0277
+  --> $DIR/p12_compile_fail_without_code.rs:3:5
+   |
+LL | //! ```compile_fail
+   |     ^^^^^^^^^^^^^^^
+   |
+   = help: add the error code the doctest is meant to fail with
+   = note: `#[forbid(p12_compile_fail_without_code)]` on by default
+
+error: P12: a compile_fail doctest without an error code passes for any error; name the code it proves, e.g. compile_fail,E0277
+  --> $DIR/p12_compile_fail_without_code.rs:11:5
+   |
+LL | /// ```compile_fail
+   |     ^^^^^^^^^^^^^^^
+   |
+   = help: add the error code the doctest is meant to fail with
+
+error: P12: a compile_fail doctest without an error code passes for any error; name the code it proves, e.g. compile_fail,E0277
+  --> $DIR/p12_compile_fail_without_code.rs:19:2
+   |
+LL |  * ```compile_fail
+   |  ^^^^^^^^^^^^^^^^^
+   |
+   = help: add the error code the doctest is meant to fail with
+
+error: aborting due to 3 previous errors
+

@@ -551,12 +551,12 @@ pub struct Comparison {
     /// ⛔⛔ THE BOUND AT THE ELEMENT WHERE `max_abs_err` OCCURRED -- **NOT** at the worst-ratio
     /// element, and not the largest bound anywhere.
     ///
-    /// THIS FIELD EXISTED AND WAS WRONG, AND THE WRONGNESS WAS THE FLATTERING KIND. It used to be
-    /// assigned inside the worst-RATIO branch, so `report()` printed `max|err|` from one element
-    /// beside a bound from another. On `rmsnorm_granite` that read as
+    /// ASSIGNED INSIDE THE WORST-RATIO BRANCH, THIS FIELD IS WRONG, AND THE WRONGNESS IS THE
+    /// FLATTERING KIND: `report()` then prints `max|err|` from one element
+    /// beside a bound from another. On `rmsnorm_granite` that reads as
     /// `max|err| = 7.812500e-3   bound = 6.093244e-3` -- an apparent 1.28x VIOLATION sitting next to
-    /// `exceeded 0/262144`, which is incoherent and would have been quoted as a violation or, worse,
-    /// as evidence the bound was fine. The two numbers must come from the SAME element or they are
+    /// `exceeded 0/262144`, which is incoherent and would be quoted as a violation or, worse,
+    /// as evidence the bound is fine. The two numbers must come from the SAME element or they are
     /// not a comparison.
     pub bound_at_max_err: f64,
     pub reference_at_max_err: f64,

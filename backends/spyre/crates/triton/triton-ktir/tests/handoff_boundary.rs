@@ -411,8 +411,8 @@ fn the_source_loops_that_still_bury_windows_are_exactly_these() {
         // SECOND trip-unroll arm (and its zero-trip deletion) now straight-line it per copy.
         ("attention_flash_causal", &[4, 4], &[]),
         // `for n in tl.range(0, D_FF, BLOCK_N)` -- 4 trips at D_FF=256 / BLOCK_N=64. NOT
-        // BURIED ANY MORE: the KV-sweep unroll (27405e501) straight-lines these too, so
-        // the recorded state moved from [0,1,2,3] to [] and this row is now a CONTROL.
+        // BURIED: the KV-sweep unroll (27405e501) straight-lines these too, so
+        // the recorded state is [] and this row is a CONTROL.
         ("swiglu_mlp_small", &[1], &[]),
         ("swiglu_mlp_granite", &[1], &[]),
         ("swiglu_mlp_tiled_k", &[1], &[]),

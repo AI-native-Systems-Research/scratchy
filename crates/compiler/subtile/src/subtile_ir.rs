@@ -212,33 +212,35 @@ pub mod sealed {
 /// forward's rope nodes ALL share the same form by construction —
 /// mixing NeoX and Interleaved in one IR is a compile error.
 ///
-/// ```compile_fail
+/// ```compile_fail,E0308
 /// // Mixing NeoX and Interleaved in one IR is rejected at the type
 /// // level: SubtileIR<NeoX>::nodes is Vec<SubtileNode<NeoX>>, so a
 /// // SubtileNode<Interleaved> won't fit in it. No need for a runtime
 /// // check; the const generic enforces it.
+/// use scratchy_ir::model_facts::HeadDim;
 /// use scratchy_subtile::subtile_ir::{
 ///     Interleaved, NeoX, SubOp, SubtileId, SubtileIR, SubtileNode, TensorId, TensorRegion,
 ///     Region, Range,
 /// };
 /// use std::marker::PhantomData;
 /// let interleaved_node = SubtileNode::<Interleaved> {
-///     id: SubtileId(0),
+///     id: SubtileId::from_index(0),
 ///     op: SubOp::<Interleaved>::RopeRotate {
-///         head_dim: 4,
+///         head_dim: HeadDim::new(4),
 ///         _form: PhantomData,
 ///     },
 ///     inputs: vec![],
 ///     output: TensorRegion {
-///         tensor: TensorId(0),
+///         tensor: TensorId::from_index(0),
 ///         region: Region { rows: Range::new(0, 1), cols: Range::new(0, 4) },
 ///     },
 /// };
 /// let _ir: SubtileIR<NeoX> = SubtileIR {
 ///     tensors: vec![],
 ///     num_sources: 0,
-///     nodes: vec![interleaved_node], // type mismatch
-///     result: TensorId(0),
+///     nodes: vec![interleaved_node], // E0308: a SubtileNode<Interleaved> in a SubtileIR<NeoX>
+///     result: TensorId::from_index(0),
+///     op_output: vec![],
 /// };
 /// ```
 pub trait RopeForm:
@@ -304,7 +306,7 @@ pub enum RopeFormTag {
 ///
 /// Constructable only via [`KvCacheLayout::for_cache_tensors`] — sealed.
 ///
-/// ```compile_fail
+/// ```compile_fail,E0451
 /// // Sealed: external code cannot construct a KvCacheLayout via the
 /// // struct literal because the `_seal: sealed::Seal` field is
 /// // private. The only path is `KvCacheLayout::for_cache_tensors(...)`,
@@ -312,7 +314,9 @@ pub enum RopeFormTag {
 /// // fabrication) structurally impossible.
 /// use scratchy_subtile::subtile_ir::{KvCacheLayout, TensorId};
 /// let _ = KvCacheLayout {
-///     cache_tensor: TensorId(0),
+///     cache_tensor: TensorId::from_index(0),
+///     v_cache_tensor: TensorId::from_index(1),
+///     _seal: todo!(), // E0451: private fields
 /// };
 /// ```
 ///
@@ -365,7 +369,7 @@ impl KvCacheLayout {
 /// `#[non_exhaustive]` so external `match`es must include a wildcard
 /// arm — preventing the silent `_ =>` regression on a future variant.
 ///
-/// ```compile_fail
+/// ```compile_fail,E0004
 /// // External match without a wildcard is rejected: the enum is
 /// // #[non_exhaustive], so the compiler forces a `_ =>` arm. That
 /// // makes adding a new variant a soft-fail (existing matchers route
@@ -1418,10 +1422,10 @@ pub enum SubOp<F: RopeForm = NeoX, S: OpStage = Tiled> {
     // ── The rest of the arch vocabulary ────────────────────────────
     //
     // ⭐ THESE EXIST SO THE SHARED FRONT END CAN EXPRESS EVERY ARCH, NOT SO EVERY TARGET CAN RUN
-    // THEM. Each used to be a `panic!("has no SubOp form on this pipeline yet")` in
-    // `lower_region`, which meant an arch using one had no SubtileIR at all and therefore no
-    // tape — so a target consuming the tape simply could not compile that arch, whatever its
-    // kernels could do. Representing the op moves the "can this run here?" question to the ONE
+    // THEM. Without a SubOp form, each is a `panic!("has no SubOp form on this pipeline yet")`
+    // in `lower_region`, so an arch using one has no SubtileIR at all and therefore no tape — and
+    // a target consuming the tape simply cannot compile that arch, whatever its kernels can do.
+    // Representing the op moves the "can this run here?" question to the ONE
     // place that can answer it: the target's opcode lowering.
     /// `cap · tanh(x / cap)` — Gemma's logit/attention soft cap.
     ///
@@ -4481,7 +4485,7 @@ pub fn head_blocks(
 /// carry `PhantomData<F>`, so a SubtileIR<NeoX> cannot hold an
 /// Interleaved-form rope node).
 ///
-/// Each node performs its source op — the SAME [`SubOp`], moved from the [`Arch`] stage to the
+/// Each node performs its source op — the SAME [`SubOp`], carried from the [`Arch`] stage to the
 /// [`Tiled`] one: the KV-cache witnesses are bound here and nothing else about the op changes.
 pub fn lower_region(
     input: &crate::lower::LoweringInput,

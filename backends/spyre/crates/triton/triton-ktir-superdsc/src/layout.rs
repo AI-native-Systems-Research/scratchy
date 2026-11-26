@@ -282,9 +282,9 @@ pub fn for_regions(node: &KtirNode, r: &[Region]) -> Result<BundleLayout, Error>
     // PACKED BY ROLE, AT DISJOINT INTRA-SEGMENT OFFSETS — one segment for every parameter the
     // program READS, one for every parameter it STORES THROUGH, and the synthetics alone in a third.
     //
-    // ⛔⛔⛔ IT USED TO BE ONE SEGMENT PER PARAMETER (`segment_base(arg_index)`, offset 0), AND THAT
-    // WAS A CEILING THE DEVICE DOES NOT HAVE. MEASURED: `decoder_layer_one_flat` is 14 parameters and
-    // `decoder_two_layers_flat` is 23, so both were refused for wanting 14/23 of 7 segments — the
+    // ⛔⛔⛔ NOT ONE SEGMENT PER PARAMETER (`segment_base(arg_index)`, offset 0): THAT IS A
+    // CEILING THE DEVICE DOES NOT HAVE. MEASURED: `decoder_layer_one_flat` is 14 parameters and
+    // `decoder_two_layers_flat` is 23, so one segment each refuses both for wanting 14/23 of 7 segments — the
     // whole decoder block, unreachable on an arithmetic of ours. The 7-segment doctrine is stated PER
     // OP: `wire::SEGMENT_OFFSETS`'s own doc says "each I/O arg lives in its OWN 16 GiB segment keyed
     // by its `arg_index` (== `ldsIdx_` == the tensor's position in `op.args`)" and `segment_base`'s
@@ -299,7 +299,7 @@ pub fn for_regions(node: &KtirNode, r: &[Region]) -> Result<BundleLayout, Error>
     // every pair of placements over their 128-B GRANULE spans — the same granule
     // `resolve_seg_base`'s footprint guard measures an access against (`align128(p.size).max(128)`)
     // — so a pair this module proves disjoint cannot be brought back together by a rounding
-    // disagreement. That is the justification the old refusal said it did not have.
+    // disagreement. That is the justification packing needs.
     //
     // ⭐ AND IT IS THE PRODUCER'S OWN CONSTRUCTION, NOT A SCHEME INVENTED HERE. scratchy's
     // `compute_bundle_layout` (`lower_subtile_tape_to_superdsc.rs`, the `pack` closure) places every
@@ -318,8 +318,8 @@ pub fn for_regions(node: &KtirNode, r: &[Region]) -> Result<BundleLayout, Error>
     // of which parameters those are — a `ktdp.store` writes through the view — and NOT "the last
     // parameter", which its own doc explains is false when a constant is first used after the output.
     //
-    // ⭐ SO `role` AND `segment` NOW AGREE, and the warning that used to stand here is gone: the role
-    // CHOOSES the segment again ([`pack`] takes only the role), so a downstream worker deriving a
+    // ⭐ SO `role` AND `segment` AGREE: the role
+    // CHOOSES the segment ([`pack`] takes only the role), so a downstream worker deriving a
     // binding region from `role.segment()` reads the same segment the placement states.
     for reg in r.iter() {
         // SIZE IS THE TENSOR'S TRUE FOOTPRINT, VIA THEIR OWN FUNCTION. `synth_footprint_bytes`
@@ -1134,9 +1134,9 @@ fn scales_for_program_shape(p: Program, f: &IRFunction<'static>) -> Result<Vec<f
 
 /// THE VALUES THE CHOSEN ENTRY POINT WILL LOOK UP — exactly those, in a fixed order, per `Program`.
 ///
-/// ⛔⛔⛔ THIS USED TO BE "EVERY FLOAT THE PROGRAM SPLATS", AND THAT WAS A REGISTRY DIVERGENCE.
+/// ⛔⛔⛔ THIS IS NOT "EVERY FLOAT THE PROGRAM SPLATS": THAT IS A REGISTRY DIVERGENCE.
 /// `rmsnorm_granite` splats three: the epsilon, `1/D_MODEL` and the reduce seed `0.0`. Registering
-/// the first two put `1/4096` in slot 1, and `compute_bundle_layout`'s scale walk refuses exactly
+/// the first two puts `1/4096` in slot 1, and `compute_bundle_layout`'s scale walk refuses exactly
 /// that, in terms:
 ///
 /// > ⛔ THE EPSILON ONLY — the mean-of-squares divisor is NOT a registry scale. `1/cols` is bound at
@@ -1145,18 +1145,17 @@ fn scales_for_program_shape(p: Program, f: &IRFunction<'static>) -> Result<Vec<f
 /// > node, shifting the tid of every constant registered after it.
 ///
 /// The index IS the device tid (`SCALARMUL_SCALE_BASE - i`), so a spurious slot moves the ADDRESS
-/// every later constant reaches the card at. It happened to be harmless for a one-node rmsnorm — the
-/// epsilon landed on slot 0 and nothing reads a later slot — but only by accident of the order the
-/// ttir emitted its constants in, which is not a property anything should depend on.
+/// every later constant reaches the card at. It is harmless for a one-node rmsnorm — the
+/// epsilon lands on slot 0 and nothing reads a later slot — but only by accident of the order the
+/// ttir emits its constants in, which is not a property anything should depend on.
 ///
 /// ⭐⭐⭐ AND IT CALLS THEIR READERS RATHER THAN RESTATING THEM. `program_rmsnorm_eps`,
-/// `program_scalarmul_scale` and `program_score_scale` were private, so the first version of this
-/// function reproduced all three structurally — two matchers for one fact, and the copy on this side
-/// is the one that would go stale unnoticed. They are `pub` now, so the registry is populated by the
-/// SAME function the body looks its value up with: agreement is not something to maintain, it is the
-/// same call. Nothing else here can drift either — the walk (`f.operations`, not `ops_deep()`), the
-/// `arith.constant`-behind-`tensor.splat` shape, the one-root rule and the all-`mulf`-agree rule are
-/// all theirs by construction now.
+/// `program_scalarmul_scale` and `program_score_scale` are `pub`, so the registry is populated by the
+/// SAME function the body looks its value up with, not by a structural copy of all three — two
+/// matchers for one fact, where the copy on this side is the one that would go stale unnoticed:
+/// agreement is not something to maintain, it is the same call. Nothing else here can drift
+/// either — the walk (`f.operations`, not `ops_deep()`), the `arith.constant`-behind-`tensor.splat`
+/// shape, the one-root rule and the all-`mulf`-agree rule are all theirs by construction.
 fn scales_for(
     p: Program,
     f: &IRFunction<'static>,

@@ -95,11 +95,11 @@
 //! # RE-RUNNING THE dxp LEG
 //!
 //! ```bash
-//! TRANSPOSE_PROBE_DIR=/tmp/trprobe cargo test --offline --test transpose_shape_probe -- --nocapture
+//! TRANSPOSE_PROBE_DIR=<probe-dir> cargo test --offline --test transpose_shape_probe -- --nocapture
 //! export DEEPTOOLS_PATH=<a deeptools checkout>   # $DEEPTOOLS_PATH/ddc/ddl_templates/ is read
-//! for d in /tmp/trprobe/*/; do
-//!   rm -rf /tmp/r && cp -R "$d" /tmp/r            # dxp WRITES into its input dir
-//!   dxp_standalone -d /tmp/r -b sentient; echo "$d -> $?"
+//! for d in <probe-dir>/*/; do
+//!   rm -rf <run-dir> && cp -R "$d" <run-dir>      # dxp WRITES into its input dir
+//!   dxp_standalone -d <run-dir> -b sentient; echo "$d -> $?"
 //! done
 //! ```
 //!

@@ -49,8 +49,8 @@ use crate::sdsc_abstract::{KindTag, Stk};
 /// compile."
 ///
 /// KIND guard — a builder that requires a `RowBlocked` A refuses a `Kernel` window by TYPE:
-/// ```compile_fail
-/// use ktir_superdsc::addr::{DevOff, Nest};
+/// ```compile_fail,E0308
+/// use ktir_superdsc::addr::{DevOff, Nest, Win};
 /// use ktir_superdsc::sdsc_abstract::{KernelTag, RowBlockedTag, Stk, StickLayout};
 /// use ktir_superdsc::superdsc_opspec::Df;
 ///

@@ -775,7 +775,7 @@ pub(crate) fn stage_bound_weights(
     {
         use rayon::prelude::*;
         let _t_cvt = std::time::Instant::now();
-        // DIRECT bf16/f32 → f16, no intermediate f32 Vec (per /tmp/zoo). The SOURCE is
+        // DIRECT bf16/f32 → f16, no intermediate f32 Vec. The SOURCE is
         // read byte-wise (`as_chunks` + `from_le_bytes`) and the DESTINATION is a fresh
         // Vec, converted with a SIMD-friendly parallel zip ACROSS ELEMENTS — so the two
         // huge embed/lm_head tensors get all cores too, not one core each. Byte-wise
@@ -937,10 +937,9 @@ impl SpyreWorker {
         // MUST be matched to the loaded checkpoint, not picked by arch name alone.
         // ⭐ ONE MATCHED VARIANT ANSWERS EVERYTHING.
         //
-        // This used to be TWO independent registry walks — `resolve_*_bundle`
-        // for the bundle, then a hand-rolled disk load for the weights — with
-        // a comment claiming it ran "AFTER try_load" while nothing called
-        // `try_load` at all. An arch registers many base models, so two walks
+        // Not TWO independent registry walks — `resolve_*_bundle`
+        // for the bundle, then a hand-rolled disk load for the weights.
+        // An arch registers many base models, so two walks
         // means two variant matches with nothing checking they agree: the
         // bundle could come from one and the weights from another.
         //
@@ -1486,11 +1485,11 @@ impl SpyreWorker {
                     .and_then(scratchy_target_spyre::bundle_code::bundle::<World>);
                 // ── PLACEMENT ANCHOR = the NARROWEST rung, not the widest ────────────────────────
                 // This is the one session built BEFORE the decode session, so its footprint is what
-                // positions decode's weight region (see the ownership note below). It used to be the
-                // WIDEST rung, which made that footprint track the ladder CEILING: every segment that
+                // positions decode's weight region (see the ownership note below). Anchoring on the
+                // WIDEST rung makes that footprint track the ladder CEILING: every segment that
                 // scales with `mq` roughly doubles when `mq_pad` goes 64→128, measured on the baked
                 // layouts as 2798.9 MiB at a 47-row ceiling vs 2993.7 MiB at 96 — with seg1 (weights,
-                // 2522.1 MiB) and seg2 (KV) identical in both. So raising the ceiling silently shifted
+                // 2522.1 MiB) and seg2 (KV) identical in both. So raising the ceiling would silently shift
                 // decode's weights ~195 MiB and cost a few percent of BOTH TTFT and decode, on a
                 // bundle a short prompt never even runs. Anchoring on the narrowest rung pins the
                 // pre-decode footprint at the `mq_pad=64` value for every ceiling — the configuration
@@ -1501,11 +1500,11 @@ impl SpyreWorker {
                 // all. The fix is to hold the reservation CONSTANT, not to remove it.
                 // ⛔ THE ANCHOR'S BUNDLE AND ITS WIDTH LABEL COME FROM THE SAME ENTRY, AS ONE PAIR —
                 // and a manifest rung whose sentinel names no compiled bundle is an INVENTORY DESYNC
-                // that REFUSES, never a fallback. The old `.or(top_prefill)` silently ran the TOP
+                // that REFUSES, never a fallback. An `.or(top_prefill)` would silently run the TOP
                 // prefill bundle under the NARROWEST rung's width label when the narrowest entry
-                // failed to resolve (the mislabel class the anchor-width note below records), and
-                // the ladder then built the widest rung too — the same bundle as two real sessions.
-                // `top_prefill` remains exactly what it was gated to be: the anchor ONLY when the
+                // fails to resolve (the mislabel class the anchor-width note below records), and
+                // the ladder would then build the widest rung too — the same bundle as two real sessions.
+                // `top_prefill` is exactly what it is gated to be: the anchor ONLY when the
                 // ladder has no multi-token rung at all, so its width is the prefill wiring's own
                 // `m_cap` in that case and never disagrees with the bundle it runs.
                 let narrowest_rung = g0
@@ -2640,14 +2639,14 @@ impl SpyreWorker {
                 // seg2 (the KV pool) showed NO correlation — region 0x14 appears in both modes. Decode is
                 // bandwidth-bound on the weights, so where they land is the whole difference.
                 //
-                // The ladder's rungs used to be WHOLE builds spawned first, so this session's ~2.6 GB
-                // seg1 raced twenty rung allocations across ~18 threads for whichever region the
+                // With the ladder's rungs as WHOLE builds spawned first, this session's ~2.6 GB
+                // seg1 races twenty rung allocations across ~18 threads for whichever region the
                 // allocator hands out first — and the session that serves EVERY TOKEN lost that race
                 // 9 times in 16. Allocating it first makes the fast placement the deterministic one.
                 // The rungs ALIAS seg1 from it anyway (`alias_seg_from`, after this wave), so they
                 // never wanted a region of their own.
                 //
-                // ⛔ THE LADDER STILL BUILDS IN PARALLEL — and now BEFORE the owner, because its
+                // ⛔ THE LADDER STILL BUILDS IN PARALLEL — and BEFORE the owner, because its
                 // host half allocates nothing. This wave reorders WHO ALLOCATES FIRST; it does not
                 // serialize startup, and the aliasing after it is unchanged.
                 let _t_wave = std::time::Instant::now();
@@ -2970,16 +2969,16 @@ impl SpyreWorker {
                 decode_ladder.sort_by_key(|r| r.seqs);
                 // ⭐ THE ACTIVATION SHADOWS' PAGES FAULT AT THE WRITE THAT FIRST TOUCHES THEM. The
                 // load faults only what it wrote (the staging walks, the keyed binds); a request's
-                // first bind faults its own pages at its own moment, and only those. The eager door
-                // that used to live here (#673) faulted every chunk session's WHOLE shadow at load —
-                // born at 18-38 ms over 115-160 MB, but the ladder's reservations grew ~12x and
+                // first bind faults its own pages at its own moment, and only those. No eager door
+                // here: faulting every chunk session's WHOLE shadow at load costs 18-38 ms over
+                // 115-160 MB at small reservations, but the ladder's reservations are ~12x that and
                 // rank with the world: measured 2026-11-12 on nickm5, 1.3 GB / 642 ms at k=1 and
                 // 10.9 GB / 3.5 s at tp/8, 86% of it per-request bind space no load-time write ever
                 // touches — and the host fault path is SERIALIZED at ~2 GB/s no matter the thread
                 // count (a 36-thread fault of 10 GB ran at the same 1.5 GB/s one thread does), so
                 // the bytes cannot be faulted faster, only fewer. A first ~1k request binds ~3-5 MB
                 // per session — milliseconds of demand faults — against seconds of every boot and
-                // 10.9 GB of RSS the door cost at tp/8.
+                // 10.9 GB of RSS an eager door costs at tp/8.
                 let sb = SuperDscBundle {
                     decode: ss,
                     decode_rungs: decode_ladder,

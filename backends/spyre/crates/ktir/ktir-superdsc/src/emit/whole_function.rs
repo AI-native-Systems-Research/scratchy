@@ -7028,9 +7028,9 @@ fn lower_function_folded<T: crate::collective::Tp>(
         // why the K cache is written ALREADY TRANSPOSED (`restickify_kt_opspec_2d`) — the relayout
         // exists to MAKE a `[k, n]` buffer, never to consume one.
         //
-        // ⛔⛔⛔ WHAT USED TO BE HERE, AND WHY BOTH OF ITS CLAIMS WERE WRONG. This site transposed B
-        // into a minted `[n, k]` intermediate with `OpFunc::Transpose` and handed the matmul THAT. Two
-        // measurements killed it:
+        // ⛔⛔⛔ WHY THIS SITE DOES NOT TRANSPOSE B into a minted `[n, k]` intermediate with
+        // `OpFunc::Transpose` and hand the matmul THAT, and why both claims of that form are wrong. Two
+        // measurements rule it out:
         //   * IT COMPUTED THE WRONG THING. Baked on both decoders, `32_transpose_o41` wrote a
         //     `[128, 64]` tile (`primaryDsInfo_` OUTPUT `stickDimOrder_ ["out","mb"]`, the 8×8
         //     inter-slice block) and `33_matmul_o42` then declared its KERNEL `layoutDimOrder_
@@ -7047,10 +7047,10 @@ fn lower_function_folded<T: crate::collective::Tp>(
         //
         // So the orientation is not lowered by an op; it is a statement about the REGION's framing, and
         // it is threaded into `matmul` (below) where the two extents are read. `assemble_transpose` and
-        // its `lower_ktir_to_superdsc::transpose` door are left exactly as they were — they serve
+        // its `lower_ktir_to_superdsc::transpose` door are unaffected — they serve
         // `Program::Transpose`, a producer stating a `linalg.transpose` in its own right.
         //
-        // ⭐ AND THE OTHER HALF IS NO LONGER A GAP — IT IS THE REFUSAL DIRECTLY BELOW. A transpose-B B
+        // ⭐ AND THE OTHER HALF IS NOT A GAP — IT IS THE REFUSAL DIRECTLY BELOW. A transpose-B B
         // whose region is a COMPUTED value has nobody to place its bytes, so this door will not lower
         // it. See [`transposed_b_is_placeable`], which states the whole argument.
         if let Some(b) = b_orient {

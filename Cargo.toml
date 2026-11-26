@@ -48,6 +48,10 @@ members = [
 # resolution never grows an edge into it.
 exclude = ["crates/targets/metal/tui", "backends/spyre-hw"]
 
+[workspace.metadata.dylint]
+# The purity rules as rustc lints: scripts/purity.sh runs them.
+libraries = [{ path = "lints/scratchy-purity" }]
+
 [workspace.package]
 version = "0.1.0"
 edition = "2024"

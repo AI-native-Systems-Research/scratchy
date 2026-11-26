@@ -468,7 +468,7 @@ impl Worker for SpyreWorker {
         }
         // ── BATCHED DECODE ────────────────────────────────────────────────────────────────────────
         // Every cached request scheduled for exactly ONE GENERATED token is a decode step, and those
-        // are the whole reason the weight set gets streamed over and over: each used to be its own
+        // are the whole reason the weight set gets streamed over and over when each is its own
         // forward. Run them together on the smallest rung that holds them and the weights move once.
         // A 1-token slice of an UNFINISHED prompt is not one of them (`solo_step_is_decode`): it is
         // a prefill continuation and stays on the per-request path below.

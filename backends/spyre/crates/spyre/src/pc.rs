@@ -4,7 +4,7 @@
 //! signed landing (search `pc::` — every hit is instrumentation).
 //!
 //! One process-wide table of atomic rows. Every bake appends one line per bundle to
-//! `/tmp/bt-passcounters.log`: per-bundle identity plus the CUMULATIVE table, so a
+//! `bt-passcounters.log` (the path the `open` below names): per-bundle identity plus the CUMULATIVE table, so a
 //! pass whose cost grows superlinearly across a bake is visible from the file alone
 //! (each line's cumulative micros vs the bundle index). Rows are Relaxed atomics —
 //! the bake is rayon-fanned, so every counter must be thread-safe.

@@ -101,8 +101,8 @@
 //! ```bash
 //! export DEEPTOOLS_PATH=<a deeptools checkout>   # $DEEPTOOLS_PATH/ddc/ddl_templates/ is read
 //! for d in <bake dir>/*/; do
-//!   rm -rf /tmp/r && cp -R "$d" /tmp/r            # dxp WRITES into its input dir
-//!   dxp_standalone -d /tmp/r -b sentient; echo "$d -> $?"
+//!   rm -rf <run-dir> && cp -R "$d" <run-dir>      # dxp WRITES into its input dir
+//!   dxp_standalone -d <run-dir> -b sentient; echo "$d -> $?"
 //! done
 //! ```
 //!

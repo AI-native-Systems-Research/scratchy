@@ -104,12 +104,12 @@ const _: () = assert!(
 /// Implemented for every [`World`]; a world past the card's sids fails the build at the first use
 /// of [`Tp::CHECKED`]:
 ///
-/// ```compile_fail
+/// ```compile_fail,E0080
 /// use ktir_superdsc::collective::{Tp, TpWorld};
 /// let () = <TpWorld<0> as Tp>::CHECKED;
 /// ```
 ///
-/// ```compile_fail
+/// ```compile_fail,E0080
 /// use ktir_superdsc::collective::{MAX_WORLD, Tp, TpWorld};
 /// let () = <TpWorld<{ MAX_WORLD + 1 }> as Tp>::CHECKED;
 /// ```
@@ -255,7 +255,7 @@ impl WindowCut {
 
     /// Re-mint from the index the `#[forward]` macro bakes.
     ///
-    /// ```compile_fail
+    /// ```compile_fail,E0080
     /// use ktir_superdsc::collective::WindowCut;
     /// const C: WindowCut = WindowCut::baked(2);
     /// ```
@@ -539,7 +539,7 @@ impl Fragment {
     /// the bundle is a `static`, so parts that carry no payload — parts no cut could have produced —
     /// fail the BUILD of the crate that bakes them:
     ///
-    /// ```compile_fail
+    /// ```compile_fail,E0080
     /// use ktir_superdsc::collective::Fragment;
     /// // A fragment of no rows moves nothing.
     /// const F: Fragment = Fragment::baked(0, 1, 0);
