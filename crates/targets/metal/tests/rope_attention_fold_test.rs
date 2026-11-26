@@ -11,7 +11,7 @@ use half::{bf16, f16};
 use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions, MTLSize};
 use scratchy_target_metal::aot::baked_build;
 use scratchy_target_metal::detect_device;
-use scratchy_target_metal::mtl4_dispatch::Mtl4DispatchBatch;
+use scratchy_target_metal::mtl4_dispatch::{Mtl4DispatchBatch, ThreadgroupGrid};
 use scratchy_target_metal::specialized_pipeline_cache::{
     ConstantValue, PipelineKey, SpecializedPipelineCache,
 };
@@ -341,7 +341,17 @@ fn run(c: &Case, how: Run) -> Option<Left> {
                 (&scales_v, 19),
             ]);
         }
-        batch.encode(&writer, &binds, &[], &[], &resident, tg(1, nq), tg(hd, 1));
+        batch.encode(
+            &writer,
+            &binds,
+            &[],
+            &[],
+            &resident,
+            ThreadgroupGrid {
+                threadgroups: tg(1, nq),
+                threads_per_threadgroup: tg(hd, 1),
+            },
+        );
         batch.barrier();
     }
     let mut binds = vec![
@@ -370,7 +380,17 @@ fn run(c: &Case, how: Run) -> Option<Left> {
                 height: nq / heads,
                 depth: splits + usize::from(how == Run::Fold),
             };
-            batch.encode(&attention, &binds, &[], &[], &resident, grid, tg(hd, 1));
+            batch.encode(
+                &attention,
+                &binds,
+                &[],
+                &[],
+                &resident,
+                ThreadgroupGrid {
+                    threadgroups: grid,
+                    threads_per_threadgroup: tg(hd, 1),
+                },
+            );
             batch.barrier();
             let binds = [(&out, 0), (&partials, 16)];
             batch.encode(
@@ -379,8 +399,10 @@ fn run(c: &Case, how: Run) -> Option<Left> {
                 &[],
                 &[],
                 &[],
-                tg(1, nq),
-                tg(combine_threads, 1),
+                ThreadgroupGrid {
+                    threadgroups: tg(1, nq),
+                    threads_per_threadgroup: tg(combine_threads, 1),
+                },
             );
         }
         None => batch.encode(
@@ -389,8 +411,10 @@ fn run(c: &Case, how: Run) -> Option<Left> {
             &[],
             &[],
             &resident,
-            tg(1, nq / heads),
-            tg(1024, 1),
+            ThreadgroupGrid {
+                threadgroups: tg(1, nq / heads),
+                threads_per_threadgroup: tg(1024, 1),
+            },
         ),
     }
     batch.commit(true);

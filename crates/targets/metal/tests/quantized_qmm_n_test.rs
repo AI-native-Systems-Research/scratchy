@@ -18,6 +18,7 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions, MTLSize};
 use scratchy_target_metal::aot::{BakedPipeline, baked_pipeline};
+use scratchy_target_metal::cpu_reference::AffineMatmul;
 use scratchy_target_metal::cpu_reference::affine_qmm_n_b4_bf16 as cpu_qmm_n_bf16;
 use scratchy_target_metal::device::detect_device;
 use scratchy_target_metal::quantized::{
@@ -152,17 +153,18 @@ fn make_inputs_bf16(
 // (imported above as `cpu_qmm_n_bf16`). Shares the transpose=false
 // matmul with qvm.
 
-#[allow(clippy::too_many_arguments)]
-fn run_qmm_n_bf16(
-    packed: &[u8],
-    scales: &[half::f16],
-    biases: &[half::f16],
-    x: &[half::bf16],
-    m: usize,
-    n: usize,
-    k: usize,
-    group_size: u32,
-) -> Option<Vec<half::bf16>> {
+fn run_qmm_n_bf16(mm: AffineMatmul<'_, half::bf16, half::f16>) -> Option<Vec<half::bf16>> {
+    let AffineMatmul {
+        packed,
+        scales,
+        biases,
+        x,
+        m,
+        n,
+        k,
+        group_size,
+    } = mm;
+    let group_size = group_size as u32;
     let device = detect_device()?.device;
 
     let packed_buf = buffer_from_bytes(&device, packed);
@@ -244,9 +246,26 @@ fn affine_qmm_n_b4_bf16_aligned_matches_cpu_reference() {
         assert_eq!(n % group_size, 0);
         let (packed, scales, biases, x) =
             make_inputs_bf16(0xC1A1_u64 ^ group_size as u64, n, k, m, group_size);
-        let expected = cpu_qmm_n_bf16(&packed, &scales, &biases, &x, m, n, k, group_size);
-        let Some(metal) = run_qmm_n_bf16(&packed, &scales, &biases, &x, m, n, k, group_size as u32)
-        else {
+        let expected = cpu_qmm_n_bf16(AffineMatmul {
+            packed: &packed,
+            scales: &scales,
+            biases: &biases,
+            x: &x,
+            m,
+            n,
+            k,
+            group_size,
+        });
+        let Some(metal) = run_qmm_n_bf16(AffineMatmul {
+            packed: &packed,
+            scales: &scales,
+            biases: &biases,
+            x: &x,
+            m,
+            n,
+            k,
+            group_size,
+        }) else {
             return;
         };
         let (idx, mv, ev, abs_err, allowed) =
@@ -275,9 +294,26 @@ fn affine_qmm_n_b4_bf16_m_tail_matches_cpu_reference() {
 
     let (packed, scales, biases, x) =
         make_inputs_bf16(0xC2A2_u64 ^ group_size as u64, n, k, m, group_size);
-    let expected = cpu_qmm_n_bf16(&packed, &scales, &biases, &x, m, n, k, group_size);
-    let Some(metal) = run_qmm_n_bf16(&packed, &scales, &biases, &x, m, n, k, group_size as u32)
-    else {
+    let expected = cpu_qmm_n_bf16(AffineMatmul {
+        packed: &packed,
+        scales: &scales,
+        biases: &biases,
+        x: &x,
+        m,
+        n,
+        k,
+        group_size,
+    });
+    let Some(metal) = run_qmm_n_bf16(AffineMatmul {
+        packed: &packed,
+        scales: &scales,
+        biases: &biases,
+        x: &x,
+        m,
+        n,
+        k,
+        group_size,
+    }) else {
         return;
     };
     let (idx, mv, ev, abs_err, allowed) = worst_abs_error_vs_noise_floor(&metal, &expected, k, 0.5);
@@ -312,9 +348,26 @@ fn affine_qmm_n_b4_bf16_k_tail_matches_cpu_reference() {
 
     let (packed, scales, biases, x) =
         make_inputs_bf16(0xC3A3_u64 ^ group_size as u64, n, k, m, group_size);
-    let expected = cpu_qmm_n_bf16(&packed, &scales, &biases, &x, m, n, k, group_size);
-    let Some(metal) = run_qmm_n_bf16(&packed, &scales, &biases, &x, m, n, k, group_size as u32)
-    else {
+    let expected = cpu_qmm_n_bf16(AffineMatmul {
+        packed: &packed,
+        scales: &scales,
+        biases: &biases,
+        x: &x,
+        m,
+        n,
+        k,
+        group_size,
+    });
+    let Some(metal) = run_qmm_n_bf16(AffineMatmul {
+        packed: &packed,
+        scales: &scales,
+        biases: &biases,
+        x: &x,
+        m,
+        n,
+        k,
+        group_size,
+    }) else {
         return;
     };
     let (idx, mv, ev, abs_err, allowed) = worst_abs_error_vs_noise_floor(&metal, &expected, k, 0.5);

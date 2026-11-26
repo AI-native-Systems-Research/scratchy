@@ -28,6 +28,7 @@ use kernel_inputs::{build_cos_sin, pseudo};
 use objc2_metal::{MTLBuffer, MTLSize};
 use scratchy_target_metal::aot::baked_build;
 use scratchy_target_metal::detect_device;
+use scratchy_target_metal::mtl4_dispatch::ThreadgroupGrid;
 use scratchy_target_metal::specialized_pipeline_cache::{
     ConstantValue, PipelineKey, SpecializedPipelineCache,
 };
@@ -146,7 +147,17 @@ fn rope_on_read_decode_parity_bench() {
         };
         let mut batch = Mtl4DispatchBatch::begin(&device)?;
         for _ in 0..PER_CB {
-            batch.encode(pipeline, &binds, &[], &[], &[&k_buf, &v_buf], grid, threads);
+            batch.encode(
+                pipeline,
+                &binds,
+                &[],
+                &[],
+                &[&k_buf, &v_buf],
+                ThreadgroupGrid {
+                    threadgroups: grid,
+                    threads_per_threadgroup: threads,
+                },
+            );
             batch.barrier();
         }
         let t = std::time::Instant::now();

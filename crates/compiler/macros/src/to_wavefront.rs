@@ -31,8 +31,6 @@
 //! skipped. The drive treats any error as "no wavefront lowering for
 //! this model" and continues; this never gates a normal build.
 
-#![allow(dead_code)]
-
 use std::collections::{BTreeMap, HashMap};
 
 use scratchy_ir::model_facts::ModelFacts;
@@ -254,7 +252,6 @@ struct Builder<'a> {
     /// Prefix KV-cache source pair `(prefix_k, prefix_v)` per kv-cache
     /// extern index (one per layer).
     prefix: HashMap<(u64, u32), (usize, usize)>,
-    eps: f32,
     m: u32,
     /// Modeled prefix length for the KV-cache `Source` rows (structural;
     /// the host eval / GPU player binds the real length at run time).
@@ -798,7 +795,6 @@ pub fn lower_decode_to_wavefront(
         weight_src: HashMap::new(),
         cos_sin: BTreeMap::new(),
         prefix: HashMap::new(),
-        eps,
         m,
         prefix_len,
         pool_rows,
@@ -2276,30 +2272,6 @@ pub fn lower_decode_to_wavefront(
         Vec::new(),
     )
     .map_err(BridgeError::TwoEmbedRows)
-}
-
-/// Recover `(group_size, bits)` for a weight from its FUF `storage`
-/// annotation (the per-model `annotate_storage_formats` pass). `None` for
-/// dense / unquantized weights.
-fn affine_gs_bits(fuf: &Fuf, id: u32, index: Option<UnrollIndex>) -> Option<(u32, u32)> {
-    for node in &fuf.nodes {
-        for inp in &node.inputs {
-            if let FufInput::Weight {
-                id: wid,
-                index: widx,
-                storage,
-            } = inp
-                && wid.0 == id
-                && *widx == index
-            {
-                return match storage {
-                    StorageFormat::Affine { bits, group_size } => Some((*group_size, *bits)),
-                    _ => None,
-                };
-            }
-        }
-    }
-    None
 }
 
 /// Outcome of resolving the wavefront weight sources to real runtime

@@ -37,7 +37,7 @@ use scratchy_target_metal::gdn_state::GDN_SSM_STATE_DTYPE;
 use scratchy_target_metal::interpreter::metal::{
     BLOCKS_PER_CHUNK, MetalDtype, MetalRungs, TerminalReads,
 };
-use scratchy_target_metal::kv_cache::KvCachePool;
+use scratchy_target_metal::kv_cache::{ChunkedKvLayout, KvCachePool};
 use scratchy_target_metal::sparse_kv::{KvMapper, SparseStores};
 use scratchy_target_metal::weights::GpuWeights;
 use scratchy_target_metal::{
@@ -353,21 +353,23 @@ fn load(repo: &str, bucket_cap: u32) -> Loaded {
     let calls = std::cell::Cell::new(0usize);
     let mut kv = unsafe {
         KvCachePool::new_chunked(
-            layers,
-            NUM_BLOCKS,
-            BLOCK_SIZE,
-            kv_heads,
-            head_dim,
-            block_cap,
-            if hybrid.is_some() {
-                None
-            } else {
-                per_layer_block_elems.clone()
+            ChunkedKvLayout {
+                num_layers: layers,
+                num_blocks: NUM_BLOCKS,
+                block_size: BLOCK_SIZE,
+                num_kv_heads: kv_heads,
+                head_dim,
+                max_blocks_per_seq: block_cap,
+                per_layer_block_elems: if hybrid.is_some() {
+                    None
+                } else {
+                    per_layer_block_elems.clone()
+                },
+                layer_to_tensor,
+                dtype: cache_dtype,
+                blocks_per_chunk,
+                initial_chunks: 1,
             },
-            layer_to_tensor,
-            cache_dtype,
-            blocks_per_chunk,
-            1,
             |bytes| {
                 let c = calls.get();
                 calls.set(c + 1);

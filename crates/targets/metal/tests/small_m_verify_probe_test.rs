@@ -14,13 +14,13 @@
 //! Run: cargo test -p scratchy-target-metal --release --test small_m_verify_probe_test -- \
 //!     --ignored --nocapture
 
-mod common;
-
 use half::bf16;
 use objc2_metal::MTLSize;
 use scratchy_target_metal::aot::baked_build;
 use scratchy_target_metal::detect_device;
-use scratchy_target_metal::mtl4_dispatch::{Mtl4DispatchBatch, shared_slice, shared_zeroed};
+use scratchy_target_metal::mtl4_dispatch::{
+    Mtl4DispatchBatch, ThreadgroupGrid, shared_slice, shared_zeroed,
+};
 use scratchy_target_metal::specialized_pipeline_cache::{
     ConstantValue, PipelineKey, SpecializedPipelineCache,
 };
@@ -179,8 +179,10 @@ fn small_m_steps_in_a_w4a8_bucket_at_qwen38_27b_shapes() {
                                 &[],
                                 &[],
                                 &[],
-                                size(n / cell.cols, live.div_ceil(cell.rows)),
-                                size(cell.threads, 1),
+                                ThreadgroupGrid {
+                                    threadgroups: size(n / cell.cols, live.div_ceil(cell.rows)),
+                                    threads_per_threadgroup: size(cell.threads, 1),
+                                },
                             );
                         }
                         None => batch.encode(
@@ -189,8 +191,10 @@ fn small_m_steps_in_a_w4a8_bucket_at_qwen38_27b_shapes() {
                             &[],
                             &[],
                             &[],
-                            size((k / 64).div_ceil(16), live),
-                            size(128, 1),
+                            ThreadgroupGrid {
+                                threadgroups: size((k / 64).div_ceil(16), live),
+                                threads_per_threadgroup: size(128, 1),
+                            },
                         ),
                     }
                     batch.barrier();

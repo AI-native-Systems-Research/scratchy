@@ -1,10 +1,4 @@
 // SPDX-License-Identifier: Apache-2.0
-//
-// Golden reference code — straightforward per-index loops win on
-// readability. Suppress the usual clippy "iterate by element"
-// pedantry so the math stays legible.
-#![allow(clippy::needless_range_loop)]
-#![allow(clippy::too_many_arguments)]
 //! CPU golden model implementations for each scratchy op.
 //!
 //! Pure-Rust reference implementations of the same operations the
@@ -15,6 +9,51 @@
 //! All functions operate on flat `&[f32]` slices (convert bf16→f32
 //! before calling). Shape conventions match the scratchy globals
 //! layout.
+
+/// Attention head geometry: the query heads, the KV heads they share, and each head's width.
+#[derive(Clone, Copy, Debug)]
+pub struct Heads {
+    pub num_q_heads: usize,
+    pub num_kv_heads: usize,
+    pub head_dim: usize,
+}
+
+/// RoPE `cos` / `sin` tables, `[max_pos, head_dim]` row-major (only the first `head_dim / 2`
+/// columns of each row are read).
+#[derive(Clone, Copy, Debug)]
+pub struct RopeTables<'a> {
+    pub cos: &'a [f32],
+    pub sin: &'a [f32],
+}
+
+/// Q, K and V rows: `q` is `[num_tokens, num_q_heads * head_dim]`, `k` and `v` are
+/// `[num_tokens, num_kv_heads * head_dim]`, all row-major.
+#[derive(Clone, Copy, Debug)]
+pub struct QkvRows<'a> {
+    pub q: &'a [f32],
+    pub k: &'a [f32],
+    pub v: &'a [f32],
+}
+
+/// A paged KV cache for writing: `k` and `v` are `[num_blocks, num_kv_heads, block_size,
+/// head_dim]` row-major.
+#[derive(Debug)]
+pub struct PagedKvMut<'a> {
+    pub k: &'a mut [f32],
+    pub v: &'a mut [f32],
+    pub block_size: usize,
+}
+
+/// A paged KV cache for reading: `k` and `v` as [`PagedKvMut`]'s, and the per-sequence
+/// `block_table` (`[batch, max_blocks_per_seq]` row-major) mapping logical blocks to physical.
+#[derive(Clone, Copy, Debug)]
+pub struct PagedKv<'a> {
+    pub k: &'a [f32],
+    pub v: &'a [f32],
+    pub block_table: &'a [u32],
+    pub block_size: usize,
+    pub max_blocks_per_seq: usize,
+}
 
 /// RMS normalization: output = (x / rms(x)) * weight
 ///
@@ -229,14 +268,17 @@ pub fn fused_gate_up_silu_mul(gate: &[f32], up: &[f32], output: &mut [f32]) {
 /// - `output`: [seq_len, dim] — rotated vectors
 pub fn rope(
     qk: &[f32],
-    cos_table: &[f32],
-    sin_table: &[f32],
+    tables: RopeTables<'_>,
     positions: &[i32],
     seq_len: usize,
     num_heads: usize,
     head_dim: usize,
     output: &mut [f32],
 ) {
+    let RopeTables {
+        cos: cos_table,
+        sin: sin_table,
+    } = tables;
     let half_dim = head_dim / 2;
     let dim = num_heads * head_dim;
     assert_eq!(qk.len(), seq_len * dim);
@@ -244,8 +286,8 @@ pub fn rope(
 
     output.copy_from_slice(qk);
 
-    for s in 0..seq_len {
-        let pos = positions[s] as usize;
+    for (s, &pos) in positions[..seq_len].iter().enumerate() {
+        let pos = pos as usize;
         for h in 0..num_heads {
             let base = s * dim + h * head_dim;
             for d in 0..half_dim {
@@ -287,21 +329,33 @@ pub fn rope(
 /// `Instruction::RopeAppend` semantics in `instr.rs` and the
 /// (currently unwritten) `rope_append_f16_specialized` shader.
 pub fn rope_append(
-    q_in: &[f32],
-    k_in: &[f32],
-    v_in: &[f32],
+    input: QkvRows<'_>,
     positions: &[u32],
     slot_mapping: &[u32],
-    cos_table: &[f32],
-    sin_table: &[f32],
+    tables: RopeTables<'_>,
     q_out: &mut [f32],
-    kv_cache_k: &mut [f32],
-    kv_cache_v: &mut [f32],
-    num_q_heads: usize,
-    num_kv_heads: usize,
-    head_dim: usize,
-    block_size: usize,
+    cache: PagedKvMut<'_>,
+    heads: Heads,
 ) {
+    let QkvRows {
+        q: q_in,
+        k: k_in,
+        v: v_in,
+    } = input;
+    let RopeTables {
+        cos: cos_table,
+        sin: sin_table,
+    } = tables;
+    let PagedKvMut {
+        k: kv_cache_k,
+        v: kv_cache_v,
+        block_size,
+    } = cache;
+    let Heads {
+        num_q_heads,
+        num_kv_heads,
+        head_dim,
+    } = heads;
     let num_tokens = positions.len();
     assert_eq!(slot_mapping.len(), num_tokens);
     let q_dim = num_q_heads * head_dim;
@@ -322,8 +376,8 @@ pub fn rope_append(
     assert_eq!(kv_cache_v.len(), kv_cache_k.len());
     let half_dim = head_dim / 2;
 
-    for t in 0..num_tokens {
-        let pos = positions[t] as usize;
+    for (t, (&pos, &slot)) in positions.iter().zip(slot_mapping).enumerate() {
+        let pos = pos as usize;
         let cos_row = &cos_table[pos * head_dim..pos * head_dim + head_dim];
         let sin_row = &sin_table[pos * head_dim..pos * head_dim + head_dim];
 
@@ -341,7 +395,7 @@ pub fn rope_append(
         }
 
         // Rotate K and write rotated K + unrotated V to the cache slot.
-        let slot = slot_mapping[t] as usize;
+        let slot = slot as usize;
         for h in 0..num_kv_heads {
             let kv_base = t * kv_dim + h * head_dim;
             let cache_base = layout.elem_offset_for_global_slot(slot as u32, h as u32);
@@ -385,18 +439,24 @@ pub fn rope_append(
 /// numerical-guard differences.
 pub fn attention_via_cache(
     q: &[f32],
-    kv_cache_k: &[f32],
-    kv_cache_v: &[f32],
-    block_table: &[u32],
+    cache: PagedKv<'_>,
     seq_used_k: &[u32],
     output: &mut [f32],
-    num_q_heads: usize,
-    num_kv_heads: usize,
-    head_dim: usize,
-    block_size: usize,
-    max_blocks_per_seq: usize,
+    heads: Heads,
     attn_scale: f32,
 ) {
+    let PagedKv {
+        k: kv_cache_k,
+        v: kv_cache_v,
+        block_table,
+        block_size,
+        max_blocks_per_seq,
+    } = cache;
+    let Heads {
+        num_q_heads,
+        num_kv_heads,
+        head_dim,
+    } = heads;
     let batch = seq_used_k.len();
     let q_dim = num_q_heads * head_dim;
     assert_eq!(q.len(), batch * q_dim);
@@ -421,7 +481,7 @@ pub fn attention_via_cache(
             let q_off = seq * q_dim + h * head_dim;
 
             let mut scores = vec![0.0_f32; kv_len];
-            for t in 0..kv_len {
+            for (t, score) in scores.iter_mut().enumerate() {
                 let logical_block = t / block_size;
                 let block_offset = t % block_size;
                 let physical_block = row_blocks[logical_block] as usize;
@@ -431,7 +491,7 @@ pub fn attention_via_cache(
                 for d in 0..head_dim {
                     dot += q[q_off + d] * kv_cache_k[k_base + d];
                 }
-                scores[t] = dot * attn_scale;
+                *score = dot * attn_scale;
             }
 
             let max_logit = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
@@ -445,13 +505,13 @@ pub fn attention_via_cache(
 
             for d in 0..head_dim {
                 let mut acc = 0.0_f32;
-                for t in 0..kv_len {
+                for (t, &score) in scores.iter().enumerate() {
                     let logical_block = t / block_size;
                     let block_offset = t % block_size;
                     let physical_block = row_blocks[logical_block] as usize;
                     let v_base =
                         layout.elem_offset(physical_block as u32, kv_h as u32, block_offset as u32);
-                    acc += scores[t] * inv_sum * kv_cache_v[v_base + d];
+                    acc += score * inv_sum * kv_cache_v[v_base + d];
                 }
                 output[q_off + d] = acc;
             }
@@ -472,11 +532,14 @@ pub fn attention_decode(
     v_cache: &[f32],
     output: &mut [f32],
     seq_len: usize,
-    num_heads: usize,
-    num_kv_heads: usize,
-    head_dim: usize,
+    heads: Heads,
     attn_scale: f32,
 ) {
+    let Heads {
+        num_q_heads: num_heads,
+        num_kv_heads,
+        head_dim,
+    } = heads;
     let gqa_ratio = num_heads / num_kv_heads;
 
     for h in 0..num_heads {
@@ -485,13 +548,13 @@ pub fn attention_decode(
 
         // Compute attention scores
         let mut scores = vec![0.0_f32; seq_len];
-        for s in 0..seq_len {
+        for (s, score) in scores.iter_mut().enumerate() {
             let k_offset = s * num_kv_heads * head_dim + kv_h * head_dim;
             let mut dot = 0.0_f32;
             for d in 0..head_dim {
                 dot += q[q_offset + d] * k_cache[k_offset + d];
             }
-            scores[s] = dot * attn_scale;
+            *score = dot * attn_scale;
         }
 
         // Softmax
@@ -508,9 +571,9 @@ pub fn attention_decode(
         // Weighted sum of values
         for d in 0..head_dim {
             let mut val = 0.0_f32;
-            for s in 0..seq_len {
+            for (s, &score) in scores.iter().enumerate() {
                 let v_offset = s * num_kv_heads * head_dim + kv_h * head_dim + d;
-                val += scores[s] * v_cache[v_offset];
+                val += score * v_cache[v_offset];
             }
             output[q_offset + d] = val;
         }
@@ -531,11 +594,14 @@ pub fn attention_prefill(
     v: &[f32],
     output: &mut [f32],
     seq_starts: &[usize],
-    num_heads: usize,
-    num_kv_heads: usize,
-    head_dim: usize,
+    heads: Heads,
     attn_scale: f32,
 ) {
+    let Heads {
+        num_q_heads: num_heads,
+        num_kv_heads,
+        head_dim,
+    } = heads;
     let gqa_ratio = num_heads / num_kv_heads;
     let num_seqs = seq_starts.len() - 1;
 
@@ -553,13 +619,13 @@ pub fn attention_prefill(
                 // Compute scores (causal: only attend to positions <= qi)
                 let attend_len = qi + 1;
                 let mut scores = vec![0.0_f32; attend_len];
-                for ki in 0..attend_len {
+                for (ki, score) in scores.iter_mut().enumerate() {
                     let k_offset = (start + ki) * num_kv_heads * head_dim + kv_h * head_dim;
                     let mut dot = 0.0_f32;
                     for d in 0..head_dim {
                         dot += q[q_offset + d] * k[k_offset + d];
                     }
-                    scores[ki] = dot * attn_scale;
+                    *score = dot * attn_scale;
                 }
 
                 // Softmax
@@ -576,9 +642,9 @@ pub fn attention_prefill(
                 // Weighted sum
                 for d in 0..head_dim {
                     let mut val = 0.0_f32;
-                    for ki in 0..attend_len {
+                    for (ki, &score) in scores.iter().enumerate() {
                         let v_offset = (start + ki) * num_kv_heads * head_dim + kv_h * head_dim + d;
-                        val += scores[ki] * v[v_offset];
+                        val += score * v[v_offset];
                     }
                     output[q_offset + d] = val;
                 }
@@ -614,22 +680,27 @@ pub fn attention_prefill(
 /// where `new_q_for_seq = cu_seqlens_q[seq+1] - cu_seqlens_q[seq]` and
 /// `q_pos_in_new = global_q - cu_seqlens_q[seq]`. K positions
 /// `> q_abs_pos` are masked out (causal).
-#[allow(clippy::too_many_arguments)]
 pub fn attention_prefill_paged(
     q: &[f32],
-    kv_cache_k: &[f32],
-    kv_cache_v: &[f32],
+    cache: PagedKv<'_>,
     output: &mut [f32],
     cu_seqlens_q: &[u32],
     seq_used_k: &[u32],
-    block_table: &[u32],
-    num_q_heads: usize,
-    num_kv_heads: usize,
-    head_dim: usize,
-    block_size: usize,
-    max_blocks_per_seq: usize,
+    heads: Heads,
     attn_scale: f32,
 ) {
+    let PagedKv {
+        k: kv_cache_k,
+        v: kv_cache_v,
+        block_table,
+        block_size,
+        max_blocks_per_seq,
+    } = cache;
+    let Heads {
+        num_q_heads,
+        num_kv_heads,
+        head_dim,
+    } = heads;
     let batch = seq_used_k.len();
     assert!(cu_seqlens_q.len() > batch);
     assert_eq!(block_table.len(), batch * max_blocks_per_seq);
@@ -664,7 +735,7 @@ pub fn attention_prefill_paged(
                 let q_off = global_q * num_q_heads * head_dim + h * head_dim;
 
                 let mut scores = vec![0.0_f32; attend_len];
-                for t in 0..attend_len {
+                for (t, score) in scores.iter_mut().enumerate() {
                     let logical_block = t / block_size;
                     let block_offset = t % block_size;
                     let physical_block = row_blocks[logical_block] as usize;
@@ -674,7 +745,7 @@ pub fn attention_prefill_paged(
                     for d in 0..head_dim {
                         dot += q[q_off + d] * kv_cache_k[k_base + d];
                     }
-                    scores[t] = dot * attn_scale;
+                    *score = dot * attn_scale;
                 }
 
                 let max_score = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
@@ -689,7 +760,7 @@ pub fn attention_prefill_paged(
 
                 for d in 0..head_dim {
                     let mut val = 0.0_f32;
-                    for t in 0..attend_len {
+                    for (t, &score) in scores.iter().enumerate() {
                         let logical_block = t / block_size;
                         let block_offset = t % block_size;
                         let physical_block = row_blocks[logical_block] as usize;
@@ -698,7 +769,7 @@ pub fn attention_prefill_paged(
                             kv_h as u32,
                             block_offset as u32,
                         );
-                        val += scores[t] * kv_cache_v[v_base + d];
+                        val += score * kv_cache_v[v_base + d];
                     }
                     output[q_off + d] = val;
                 }
@@ -936,9 +1007,7 @@ mod tests {
         let slot_mapping = vec![3u32];
         // cos[0,d] = 1 for d in [0,half); sin[0,d] = 0.
         let mut cos_table = vec![0.0_f32; head_dim];
-        for d in 0..half {
-            cos_table[d] = 1.0;
-        }
+        cos_table[..half].fill(1.0);
         let sin_table = vec![0.0_f32; head_dim];
 
         let mut q_out = vec![0.0_f32; q_in.len()];
@@ -952,20 +1021,28 @@ mod tests {
         let mut kv_cache_v = vec![0.0_f32; layout.buffer_elems()];
 
         rope_append(
-            &q_in,
-            &k_in,
-            &v_in,
+            QkvRows {
+                q: &q_in,
+                k: &k_in,
+                v: &v_in,
+            },
             &positions,
             &slot_mapping,
-            &cos_table,
-            &sin_table,
+            RopeTables {
+                cos: &cos_table,
+                sin: &sin_table,
+            },
             &mut q_out,
-            &mut kv_cache_k,
-            &mut kv_cache_v,
-            num_q_heads,
-            num_kv_heads,
-            head_dim,
-            block_size,
+            PagedKvMut {
+                k: &mut kv_cache_k,
+                v: &mut kv_cache_v,
+                block_size,
+            },
+            Heads {
+                num_q_heads,
+                num_kv_heads,
+                head_dim,
+            },
         );
 
         // No rotation → q_out equals q_in.
@@ -1003,20 +1080,28 @@ mod tests {
         let mut kv_cache_v = vec![0.0; 2];
 
         rope_append(
-            &q_in,
-            &k_in,
-            &v_in,
+            QkvRows {
+                q: &q_in,
+                k: &k_in,
+                v: &v_in,
+            },
             &positions,
             &slot_mapping,
-            &cos_table,
-            &sin_table,
+            RopeTables {
+                cos: &cos_table,
+                sin: &sin_table,
+            },
             &mut q_out,
-            &mut kv_cache_k,
-            &mut kv_cache_v,
-            1,
-            1,
-            head_dim,
-            1,
+            PagedKvMut {
+                k: &mut kv_cache_k,
+                v: &mut kv_cache_v,
+                block_size: 1,
+            },
+            Heads {
+                num_q_heads: 1,
+                num_kv_heads: 1,
+                head_dim,
+            },
         );
         // q_out = (3*0 - 4*1, 4*0 + 3*1) = (-4, 3)
         assert_eq!(q_out, vec![-4.0, 3.0]);
@@ -1079,16 +1164,20 @@ mod tests {
         let mut paged_out = vec![0.0_f32; head_dim];
         attention_via_cache(
             &q,
-            &kv_cache_k,
-            &kv_cache_v,
-            &block_table,
+            PagedKv {
+                k: &kv_cache_k,
+                v: &kv_cache_v,
+                block_table: &block_table,
+                block_size,
+                max_blocks_per_seq: max_blocks,
+            },
             &seq_used_k,
             &mut paged_out,
-            num_q_heads,
-            num_kv_heads,
-            head_dim,
-            block_size,
-            max_blocks,
+            Heads {
+                num_q_heads,
+                num_kv_heads,
+                head_dim,
+            },
             scale,
         );
 
@@ -1102,9 +1191,11 @@ mod tests {
             &v_contig,
             &mut ref_out,
             kv_len,
-            num_q_heads,
-            num_kv_heads,
-            head_dim,
+            Heads {
+                num_q_heads,
+                num_kv_heads,
+                head_dim,
+            },
             scale,
         );
         for (i, (&p, &r)) in paged_out.iter().zip(ref_out.iter()).enumerate() {
@@ -1125,16 +1216,20 @@ mod tests {
         let kv_cache_v = vec![0.0_f32; 8];
         attention_via_cache(
             &q,
-            &kv_cache_k,
-            &kv_cache_v,
-            &[0u32, 0],
+            PagedKv {
+                k: &kv_cache_k,
+                v: &kv_cache_v,
+                block_table: &[0u32, 0],
+                block_size: 2,
+                max_blocks_per_seq: 2,
+            },
             &[0u32],
             &mut output,
-            1,
-            1,
-            4,
-            2,
-            2,
+            Heads {
+                num_q_heads: 1,
+                num_kv_heads: 1,
+                head_dim: 4,
+            },
             0.5,
         );
         for v in &output {
@@ -1167,9 +1262,11 @@ mod tests {
             &v_cache,
             &mut output,
             seq_len,
-            num_heads,
-            num_kv_heads,
-            head_dim,
+            Heads {
+                num_q_heads: num_heads,
+                num_kv_heads,
+                head_dim,
+            },
             scale,
         );
 

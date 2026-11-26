@@ -47,13 +47,8 @@ pub trait AffineFusedMoEOps {
     fn load(
         gw: &mut crate::weights::GpuWeights,
         prefix: &str,
-        num_experts: usize,
-        top_k: usize,
-        intermediate_size: usize,
-        hidden_size: usize,
-        group_size: u32,
-        bits: ExpertBits,
-        gate_bits: u32,
+        bank: ExpertBank,
+        quant: AffineExperts,
     ) -> anyhow::Result<Self>
     where
         Self: Sized;
@@ -61,13 +56,8 @@ pub trait AffineFusedMoEOps {
     fn load_with_naming(
         gw: &mut crate::weights::GpuWeights,
         prefix: &str,
-        num_experts: usize,
-        top_k: usize,
-        intermediate_size: usize,
-        hidden_size: usize,
-        group_size: u32,
-        bits: ExpertBits,
-        gate_bits: u32,
+        bank: ExpertBank,
+        quant: AffineExperts,
         naming: ExpertNaming,
         renormalize: bool,
     ) -> anyhow::Result<Self>
@@ -86,31 +76,13 @@ impl AffineFusedMoEOps for AffineFusedMoELayer {
     /// stride so the `affine_gather_qmv` kernel can resolve
     /// `expert_offset = e * out * in/8` (for U32 weights) or
     /// `e * out * in/gs` (for F16 scales/biases) with a single load.
-    #[allow(clippy::too_many_arguments)]
     fn load(
         gw: &mut crate::weights::GpuWeights,
         prefix: &str,
-        num_experts: usize,
-        top_k: usize,
-        intermediate_size: usize,
-        hidden_size: usize,
-        group_size: u32,
-        bits: ExpertBits,
-        gate_bits: u32,
+        bank: ExpertBank,
+        quant: AffineExperts,
     ) -> anyhow::Result<Self> {
-        Self::load_with_naming(
-            gw,
-            prefix,
-            num_experts,
-            top_k,
-            intermediate_size,
-            hidden_size,
-            group_size,
-            bits,
-            gate_bits,
-            ExpertNaming::Mixtral,
-            true,
-        )
+        Self::load_with_naming(gw, prefix, bank, quant, ExpertNaming::Mixtral, true)
     }
 
     /// Load with explicit per-expert naming convention.
@@ -127,20 +99,25 @@ impl AffineFusedMoEOps for AffineFusedMoELayer {
     /// time via `take_affine_dequant_b4` so the routing Gemm step
     /// stays on the dense BF16/F16 path (no quantized GEMM kernel
     /// for `[E, hidden]` is needed).
-    #[allow(clippy::too_many_arguments)]
     fn load_with_naming(
         gw: &mut crate::weights::GpuWeights,
         prefix: &str,
-        num_experts: usize,
-        top_k: usize,
-        intermediate_size: usize,
-        hidden_size: usize,
-        group_size: u32,
-        bits: ExpertBits,
-        gate_bits: u32,
+        bank: ExpertBank,
+        quant: AffineExperts,
         naming: ExpertNaming,
         renormalize: bool,
     ) -> anyhow::Result<Self> {
+        let ExpertBank {
+            num_experts,
+            top_k,
+            intermediate_size,
+            hidden_size,
+        } = bank;
+        let AffineExperts {
+            group_size,
+            bits,
+            gate_bits,
+        } = quant;
         use crate::dtype::DType;
 
         // Router gate: quantized in mlx-community 4bit MoE
@@ -182,7 +159,19 @@ impl AffineFusedMoEOps for AffineFusedMoELayer {
         let n = num_experts;
         let (inter, hidden) = (intermediate_size, hidden_size);
         let in_proj = |gw: &mut crate::weights::GpuWeights, role, bits| {
-            load_expert_projection(gw, prefix, naming, role, n, inter, hidden, group_size, bits)
+            load_expert_projection(
+                gw,
+                prefix,
+                naming,
+                role,
+                ExpertProjection {
+                    num_experts: n,
+                    n_out: inter,
+                    k_in: hidden,
+                    group_size,
+                    bits,
+                },
+            )
         };
         let gate = bits.gate().map(|b| in_proj(gw, R::Gate, b)).transpose()?;
         let [up_w, up_s, up_b] = in_proj(gw, R::Up, bits.up())?;
@@ -191,11 +180,13 @@ impl AffineFusedMoEOps for AffineFusedMoELayer {
             prefix,
             naming,
             R::Down,
-            n,
-            hidden,
-            inter,
-            group_size,
-            bits.down(),
+            ExpertProjection {
+                num_experts: n,
+                n_out: hidden,
+                k_in: inter,
+                group_size,
+                bits: bits.down(),
+            },
         )?;
         let [gate_w, gate_s, gate_b] = gate.map_or([None; 3], |t| t.map(Some));
 
@@ -225,6 +216,17 @@ impl AffineFusedMoEOps for AffineFusedMoELayer {
 /// `[E, n_out, k_in / div]` with the weight packed `bits` wide (the ceil(k·bits/32) law, exact:
 /// `k_in` is a multiple of the group size).
 ///
+/// One routed-expert projection's stack: its experts, each one's `[n_out, k_in]` extent, and the
+/// MLX-affine group width and bits its codes are packed at.
+#[derive(Clone, Copy)]
+struct ExpertProjection {
+    num_experts: usize,
+    n_out: usize,
+    k_in: usize,
+    group_size: u32,
+    bits: u32,
+}
+
 /// The projection `role` of a bank named `naming` (the bundle table's
 /// [`scratchy_tensors::bundle_roles::Layout::ExpertProj`]): its pre-stacked
 /// `{prefix}[.{infix}].{proj}.*` tensors are taken zero-copy, their shapes verified by
@@ -232,18 +234,20 @@ impl AffineFusedMoEOps for AffineFusedMoELayer {
 /// stack); without them, each expert's own `{prefix}.experts.{e}.{proj}.*` is stacked into one
 /// buffer per tensor. Experts are WEIGHTS: they go to the weight pool, not the wired activation
 /// arena (`alloc_uninit` once pinned mixtral's 23.62 GiB of experts as "scratch").
-#[allow(clippy::too_many_arguments)]
 fn load_expert_projection(
     gw: &mut crate::weights::GpuWeights,
     prefix: &str,
     naming: ExpertNaming,
     role: R,
-    num_experts: usize,
-    n_out: usize,
-    k_in: usize,
-    group_size: u32,
-    bits: u32,
+    proj: ExpertProjection,
 ) -> anyhow::Result<[crate::tensor::GpuTensor; 3]> {
+    let ExpertProjection {
+        num_experts,
+        n_out,
+        k_in,
+        group_size,
+        bits,
+    } = proj;
     use crate::dtype::DType;
     let proj = naming.proj(role).ok_or_else(|| {
         anyhow::anyhow!("affine MoE `{prefix}`: a {naming:?} bank holds no {role:?} projection")
@@ -400,10 +404,7 @@ pub trait SwitchGluExpertsOps {
     fn load(
         gw: &mut crate::weights::GpuWeights,
         prefix: &str,
-        num_experts: usize,
-        top_k: usize,
-        moe_intermediate_size: usize,
-        hidden_size: usize,
+        bank: ExpertBank,
         group_size: u32,
         bits: u32,
     ) -> anyhow::Result<Self>
@@ -416,17 +417,19 @@ impl SwitchGluExpertsOps for SwitchGluExpertsLayer {
     /// (= `...layers.N.experts.switch_glu`) through [`load_expert_projection`]
     /// with no stacked infix (the leaves are `{prefix}.{gate,up,down}_proj.*`).
     /// NO router gate is loaded.
-    #[allow(clippy::too_many_arguments)]
     fn load(
         gw: &mut crate::weights::GpuWeights,
         prefix: &str,
-        num_experts: usize,
-        top_k: usize,
-        moe_intermediate_size: usize,
-        hidden_size: usize,
+        bank: ExpertBank,
         group_size: u32,
         bits: u32,
     ) -> anyhow::Result<Self> {
+        let ExpertBank {
+            num_experts,
+            top_k,
+            intermediate_size: moe_intermediate_size,
+            hidden_size,
+        } = bank;
         anyhow::ensure!(
             bits == 4 || bits == 8,
             "SwitchGluExpertsLayer: only bits ∈ {{4, 8}} supported (got {bits})"
@@ -434,7 +437,19 @@ impl SwitchGluExpertsOps for SwitchGluExpertsLayer {
         let (n, inter, hidden) = (num_experts, moe_intermediate_size, hidden_size);
         let naming = ExpertNaming::SwitchGlu;
         let proj = |gw: &mut crate::weights::GpuWeights, role, n_out, k_in| {
-            load_expert_projection(gw, prefix, naming, role, n, n_out, k_in, group_size, bits)
+            load_expert_projection(
+                gw,
+                prefix,
+                naming,
+                role,
+                ExpertProjection {
+                    num_experts: n,
+                    n_out,
+                    k_in,
+                    group_size,
+                    bits,
+                },
+            )
         };
         let [expert_gate_w, expert_gate_scales, expert_gate_biases] =
             proj(gw, R::Gate, inter, hidden)?;
@@ -476,10 +491,7 @@ pub trait FusedMoEOps {
     fn load(
         gw: &mut crate::weights::GpuWeights,
         prefix: &str,
-        num_experts: usize,
-        top_k: usize,
-        intermediate_size: usize,
-        hidden_size: usize,
+        bank: ExpertBank,
         stream: crate::CUstream,
     ) -> anyhow::Result<Self>
     where
@@ -488,13 +500,8 @@ pub trait FusedMoEOps {
     fn load_affine(
         gw: &mut crate::weights::GpuWeights,
         prefix: &str,
-        num_experts: usize,
-        top_k: usize,
-        intermediate_size: usize,
-        hidden_size: usize,
-        group_size: u32,
-        bits: ExpertBits,
-        gate_bits: u32,
+        bank: ExpertBank,
+        quant: AffineExperts,
     ) -> anyhow::Result<Self>
     where
         Self: Sized;
@@ -509,14 +516,10 @@ impl FusedMoEOps for FusedMoELayer {
     /// 1-layer Mixtral test config) still satisfy macro expansion
     /// under `--features metal` — same surface the pre-§2 `bail!`
     /// stub provided.
-    #[allow(clippy::too_many_arguments)]
     fn load(
         _gw: &mut crate::weights::GpuWeights,
         _prefix: &str,
-        _num_experts: usize,
-        _top_k: usize,
-        _intermediate_size: usize,
-        _hidden_size: usize,
+        _bank: ExpertBank,
         _stream: crate::CUstream,
     ) -> anyhow::Result<Self> {
         anyhow::bail!(
@@ -529,28 +532,14 @@ impl FusedMoEOps for FusedMoELayer {
     /// (metal). The macro detects `StorageFormat::Affine` on the MoE
     /// source weights and emits this call site with `group_size` and
     /// `bits` baked in from the model's `quantization_config`.
-    #[allow(clippy::too_many_arguments)]
     fn load_affine(
         gw: &mut crate::weights::GpuWeights,
         prefix: &str,
-        num_experts: usize,
-        top_k: usize,
-        intermediate_size: usize,
-        hidden_size: usize,
-        group_size: u32,
-        bits: ExpertBits,
-        gate_bits: u32,
+        bank: ExpertBank,
+        quant: AffineExperts,
     ) -> anyhow::Result<Self> {
         Ok(Self::Affine(Box::new(AffineFusedMoELayer::load(
-            gw,
-            prefix,
-            num_experts,
-            top_k,
-            intermediate_size,
-            hidden_size,
-            group_size,
-            bits,
-            gate_bits,
+            gw, prefix, bank, quant,
         )?)))
     }
 }
@@ -563,14 +552,9 @@ pub trait AffineSharedFusedMoEOps {
     fn load(
         gw: &mut crate::weights::GpuWeights,
         prefix: &str,
-        num_experts: usize,
-        top_k: usize,
-        moe_intermediate_size: usize,
+        bank: ExpertBank,
         shared_expert_intermediate_size: usize,
-        hidden_size: usize,
-        group_size: u32,
-        bits: ExpertBits,
-        gate_bits: u32,
+        quant: AffineExperts,
     ) -> anyhow::Result<Self>
     where
         Self: Sized;
@@ -581,34 +565,25 @@ impl AffineSharedFusedMoEOps for AffineSharedFusedMoELayer {
     /// weights use HF's `gate_proj/up_proj/down_proj` naming; shared
     /// expert lives at `{prefix}.shared_expert.{gate,up,down}_proj`
     /// with a sigmoid gate at `{prefix}.shared_expert_gate.weight`.
-    #[allow(clippy::too_many_arguments)]
     fn load(
         gw: &mut crate::weights::GpuWeights,
         prefix: &str,
-        num_experts: usize,
-        top_k: usize,
-        moe_intermediate_size: usize,
+        bank: ExpertBank,
         shared_expert_intermediate_size: usize,
-        hidden_size: usize,
-        group_size: u32,
-        bits: ExpertBits,
-        gate_bits: u32,
+        quant: AffineExperts,
     ) -> anyhow::Result<Self> {
         use crate::dtype::DType;
         use crate::tensor::GpuTensor;
+        let hidden_size = bank.hidden_size;
+        let (group_size, bits) = (quant.group_size, quant.bits);
 
         // Qwen-MoE family always renormalizes (`norm_topk_prob = true`
         // is the family default; Qwen3-MoE configs make it explicit).
         let routed = AffineFusedMoELayer::load_with_naming(
             gw,
             prefix,
-            num_experts,
-            top_k,
-            moe_intermediate_size,
-            hidden_size,
-            group_size,
-            bits,
-            gate_bits,
+            bank,
+            quant,
             ExpertNaming::Qwen,
             true,
         )?;
@@ -792,14 +767,10 @@ impl AffineSharedFusedMoEOps for AffineSharedFusedMoELayer {
 
 /// Metal load extension trait on the neutral [`GptOssMoELayer`].
 pub trait GptOssMoEOps {
-    #[allow(clippy::too_many_arguments)]
     fn load(
         gw: &mut crate::weights::GpuWeights,
         prefix: &str,
-        num_experts: usize,
-        top_k: usize,
-        intermediate_size: usize,
-        hidden_size: usize,
+        bank: ExpertBank,
         group_size: u32,
         bits: u32,
         gate_bits: u32,
@@ -866,18 +837,20 @@ impl GptOssMoEOps for GptOssMoELayer {
     ///   biases, interleaved per expert (expert e's `inter` gate rows then
     ///   its `inter` up rows) into one `[E, 2·inter]` buffer;
     ///   `{prefix}.experts.down_proj.bias` → `[E, hidden]`.
-    #[allow(clippy::too_many_arguments)]
     fn load(
         gw: &mut crate::weights::GpuWeights,
         prefix: &str,
-        num_experts: usize,
-        top_k: usize,
-        intermediate_size: usize,
-        hidden_size: usize,
+        bank: ExpertBank,
         group_size: u32,
         bits: u32,
         gate_bits: u32,
     ) -> anyhow::Result<Self> {
+        let ExpertBank {
+            num_experts,
+            top_k,
+            intermediate_size,
+            hidden_size,
+        } = bank;
         use crate::dtype::DType;
 
         anyhow::ensure!(
@@ -938,7 +911,19 @@ impl GptOssMoEOps for GptOssMoELayer {
         let (n, inter, hidden) = (num_experts, intermediate_size, hidden_size);
         let naming = ExpertNaming::GptOss;
         let proj = |gw: &mut crate::weights::GpuWeights, role, n_out, k_in| {
-            load_expert_projection(gw, prefix, naming, role, n, n_out, k_in, group_size, bits)
+            load_expert_projection(
+                gw,
+                prefix,
+                naming,
+                role,
+                ExpertProjection {
+                    num_experts: n,
+                    n_out,
+                    k_in,
+                    group_size,
+                    bits,
+                },
+            )
         };
         let [expert_gate_w, expert_gate_scales, expert_gate_biases] =
             proj(gw, R::Gate, inter, hidden)?;
@@ -1027,11 +1012,8 @@ pub trait SharedFusedMoEOps {
     fn load(
         gw: &mut crate::weights::GpuWeights,
         prefix: &str,
-        num_experts: usize,
-        top_k: usize,
-        moe_intermediate_size: usize,
+        bank: ExpertBank,
         shared_expert_intermediate_size: usize,
-        hidden_size: usize,
         stream: crate::CUstream,
     ) -> anyhow::Result<Self>
     where
@@ -1040,14 +1022,9 @@ pub trait SharedFusedMoEOps {
     fn load_affine(
         gw: &mut crate::weights::GpuWeights,
         prefix: &str,
-        num_experts: usize,
-        top_k: usize,
-        moe_intermediate_size: usize,
+        bank: ExpertBank,
         shared_expert_intermediate_size: usize,
-        hidden_size: usize,
-        group_size: u32,
-        bits: ExpertBits,
-        gate_bits: u32,
+        quant: AffineExperts,
     ) -> anyhow::Result<Self>
     where
         Self: Sized;
@@ -1056,15 +1033,11 @@ pub trait SharedFusedMoEOps {
 impl SharedFusedMoEOps for SharedFusedMoELayer {
     /// Metal load stub — same rationale as
     /// [`FusedMoEOps::load`] (the metal Dense MoE branch).
-    #[allow(clippy::too_many_arguments)]
     fn load(
         _gw: &mut crate::weights::GpuWeights,
         _prefix: &str,
-        _num_experts: usize,
-        _top_k: usize,
-        _moe_intermediate_size: usize,
+        _bank: ExpertBank,
         _shared_expert_intermediate_size: usize,
-        _hidden_size: usize,
         _stream: crate::CUstream,
     ) -> anyhow::Result<Self> {
         anyhow::bail!(
@@ -1075,30 +1048,19 @@ impl SharedFusedMoEOps for SharedFusedMoELayer {
 
     /// Macro-emitted load entry for MLX-affine int4 Qwen-MoE
     /// checkpoints (metal).
-    #[allow(clippy::too_many_arguments)]
     fn load_affine(
         gw: &mut crate::weights::GpuWeights,
         prefix: &str,
-        num_experts: usize,
-        top_k: usize,
-        moe_intermediate_size: usize,
+        bank: ExpertBank,
         shared_expert_intermediate_size: usize,
-        hidden_size: usize,
-        group_size: u32,
-        bits: ExpertBits,
-        gate_bits: u32,
+        quant: AffineExperts,
     ) -> anyhow::Result<Self> {
         Ok(Self::Affine(Box::new(AffineSharedFusedMoELayer::load(
             gw,
             prefix,
-            num_experts,
-            top_k,
-            moe_intermediate_size,
+            bank,
             shared_expert_intermediate_size,
-            hidden_size,
-            group_size,
-            bits,
-            gate_bits,
+            quant,
         )?)))
     }
 }
@@ -1111,16 +1073,9 @@ pub trait DeepSeekV2MoEOps {
     fn load(
         gw: &mut crate::weights::GpuWeights,
         prefix: &str,
-        n_routed_experts: usize,
+        bank: ExpertBank,
         n_shared_experts: usize,
-        top_k: usize,
-        moe_intermediate_size: usize,
-        hidden_size: usize,
-        norm_topk_prob: bool,
-        routed_scaling_factor: f32,
-        use_sigmoid: bool,
-        n_expert_group: usize,
-        topk_group: usize,
+        routing: GroupedRouting,
         stream: crate::CUstream,
     ) -> anyhow::Result<Self>
     where
@@ -1129,20 +1084,12 @@ pub trait DeepSeekV2MoEOps {
 
 impl DeepSeekV2MoEOps for DeepSeekV2MoELayer {
     /// Metal stub — see [`FusedMoEOps::load`].
-    #[allow(clippy::too_many_arguments)]
     fn load(
         _gw: &mut crate::weights::GpuWeights,
         _prefix: &str,
-        _n_routed_experts: usize,
+        _bank: ExpertBank,
         _n_shared_experts: usize,
-        _top_k: usize,
-        _moe_intermediate_size: usize,
-        _hidden_size: usize,
-        _norm_topk_prob: bool,
-        _routed_scaling_factor: f32,
-        _use_sigmoid: bool,
-        _n_expert_group: usize,
-        _topk_group: usize,
+        _routing: GroupedRouting,
         _stream: crate::CUstream,
     ) -> anyhow::Result<Self> {
         anyhow::bail!(

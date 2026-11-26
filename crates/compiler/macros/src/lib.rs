@@ -68,7 +68,7 @@ mod typed_shapes;
 mod typed_shapes_tests;
 // ⭐ THE ONE PRODUCER OF THE MODEL'S WEIGHT ACCESSOR SET, for every target: one body, since
 // the target is a compile-time singleton — there is no second target in the build to
-// compromise for. Packing gate/up into a single `__fused__`
+// compromise for. Packing gate/up into a single `_fused_`
 // buffer is a target's kernel ABI, so it arrives as a bool argument rather than a second walk.
 pub mod weight_bindings;
 pub mod weight_vocab;
@@ -1067,18 +1067,20 @@ pub fn compile_carrier(
         };
 
         let (codegen_items, model_affine_rows) = codegen::emit_model(
-            &sm.prog,
-            sm.model,
-            &sm.fuf,
+            codegen::ModelEmitCx {
+                program: &sm.prog,
+                model: sm.model,
+                fuf: &sm.fuf,
+                manifest: &manifest,
+                tp_world_size: sm.tp_world_size,
+                emitter,
+            },
             &sm.workloads,
-            &manifest,
             sm.inferred,
             canonical_override.as_ref(),
-            sm.tp_world_size,
             mode.emit_arch_dispatch,
             canonical_affine_rows,
             dump_dir,
-            emitter,
         );
         if is_canonical {
             emitted_affine_rows.insert(sm.mod_name.clone(), model_affine_rows);
@@ -1602,7 +1604,6 @@ pub fn compile_carrier(
     let facade = emitter.facade();
     Ok(quote! {
         // The target's runtime crate, which the emitted code names its types through.
-        #[allow(unused_imports)]
         use #facade as __gpu;
 
         // Rebuild-on-change for every JSON the macro read.
@@ -1949,15 +1950,25 @@ fn emit_arch_dispatcher(
     })
 }
 
-/// PascalCase a snake_case ident while preserving underscores
-/// between segments (they're version separators in our model names).
+/// UpperCamelCase a snake_case ident, keeping the underscores between two digits (they're version
+/// separators in our model names).
 fn pascal_case(ident: &Ident) -> Ident {
     let s = ident.to_string();
+    let chars: Vec<char> = s.chars().collect();
     let mut out = String::with_capacity(s.len());
     let mut capitalize_next = true;
-    for c in s.chars() {
+    for (i, &c) in chars.iter().enumerate() {
         if c == '_' {
-            out.push('_');
+            // An underscore beside a letter goes (`parity_tiny` → `ParityTiny`, `glm_4` →
+            // `Glm4`); one between two digits stays, so `qwen3_5` and `qwen35` stay apart
+            // (`Qwen3_5`, `Qwen35`).
+            let digit = |j: Option<usize>| {
+                j.and_then(|j| chars.get(j))
+                    .is_some_and(char::is_ascii_digit)
+            };
+            if digit(i.checked_sub(1)) && digit(Some(i + 1)) {
+                out.push('_');
+            }
             capitalize_next = true;
         } else if capitalize_next {
             out.extend(c.to_uppercase());

@@ -6,14 +6,6 @@
 //! Provides Metal device management, shader compilation, and kernel dispatch
 //! primitives for Apple Silicon GPUs.
 
-// Kernel-launch / dispatch / record entry points pass the full set of
-// buffers, dims, scales, and offsets positionally — bundling them into
-// param structs would only obscure the 1:1 mapping to the MSL kernel
-// signatures, so `too_many_arguments` is expected here. Likewise the
-// CPU-reference helpers mirror those wide signatures. `type_complexity`
-// is allowed for the same shader-table lookup return tuples.
-#![allow(clippy::too_many_arguments, clippy::type_complexity)]
-
 /// Compile-time-generated kernel instantiation tables. The
 /// `STEEL_PAGED_HEAD_DIMS` slice and `steel_paged_symbol()` lookup
 /// in here are emitted by `build.rs` from the same head-dim list
@@ -289,6 +281,19 @@ pub mod device_metal;
 pub mod layers;
 pub mod layers_moe;
 pub mod layers_quant;
+/// Every weight-loading extension trait, for an emitted `load` to glob-import: the path-syntax
+/// `LinearLayer::load_dense_or_ggml(..)`, `RmsNorm::load(..)`, `FusedMoE::load(..)`, … calls it
+/// emits resolve through them.
+pub mod load_ops {
+    pub use crate::layers::{
+        EmbeddingOps as _, GatedDeltaNetOps as _, LayerNormOps as _, LinearLayerOps as _,
+        MetalAffineEmbedOps as _, MetalLinearLayerOps as _, RmsNormOps as _,
+    };
+    pub use crate::layers_moe::{
+        DeepSeekV2MoEOps as _, FusedMoEOps as _, Gemma4RouterOps as _, GptOssMoEOps as _,
+        SharedFusedMoEOps as _, SwitchGluExpertsOps as _,
+    };
+}
 // Per-accessor layered weight-load helpers the forward-compiler macro emits as
 // `crate::__gpu::load_layered_*`: the neutral ones re-shared from
 // scratchy-layers, the metal-divergent (RmsNorm keep-dtype, direct-write pack)

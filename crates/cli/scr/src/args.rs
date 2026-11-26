@@ -509,7 +509,6 @@ impl ServeArgs {
     ///
     /// Priority: positional `model_tag` > `--model` flag > VLLM_MODEL env var.
     /// Returns an error if none is specified.
-    #[cfg_attr(not(feature = "serve"), allow(dead_code))]
     pub fn resolved_model(&self) -> Result<String, String> {
         if let Some(ref tag) = self.model_tag {
             Ok(tag.clone())
@@ -612,7 +611,6 @@ pub struct ChatArgs {
 
 impl ChatArgs {
     /// Resolve the effective model path/ID (if any).
-    #[cfg_attr(not(feature = "chat"), allow(dead_code))]
     pub fn resolved_model(&self) -> Option<String> {
         self.model_tag.clone().or_else(|| self.model.clone())
     }
@@ -733,7 +731,6 @@ pub struct BatchArgs {
 
 impl BatchArgs {
     /// Resolve the effective model path/ID.
-    #[cfg_attr(not(any(feature = "chat", feature = "serve")), allow(dead_code))]
     pub fn resolved_model(&self) -> Result<String, String> {
         if let Some(ref tag) = self.model_tag {
             Ok(tag.clone())

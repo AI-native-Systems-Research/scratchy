@@ -13,7 +13,7 @@ use objc2_metal::{MTLBuffer as _, MTLSize};
 use scratchy_target_metal::aot::baked_build;
 use scratchy_target_metal::detect_device;
 use scratchy_target_metal::mtl4_dispatch::{
-    Buffer, Mtl4DispatchBatch, read_slice, shared_slice, shared_zeroed,
+    Buffer, Mtl4DispatchBatch, ThreadgroupGrid, read_slice, shared_slice, shared_zeroed,
 };
 use scratchy_target_metal::off_tape::VocabSuffix;
 use scratchy_target_metal::specialized_pipeline_cache::{
@@ -141,7 +141,17 @@ fn a_pass_past_the_prefix_picks_what_the_whole_vocabulary_picks() {
                 let (grid, threads) = qmv_dispatch_shape(kernel, m, n, 1);
                 let pso = build(&key);
                 let binds = [(&codes, 0), (&scales, 1), (&biases, 2), (&x, 3), (y, 4)];
-                batch.encode(&pso, &binds, &[], &[], &[], size(grid), size(threads));
+                batch.encode(
+                    &pso,
+                    &binds,
+                    &[],
+                    &[],
+                    &[],
+                    ThreadgroupGrid {
+                        threadgroups: size(grid),
+                        threads_per_threadgroup: size(threads),
+                    },
+                );
                 batch.barrier();
             };
             // The whole vocabulary: one matvec over every row, the argmax over each whole row.
@@ -165,8 +175,10 @@ fn a_pass_past_the_prefix_picks_what_the_whole_vocabulary_picks() {
                 &[(m, 2)],
                 &[],
                 &[],
-                one(m as usize),
-                one(1024),
+                ThreadgroupGrid {
+                    threadgroups: one(m as usize),
+                    threads_per_threadgroup: one(1024),
+                },
             );
             batch.commit(true);
             // The prefix's matvec, then the pass past it.

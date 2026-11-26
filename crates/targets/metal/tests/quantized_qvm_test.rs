@@ -20,6 +20,7 @@ mod common;
 
 use objc2_metal::MTLSize;
 use scratchy_target_metal::aot::baked_pipeline;
+use scratchy_target_metal::cpu_reference::AffineMatmul;
 use scratchy_target_metal::cpu_reference::affine_qvm_b4_bf16 as cpu_qvm_bf16;
 use scratchy_target_metal::device::detect_device;
 use scratchy_target_metal::quantized::{
@@ -88,18 +89,21 @@ fn make_inputs_bf16(
 /// threads come from `qvm_dispatch_shape`.
 ///
 /// Returns `None` if the host has no MTL4 queue (caller skips).
-#[allow(clippy::too_many_arguments)]
 fn run_qvm_bf16(
-    packed: &[u8],
-    scales: &[half::f16],
-    biases: &[half::f16],
-    x: &[half::bf16],
-    m: usize,
-    n: usize,
-    k: usize,
-    group_size: u32,
+    mm: AffineMatmul<'_, half::bf16, half::f16>,
     expected_kernel: QvmKernel,
 ) -> Option<Vec<half::bf16>> {
+    let AffineMatmul {
+        packed,
+        scales,
+        biases,
+        x,
+        m,
+        n,
+        k,
+        group_size,
+    } = mm;
+    let group_size = group_size as u32;
     let device = detect_device()?.device;
 
     let packed_buf = common::shared_slice(&device, packed);
@@ -233,16 +237,27 @@ fn affine_qvm_b4_bf16_standard_k_small_matches_cpu_reference() {
 
     let (packed, scales, biases, x) =
         make_inputs_bf16(0xD1D1_u64 ^ group_size as u64, n, k, m, group_size);
-    let expected = cpu_qvm_bf16(&packed, &scales, &biases, &x, m, n, k, group_size);
-    let Some(metal) = run_qvm_bf16(
-        &packed,
-        &scales,
-        &biases,
-        &x,
+    let expected = cpu_qvm_bf16(AffineMatmul {
+        packed: &packed,
+        scales: &scales,
+        biases: &biases,
+        x: &x,
         m,
         n,
         k,
-        group_size as u32,
+        group_size,
+    });
+    let Some(metal) = run_qvm_bf16(
+        AffineMatmul {
+            packed: &packed,
+            scales: &scales,
+            biases: &biases,
+            x: &x,
+            m,
+            n,
+            k,
+            group_size,
+        },
         expected_kernel,
     ) else {
         return;
@@ -276,16 +291,27 @@ fn affine_qvm_b4_bf16_split_k8_k_2048_matches_cpu_reference() {
 
     let (packed, scales, biases, x) =
         make_inputs_bf16(0xD2D2_u64 ^ group_size as u64, n, k, m, group_size);
-    let expected = cpu_qvm_bf16(&packed, &scales, &biases, &x, m, n, k, group_size);
-    let Some(metal) = run_qvm_bf16(
-        &packed,
-        &scales,
-        &biases,
-        &x,
+    let expected = cpu_qvm_bf16(AffineMatmul {
+        packed: &packed,
+        scales: &scales,
+        biases: &biases,
+        x: &x,
         m,
         n,
         k,
-        group_size as u32,
+        group_size,
+    });
+    let Some(metal) = run_qvm_bf16(
+        AffineMatmul {
+            packed: &packed,
+            scales: &scales,
+            biases: &biases,
+            x: &x,
+            m,
+            n,
+            k,
+            group_size,
+        },
         expected_kernel,
     ) else {
         return;
@@ -319,16 +345,27 @@ fn affine_qvm_b4_bf16_split_k8_k_8192_matches_cpu_reference() {
 
     let (packed, scales, biases, x) =
         make_inputs_bf16(0xD3D3_u64 ^ group_size as u64, n, k, m, group_size);
-    let expected = cpu_qvm_bf16(&packed, &scales, &biases, &x, m, n, k, group_size);
-    let Some(metal) = run_qvm_bf16(
-        &packed,
-        &scales,
-        &biases,
-        &x,
+    let expected = cpu_qvm_bf16(AffineMatmul {
+        packed: &packed,
+        scales: &scales,
+        biases: &biases,
+        x: &x,
         m,
         n,
         k,
-        group_size as u32,
+        group_size,
+    });
+    let Some(metal) = run_qvm_bf16(
+        AffineMatmul {
+            packed: &packed,
+            scales: &scales,
+            biases: &biases,
+            x: &x,
+            m,
+            n,
+            k,
+            group_size,
+        },
         expected_kernel,
     ) else {
         return;
@@ -363,16 +400,27 @@ fn affine_qvm_b4_bf16_split_k32_k_16384_matches_cpu_reference() {
 
     let (packed, scales, biases, x) =
         make_inputs_bf16(0xD4D4_u64 ^ group_size as u64, n, k, m, group_size);
-    let expected = cpu_qvm_bf16(&packed, &scales, &biases, &x, m, n, k, group_size);
-    let Some(metal) = run_qvm_bf16(
-        &packed,
-        &scales,
-        &biases,
-        &x,
+    let expected = cpu_qvm_bf16(AffineMatmul {
+        packed: &packed,
+        scales: &scales,
+        biases: &biases,
+        x: &x,
         m,
         n,
         k,
-        group_size as u32,
+        group_size,
+    });
+    let Some(metal) = run_qvm_bf16(
+        AffineMatmul {
+            packed: &packed,
+            scales: &scales,
+            biases: &biases,
+            x: &x,
+            m,
+            n,
+            k,
+            group_size,
+        },
         expected_kernel,
     ) else {
         return;
@@ -404,16 +452,27 @@ fn affine_qvm_b4_bf16_standard_m_2_matches_cpu_reference() {
 
     let (packed, scales, biases, x) =
         make_inputs_bf16(0xD5D5_u64 ^ group_size as u64, n, k, m, group_size);
-    let expected = cpu_qvm_bf16(&packed, &scales, &biases, &x, m, n, k, group_size);
-    let Some(metal) = run_qvm_bf16(
-        &packed,
-        &scales,
-        &biases,
-        &x,
+    let expected = cpu_qvm_bf16(AffineMatmul {
+        packed: &packed,
+        scales: &scales,
+        biases: &biases,
+        x: &x,
         m,
         n,
         k,
-        group_size as u32,
+        group_size,
+    });
+    let Some(metal) = run_qvm_bf16(
+        AffineMatmul {
+            packed: &packed,
+            scales: &scales,
+            biases: &biases,
+            x: &x,
+            m,
+            n,
+            k,
+            group_size,
+        },
         expected_kernel,
     ) else {
         return;

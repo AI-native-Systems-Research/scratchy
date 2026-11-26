@@ -17,7 +17,7 @@ use half::{bf16, f16};
 use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions, MTLSize};
 use scratchy_target_metal::aot::baked_build;
 use scratchy_target_metal::detect_device;
-use scratchy_target_metal::mtl4_dispatch::Mtl4DispatchBatch;
+use scratchy_target_metal::mtl4_dispatch::{Mtl4DispatchBatch, ThreadgroupGrid};
 use scratchy_target_metal::specialized_pipeline_cache::{
     ComputePipelineState, PipelineKey, SpecializedPipelineCache,
 };
@@ -296,14 +296,34 @@ fn run(r: &Rig, c: &Case, i: &Inputs, fused: bool) -> [Vec<u16>; 3] {
             (&g[2], 9),
             (&s, 15),
         ];
-        batch.encode(&r.program, &binds, &[], &[], &[], rows, threads);
+        batch.encode(
+            &r.program,
+            &binds,
+            &[],
+            &[],
+            &[],
+            ThreadgroupGrid {
+                threadgroups: rows,
+                threads_per_threadgroup: threads,
+            },
+        );
         out
     } else {
         // The residual adds into its own row, as the unfused tape's does.
         let (y, res, sum) = (buf(&zeros), buf(&i.x[2]), buf(&zeros));
         let (normed, weighted) = (buf(&zeros), buf(&zeros));
         let mut step = |pso, binds: &[(&Buffer, usize)], grid, t| {
-            batch.encode(pso, binds, &[], &[], &[], grid, t);
+            batch.encode(
+                pso,
+                binds,
+                &[],
+                &[],
+                &[],
+                ThreadgroupGrid {
+                    threadgroups: grid,
+                    threads_per_threadgroup: t,
+                },
+            );
             batch.barrier();
         };
         let (each, per) = (size((n / 256, 1, 1)), size((256, 1, 1)));

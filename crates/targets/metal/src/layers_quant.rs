@@ -13,7 +13,7 @@
 use anyhow::Result;
 use scratchy_layers::{Embedding, Linear, LinearLayer};
 use scratchy_quantizations::{
-    AffineQuantEmbedding, AffineQuantLinear, Nvfp4Linear, affine_dequant_b4_to_dtype,
+    AffineQuantEmbedding, AffineQuantLinear, AffineWeight, Nvfp4Linear, affine_dequant_b4_to_dtype,
 };
 use scratchy_tensors::{DType, GpuTensor, WeightSource};
 
@@ -121,7 +121,17 @@ fn affine_dequant_b4_bytes<W: WeightSource + ?Sized>(
     );
 
     let out_bytes = affine_dequant_b4_to_dtype(
-        &w_bytes, &s_bytes, &b_bytes, n, k, group_size, bits, s_dtype, dtype_out,
+        AffineWeight {
+            weight_bytes: &w_bytes,
+            scales_bytes: &s_bytes,
+            biases_bytes: &b_bytes,
+            n,
+            k,
+            group_size,
+            bits,
+            scale_dtype: s_dtype,
+        },
+        dtype_out,
     )?;
     Ok((out_bytes, n, k))
 }

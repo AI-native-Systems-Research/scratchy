@@ -6,6 +6,7 @@
 // test modules that currently fail to compile after the objc2-metal
 // migration. Integration tests bypass that scope.
 
+use scratchy_target_metal::cpu_reference::AffineMatmul;
 use scratchy_target_metal::cpu_reference::{
     affine_dequantize_b4_bf16, affine_dequantize_b4_f16, affine_qmm_n_b4_bf16,
     affine_qmm_t_b4_bf16, affine_qmm_t_b4_f16, affine_qmv_b4_f16, affine_qvm_b4_bf16,
@@ -67,7 +68,16 @@ fn qmm_t_b4_bf16_all_ones_matches_row_sum() {
     let x: Vec<half::bf16> = (0..(m * k))
         .map(|i| half::bf16::from_f32(i as f32))
         .collect();
-    let y = affine_qmm_t_b4_bf16(&packed, &scales, &biases, &x, m, n, k, gs);
+    let y = affine_qmm_t_b4_bf16(AffineMatmul {
+        packed: &packed,
+        scales: &scales,
+        biases: &biases,
+        x: &x,
+        m,
+        n,
+        k,
+        group_size: gs,
+    });
     for i in 0..m {
         let row_sum: f32 = (0..k).map(|kk| (i * k + kk) as f32).sum();
         for j in 0..n {
@@ -94,7 +104,16 @@ fn qmm_n_b4_bf16_all_ones_matches_row_sum() {
     let x: Vec<half::bf16> = (0..(m * k))
         .map(|i| half::bf16::from_f32(i as f32))
         .collect();
-    let y = affine_qmm_n_b4_bf16(&packed, &scales, &biases, &x, m, n, k, gs);
+    let y = affine_qmm_n_b4_bf16(AffineMatmul {
+        packed: &packed,
+        scales: &scales,
+        biases: &biases,
+        x: &x,
+        m,
+        n,
+        k,
+        group_size: gs,
+    });
     for i in 0..m {
         let row_sum: f32 = (0..k).map(|kk| (i * k + kk) as f32).sum();
         for j in 0..n {
@@ -123,8 +142,26 @@ fn qmv_alias_matches_qmm_t() {
     let x: Vec<half::f16> = (0..(m * k))
         .map(|i| half::f16::from_f32((i as f32) * 0.1))
         .collect();
-    let a = affine_qmm_t_b4_f16(&packed, &scales, &biases, &x, m, n, k, gs);
-    let b = affine_qmv_b4_f16(&packed, &scales, &biases, &x, m, n, k, gs);
+    let a = affine_qmm_t_b4_f16(AffineMatmul {
+        packed: &packed,
+        scales: &scales,
+        biases: &biases,
+        x: &x,
+        m,
+        n,
+        k,
+        group_size: gs,
+    });
+    let b = affine_qmv_b4_f16(AffineMatmul {
+        packed: &packed,
+        scales: &scales,
+        biases: &biases,
+        x: &x,
+        m,
+        n,
+        k,
+        group_size: gs,
+    });
     assert_eq!(a, b);
 }
 
@@ -145,7 +182,25 @@ fn qvm_alias_matches_qmm_n() {
     let x: Vec<half::bf16> = (0..(m * k))
         .map(|i| half::bf16::from_f32((i as f32) * 0.1))
         .collect();
-    let a = affine_qmm_n_b4_bf16(&packed, &scales, &biases, &x, m, n, k, gs);
-    let b = affine_qvm_b4_bf16(&packed, &scales, &biases, &x, m, n, k, gs);
+    let a = affine_qmm_n_b4_bf16(AffineMatmul {
+        packed: &packed,
+        scales: &scales,
+        biases: &biases,
+        x: &x,
+        m,
+        n,
+        k,
+        group_size: gs,
+    });
+    let b = affine_qvm_b4_bf16(AffineMatmul {
+        packed: &packed,
+        scales: &scales,
+        biases: &biases,
+        x: &x,
+        m,
+        n,
+        k,
+        group_size: gs,
+    });
     assert_eq!(a, b);
 }

@@ -294,7 +294,7 @@ pub fn slot(ix: SourceIx) -> proc_macro2::Ident {
 /// How a preset binds a gated MLP's gate and up projections.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MlpForm {
-    /// ONE packed `__fused__` buffer, read by the fused gate/up kernel (dense).
+    /// ONE packed `_fused_` buffer, read by the fused gate/up kernel (dense).
     Packed,
     /// Two projections, then the activation-multiply (affine quant).
     Split,

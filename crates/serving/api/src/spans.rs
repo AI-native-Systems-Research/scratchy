@@ -29,14 +29,6 @@ pub(crate) struct SpanConfig {
 }
 
 impl SpanConfig {
-    #[allow(dead_code)]
-    pub(crate) fn with_pad_token(block_size: usize, pad_token: u32) -> Self {
-        Self {
-            pad_token: Some(pad_token),
-            block_size,
-        }
-    }
-
     /// Resolve pad token from `VLLM_V1_SPANS_PAD_TOKEN` env var, falling back
     /// to the tokenizer's encoding of `" "` (whitespace), then 0.
     ///
@@ -578,17 +570,23 @@ fn timed_generate(
     Ok(crate::llm::QueryOutput { steps })
 }
 
-#[allow(clippy::too_many_arguments)]
+/// What tokenizing a span query reads: the tokenizer, the chat template, the
+/// span settings and the KV block size spans align to.
+#[derive(Clone, Copy)]
+pub(crate) struct SpanTokenizing<'a> {
+    pub(crate) tokenizer: &'a Arc<Tokenizer>,
+    pub(crate) template: &'a crate::chat_template::ChatTemplate,
+    pub(crate) cfg: &'a SpanConfig,
+    pub(crate) block_size: usize,
+}
+
 pub(crate) fn execute_spnl_query_sync(
     spnl_json: &str,
     params: Option<scratchy_core_common::SamplingParams>,
     seal: bool,
     volatile: bool,
     #[cfg(feature = "rag")] aug_options: &crate::augment::AugmentOptions,
-    tokenizer: &Arc<Tokenizer>,
-    template: &crate::chat_template::ChatTemplate,
-    cfg: &SpanConfig,
-    block_size: usize,
+    tokenizing: SpanTokenizing<'_>,
     mut generate: impl FnMut(
         &[crate::llm::Prompt],
         Option<scratchy_core_common::SamplingParams>,
@@ -596,6 +594,12 @@ pub(crate) fn execute_spnl_query_sync(
         bool,
     ) -> anyhow::Result<Vec<crate::llm::RequestOutput>>,
 ) -> anyhow::Result<crate::llm::QueryOutput> {
+    let SpanTokenizing {
+        tokenizer,
+        template,
+        cfg,
+        block_size,
+    } = tokenizing;
     use spnl_core::optimizer::llo::llir::{Bulk, Repeat, SingleGenerateQuery};
 
     // Try full SpnlQuery first (supports nested generates).
@@ -618,17 +622,7 @@ pub(crate) fn execute_spnl_query_sync(
                 .map_err(|e| anyhow::anyhow!("RAG indexing failed: {e}"))?;
             rt.block_on(optimize_augments(&query, aug_options))?
         };
-        return dispatch_spnl_query_sync(
-            &query,
-            params,
-            seal,
-            volatile,
-            tokenizer,
-            template,
-            cfg,
-            block_size,
-            &mut generate,
-        );
+        return dispatch_spnl_query_sync(&query, params, seal, volatile, tokenizing, &mut generate);
     }
 
     // Fallback: parse as SingleGenerateQuery for backward compatibility.
@@ -674,16 +668,12 @@ pub(crate) fn execute_spnl_query_sync(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn dispatch_spnl_query_sync(
     query: &SpnlQuery,
     params: Option<scratchy_core_common::SamplingParams>,
     seal: bool,
     volatile: bool,
-    tokenizer: &Arc<Tokenizer>,
-    template: &crate::chat_template::ChatTemplate,
-    cfg: &SpanConfig,
-    block_size: usize,
+    tokenizing: SpanTokenizing<'_>,
     generate: &mut impl FnMut(
         &[crate::llm::Prompt],
         Option<scratchy_core_common::SamplingParams>,
@@ -691,10 +681,16 @@ fn dispatch_spnl_query_sync(
         bool,
     ) -> anyhow::Result<Vec<crate::llm::RequestOutput>>,
 ) -> anyhow::Result<crate::llm::QueryOutput> {
+    let SpanTokenizing {
+        tokenizer,
+        template,
+        cfg,
+        block_size,
+    } = tokenizing;
     match query {
-        SpnlQuery::Generate(g) if has_nested_generates(&g.input) => execute_nested_generate_sync(
-            g, params, seal, volatile, tokenizer, template, cfg, block_size, generate,
-        ),
+        SpnlQuery::Generate(g) if has_nested_generates(&g.input) => {
+            execute_nested_generate_sync(g, params, seal, volatile, tokenizing, generate)
+        }
         SpnlQuery::Generate(g) => {
             let spec = outer_generate_to_single(g);
             let span_tok = tokenize_span_query(&spec, tokenizer, template, cfg)
@@ -707,9 +703,7 @@ fn dispatch_spnl_query_sync(
         SpnlQuery::Seq(children) => {
             let mut last = crate::llm::QueryOutput { steps: Vec::new() };
             for child in children {
-                last = dispatch_spnl_query_sync(
-                    child, None, seal, volatile, tokenizer, template, cfg, block_size, generate,
-                )?;
+                last = dispatch_spnl_query_sync(child, None, seal, volatile, tokenizing, generate)?;
             }
             Ok(last)
         }
@@ -750,16 +744,12 @@ fn dispatch_spnl_query_sync(
 
 /// Sync nested generate: execute inner generates, build outer prompt, execute outer.
 /// Uses raw token IDs from `RequestOutput` directly — no text round-tripping needed.
-#[allow(clippy::too_many_arguments)]
 fn execute_nested_generate_sync(
     outer_g: &Generate,
     params: Option<scratchy_core_common::SamplingParams>,
     seal: bool,
     volatile: bool,
-    tokenizer: &Arc<Tokenizer>,
-    template: &crate::chat_template::ChatTemplate,
-    cfg: &SpanConfig,
-    block_size: usize,
+    tokenizing: SpanTokenizing<'_>,
     generate: &mut impl FnMut(
         &[crate::llm::Prompt],
         Option<scratchy_core_common::SamplingParams>,
@@ -767,6 +757,12 @@ fn execute_nested_generate_sync(
         bool,
     ) -> anyhow::Result<Vec<crate::llm::RequestOutput>>,
 ) -> anyhow::Result<crate::llm::QueryOutput> {
+    let SpanTokenizing {
+        tokenizer,
+        template,
+        cfg,
+        block_size,
+    } = tokenizing;
     let mut inner_gens: Vec<&Generate> = Vec::new();
     collect_generates(&outer_g.input, &mut inner_gens);
 

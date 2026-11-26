@@ -9,7 +9,7 @@ use half::bf16;
 use objc2_metal::{MTLBuffer as _, MTLSize};
 use scratchy_target_metal::aot::baked_build;
 use scratchy_target_metal::detect_device;
-use scratchy_target_metal::mtl4_dispatch::{Mtl4DispatchBatch, shared_slice};
+use scratchy_target_metal::mtl4_dispatch::{Mtl4DispatchBatch, ThreadgroupGrid, shared_slice};
 use scratchy_target_metal::specialized_pipeline_cache::{
     ConstantValue, PipelineKey, SpecializedPipelineCache,
 };
@@ -104,15 +104,17 @@ fn every_live_row_is_written_past_32k_padded_rows() {
             &[],
             &[],
             &[],
-            MTLSize {
-                width: n / 64,
-                height: m.div_ceil(64),
-                depth: 1,
-            },
-            MTLSize {
-                width: tx as usize,
-                height: ty as usize,
-                depth: tz as usize,
+            ThreadgroupGrid {
+                threadgroups: MTLSize {
+                    width: n / 64,
+                    height: m.div_ceil(64),
+                    depth: 1,
+                },
+                threads_per_threadgroup: MTLSize {
+                    width: tx as usize,
+                    height: ty as usize,
+                    depth: tz as usize,
+                },
             },
         );
         batch.commit(true);

@@ -40,12 +40,12 @@ use scratchy_subtile::subtile_ir::{EwKind, SubOp};
 /// operand order changes still resolves the same tensor.
 /// How the target's kernels want an MLP's gate and up projections stored.
 ///
-/// ⛔ NOT A `bool`. It decides the NAME of an emitted field, and the emitted load body recovers
-/// that field's sources by splitting the name on `__fused__` — so the wrong answer is not a
-/// wrong flag, it is a field that resolves to no safetensors key.
+/// ⛔ NOT A `bool`. It decides the NAME of an emitted field, which a target's tape names its
+/// packed weight site by too — so the wrong answer is not a wrong flag, it is a field no tape
+/// site reads.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum MlpPacking {
-    /// ONE buffer holding both, named `{gate}__fused__{up}` — a fused-MLP kernel reads a
+    /// ONE buffer holding both, named `{gate}_fused_{up}` — a fused-MLP kernel reads a
     /// single packed weight.
     Packed,
     /// Two weights: an MLP of two matmuls plus a `SiluMul`, with no packed-buffer kernel.
@@ -80,16 +80,16 @@ pub struct WeightAbi {
     pub embed: EmbedStorage,
 }
 
-/// The accessor BASE of a weight: its path joined. Its layer is its unroll index's alone, appended
-/// downstream; a path ending in a numeral (Qwen2-VL's `merger.mlp.0`, `merger.mlp.2`) is its own
-/// base. This is a target bridge's `base` exactly — two spellings of one base is what this file
-/// exists to prevent.
+/// The accessor BASE of a weight: its path joined, in snake case (a checkpoint's `attn.Wo` is
+/// `attn_wo`). Its layer is its unroll index's alone, appended downstream; a path ending in a
+/// numeral (Qwen2-VL's `merger.mlp.0`, `merger.mlp.2`) is its own base. This is a target bridge's
+/// `base` exactly — two spellings of one base is what this file exists to prevent.
 fn accessor_base(program: &Program, id: WeightId) -> String {
-    program.weights.path(id).join("_")
+    program.weights.path(id).join("_").to_ascii_lowercase()
 }
 
-/// The field name of a gate/up pair PACKED INTO ONE weight: `{gate}__fused__{up}` plus the
-/// layer, which is the spelling the load body inverts by splitting on `__fused__`.
+/// The field name of a gate/up pair PACKED INTO ONE weight: `{gate}_fused_{up}` plus the
+/// layer, which is the spelling a target's tape names the packed site by.
 fn fused_field_name(
     program: &Program,
     gate: WeightId,
@@ -97,7 +97,7 @@ fn fused_field_name(
     index: Option<UnrollIndex>,
 ) -> syn::Ident {
     let base = format!(
-        "{}__fused__{}",
+        "{}_fused_{}",
         accessor_base(program, gate),
         accessor_base(program, up)
     );
@@ -505,9 +505,8 @@ mod tests {
     /// weights. That is a target-ABI fact, so it is an ARGUMENT — and this pins both answers from
     /// one walk, which is the whole reason a target's inline producer could be deleted.
     ///
-    /// The packed name is load-bearing, not cosmetic: the emitted load body recovers the
-    /// sources by splitting it on `__fused__`, so a different spelling is a field that resolves
-    /// to no safetensors key.
+    /// The packed name is load-bearing, not cosmetic: a target's tape names the packed site by
+    /// it, so a different spelling is a field no tape site reads.
     #[test]
     fn packing_gate_up_is_one_field_named_for_both_and_unpacking_is_two() {
         let program = program_with(&[&["mlp", "gate_proj"], &["mlp", "up_proj"]]);
@@ -527,7 +526,7 @@ mod tests {
             .map(|a| a.name.to_string())
             .collect();
         assert!(
-            names.contains(&"mlp_gate_proj__fused__mlp_up_proj".to_string()),
+            names.contains(&"mlp_gate_proj_fused_mlp_up_proj".to_string()),
             "packed pair must be ONE field named for both halves, got {names:?}"
         );
         assert!(
@@ -537,7 +536,7 @@ mod tests {
         let fused = packed
             .accessors
             .iter()
-            .find(|a| a.name.to_string().contains("__fused__"))
+            .find(|a| a.name.to_string().contains("_fused_"))
             .expect("fused accessor");
         assert_eq!(
             fused.source_weights,
@@ -564,7 +563,7 @@ mod tests {
             "unpacked must be two fields, got {split_names:?}"
         );
         assert!(
-            !split_names.iter().any(|n| n.contains("__fused__")),
+            !split_names.iter().any(|n| n.contains("_fused_")),
             "unpacked must name no packed buffer: {split_names:?}"
         );
     }

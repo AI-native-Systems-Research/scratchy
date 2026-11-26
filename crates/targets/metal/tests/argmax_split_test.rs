@@ -11,7 +11,7 @@ use objc2_metal::MTLSize;
 use scratchy_target_metal::aot::baked_build;
 use scratchy_target_metal::detect_device;
 use scratchy_target_metal::mtl4_dispatch::{
-    Mtl4DispatchBatch, read_slice, shared_slice, shared_zeroed,
+    Mtl4DispatchBatch, ThreadgroupGrid, read_slice, shared_slice, shared_zeroed,
 };
 use scratchy_target_metal::specialized_pipeline_cache::{
     ConstantValue, PipelineKey, SpecializedPipelineCache,
@@ -102,7 +102,17 @@ fn run(rows: &[Vec<f32>], prefix: Option<usize>) -> Option<Vec<u32>> {
     if let Some(suffix) = inputs.get(1) {
         binds.push((suffix, 3));
     }
-    b.encode(&pso, &binds, &[(batch as u32, 2)], &[], &[], grid, threads);
+    b.encode(
+        &pso,
+        &binds,
+        &[(batch as u32, 2)],
+        &[],
+        &[],
+        ThreadgroupGrid {
+            threadgroups: grid,
+            threads_per_threadgroup: threads,
+        },
+    );
     b.commit(true);
     Some(read_slice(&out, batch))
 }

@@ -24,6 +24,7 @@ use scratchy_state_decoder_gdn::reference::{
     GatingInputs, gdn_causal_conv1d, gdn_gating, gdn_rms_norm_gated,
 };
 use scratchy_target_metal::aot::{bake, baked_build};
+use scratchy_target_metal::cpu_golden::QkvRows;
 use scratchy_target_metal::detect_device;
 use scratchy_target_metal::gdn_state::GDN_SSM_STATE_DTYPE;
 use scratchy_target_metal::specialized_pipeline_cache::{
@@ -143,26 +144,56 @@ fn buf_u32(device: &Device, data: &[u32]) -> Buffer {
     buf
 }
 
+/// The GDN head geometry: key heads, value heads, and each one's width.
+#[derive(Clone, Copy)]
+struct GdnHeads {
+    nk: usize,
+    nv: usize,
+    hk: usize,
+    hv: usize,
+}
+
+/// The per-token gates, `[T, nv]` each: the decay's log `g` and the update `beta`.
+#[derive(Clone, Copy)]
+struct Gates<'a> {
+    g: &'a [f32],
+    beta: &'a [f32],
+}
+
+/// A scan's inputs: the conv output (`[q:key_dim|k:key_dim|v:value_dim]` rows) and the gates.
+#[derive(Clone, Copy)]
+struct ScanInputs<'a> {
+    conv_out: &'a [f32],
+    g: &'a [f32],
+    beta: &'a [f32],
+}
+
+/// A varlen batch's sequences: their cumulative token offsets, state slots and fresh flags, and the
+/// batch's tokens.
+#[derive(Clone, Copy)]
+struct Varlen<'a> {
+    cu: &'a [i32],
+    si: &'a [GdnSeqSlots],
+    fresh: &'a [u32],
+    num_tokens: usize,
+}
+
 /// CPU reference mirroring `reference::gdn_recurrent` (single sequence, zero
 /// initial state). q/k: [T, nk*hk]; v/o: [T, nv*hv]; g/beta: [T, nv].
 /// `slot_after_rows` names the rows whose end is a step boundary the state crosses through the
 /// pool's f16 slot — a store, then the next step's load — so the reference rounds its state
 /// through f16 there, as the state the kernel carries on.
-#[allow(clippy::too_many_arguments)]
 fn recurrent_ref(
-    q: &[f32],
-    k: &[f32],
-    v: &[f32],
-    g: &[f32],
-    beta: &[f32],
-    nk: usize,
-    nv: usize,
-    hk: usize,
-    hv: usize,
+    qkv: QkvRows<'_>,
+    gates: Gates<'_>,
+    heads: GdnHeads,
     t: usize,
     scale: f32,
     slot_after_rows: &[usize],
 ) -> Vec<f32> {
+    let QkvRows { q, k, v } = qkv;
+    let Gates { g, beta } = gates;
+    let GdnHeads { nk, nv, hk, hv } = heads;
     let key_dim = nk * hk;
     let value_dim = nv * hv;
     let groups = nv / nk;
@@ -237,24 +268,23 @@ fn split_conv(
 /// Dispatch `gdn_scan_varlen_f32` for one varlen batch; returns `o` [T, value_dim].
 /// `state_buf` is mutated in place (shared across calls for continuity tests); so is a drafting
 /// model's `(drafts, lanes)` buffer of draft lanes (buffer 9).
-#[allow(clippy::too_many_arguments)]
 fn dispatch_scan(
     device: &Device,
     cache: &SpecializedPipelineCache,
-    conv_out: &[f32],
-    g: &[f32],
-    beta: &[f32],
+    inputs: ScanInputs<'_>,
     state_buf: &Buffer,
-    cu: &[i32],
-    si: &[GdnSeqSlots],
-    fresh: &[u32],
-    nk: usize,
-    nv: usize,
-    hk: usize,
-    hv: usize,
-    num_tokens: usize,
+    seqs: Varlen<'_>,
+    heads: GdnHeads,
     drafts: Option<(u8, &Buffer)>,
 ) -> Option<Vec<f32>> {
+    let ScanInputs { conv_out, g, beta } = inputs;
+    let Varlen {
+        cu,
+        si,
+        fresh,
+        num_tokens,
+    } = seqs;
+    let GdnHeads { nk, nv, hk, hv } = heads;
     let value_dim = nv * hv;
     let scale = (hk as f32).powf(-0.5);
     let key = PipelineKey::new(
@@ -903,24 +933,36 @@ fn gdn_scan_varlen_matches_reference() {
     let g = fill(t * nv);
     let beta = fill(t * nv);
     let (q, k, v) = split_conv(&conv_out, nk, nv, hk, hv, t);
-    let o_ref = recurrent_ref(&q, &k, &v, &g, &beta, nk, nv, hk, hv, t, scale, &[]);
+    let o_ref = recurrent_ref(
+        QkvRows {
+            q: &q,
+            k: &k,
+            v: &v,
+        },
+        Gates { g: &g, beta: &beta },
+        GdnHeads { nk, nv, hk, hv },
+        t,
+        scale,
+        &[],
+    );
 
     let state_buf = buf_zero_ssm(&device, nv * hv * hk); // 1 slot
     let Some(o) = dispatch_scan(
         &device,
         &cache,
-        &conv_out,
-        &g,
-        &beta,
+        ScanInputs {
+            conv_out: &conv_out,
+            g: &g,
+            beta: &beta,
+        },
         &state_buf,
-        &[0, t as i32],
-        &[GdnSeqSlots::plain(GdnSlot::new(0))],
-        &[1],
-        nk,
-        nv,
-        hk,
-        hv,
-        t,
+        Varlen {
+            cu: &[0, t as i32],
+            si: &[GdnSeqSlots::plain(GdnSlot::new(0))],
+            fresh: &[1],
+            num_tokens: t,
+        },
+        GdnHeads { nk, nv, hk, hv },
         None,
     ) else {
         return;
@@ -958,24 +1000,36 @@ fn gdn_scan_varlen_production_head_dim() {
     let g = fill(t * nv);
     let beta = fill(t * nv);
     let (q, k, v) = split_conv(&conv_out, nk, nv, hk, hv, t);
-    let o_ref = recurrent_ref(&q, &k, &v, &g, &beta, nk, nv, hk, hv, t, scale, &[]);
+    let o_ref = recurrent_ref(
+        QkvRows {
+            q: &q,
+            k: &k,
+            v: &v,
+        },
+        Gates { g: &g, beta: &beta },
+        GdnHeads { nk, nv, hk, hv },
+        t,
+        scale,
+        &[],
+    );
 
     let state_buf = buf_zero_ssm(&device, nv * hv * hk);
     let Some(o) = dispatch_scan(
         &device,
         &cache,
-        &conv_out,
-        &g,
-        &beta,
+        ScanInputs {
+            conv_out: &conv_out,
+            g: &g,
+            beta: &beta,
+        },
         &state_buf,
-        &[0, t as i32],
-        &[GdnSeqSlots::plain(GdnSlot::new(0))],
-        &[1],
-        nk,
-        nv,
-        hk,
-        hv,
-        t,
+        Varlen {
+            cu: &[0, t as i32],
+            si: &[GdnSeqSlots::plain(GdnSlot::new(0))],
+            fresh: &[1],
+            num_tokens: t,
+        },
+        GdnHeads { nk, nv, hk, hv },
         None,
     ) else {
         return;
@@ -1015,15 +1069,16 @@ fn gdn_scan_varlen_continuity() {
     let beta_full = fill(t_full * nv);
     let (q, k, v) = split_conv(&conv_full, nk, nv, hk, hv, t_full);
     let o_full = recurrent_ref(
-        &q,
-        &k,
-        &v,
-        &g_full,
-        &beta_full,
-        nk,
-        nv,
-        hk,
-        hv,
+        QkvRows {
+            q: &q,
+            k: &k,
+            v: &v,
+        },
+        Gates {
+            g: &g_full,
+            beta: &beta_full,
+        },
+        GdnHeads { nk, nv, hk, hv },
         t_full,
         scale,
         &[4],
@@ -1035,18 +1090,19 @@ fn gdn_scan_varlen_continuity() {
     let Some(_a) = dispatch_scan(
         &device,
         &cache,
-        &conv_full[..5 * conv_dim],
-        &g_full[..5 * nv],
-        &beta_full[..5 * nv],
+        ScanInputs {
+            conv_out: &conv_full[..5 * conv_dim],
+            g: &g_full[..5 * nv],
+            beta: &beta_full[..5 * nv],
+        },
         &state_buf,
-        &[0, 5],
-        &[GdnSeqSlots::plain(GdnSlot::new(0))],
-        &[1],
-        nk,
-        nv,
-        hk,
-        hv,
-        5,
+        Varlen {
+            cu: &[0, 5],
+            si: &[GdnSeqSlots::plain(GdnSlot::new(0))],
+            fresh: &[1],
+            num_tokens: 5,
+        },
+        GdnHeads { nk, nv, hk, hv },
         None,
     ) else {
         return;
@@ -1055,18 +1111,19 @@ fn gdn_scan_varlen_continuity() {
     let Some(b) = dispatch_scan(
         &device,
         &cache,
-        &conv_full[5 * conv_dim..],
-        &g_full[5 * nv..],
-        &beta_full[5 * nv..],
+        ScanInputs {
+            conv_out: &conv_full[5 * conv_dim..],
+            g: &g_full[5 * nv..],
+            beta: &beta_full[5 * nv..],
+        },
         &state_buf,
-        &[0, 1],
-        &[GdnSeqSlots::plain(GdnSlot::new(0))],
-        &[0],
-        nk,
-        nv,
-        hk,
-        hv,
-        1,
+        Varlen {
+            cu: &[0, 1],
+            si: &[GdnSeqSlots::plain(GdnSlot::new(0))],
+            fresh: &[0],
+            num_tokens: 1,
+        },
+        GdnHeads { nk, nv, hk, hv },
         None,
     ) else {
         return;
@@ -2397,18 +2454,19 @@ fn gdn_scan_varlen_replays_a_fully_kept_verify_step() {
         dispatch_scan(
             &device,
             &cache,
-            &at(&conv, conv_dim, r.clone()),
-            &at(&g, nv, r.clone()),
-            &at(&beta, nv, r),
+            ScanInputs {
+                conv_out: &at(&conv, conv_dim, r.clone()),
+                g: &at(&g, nv, r.clone()),
+                beta: &at(&beta, nv, r),
+            },
             state,
-            &[0, n as i32],
-            &entry,
-            &step,
-            nk,
-            nv,
-            hk,
-            hv,
-            n,
+            Varlen {
+                cu: &[0, n as i32],
+                si: &entry,
+                fresh: &step,
+                num_tokens: n,
+            },
+            GdnHeads { nk, nv, hk, hv },
             Some((rows.0, lanes)),
         )
     };
@@ -2490,15 +2548,16 @@ fn gdn_scan_varlen_resumes_from_checkpoint() {
     // (row 4's end — the replay's boundary).
     let o_full = |slot_after_rows: &[usize]| {
         recurrent_ref(
-            &q,
-            &k,
-            &v,
-            &g_full,
-            &beta_full,
-            nk,
-            nv,
-            hk,
-            hv,
+            QkvRows {
+                q: &q,
+                k: &k,
+                v: &v,
+            },
+            Gates {
+                g: &g_full,
+                beta: &beta_full,
+            },
+            GdnHeads { nk, nv, hk, hv },
             t_full,
             scale,
             slot_after_rows,
@@ -2539,18 +2598,19 @@ fn gdn_scan_varlen_resumes_from_checkpoint() {
         dispatch_scan(
             &device,
             &cache,
-            conv,
-            g,
-            beta,
+            ScanInputs {
+                conv_out: conv,
+                g,
+                beta,
+            },
             state,
-            &[0, num_tokens as i32],
-            &entry,
-            &step,
-            nk,
-            nv,
-            hk,
-            hv,
-            num_tokens,
+            Varlen {
+                cu: &[0, num_tokens as i32],
+                si: &entry,
+                fresh: &step,
+                num_tokens,
+            },
+            GdnHeads { nk, nv, hk, hv },
             Some((rows.0, lanes)),
         )
     };
@@ -2730,18 +2790,19 @@ fn gdn_scan_simd_resumes_from_checkpoint() {
                     dispatch_scan(
                         &device,
                         &cache,
-                        conv,
-                        &g,
-                        &beta,
+                        ScanInputs {
+                            conv_out: conv,
+                            g: &g,
+                            beta: &beta,
+                        },
                         state,
-                        &cu,
-                        &entry,
-                        &code,
-                        nk,
-                        nv,
-                        hk,
-                        hv,
-                        t,
+                        Varlen {
+                            cu: &cu,
+                            si: &entry,
+                            fresh: &code,
+                            num_tokens: t,
+                        },
+                        GdnHeads { nk, nv, hk, hv },
                         Some((rows.0, lanes)),
                     )
                 }

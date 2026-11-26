@@ -56,8 +56,6 @@ enum Response {
 }
 
 struct WorkerThread {
-    #[allow(dead_code)]
-    rank: usize,
     is_output_rank: bool,
     tx: std::sync::mpsc::Sender<Request>,
     rx: std::sync::mpsc::Receiver<Response>,
@@ -110,7 +108,6 @@ fn worker_loop(
 /// tokio scheduling issues.
 pub struct ThreadPoolExecutor {
     workers: Vec<WorkerThread>,
-    #[allow(dead_code)]
     parallel_config: ResolvedParallelConfig,
     is_shutdown: bool,
 }
@@ -135,7 +132,6 @@ impl ThreadPoolExecutor {
                     .expect("failed to spawn worker thread");
 
                 WorkerThread {
-                    rank,
                     is_output_rank: rank == output_rank,
                     tx: req_tx,
                     rx: resp_rx,

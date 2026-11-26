@@ -688,18 +688,18 @@ impl Recording<'_> {
         self.weight(i).map_or(LayerId(0), |e| self.layer(e))
     }
 
-    /// A weight's accessor base: its path joined with `_`. Its layer is its unroll index's alone
-    /// ([`Self::layer`]): a path ending in a numeral (Qwen2-VL's `merger.mlp.0` and `merger.mlp.2`)
-    /// is two weights, two bases, not one base's two layers. A `BundleTensor` binding names the
+    /// A weight's accessor base: its path joined with `_`, in snake case. Its layer is its unroll
+    /// index's alone ([`Self::layer`]): a path ending in a numeral (Qwen2-VL's `merger.mlp.0` and
+    /// `merger.mlp.2`) is two weights, two bases, not one base's two layers. A `BundleTensor` binding names the
     /// BUNDLE's path — the tensor inside it resolves by `WeightTensor` at command lowering, so the
     /// base is the bundle's own.
     fn base(&self, i: usize, e: usize) -> Result<String, StepRefusal> {
         match &self.l.bindings()[e] {
             SourceBinding::Weight { id, .. }
             | SourceBinding::WeightScale { id, .. }
-            | SourceBinding::BundleTensor { id, .. } => {
-                Ok(self.facts.weight_paths[*id as usize].join("_"))
-            }
+            | SourceBinding::BundleTensor { id, .. } => Ok(self.facts.weight_paths[*id as usize]
+                .join("_")
+                .to_ascii_lowercase()),
             _ => Err(self.no(i, Refused::NotAWeight(e))),
         }
     }
@@ -1870,7 +1870,7 @@ impl Recording<'_> {
                 };
                 // One packed site, read for both weights.
                 let (eg, eu) = (self.weight_of(gate)?, self.weight_of(up)?);
-                let base = format!("{}__fused__{}", self.base(gate, eg)?, self.base(up, eu)?);
+                let base = format!("{}_fused_{}", self.base(gate, eg)?, self.base(up, eu)?);
                 self.read_through(gate, WeightKind::Linear, eg, &base)?;
                 self.read_through(up, WeightKind::Linear, eu, &base)?;
                 let site = vec![WeightSlot {

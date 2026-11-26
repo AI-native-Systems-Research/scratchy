@@ -12,7 +12,7 @@ use half::bf16;
 use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions, MTLSize};
 use scratchy_target_metal::aot::baked_build;
 use scratchy_target_metal::detect_device;
-use scratchy_target_metal::mtl4_dispatch::Mtl4DispatchBatch;
+use scratchy_target_metal::mtl4_dispatch::{Mtl4DispatchBatch, ThreadgroupGrid};
 use scratchy_target_metal::specialized_pipeline_cache::{
     ConstantValue, PipelineKey, SpecializedPipelineCache,
 };
@@ -266,7 +266,17 @@ fn staged_tile_matches_the_reference_at_every_split() {
                     (&counters, 6),
                 ];
                 let grid = size(n / TILE, splits);
-                batch.encode(&pso, &binds, &[], &[], &[], grid, size(64, 1));
+                batch.encode(
+                    &pso,
+                    &binds,
+                    &[],
+                    &[],
+                    &[],
+                    ThreadgroupGrid {
+                        threadgroups: grid,
+                        threads_per_threadgroup: size(64, 1),
+                    },
+                );
                 batch.commit(true);
                 let worst = worst(&read_bf16(&y, rows * n), &want);
                 assert!(
@@ -321,7 +331,17 @@ fn staged_gate_up_matches_the_reference_at_every_split() {
                     (&counters, 9),
                 ];
                 let grid = size(n / PAIR_TILE, splits);
-                batch.encode(&pso, &binds, &[], &[], &[], grid, size(32, 1));
+                batch.encode(
+                    &pso,
+                    &binds,
+                    &[],
+                    &[],
+                    &[],
+                    ThreadgroupGrid {
+                        threadgroups: grid,
+                        threads_per_threadgroup: size(32, 1),
+                    },
+                );
                 batch.commit(true);
                 let worst = worst(&read_bf16(&y, rows * n), &want);
                 assert!(
@@ -619,7 +639,17 @@ fn staged_tiles_on_a_chip_emulated_by_width() {
                                 (&partials, 5),
                                 (&counters, 6),
                             ];
-                            batch.encode(pso, &binds, &[], &[], &[], grid, threads);
+                            batch.encode(
+                                pso,
+                                &binds,
+                                &[],
+                                &[],
+                                &[],
+                                ThreadgroupGrid {
+                                    threadgroups: grid,
+                                    threads_per_threadgroup: threads,
+                                },
+                            );
                         }
                         Binds::PairMlx | Binds::PairPlanes => {
                             let ([gw, gs, gb], [uw, us, ub]) = match *binds {
@@ -638,7 +668,17 @@ fn staged_tiles_on_a_chip_emulated_by_width() {
                                 (&partials, 8),
                                 (&counters, 9),
                             ];
-                            batch.encode(pso, &binds, &[], &[], &[], grid, threads);
+                            batch.encode(
+                                pso,
+                                &binds,
+                                &[],
+                                &[],
+                                &[],
+                                ThreadgroupGrid {
+                                    threadgroups: grid,
+                                    threads_per_threadgroup: threads,
+                                },
+                            );
                         }
                     }
                 }
@@ -740,7 +780,17 @@ fn staged_fidelity_on_a_chip_emulated_by_width() {
                                     (&partials, 5),
                                     (&counters, 6),
                                 ];
-                                batch.encode(pso, &binds, &[], &[], &[], grid, threads);
+                                batch.encode(
+                                    pso,
+                                    &binds,
+                                    &[],
+                                    &[],
+                                    &[],
+                                    ThreadgroupGrid {
+                                        threadgroups: grid,
+                                        threads_per_threadgroup: threads,
+                                    },
+                                );
                             }
                             Binds::PairPlanes | Binds::PairMlx => {
                                 let ([gw, gs, gb], [uw, us, ub]) = (&copy[0], &copy[1]);
@@ -756,7 +806,17 @@ fn staged_fidelity_on_a_chip_emulated_by_width() {
                                     (&partials, 8),
                                     (&counters, 9),
                                 ];
-                                batch.encode(pso, &binds, &[], &[], &[], grid, threads);
+                                batch.encode(
+                                    pso,
+                                    &binds,
+                                    &[],
+                                    &[],
+                                    &[],
+                                    ThreadgroupGrid {
+                                        threadgroups: grid,
+                                        threads_per_threadgroup: threads,
+                                    },
+                                );
                             }
                         }
                         // Splash's serial encoder: every dispatch waits for the one before.
@@ -948,8 +1008,10 @@ fn register_tile_matches_the_reference_at_every_split() {
                     &[],
                     &[],
                     &[],
-                    size(k / 32, lanes),
-                    size(128, 1),
+                    ThreadgroupGrid {
+                        threadgroups: size(k / 32, lanes),
+                        threads_per_threadgroup: size(128, 1),
+                    },
                 );
                 batch.barrier();
                 let binds = [
@@ -967,8 +1029,10 @@ fn register_tile_matches_the_reference_at_every_split() {
                     &[],
                     &[],
                     &[],
-                    size(n / TILE, splits),
-                    size(128, 1),
+                    ThreadgroupGrid {
+                        threadgroups: size(n / TILE, splits),
+                        threads_per_threadgroup: size(128, 1),
+                    },
                 );
                 batch.commit(true);
                 let want: Vec<f32> = match residual_end {
@@ -1133,7 +1197,17 @@ fn register_tile_on_a_chip_emulated_by_width() {
                                 size(32 * SMALL_M_SIMDGROUPS as usize, 1),
                             ),
                         };
-                        batch.encode(pso, &binds, &[], &[], &[], grid, threads);
+                        batch.encode(
+                            pso,
+                            &binds,
+                            &[],
+                            &[],
+                            &[],
+                            ThreadgroupGrid {
+                                threadgroups: grid,
+                                threads_per_threadgroup: threads,
+                            },
+                        );
                     }
                     _ => {
                         if cell == 3 {
@@ -1143,8 +1217,10 @@ fn register_tile_on_a_chip_emulated_by_width() {
                                 &[],
                                 &[],
                                 &[],
-                                size(k / 32, lanes),
-                                size(128, 1),
+                                ThreadgroupGrid {
+                                    threadgroups: size(k / 32, lanes),
+                                    threads_per_threadgroup: size(128, 1),
+                                },
                             );
                             batch.barrier();
                         }
@@ -1164,8 +1240,10 @@ fn register_tile_on_a_chip_emulated_by_width() {
                             &[],
                             &[],
                             &[],
-                            size(n / TILE, splits),
-                            size(128, 1),
+                            ThreadgroupGrid {
+                                threadgroups: size(n / TILE, splits),
+                                threads_per_threadgroup: size(128, 1),
+                            },
                         );
                     }
                 }

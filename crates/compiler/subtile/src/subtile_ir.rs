@@ -36,8 +36,6 @@
 //! the player computes with — not the correctness *oracle* (that is
 //! a target's non-mega forward at temp=0).
 
-#![allow(dead_code)]
-
 use scratchy_ir::model_facts::{Attention, HeadDim, Mla, QueryHeads};
 use std::marker::PhantomData;
 
@@ -7055,6 +7053,7 @@ mod tests {
     }
 }
 
+#[cfg(test)]
 mod sample_rows_tests {
     use super::*;
     use crate::lower::{GemmWeight, InputRef, LoweringInput, OpDesc};

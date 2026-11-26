@@ -249,7 +249,6 @@ pub(crate) fn emit(cx: &DispatchCx<'_>) -> TokenStream {
         /// All tensors in `ctx` must be valid GPU memory; `device`
         /// must be the live backend device.
         #[cfg(scratchy_target = "metal")]
-        #[allow(clippy::too_many_arguments)]
         pub unsafe fn forward(
             w: &Weights,
             ctx: &crate::__gpu::ForwardCtx,
@@ -267,7 +266,6 @@ pub(crate) fn emit(cx: &DispatchCx<'_>) -> TokenStream {
         /// # Safety
         /// Same as [`forward`].
         #[cfg(scratchy_target = "metal")]
-        #[allow(clippy::too_many_arguments)]
         pub unsafe fn forward_with_metal_followup(
             w: &Weights,
             ctx: &crate::__gpu::ForwardCtx,
@@ -312,7 +310,6 @@ pub(crate) fn emit(cx: &DispatchCx<'_>) -> TokenStream {
         /// Same as [`forward`]; additionally, `body` must not retain
         /// any references to the encoder past its return.
         #[cfg(scratchy_target = "metal")]
-        #[allow(clippy::too_many_arguments)]
         pub unsafe fn forward_chain_with_encoder(
             w: &Weights,
             ctx: &crate::__gpu::ForwardCtx,

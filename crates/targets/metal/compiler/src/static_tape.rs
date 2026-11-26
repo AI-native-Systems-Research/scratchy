@@ -230,10 +230,24 @@ impl ArenaOperands {
                 })
             })
             .collect::<Result<Vec<_>, BakeDefect>>()?;
+        let consts = quote!(#(#consts)*);
+        let uses = crate::const_tokens::uses_named(
+            &consts,
+            [
+                ("__a", quote! { use super::__arena as __a; }),
+                (
+                    "hosts",
+                    quote! { use ::scratchy_target_metal::tape::typed::hosts; },
+                ),
+                (
+                    "slot",
+                    quote! { use ::scratchy_target_metal::tape::typed::slot; },
+                ),
+            ],
+        );
         Ok(quote! {
-            use super::__arena as __a;
-            use ::scratchy_target_metal::tape::typed::{hosts, slot};
-            #(#consts)*
+            #uses
+            #consts
         })
     }
 
@@ -351,7 +365,6 @@ impl CommandPool {
             sources: &self.sources,
         };
         let gemms = TypedGemms::of(&parts, typed, named, &reads, weight_markers)?;
-        let aliases = crate::const_tokens::alias_preamble();
         let array = |name: &str, values: Vec<TokenStream>, ty: TokenStream| {
             let (id, len) = (
                 quote::format_ident!("{name}"),
@@ -502,10 +515,7 @@ impl CommandPool {
                 }
             }
         });
-        let tokens = quote! {
-            #[cfg(scratchy_target = "metal")]
-            mod __tape_cmds {
-                #aliases
+        let body = quote! {
                 #markers
                 #operands
                 #gemm_helpers
@@ -523,6 +533,13 @@ impl CommandPool {
                     gates: __ti::PartArray(&GATES),
                 };
                 pub(super) static KERNELS: [__tl::BakedKernel; #kernels_len] = [ #(#kernels),* ];
+        };
+        let aliases = crate::const_tokens::alias_preamble(&body);
+        let tokens = quote! {
+            #[cfg(scratchy_target = "metal")]
+            mod __tape_cmds {
+                #aliases
+                #body
             }
             #[cfg(scratchy_target = "metal")]
             static METAL_KERNELS: &[::scratchy_target_metal::tape::lowered::BakedKernel] =
@@ -1149,10 +1166,23 @@ pub fn bake_module() -> TokenStream {
             };
         });
     }
+    let statics = quote!(#(#statics)*);
+    let uses = crate::const_tokens::uses_named(
+        &statics,
+        [
+            (
+                "__tc",
+                quote! { use ::scratchy_target_metal::tape::constants as __tc; },
+            ),
+            (
+                "__tl",
+                quote! { use ::scratchy_target_metal::tape::lowered as __tl; },
+            ),
+        ],
+    );
     quote! {
-        use ::scratchy_target_metal::tape::constants as __tc;
-        use ::scratchy_target_metal::tape::lowered as __tl;
-        #(#statics)*
+        #uses
+        #statics
     }
 }
 
@@ -1531,12 +1561,15 @@ pub fn bake_bucket_tapes(
     // literal below names its type through `__tl`/`__tc`/`__ti` instead of spelling
     // `::scratchy_target_metal::tape::<module>::` on the order of a million times — see
     // `const_tokens::alias_preamble`.
-    let aliases = crate::const_tokens::alias_preamble();
+    let body = quote! {
+        #(#body_statics)*
+        &[ #(#entries)* ]
+    };
+    let aliases = crate::const_tokens::alias_preamble(&body);
     Ok(quote! {
         {
             #aliases
-            #(#body_statics)*
-            &[ #(#entries)* ]
+            #body
         }
     })
 }

@@ -126,14 +126,14 @@ pub fn emit_per_variant(
     // (`[ng, ng, d]`, MoonViT `[64, 64, 1152]`): `sqrt(shape[0])`
     // mis-derived ng=8 for the latter and the interp read a garbage
     // 8×8 view (live pos_embeds absmax 26 vs golden 195).
-    let pe_embed_dim_lit = proc_macro2::Literal::u32_unsuffixed(embed_dim);
+    let pe_embed_dim_lit = proc_macro2::Literal::usize_suffixed(embed_dim as usize);
     let wrapper_ctor: TokenStream = match &model.arch.pos_embed_key {
         ::std::option::Option::Some(key) => {
             let key_lit = syn::LitStr::new(key, proc_macro2::Span::call_site());
             quote! {{
                 let mut __vw = crate::__gpu::VisionWrapper::new(weights);
                 if let ::std::option::Option::Some(__pe_tbl) = gw.tensor_to_f32(#key_lit) {
-                    let __rows = __pe_tbl.len() / (#pe_embed_dim_lit as usize);
+                    let __rows = __pe_tbl.len() / #pe_embed_dim_lit;
                     let __ng = (__rows as f64).sqrt().round() as usize;
                     ::std::assert_eq!(
                         __ng * __ng,
@@ -175,6 +175,7 @@ pub fn emit_per_variant(
     let pool_kernel = *model.bounds.get("vision_pool_kernel").unwrap_or(&0) as u32;
     let pool_kernel_lit = proc_macro2::Literal::u32_unsuffixed(pool_kernel);
     let in_chans_lit = proc_macro2::Literal::u32_unsuffixed(in_chans);
+    let in_chans_usize_lit = proc_macro2::Literal::usize_suffixed(in_chans as usize);
     let d_model_lit = proc_macro2::Literal::u32_unsuffixed(d_model);
     let d_model_usize_lit = proc_macro2::Literal::usize_unsuffixed(d_model as usize);
     let eps_lit = proc_macro2::Literal::f32_suffixed(eps);
@@ -322,7 +323,6 @@ pub fn emit_per_variant(
         /// variant geometric difference within a VL family). Returns
         /// `Ok(None)` when the checkpoint isn't a vision tower or
         /// the d_model doesn't match this variant.
-        #[allow(clippy::not_unsafe_ptr_arg_deref)]
         fn try_load_mm(
             gw: &mut crate::__gpu::weights::GpuWeights,
             stream: crate::__gpu::CUstream,
@@ -367,7 +367,7 @@ pub fn emit_per_variant(
                         // behavior) misperms HF-native weights — the result
                         // has the right total element count but every index
                         // is mispaired, silently corrupting all patches.
-                        let in_chans_usize: usize = #in_chans_lit as usize;
+                        let in_chans_usize: usize = #in_chans_usize_lit;
                         gw.flatten_conv_weight(
                             #flatten_key_lit,
                             #flatten_lead_lit,
@@ -392,7 +392,6 @@ pub fn emit_per_variant(
         // `&mut GpuWeights<BackendAllocator>` the per-arch `try_load_mm` above
         // expects, so the registration rows can reference one fn item that
         // coerces to the pointer.
-        #[allow(clippy::not_unsafe_ptr_arg_deref)]
         fn __try_load_mm_erased(
             __gw_handle: ::scratchy_forward_compiler::GpuWeightsHandle<'_>,
             stream: crate::__gpu::CUstream,

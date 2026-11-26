@@ -603,18 +603,18 @@ impl InputBatch {
             .collect();
         self.step_rows = rows;
 
-        let attn_meta = AttentionMetadata::new(
+        let attn_meta = AttentionMetadata {
             num_reqs,
-            offset,
+            total_tokens: offset,
             query_start_loc,
             q_lens,
             seq_lens,
-            batch_block_ids,
-            batch_tokens_before,
-            is_prefill_vec,
-            batch_req_ids,
-        )
-        .with_sliding_groups(sliding_groups);
+            block_ids: batch_block_ids,
+            sliding_groups,
+            tokens_before: batch_tokens_before,
+            is_prefill: is_prefill_vec,
+            req_ids: batch_req_ids,
+        };
 
         PreparedInputs {
             req_inputs,

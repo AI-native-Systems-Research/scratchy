@@ -13,6 +13,7 @@ mod common;
 
 use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions, MTLSize};
 use scratchy_target_metal::aot::baked_pipeline;
+use scratchy_target_metal::cpu_reference::AffineMatmul;
 use scratchy_target_metal::cpu_reference::{affine_qmm_t_b8_bf16_s_bf16, affine_qmm_t_b8_f16};
 use scratchy_target_metal::detect_device;
 use scratchy_target_metal::quantized::{
@@ -80,7 +81,6 @@ fn zeroed_buffer(device: &Device, n_bytes: usize) -> Buffer {
 /// Realistic 8-bit affine inputs: one byte per element; scale ≈
 /// weight_range/255 with bias = range minimum, so dequantized weights
 /// land in ±0.1 like real checkpoint tensors.
-#[allow(clippy::type_complexity)]
 fn make_inputs_b8_f32(
     seed: u64,
     n: usize,
@@ -112,7 +112,6 @@ enum Op {
     QmmTNax(NaxDequant),
 }
 
-#[allow(clippy::too_many_arguments)]
 fn run_case_bf16(op: Op, m: usize, n: usize, k: usize, group_size: usize, seed: u64, tol: f32) {
     let Some(di) = detect_device() else {
         eprintln!("skipping: no Metal device");
@@ -124,7 +123,16 @@ fn run_case_bf16(op: Op, m: usize, n: usize, k: usize, group_size: usize, seed: 
     let biases: Vec<half::bf16> = biases_f.iter().map(|&v| half::bf16::from_f32(v)).collect();
     let x: Vec<half::bf16> = x_f.iter().map(|&v| half::bf16::from_f32(v)).collect();
 
-    let expected = affine_qmm_t_b8_bf16_s_bf16(&packed, &scales, &biases, &x, m, n, k, group_size);
+    let expected = affine_qmm_t_b8_bf16_s_bf16(AffineMatmul {
+        packed: &packed,
+        scales: &scales,
+        biases: &biases,
+        x: &x,
+        m,
+        n,
+        k,
+        group_size,
+    });
 
     let packed_buf = buffer_from_bytes(&device, &packed);
     let scales_buf = buffer_from_bytes(&device, as_bytes(&scales));
@@ -345,7 +353,16 @@ fn qmv_b8_f16_matches_cpu() {
     let scales: Vec<half::f16> = scales_f.iter().map(|&v| half::f16::from_f32(v)).collect();
     let biases: Vec<half::f16> = biases_f.iter().map(|&v| half::f16::from_f32(v)).collect();
     let x: Vec<half::f16> = x_f.iter().map(|&v| half::f16::from_f32(v)).collect();
-    let expected = affine_qmm_t_b8_f16(&packed, &scales, &biases, &x, m, n, k, gs);
+    let expected = affine_qmm_t_b8_f16(AffineMatmul {
+        packed: &packed,
+        scales: &scales,
+        biases: &biases,
+        x: &x,
+        m,
+        n,
+        k,
+        group_size: gs,
+    });
 
     let packed_buf = buffer_from_bytes(&device, &packed);
     let scales_buf = buffer_from_bytes(&device, as_bytes(&scales));
