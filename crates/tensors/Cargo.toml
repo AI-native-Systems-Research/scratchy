@@ -18,6 +18,9 @@ anyhow = { workspace = true }
 memmap2 = { workspace = true }
 # A dim's number as a type (`typed::Dim::Num`), a law between dims a bound on those numbers.
 typenum = { workspace = true }
+# `Serialize` on the law-carrying facts (`rotary_facts`), so a target's static tape builds one
+# through its checked `const fn try_new`.
+serde = { workspace = true }
 
 [dev-dependencies]
 # The manifest guard in tests/cfg_neutrality.rs reads `cargo metadata`'s JSON.

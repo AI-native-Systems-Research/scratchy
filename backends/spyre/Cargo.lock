@@ -1654,6 +1654,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "rayon",
+ "regex",
  "scratchy-forward-compiler",
  "scratchy-forward-compiler-frontend",
  "scratchy-ir",
@@ -1853,6 +1854,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "memmap2",
+ "serde",
  "typenum",
 ]
 

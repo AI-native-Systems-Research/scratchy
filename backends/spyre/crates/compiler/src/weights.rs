@@ -45,6 +45,7 @@ pub(crate) fn weights_struct(cx: &StructCx<'_>) -> WeightsStruct {
                 std::num::NonZeroU32::new(8192).expect("8192 != 0"),
             )),
             num_tokens,
+            to_wavefront::DenseExperts::Refuse,
         )
         .ok()
     });

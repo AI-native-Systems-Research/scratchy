@@ -3004,6 +3004,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "scratchy-const-tokens"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "serde",
+ "syn 3.0.10",
+]
+
+[[package]]
 name = "scratchy-core-common"
 version = "0.1.0"
 dependencies = [
@@ -3104,6 +3114,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "rayon",
+ "regex",
  "scratchy-forward-compiler",
  "scratchy-forward-compiler-frontend",
  "scratchy-ir",
@@ -3397,6 +3408,7 @@ version = "0.1.0"
 dependencies = [
  "proc-macro2",
  "quote",
+ "scratchy-const-tokens",
  "scratchy-forward-compiler",
  "scratchy-forward-compiler-frontend",
  "scratchy-forward-compiler-macro",
@@ -3469,6 +3481,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "memmap2",
+ "serde",
  "serde_json",
  "typenum",
 ]

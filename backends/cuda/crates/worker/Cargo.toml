@@ -1,0 +1,51 @@
+[package]
+name = "scratchy-target-cuda-worker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The CUDA backend's serving worker: its WorkerFactory registration and, under `nvcc`, the Worker that plays the emitted tapes."
+
+# ⭐ WHY THIS CRATE EXISTS.
+#
+# The serving engine builds its worker through the neutral `WorkerFactory` registry
+# (`scratchy-serving-engine`'s `worker_factory`, collected by `inventory`): a binary links exactly
+# one target's worker, and `linked_factory` returns it. This crate is CUDA's entry in that
+# registry; the `cuda` binary anchors it, so no shared crate names it. Everything CUDA knows about
+# serving is here.
+#
+# The models reach it through the CUDA model registry (`scratchy-target-cuda`'s `registry`), which
+# the CUDA models crate fills at link time; this crate depends on that crate and anchors it.
+#
+# THE FEATURE TIERS, as `scratchy-target-cuda`'s:
+#
+#   (none) — toolchain-free. The factory registers and claims `--device cuda`, and refuses to
+#            build a worker with a message naming the `nvcc` feature. The step planning (`plan`)
+#            and its tests build here.
+#   nvcc   — the `Worker` itself (`serving`), which plays the tapes through the CUDA runtime.
+[features]
+nvcc = ["scratchy-target-cuda/nvcc"]
+
+[dependencies]
+scratchy-target-cuda = { path = "../cuda" }
+# The selected models, compiled for CUDA: their tapes and weight tables, found through the
+# `CudaModelEntry` rows they submit.
+scratchy-target-cuda-models = { path = "../models" }
+# The traits this crate implements (`Worker`, `WorkerFactory`), the shared per-request store
+# (`InputBatch`) and the GDN slot key: all below the target crates, so a backend can register.
+scratchy-serving-engine = { workspace = true }
+scratchy-serving-scheduler = { workspace = true }
+scratchy-core-common = { workspace = true }
+scratchy-core-model = { workspace = true }
+# The shared GDN slot allocator (`slots`) and the step codes it hands out (`pool`). No backend
+# feature: the allocator is host bookkeeping.
+scratchy-state-decoder-gdn = { path = "../../../../crates/state/decoder/gdn" }
+inventory = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+# The checkpoint's `quantization_config`, read as the raw JSON `HfModelConfig` keeps (`plan`).
+serde_json = { workspace = true }
+
+# The device argmax against `plan::greedy_token`, bit for bit (W7): an H100 test.
+[[test]]
+name = "argmax"
+required-features = ["nvcc"]

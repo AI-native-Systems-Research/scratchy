@@ -1789,6 +1789,10 @@ pub fn initialize_stack(
         config.chat_template.as_deref(),
     )?;
     engine.set_generation_defaults(load_generation_defaults(core.model_dir.as_deref()));
+    // The sampling the backend serves, checked as each request is submitted.
+    if let Ok(backend) = linked_factory() {
+        engine.set_served(backend.served());
+    }
     engine.set_scores_prompts(core.scores_prompts);
     if !config.disable_async_scheduling && !speculation.requires_sync() {
         engine.set_async_scheduling(true);

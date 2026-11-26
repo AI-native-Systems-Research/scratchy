@@ -175,14 +175,7 @@ impl HeadDim {
 /// value its checkpoints were trained against when they omit it, never a value this compiler
 /// picks). A config that states none of an arch that declares none is a load error. Finite and
 /// positive.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct RopeTheta(f64);
-
-impl RopeTheta {
-    pub fn get(self) -> f64 {
-        self.0
-    }
-}
+pub use scratchy_tensors::RopeTheta;
 
 /// The text backbone's geometry, typed at load — see [`ModelParams::text`]. A `#[vision_forward]`
 /// config is a VL wrapper whose `text_config` states the decoder it feeds; its tower's own
@@ -248,18 +241,19 @@ impl TextGeometry {
                     .to_string(),
             )
         })?;
-        if !(theta.is_finite() && theta > 0.0) {
-            return Err(missing(format!("`rope_theta` is {theta}")));
-        }
+        let rope_theta =
+            RopeTheta::try_new(theta).ok_or_else(|| missing(format!("`rope_theta` is {theta}")))?;
         let rope_local = match scalars.get("rope_local_base_freq").copied() {
             None => None,
-            Some(t) if t.is_finite() && t > 0.0 => Some(RopeTheta(t)),
-            Some(t) => return Err(missing(format!("`rope_local_base_freq` is {t}"))),
+            Some(t) => Some(
+                RopeTheta::try_new(t)
+                    .ok_or_else(|| missing(format!("`rope_local_base_freq` is {t}")))?,
+            ),
         };
         Ok(Self {
             layers,
             head_dim,
-            rope_theta: RopeTheta(theta),
+            rope_theta,
             rope_local,
         })
     }

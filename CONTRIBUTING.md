@@ -150,7 +150,8 @@ sent back regardless of how well it works:
 #### Build — scope to one model
 
 Pick your target's CLI (`scr` on metal: `-p scratchy-target-metal-cli`; `spyre`: built in
-its own workspace, `cd backends/spyre-hw && cargo build`) and
+its own workspace, `cd backends/spyre-hw && cargo build`; `cuda`: built in its own workspace,
+`cd backends/cuda && cargo build`, FP8 models only) and
 name at least one model. Naming zero models is a **build-time panic**, not a
 silent empty binary.
 
@@ -199,6 +200,7 @@ break:
 cargo fmt --all -- --check
 cargo fmt --manifest-path backends/spyre/Cargo.toml --all -- --check
 cargo fmt --manifest-path backends/spyre-hw/Cargo.toml --all -- --check
+cargo fmt --manifest-path backends/cuda/Cargo.toml --all -- --check
 
 # macOS / metal job
 cargo clippy -p scratchy-target-metal-models \
@@ -219,6 +221,10 @@ cargo clippy --workspace --features scratchy-models/granite-3.1-8b-instruct \
   cargo clippy --workspace --features scratchy-models/granite-3.1-8b-instruct -- -D warnings)
 (cd backends/spyre-hw && SCRATCHY_SKIP_SENDNN_CXX=1 \
   cargo clippy --workspace --features model/granite-3.1-8b-instruct -- -D warnings)
+# ... and the CUDA workspace (backends/cuda), no nvcc; linux-cuda then runs its host and tape tests
+(cd backends/cuda && cargo clippy --workspace --all-targets \
+  --features scratchy-models/qwen3.8-27b-text-only,scratchy-quantizations/fp8-dynamic-per-channel \
+  -- -D warnings)
 
 # e2e smoke, as CI runs it
 cargo test -p scratchy-e2e -p scratchy-target-metal-models \

@@ -1429,7 +1429,7 @@ fn plan_field_load(
         // shared tensors and the DSL leaf accessors keep sole ownership.
         let moe_base = program.weights.path(only_src).first().cloned();
         let shared_expert_intermediate_size = match &moe_base {
-            Some(b) if program.weights.has_subtree(&[b.as_str(), "shared_expert"]) => 0,
+            Some(b) if program.weights.shared_expert_bases().contains(b) => 0,
             _ => shared_expert_intermediate_size,
         };
         let (affine, gate_bits) = moe_affine_plan(program, fuf, model, &prefix, accessor);
@@ -9777,6 +9777,170 @@ mod tests {
 mod fingerprint_tests {
     use super::*;
     use crate::fixtures::{arch_configs, config_of, dsl_of, fuf_of, fuf_of_ast, variant_of};
+
+    /// The three fp8 checkpoints' layer-0 and layer-3 tensors, from their safetensors headers
+    /// (`tests/fixtures/fp8_checkpoint_layer_dtypes.json`): each resolves to fp8 iff the header
+    /// stores it F8_E4M3. A tensor that is a model weight's own reads `storage_format_for_weight`;
+    /// one inside a MoE bundle (a router's projection, an expert's) reads its bundle's format, unless
+    /// an `ignore` entry names its module, the way a target's loader must read each bundle tensor.
+    /// Only a Linear's `.weight` is ever quantized (compressed-tensors `targets: ["Linear"]`).
+    #[test]
+    fn fp8_storage_follows_each_checkpoints_header() {
+        use crate::quantization::{StorageFormat, ignore_entry_matches, storage_format_for_weight};
+        use scratchy_subtile::handoff::{BUNDLE_PREFIX_REWRITES, PER_EXPERT_TENSOR_LEAVES};
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/fp8_checkpoint_layer_dtypes.json");
+        let fixture: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        // Every expert tensor leaf the fixture holds is one the shared table names.
+        let expert_leaves: Vec<&str> = PER_EXPERT_TENSOR_LEAVES.iter().map(|&(_, l)| l).collect();
+        for (arch, stem) in [
+            ("qwen3-5", "qwen3.8-27b"),
+            ("qwen3-5-moe", "qwen3.6-35b-a3b"),
+            ("gemma4-moe", "gemma-4-26b-a4b-it"),
+        ] {
+            let model = variant_of(arch, stem, "fp8-dynamic-per-channel")
+                .unwrap_or_else(|| panic!("{stem}: the declared fp8 preset was refused"));
+            let ignore = &model.quantization.as_ref().unwrap().modules_to_not_convert;
+            let (program, fuf) = fuf_of(arch, &model);
+            // Each layer-0/3 weight's checkpoint prefix (a bundle's as its tensors sit on disk).
+            let mut weights: Vec<(String, String, StorageFormat)> = Vec::new();
+            for input in fuf.nodes.iter().flat_map(|n| &n.inputs) {
+                if let crate::fuf::FufInput::Weight { id, index, storage } = input
+                    && matches!(index.map(|i| i.0), Some(0 | 3))
+                {
+                    let prefix =
+                        safetensors_prefix(program.weight_naming(), &model.arch, *id, *index);
+                    let prefix = (BUNDLE_PREFIX_REWRITES.iter())
+                        .find_map(|&(from, to)| Some(format!("{}{to}", prefix.strip_suffix(from)?)))
+                        .unwrap_or(prefix);
+                    let dotted = program.weights.path(*id).join(".");
+                    let fmt = storage_format_for_weight(&program, &fuf, *id, *index, &model);
+                    assert_eq!(&fmt, storage, "{stem}: {prefix}'s annotated storage");
+                    weights.push((prefix, dotted, fmt));
+                }
+            }
+            let tensors = fixture["models"][stem]["tensors"].as_object().unwrap();
+            assert!(tensors.len() > 20, "{stem}: the fixture's layers 0 and 3");
+            let mut experts = 0;
+            for (name, dtype) in tensors {
+                // The loader reads HF's `model.language_model.` decoder under ours.
+                let name = name.replace("model.language_model.", "language_model.model.");
+                let (prefix, dotted, fmt) = (weights.iter())
+                    .filter(|(p, ..)| name == *p || name.starts_with(&format!("{p}.")))
+                    .max_by_key(|(p, ..)| p.len())
+                    .unwrap_or_else(|| panic!("{stem}: no model weight loads {name}"));
+                let leaf = name[prefix.len()..].trim_start_matches('.');
+                let fp8 = match leaf {
+                    "" | "weight" => matches!(fmt, StorageFormat::Fp8 { .. }),
+                    sub => {
+                        let Some(sub) = sub.strip_suffix(".weight") else {
+                            assert_eq!(dtype, "BF16", "{stem}: {name} is no Linear's weight");
+                            continue;
+                        };
+                        // An expert's own tensor: `….{e}.<leaf>`, the leaf the shared table names.
+                        let segs: Vec<&str> = sub.split('.').collect();
+                        if let Some(e) = segs.iter().position(|s| s.parse::<u32>().is_ok()) {
+                            let leaf = format!("{}.weight", segs[e + 1..].join("."));
+                            assert!(expert_leaves.contains(&leaf.as_str()), "{stem}: {name}");
+                            experts += 1;
+                        }
+                        let (role, module) = (format!("{dotted}.{sub}"), format!("{prefix}.{sub}"));
+                        matches!(fmt, StorageFormat::Fp8 { .. })
+                            && !(ignore.iter())
+                                .any(|e| ignore_entry_matches(e, &role, || module.clone()))
+                    }
+                };
+                assert_eq!(
+                    fp8,
+                    dtype == "F8_E4M3",
+                    "{stem}: {name} is {dtype}, resolved {fmt:?}"
+                );
+            }
+            // The MoE checkpoints' expert 0, gate, up and down, at both layers.
+            assert_eq!(
+                experts,
+                if arch == "qwen3-5" { 0 } else { 6 },
+                "{stem}'s expert tensors"
+            );
+        }
+    }
+
+    /// An fp8 checkpoint's expert banks (Qwen3.6's `moe_block`, Gemma 4's SwitchGLU) lower as
+    /// fp8 expert matmuls, each binding its scale as operand 3, for a target that realizes them
+    /// (`DenseExperts::Lower`); read as dense, their e4m3 bytes would be taken for bf16. A target
+    /// passing `Refuse` (Metal, Spyre) keeps the path it had: the Qwen bank refused, the Gemma one
+    /// the affine fallback.
+    #[test]
+    fn an_fp8_expert_bank_lowers_as_fp8_only_where_its_target_realizes_it() {
+        use crate::to_wavefront::{
+            DenseExperts, KvPool, PrefixCapacity, lower_decode_to_wavefront,
+        };
+        use scratchy_subtile::lower::ExpertWeight;
+        use scratchy_subtile::subtile_ir::SubOp;
+        let prefix = KvPool::at_context(PrefixCapacity::new(
+            std::num::NonZeroU32::new(8192).unwrap(),
+        ));
+        for (arch, stem) in [
+            ("qwen3-5-moe", "qwen3.6-35b-a3b"),
+            ("gemma4-moe", "gemma-4-26b-a4b-it"),
+        ] {
+            let model = variant_of(arch, stem, "fp8-dynamic-per-channel")
+                .unwrap_or_else(|| panic!("{stem}: the declared fp8 preset was refused"));
+            let ast = crate::draft_capture::insert(&dsl_of(arch));
+            let (_, fuf, inferred) = crate::fixtures::inferred_fuf_of_ast(arch, &model, &ast);
+            let lower = |experts| {
+                let wp = crate::workload::WorkloadPoint {
+                    num_tokens: 1,
+                    sk_bucket: 256,
+                };
+                let bounds = bounds_for_wp(&model, wp, 1);
+                // #1093: the bridge takes the config params and the typed facts together.
+                let facts = fill_canonical_params(
+                    &model,
+                    1,
+                    None,
+                    None,
+                    &KvCacheLayers::of(&fuf),
+                    None,
+                    crate::target::KvStore::Dense,
+                )
+                .0;
+                let bridge = crate::to_wavefront::BridgeModel {
+                    params: &model,
+                    facts: &facts,
+                };
+                lower_decode_to_wavefront(&fuf, &inferred, &bounds, &bridge, prefix, 1, experts)
+            };
+            let lowered = lower(DenseExperts::Lower).expect("the fp8 model lowers");
+            let banks: Vec<_> = (lowered.input.ops.iter())
+                .filter_map(|o| match o.op {
+                    SubOp::ExpertMatmul { weight, .. } => Some((weight, o.inputs.len())),
+                    _ => None,
+                })
+                .collect();
+            assert!(!banks.is_empty(), "{stem}: no expert matmul");
+            for bank in banks {
+                assert_eq!(bank, (ExpertWeight::Fp8Dynamic, 4), "{stem}");
+            }
+            let refused = lower(DenseExperts::Refuse);
+            let kept = (refused.iter().flat_map(|l| &l.input.ops)).all(|o| {
+                !matches!(
+                    o.op,
+                    SubOp::ExpertMatmul {
+                        weight: ExpertWeight::Fp8Dynamic | ExpertWeight::Dense,
+                        ..
+                    }
+                )
+            });
+            assert!(kept, "{stem}: an fp8 expert matmul under Refuse");
+            assert_eq!(
+                refused.is_err(),
+                arch == "qwen3-5-moe",
+                "{stem}: Refuse's path"
+            );
+        }
+    }
 
     /// A shim's `load` delegates to its canonical's body — the affine
     /// bit-widths are baked into THAT body, and the shim's own accessor
