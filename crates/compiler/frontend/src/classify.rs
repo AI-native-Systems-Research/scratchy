@@ -39,7 +39,6 @@ fn dimspec_to_dim(s: &ast::DimSpec) -> Dim {
 /// Classify the AST against the decoder prelude. Convenience entry
 /// point used by unit tests in adjacent modules; production code in
 /// `compile_carrier` calls [`classify_with`] with an explicit prelude.
-#[allow(dead_code)]
 pub fn classify(ast: &ast::Ast) -> ClassifyResult<Program> {
     classify_with(ast, Prelude::Decoder)
 }

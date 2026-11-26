@@ -166,7 +166,6 @@ fn body_limit(max_model_len: usize, takes_images: bool) -> usize {
 /// Build the axum router with all API routes.
 pub fn build_router(state: Arc<AppState>) -> Router {
     let limit = body_limit(state.engine.max_model_len(), state.engine.takes_images());
-    #[allow(unused_mut)]
     let mut router = Router::new()
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/chat/completions/render", post(render_chat_completion))
@@ -264,7 +263,6 @@ fn log_routes(state: &AppState) {
 }
 
 /// Start the HTTP server (plain HTTP or HTTPS if SSL cert/key are configured).
-#[allow(clippy::needless_return)]
 pub async fn serve(state: Arc<AppState>) -> Result<(), Box<dyn std::error::Error>> {
     let router = build_router(state.clone());
 

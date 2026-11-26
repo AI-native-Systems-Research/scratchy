@@ -1389,8 +1389,7 @@ fn plan_field_load(
         // Probe storage format: if expert weights are MLX-affine int4
         // (mlx-community 4bit Mixtral / Qwen-MoE), emit the affine
         // `load_affine` call site; otherwise emit cuda `load`.
-        // Same check the expert kernels key on via
-        // `affine_gs_bits`. Source weights all share storage format
+        // Source weights all share storage format
         // (the macro asserts this elsewhere for AffineQuantLinear).
         // Resolved at this accessor's layer index — MLX mixed/dynamic quant
         // (OptiQ) varies expert bits per numbered layer; emit_group_let
@@ -3081,29 +3080,43 @@ fn effective_fingerprint_rows<'a>(
     }
 }
 
+/// The model an emission is for and the target it compiles to: what every
+/// per-model emitter below reads.
+#[derive(Clone, Copy)]
+pub struct ModelEmitCx<'a> {
+    pub program: &'a Program,
+    pub fuf: &'a Fuf,
+    pub model: &'a ModelParams,
+    pub manifest: &'a crate::weights_manifest::WeightsManifest,
+    pub tp_world_size: u8,
+    pub emitter: &'a dyn crate::target::TargetEmitter,
+}
+
 /// Emit the `Weights` struct definition (or alias) + its `load` +
 /// `fingerprint_matches` free fns. Returns the tokens alongside the
 /// affine rows its fingerprint gate actually carries (the canonical's,
 /// for a rowless shim) so the caller can hand them to that variant's
 /// future shims.
-#[allow(clippy::too_many_arguments)]
 fn emit_weights_struct(
-    program: &Program,
-    fuf: &Fuf,
+    cx: ModelEmitCx<'_>,
     // The accessor set, from the SHARED TAPE. `None` (no tape lowered
     // for this variant — a shim, or a target's first pass before the
     // front-end swap) emits a `Weights` with no accessor fields.
     tape_accessors: Option<&[WeightAccessor]>,
     // The fields' typed handles (none for a shim, whose `Weights` is its canonical's).
     dims: &ModelDims,
-    model: &ModelParams,
-    manifest: &crate::weights_manifest::WeightsManifest,
     mode: WeightsEmitMode<'_>,
-    tp_world_size: u8,
     emit_fingerprint: bool,
     canonical_affine_rows: Option<&[(String, u32, u32)]>,
-    emitter: &dyn crate::target::TargetEmitter,
 ) -> (TokenStream, Vec<(String, u32, u32)>) {
+    let ModelEmitCx {
+        program,
+        fuf,
+        model,
+        manifest,
+        tp_world_size,
+        emitter,
+    } = cx;
     let accessors: Vec<WeightAccessor> = tape_accessors.map(<[_]>::to_vec).unwrap_or_default();
 
     // Storage-format guard: a given accessor's `rust_type` must be
@@ -4032,7 +4045,6 @@ fn emit_weights_struct(
             let main = if uses_rotary {
                 quote! {
                     #[inline]
-                    #[allow(dead_code)]
                     pub fn rotary_cos_sin(&self, _layer: u32)
                         -> crate::__gpu::tensor::GpuTensor
                     {
@@ -4045,7 +4057,6 @@ fn emit_weights_struct(
             let local = if uses_rotary_local {
                 quote! {
                     #[inline]
-                    #[allow(dead_code)]
                     pub fn rotary_local_cos_sin(&self, _layer: u32)
                         -> crate::__gpu::tensor::GpuTensor
                     {
@@ -6710,12 +6721,10 @@ fn emit_weights_accessor_methods(accessors: &[WeightAccessor], dims: &ModelDims)
     if groups.is_empty() {
         return TokenStream::new();
     }
-    // Per-method `#[cfg]` / `#[inline]` / `#[allow(dead_code)]` are
-    // redundant — the impl block carries the cfg, the methods are
-    // trivial enough that LLVM inlines them in release without the
-    // hint, and the unused-warning is suppressed at the impl level.
-    // Dropping per-method attrs collapses each accessor from ~7
-    // lines to ~3.
+    // Per-method `#[cfg]` / `#[inline]` are redundant — the impl block
+    // carries the cfg, and the methods are trivial enough that LLVM
+    // inlines them in release without the hint. Dropping per-method
+    // attrs collapses each accessor from ~7 lines to ~3.
     let methods: Vec<TokenStream> = groups
         .iter()
         .map(|g| {
@@ -6760,7 +6769,6 @@ fn emit_weights_accessor_methods(accessors: &[WeightAccessor], dims: &ModelDims)
         })
         .collect();
     quote! {
-        #[allow(dead_code)]
         impl Weights {
             #(#methods)*
         }
@@ -6943,11 +6951,9 @@ pub fn emit_weight_accessors_impl(
             .then(a.3.cmp(&b.3)) // slot
     });
     let method_summaries: HashMap<&'static str, String> = {
-        #[allow(clippy::type_complexity)]
-        let mut by_method: HashMap<
-            &'static str,
-            Vec<(u32, &'static str, u32, u32, String)>,
-        > = HashMap::new();
+        // `(tape_index, role, op_idx, slot, base)`: an inventory row without its method.
+        type MethodRow = (u32, &'static str, u32, u32, String);
+        let mut by_method: HashMap<&'static str, Vec<MethodRow>> = HashMap::new();
         for (tape, role, op, slot, method, base) in &sorted_inv {
             by_method
                 .entry(method)
@@ -8600,19 +8606,14 @@ pub(crate) fn mla_of(fuf: &Fuf, model: &ModelParams) -> Option<scratchy_ir::mode
 /// asserted equal where both are in scope (`scratchy_forward_compiler::DFLASH2_BLOCK_LANES`).
 pub const DFLASH2_BLOCK_LANES: u64 = scratchy_forward_compiler::DFLASH2_BLOCK_LANES as u64;
 
-#[allow(clippy::too_many_arguments)]
 pub fn emit_model(
-    program: &Program,
-    model: &ModelParams,
-    fuf: &Fuf,
+    cx: ModelEmitCx<'_>,
     workloads: &WorkloadPoints,
-    manifest: &crate::weights_manifest::WeightsManifest,
     // The arch's traced shapes — threaded only so the PD-wavefront
     // macro-emission (`dump_wavefront_mega`) can resolve weight shapes;
     // unused on the normal codegen path.
     inferred: &crate::shape::Inferred,
     canonical_override: Option<&Ident>,
-    tp_world_size: u8,
     emit_fingerprint: bool,
     // The canonical's affine rows, for a shim whose own accessor set
     // yields none (a shim lowers no tape, so it has no accessors) — its
@@ -8622,9 +8623,15 @@ pub fn emit_model(
     // The build's own output directory for a `superdsc-dump` build (`compile_carrier`'s caller passes
     // it); `None` writes no dump.
     dump_dir: Option<&std::path::Path>,
-    // The target this build compiles for: what it bakes per model is its own.
-    emitter: &dyn crate::target::TargetEmitter,
 ) -> (TokenStream, Vec<(String, u32, u32)>) {
+    let ModelEmitCx {
+        program,
+        fuf,
+        model,
+        manifest,
+        tp_world_size,
+        emitter,
+    } = cx;
     // Vision encoders have no terminal `gemm(<tile>, lm_head)`; the
     // entire FUF is the backbone. The `BackboneLayout::Encoder` arm
     // (which already covers text-side encoders like ModernBERT)
@@ -8633,34 +8640,19 @@ pub fn emit_model(
     // separate vision flag needed.
 
     if let Some(canonical) = canonical_override {
-        return emit_shim_model(
-            program,
-            fuf,
-            model,
-            manifest,
-            canonical,
-            tp_world_size,
-            emit_fingerprint,
-            canonical_affine_rows,
-            emitter,
-        );
+        return emit_shim_model(cx, canonical, emit_fingerprint, canonical_affine_rows);
     }
     // The struct emitter. A target may call it more than once — with no accessors, then with its
     // tape's once it has lowered one. Returns the emitted tokens alongside the affine rows its
     // fingerprint gate carries.
     let emit_struct = |tape_accs: Option<&[WeightAccessor]>, dims: &ModelDims| {
         emit_weights_struct(
-            program,
-            fuf,
+            cx,
             tape_accs,
             dims,
-            model,
-            manifest,
             WeightsEmitMode::Canonical,
-            tp_world_size,
             emit_fingerprint,
             None,
-            emitter,
         )
     };
     // The fields' typed handles, from the tape's accessor set: the struct holds them, and a
@@ -8726,12 +8718,6 @@ pub fn emit_model(
     (tokens, weights_affine_rows)
 }
 
-/// Unused — consumers used to reach this by name from tests.
-/// Retained as a no-op type anchor while the trait-based shim is
-/// being deleted from downstream call sites.
-#[allow(dead_code)]
-fn _unused(_: OpKind) {}
-
 /// Emit a shim variant module: one whose forward-fn bodies are
 /// byte-identical to a canonical sibling's. Instead of re-emitting
 /// the bodies (which rustc would LLVM-optimize independently per
@@ -8760,33 +8746,23 @@ fn _unused(_: OpKind) {}
 ///   re-emit. rustc doesn't re-monomorphize `pub use` paths, so
 ///   the canonical's release-optimized forward is called directly
 ///   through this module without additional LLVM work.
-#[allow(clippy::too_many_arguments)]
 fn emit_shim_model(
-    program: &Program,
-    fuf: &Fuf,
-    model: &ModelParams,
-    manifest: &crate::weights_manifest::WeightsManifest,
+    cx: ModelEmitCx<'_>,
     canonical: &Ident,
-    tp_world_size: u8,
     emit_fingerprint: bool,
     // The canonical's affine rows — the fallback for this shim's
     // fingerprint gate when its own accessor set yields none.
     canonical_affine_rows: Option<&[(String, u32, u32)]>,
-    emitter: &dyn crate::target::TargetEmitter,
 ) -> (TokenStream, Vec<(String, u32, u32)>) {
     let (weights, shim_affine_rows) = emit_weights_struct(
-        program,
-        fuf,
+        cx,
         None,
         &ModelDims::default(),
-        model,
-        manifest,
         WeightsEmitMode::Shim { canonical },
-        tp_world_size,
         emit_fingerprint,
         canonical_affine_rows,
-        emitter,
     );
+    let emitter = cx.emitter;
 
     // The shim's forward is its canonical's: the target re-exports whatever of the canonical's
     // emission its loaded-model surface names — variant-specific differences (quant format,

@@ -31,7 +31,7 @@ use scratchy_serving_engine::worker_factory::VerifySeqs;
 use scratchy_state_decoder_gdn::pool::{DraftLanes, GdnSave, GdnSlot, GdnStatePool};
 use scratchy_state_decoder_gdn::slots::{GdnRow, GdnSlotAllocator};
 use scratchy_target_metal::dtype::DType as GpuDType;
-use scratchy_target_metal::kv_cache::KvCachePool;
+use scratchy_target_metal::kv_cache::{ChunkedKvLayout, KvCachePool};
 
 use scratchy_target_metal::OwnedTensor;
 use scratchy_target_metal::interpreter::metal::{
@@ -3447,21 +3447,23 @@ impl MetalWorker {
             let alloc_chunk_counter = std::cell::Cell::new(0usize);
             let chunks_per_layer = draft_chunks;
             KvCachePool::new_chunked(
-                num_layers_draft,
-                draft_blocks,
-                self.config.block_size.get(),
-                kv_row(model.as_ref()).kv_heads,
-                kv_row(model.as_ref()).head_size,
-                draft_block_cap,
-                // Draft pool stays uniform (matching the uniform
-                // store sizing above): spec-decode is not
-                // enabled for hybrid-attention-geometry arches (Gemma4).
-                None,
-                // One physical tensor per KV layer (no group sharing on draft).
-                layer_to_tensor_draft,
-                cache_dtype,
-                blocks_per_chunk,
-                draft_chunks,
+                ChunkedKvLayout {
+                    num_layers: num_layers_draft,
+                    num_blocks: draft_blocks,
+                    block_size: self.config.block_size.get(),
+                    num_kv_heads: kv_row(model.as_ref()).kv_heads,
+                    head_dim: kv_row(model.as_ref()).head_size,
+                    max_blocks_per_seq: draft_block_cap,
+                    // Draft pool stays uniform (matching the uniform
+                    // store sizing above): spec-decode is not
+                    // enabled for hybrid-attention-geometry arches (Gemma4).
+                    per_layer_block_elems: None,
+                    // One physical tensor per KV layer (no group sharing on draft).
+                    layer_to_tensor: layer_to_tensor_draft,
+                    dtype: cache_dtype,
+                    blocks_per_chunk,
+                    initial_chunks: draft_chunks,
+                },
                 |bytes| {
                     let c = alloc_chunk_counter.get();
                     alloc_chunk_counter.set(c + 1);
@@ -7227,29 +7229,31 @@ impl Worker for MetalWorker {
             let alloc_chunk_counter = std::cell::Cell::new(0usize);
             let n_slots = num_tensors_for_pool * 2;
             KvCachePool::new_chunked(
-                num_layers_for_pool,
-                num_gpu_blocks,
-                self.config.block_size.get(),
-                kv_row(model.as_ref()).kv_heads,
-                kv_row(model.as_ref()).head_size,
-                pool_block_cap,
-                // Hybrid: all tensors page-unified → uniform per_block_elems
-                // (None falls back to num_kv_heads·block_size·head_dim, which
-                // equals the unified size for gemma4). Uniform path unchanged.
-                if hybrid_layout.is_some() {
-                    None
-                } else {
-                    per_layer_block_elems.clone()
+                ChunkedKvLayout {
+                    num_layers: num_layers_for_pool,
+                    num_blocks: num_gpu_blocks,
+                    block_size: self.config.block_size.get(),
+                    num_kv_heads: kv_row(model.as_ref()).kv_heads,
+                    head_dim: kv_row(model.as_ref()).head_size,
+                    max_blocks_per_seq: pool_block_cap,
+                    // Hybrid: all tensors page-unified → uniform per_block_elems
+                    // (None falls back to num_kv_heads·block_size·head_dim, which
+                    // equals the unified size for gemma4). Uniform path unchanged.
+                    per_layer_block_elems: if hybrid_layout.is_some() {
+                        None
+                    } else {
+                        per_layer_block_elems.clone()
+                    },
+                    // Layer → physical tensor: vLLM's group-shared position, or a
+                    // recurrent hybrid's KV layer.
+                    layer_to_tensor,
+                    dtype: cache_dtype,
+                    blocks_per_chunk,
+                    // Reactive: 1 chunk up front; the rest grow on demand via
+                    // `grow_metal_kv_to_cover` (called from execute_model each
+                    // step before the forward).
+                    initial_chunks: 1,
                 },
-                // Layer → physical tensor: vLLM's group-shared position, or a
-                // recurrent hybrid's KV layer.
-                layer_to_tensor,
-                cache_dtype,
-                blocks_per_chunk,
-                // Reactive: 1 chunk up front; the rest grow on demand via
-                // `grow_metal_kv_to_cover` (called from execute_model each
-                // step before the forward).
-                1,
                 |bytes| {
                     let c = alloc_chunk_counter.get();
                     alloc_chunk_counter.set(c + 1);

@@ -233,7 +233,6 @@ fn main() -> Result<()> {
         }
         let _ = cfg;
         per_size.push(SizeProbe {
-            repo: repo.clone(),
             bounds: bounds_from_config(cfg),
             tensors,
         });
@@ -265,8 +264,6 @@ fn main() -> Result<()> {
 /// the layer prefix strip (`model.layers.<N>.<path>` → `<path>`);
 /// we assert all duplicates agree on shape when building the map.
 struct SizeProbe {
-    #[allow(dead_code)]
-    repo: String,
     bounds: BTreeMap<String, u64>,
     tensors: BTreeMap<String, Vec<usize>>,
 }

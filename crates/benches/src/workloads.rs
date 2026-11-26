@@ -92,6 +92,7 @@ impl Score {
                 rule,
             } => {
                 let right = match rule {
+                    #[cfg(any(feature = "datasets", test))]
                     Rule::OneAnswer => crate::scoring::contains_or_f1(response, answer),
                     Rule::AnyAnswer => {
                         let all: Vec<&str> = std::iter::once(answer.as_str())
@@ -120,7 +121,7 @@ impl Score {
 pub(crate) enum Rule {
     /// 2WikiMultihopQA's and HotpotQA's: [`crate::scoring::contains_or_f1`], one answer. Their
     /// loaders need the `datasets` feature.
-    #[cfg_attr(not(any(feature = "datasets", test)), allow(dead_code))]
+    #[cfg(any(feature = "datasets", test))]
     OneAnswer,
     /// MuSiQue's and MS MARCO's: [`crate::scoring::any_contains_or_f1`], any of the answers.
     AnyAnswer,

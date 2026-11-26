@@ -322,7 +322,6 @@ pub fn emit_per_variant(
         /// variant geometric difference within a VL family). Returns
         /// `Ok(None)` when the checkpoint isn't a vision tower or
         /// the d_model doesn't match this variant.
-        #[allow(clippy::not_unsafe_ptr_arg_deref)]
         fn try_load_mm(
             gw: &mut crate::__gpu::weights::GpuWeights,
             stream: crate::__gpu::CUstream,
@@ -392,7 +391,6 @@ pub fn emit_per_variant(
         // `&mut GpuWeights<BackendAllocator>` the per-arch `try_load_mm` above
         // expects, so the registration rows can reference one fn item that
         // coerces to the pointer.
-        #[allow(clippy::not_unsafe_ptr_arg_deref)]
         fn __try_load_mm_erased(
             __gw_handle: ::scratchy_forward_compiler::GpuWeightsHandle<'_>,
             stream: crate::__gpu::CUstream,

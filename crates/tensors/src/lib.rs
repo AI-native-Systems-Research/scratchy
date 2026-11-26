@@ -1,6 +1,4 @@
 // SPDX-License-Identifier: Apache-2.0
-#![allow(unsafe_op_in_unsafe_fn)]
-#![allow(clippy::missing_safety_doc)]
 //! Backend-neutral GPU tensor core.
 //!
 //! The foundational types every backend builds on: [`GpuTensor`] (32-byte
@@ -74,7 +72,9 @@ impl<'a> ForwardCtxHandle<'a> {
     /// the target's `ForwardCtx`).
     #[inline]
     pub unsafe fn as_ref<T>(self) -> &'a T {
-        &*(self.ptr as *const T)
+        // SAFETY: the caller guarantees `T` is the type `new` erased, so the
+        // pointer is a live `&'a T` cast back to its own type.
+        unsafe { &*(self.ptr as *const T) }
     }
 }
 
@@ -108,7 +108,10 @@ impl<'a> ForwardDeviceHandle<'a> {
     /// handle is live.
     #[inline]
     pub unsafe fn as_mut<T>(self) -> &'a mut T {
-        &mut *(self.ptr as *mut T)
+        // SAFETY: the caller guarantees `T` is the type `new` erased and that
+        // the returned `&mut` is not aliased, so the pointer is the unique
+        // `&'a mut T` it was built from.
+        unsafe { &mut *(self.ptr as *mut T) }
     }
 }
 
@@ -155,6 +158,9 @@ impl<'a> GpuWeightsHandle<'a> {
     /// handle is live.
     #[inline]
     pub unsafe fn as_mut<T>(self) -> &'a mut T {
-        &mut *(self.ptr as *mut T)
+        // SAFETY: the caller guarantees `T` is the type `new` erased and that
+        // the returned `&mut` is not aliased, so the pointer is the unique
+        // `&'a mut T` it was built from.
+        unsafe { &mut *(self.ptr as *mut T) }
     }
 }

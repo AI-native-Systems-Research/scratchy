@@ -236,14 +236,16 @@ impl Gemma4RouterOps for GemmaRouterLayer {
                     "GemmaRouterLayer (spyre): {prefix}.proj.scales must be F16/BF16, got {s_dt:?}"
                 );
                 let dense = scratchy_quantizations::affine::affine_dequant_b4_to_dtype(
-                    &w_bytes,
-                    &s_bytes,
-                    &b_bytes,
-                    num_experts,
-                    hidden_size,
-                    group_size,
-                    bits,
-                    s_dt,
+                    scratchy_quantizations::affine::AffineWeight {
+                        weight_bytes: &w_bytes,
+                        scales_bytes: &s_bytes,
+                        biases_bytes: &b_bytes,
+                        n: num_experts,
+                        k: hidden_size,
+                        group_size,
+                        bits,
+                        scale_dtype: s_dt,
+                    },
                     scratchy_tensors::DType::BF16,
                 )
                 .map_err(|e| {

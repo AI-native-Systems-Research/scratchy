@@ -276,7 +276,9 @@ impl<'a> TensorView<'a> {
     /// Caller must ensure the resulting pointer + shape stays within valid memory.
     pub unsafe fn offset_bytes(&self, byte_offset: usize, new_shape: &[usize]) -> TensorView<'a> {
         TensorView {
-            inner: self.inner.offset_bytes(byte_offset, new_shape),
+            // SAFETY: the caller guarantees the offset view stays within the
+            // memory this view borrows.
+            inner: unsafe { self.inner.offset_bytes(byte_offset, new_shape) },
             _lifetime: PhantomData,
         }
     }
@@ -449,8 +451,7 @@ mod tests {
     #[test]
     fn test_clone() {
         let t1 = unsafe { GpuTensor::new(0x2000 as *mut u8, &[8, 64], DType::BF16) };
-        #[allow(clippy::clone_on_copy)]
-        let t2 = t1.clone();
+        let t2 = Clone::clone(&t1);
         assert_eq!(t1.raw_ptr(), t2.raw_ptr());
         assert_eq!(t1.numel(), t2.numel());
     }

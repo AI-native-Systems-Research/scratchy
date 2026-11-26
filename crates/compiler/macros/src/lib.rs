@@ -1067,18 +1067,20 @@ pub fn compile_carrier(
         };
 
         let (codegen_items, model_affine_rows) = codegen::emit_model(
-            &sm.prog,
-            sm.model,
-            &sm.fuf,
+            codegen::ModelEmitCx {
+                program: &sm.prog,
+                model: sm.model,
+                fuf: &sm.fuf,
+                manifest: &manifest,
+                tp_world_size: sm.tp_world_size,
+                emitter,
+            },
             &sm.workloads,
-            &manifest,
             sm.inferred,
             canonical_override.as_ref(),
-            sm.tp_world_size,
             mode.emit_arch_dispatch,
             canonical_affine_rows,
             dump_dir,
-            emitter,
         );
         if is_canonical {
             emitted_affine_rows.insert(sm.mod_name.clone(), model_affine_rows);
@@ -1602,7 +1604,6 @@ pub fn compile_carrier(
     let facade = emitter.facade();
     Ok(quote! {
         // The target's runtime crate, which the emitted code names its types through.
-        #[allow(unused_imports)]
         use #facade as __gpu;
 
         // Rebuild-on-change for every JSON the macro read.

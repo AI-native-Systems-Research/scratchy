@@ -62,6 +62,7 @@ pub(crate) fn best_token_f1(answers: &[String], actual: &str) -> f64 {
 /// answer with no tokens (punctuation only) is right only as a substring; an empty one is a
 /// substring of anything. This is `multihop`'s and `hotpotqa`'s rule, F1 computed as they compute
 /// it, which differs from [`token_f1`] only where the expected answer has no tokens.
+#[cfg(any(feature = "datasets", test))]
 pub(crate) fn contains_or_f1(response: &str, expected: &str) -> bool {
     let (resp, exp) = (response.to_lowercase(), expected.to_lowercase());
     if resp.contains(&exp) {

@@ -66,13 +66,6 @@ pub struct HttpEmbeddingProvider {
 }
 
 impl HttpEmbeddingProvider {
-    #[allow(dead_code)]
-    pub fn new(model: &str, dimensions: usize) -> Self {
-        let base_url = std::env::var("VLLM_EMBEDDING_BASE_URL")
-            .unwrap_or_else(|_| "http://localhost:11434/v1".to_string());
-        Self::with_base_url(model, dimensions, base_url)
-    }
-
     /// Create a provider targeting an explicit base URL (e.g. a sidecar).
     pub fn with_base_url(model: &str, dimensions: usize, base_url: String) -> Self {
         let api_key = std::env::var("VLLM_EMBEDDING_API_KEY").ok();
@@ -86,14 +79,6 @@ impl HttpEmbeddingProvider {
                 .build()
                 .into(),
         }
-    }
-
-    /// Probe the embedding endpoint to detect dimensions.
-    #[allow(dead_code)]
-    pub fn probe_dimensions(model: &str) -> Result<usize> {
-        let provider = Self::new(model, 0);
-        let resp = provider.call_api(&["probe".to_string()])?;
-        Ok(resp[0].len())
     }
 
     pub(crate) fn call_api(&self, inputs: &[String]) -> Result<Vec<Vec<f32>>> {

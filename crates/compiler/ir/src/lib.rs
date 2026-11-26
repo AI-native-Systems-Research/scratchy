@@ -277,7 +277,6 @@ pub trait WeightAccessors {
 /// on `eval<W: CanonicalParams>` and `run<W>` / `run_backbone<W>` as
 /// method-level generics, parameterizing the interpreter's access to
 /// per-canonical model constants without polluting every static row.
-#[allow(clippy::type_complexity)]
 #[derive(Debug)]
 pub enum Instruction {
     Embed(u32),

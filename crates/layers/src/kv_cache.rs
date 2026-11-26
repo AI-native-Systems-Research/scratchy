@@ -12,6 +12,35 @@ use scratchy_tensors::{DType, PoolMemory};
 
 /// Paged KV cache pool for all transformer layers.
 ///
+/// The geometry and chunking of a pool [`KvCachePool::new_chunked`] allocates.
+pub struct ChunkedKvLayout {
+    pub num_layers: usize,
+    pub num_blocks: usize,
+    pub block_size: usize,
+    pub num_kv_heads: usize,
+    pub head_dim: usize,
+    /// Per-sequence block-table row capacity (see the pool's field). Runtime-
+    /// derived `min(ceil(max_model_len/block_size), num_blocks).max(1)`.
+    pub max_blocks_per_seq: usize,
+    /// Per-TENSOR block-elem override for hybrid-geometry models
+    /// (Gemma4). `None` = uniform (the common case). When `Some`, len must
+    /// equal the physical tensor count (`num_layers`, or `group_size` when
+    /// `layer_to_tensor` is `Some`) and each entry is that tensor's
+    /// `kv_heads * block_size * head_dim` (page-unified → uniform per tensor).
+    pub per_layer_block_elems: Option<Vec<usize>>,
+    /// vLLM group-shared layout: maps each logical layer → physical tensor.
+    /// `None` = one tensor per layer (identity; every uniform model). `Some`
+    /// collapses the `num_layers` chunk vecs to `max(map)+1` shared tensors.
+    pub layer_to_tensor: Option<Vec<usize>>,
+    pub dtype: DType,
+    pub blocks_per_chunk: usize,
+    /// Chunks to allocate up front. `1` = reactive/lazy (grow on
+    /// demand via `grow_to_cover`); `usize::MAX` = eager (allocate
+    /// the whole pool now — used for the draft pool, whose spec-decode
+    /// forward path has no growth hook).
+    pub initial_chunks: usize,
+}
+
 /// Allocates persistent device memory for K and V caches. Block
 /// allocation/freeing is managed by the scheduler — this struct just owns
 /// the storage.
@@ -134,36 +163,24 @@ impl<M: PoolMemory> KvCachePool<M> {
     /// # Safety
     /// Caller must ensure the target's device is initialized on this
     /// thread.
-    #[allow(clippy::too_many_arguments)]
     pub unsafe fn new_chunked(
-        num_layers: usize,
-        num_blocks: usize,
-        block_size: usize,
-        num_kv_heads: usize,
-        head_dim: usize,
-        // Per-sequence block-table row capacity (see the struct field). Runtime-
-        // derived `min(ceil(max_model_len/block_size), num_blocks).max(1)`.
-        max_blocks_per_seq: usize,
-        // Per-TENSOR block-elem override for hybrid-geometry models
-        // (Gemma4). `None` = uniform (the common case). When `Some`, len must
-        // equal the physical tensor count (`num_layers`, or `group_size` when
-        // `layer_to_tensor` is `Some`) and each entry is that tensor's
-        // `kv_heads * block_size * head_dim` (page-unified → uniform per tensor).
-        per_layer_block_elems: Option<Vec<usize>>,
-        // vLLM group-shared layout: maps each logical layer → physical tensor.
-        // `None` = one tensor per layer (identity; every uniform model). `Some`
-        // collapses the `num_layers` chunk vecs to `max(map)+1` shared tensors.
-        layer_to_tensor: Option<Vec<usize>>,
-        dtype: DType,
-        blocks_per_chunk: usize,
-        // Chunks to allocate up front. `1` = reactive/lazy (grow on
-        // demand via `grow_to_cover`); `usize::MAX` = eager (allocate
-        // the whole pool now — used for the draft pool, whose spec-decode
-        // forward path has no growth hook).
-        initial_chunks: usize,
+        layout: ChunkedKvLayout,
         mut alloc_chunk: impl FnMut(usize) -> Result<M>,
         mut alloc_table: impl FnMut(usize) -> Result<M>,
     ) -> Result<Self> {
+        let ChunkedKvLayout {
+            num_layers,
+            num_blocks,
+            block_size,
+            num_kv_heads,
+            head_dim,
+            max_blocks_per_seq,
+            per_layer_block_elems,
+            layer_to_tensor,
+            dtype,
+            blocks_per_chunk,
+            initial_chunks,
+        } = layout;
         assert!(blocks_per_chunk > 0, "blocks_per_chunk must be non-zero");
         if dtype.is_fp8() {
             anyhow::bail!("new_chunked: FP8 cache dtype is not supported");
@@ -516,18 +533,20 @@ mod group_shared_tests {
     fn build(num_layers: usize, map: Option<Vec<usize>>) -> KvCachePool<MockMem> {
         unsafe {
             KvCachePool::<MockMem>::new_chunked(
-                num_layers,
-                64,
-                16,
-                8,
-                256,
-                // max_blocks_per_seq: 64 blocks / 16 block_size = 4.
-                4,
-                None,
-                map,
-                DType::BF16,
-                16,
-                1,
+                ChunkedKvLayout {
+                    num_layers,
+                    num_blocks: 64,
+                    block_size: 16,
+                    num_kv_heads: 8,
+                    head_dim: 256,
+                    // max_blocks_per_seq: 64 blocks / 16 block_size = 4.
+                    max_blocks_per_seq: 4,
+                    per_layer_block_elems: None,
+                    layer_to_tensor: map,
+                    dtype: DType::BF16,
+                    blocks_per_chunk: 16,
+                    initial_chunks: 1,
+                },
                 |b| Ok(MockMem::alloc(b)),
                 |b| Ok(MockMem::alloc(b)),
             )

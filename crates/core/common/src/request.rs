@@ -500,7 +500,6 @@ impl Request {
     /// Create a new `Request` with the given core fields.
     ///
     /// Initializes all mutable counters to their default state.
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         request_id: String,
         prompt_token_ids: Vec<u32>,
