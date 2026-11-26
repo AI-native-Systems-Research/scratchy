@@ -267,6 +267,12 @@ pub struct MetalWorker {
     /// The passes of a multi-token-prediction head (a `draft_model` that reads the target's
     /// hidden states), run at the end of a step the engine planned drafts for.
     mtp_drafter: Option<::scratchy_serving_engine::spec_decode::MtpDrafter>,
+    /// A parallel-drafting head's placeholder target hidden row (P-EAGLE's `mask_hidden`, the
+    /// model dtype): what each of its rows past a sequence's newest reads.
+    mask_hidden: Option<Vec<u8>>,
+    /// The MTP head's target hidden rows are the layers its target captures for it
+    /// (`HeadRegistration::reads_captures`), not the target's final hidden states.
+    head_reads_captures: bool,
     /// Splash's DFlash2 drafter (a `draft_model` that drafts a block a pass), run at the end of a
     /// step the engine planned drafts for.
     dflash2: Option<Dflash2>,
@@ -1003,6 +1009,8 @@ impl MetalWorker {
             prompt_logprobs_acc: Default::default(),
             draft_vocab_suffix: None,
             mtp_drafter: None,
+            mask_hidden: None,
+            head_reads_captures: false,
             dflash2: None,
             sampler_kernels: None,
             sampler_arena: None,
@@ -1910,21 +1918,47 @@ impl MetalWorker {
         // A multi-token-prediction head carries no embedding or lm_head: lend it the target's,
         // from the target store's refs (same mmap → no second upload).
         let mut block_budget = None;
-        if let Some(head) = scratchy_forward_compiler::draft_head(&draft_arch) {
-            match head.drafting {
-                // It drafts over its whole vocabulary until its bake says otherwise (below: a
-                // vocabulary suffix).
-                scratchy_forward_compiler::HeadDrafting::Chained => {
-                    self.mtp_drafter = Some(::scratchy_serving_engine::spec_decode::MtpDrafter {
-                        budget: draft_budget(&head),
-                        max_model_len: self.max_model_len(),
-                        reads_target_kv: head.reads_target_kv,
-                        draft_vocab: None,
-                    });
+        let has_key = |key: &str| draft_hf_config.extra.contains_key(key);
+        if let Some(head) = scratchy_forward_compiler::draft_head(&draft_arch, &has_key) {
+            use ::scratchy_serving_engine::spec_decode::PastFirst;
+            use scratchy_forward_compiler::HeadDrafting;
+            let past_first = match head.drafting {
+                HeadDrafting::Chained => Some(PastFirst::Chained),
+                // Its placeholder target hidden row is a tensor of its checkpoint its forward
+                // never binds: the worker lays it out for the rows that read it.
+                HeadDrafting::Parallel(parallel) => {
+                    let fail = |why: String| {
+                        ExecutorError::WorkerInit(format!(
+                            "MTP head: {}: {why}",
+                            parallel.mask_hidden
+                        ))
+                    };
+                    let (bytes, dtype, _) = (draft_weights.take_to_cpu_bytes(parallel.mask_hidden))
+                        .map_err(|e| fail(e.to_string()))?;
+                    if dtype != GpuDType::BF16 {
+                        return Err(fail(format!("{dtype:?}, not the head's bf16")));
+                    }
+                    self.mask_hidden = Some(bytes);
+                    Some(PastFirst::Parallel {
+                        mask_token: parallel.mask_token,
+                    })
                 }
-                scratchy_forward_compiler::HeadDrafting::Block => {
+                HeadDrafting::Block => {
                     block_budget = Some(draft_budget(&head));
+                    None
                 }
+            };
+            // It drafts over its whole vocabulary until its bake says otherwise (below: a
+            // vocabulary suffix).
+            if let Some(past_first) = past_first {
+                self.mtp_drafter = Some(::scratchy_serving_engine::spec_decode::MtpDrafter {
+                    budget: draft_budget(&head),
+                    max_model_len: self.max_model_len(),
+                    reads_target_kv: head.reads_target_kv,
+                    draft_vocab: None,
+                    past_first,
+                });
+                self.head_reads_captures = head.reads_captures;
             }
             let (Some(target), Some(refs)) =
                 (self.model.as_deref(), self.target_tensor_refs.as_ref())
@@ -1940,6 +1974,13 @@ impl MetalWorker {
                 let from = target.lent_weight_prefix(w).ok_or_else(|| {
                     ExecutorError::WorkerInit(format!("MTP head: the target has no {w:?} to lend"))
                 })?;
+                let own = draft_weights.shadow(to);
+                if own > 0 {
+                    info!(
+                        "ScratchyWorker(metal): MTP head reads its target's {w:?}, not the {own} \
+                         tensors of its own under {to}"
+                    );
+                }
                 let lent = draft_weights
                     .lend(refs, from, to, head.rows(w))
                     .map_err(|e| {
@@ -2371,19 +2412,33 @@ impl MetalWorker {
         let model = (self.draft_model.as_deref()).ok_or_else(|| fail("no head"))?;
         let device = (self.gpu_device.as_ref()).ok_or_else(|| fail("no device"))?;
         let rope_bytes = model.metal_rope_rows(&[0]).map_or(0, |row| row.len());
-        // A head's hidden rows, read and exported, are its target's width.
-        let target = (self.model.as_deref()).ok_or_else(|| fail("no target"))?;
-        let layout = ChainLayout::of(Some(drafting), target.hidden_size() as usize, rope_bytes);
+        // A head's target hidden rows, read and exported: its target's width, or the layers its
+        // target captures for it side by side.
+        let width = model.target_hidden_width() as usize;
+        let mask_token = self.mask_token();
+        let layout = ChainLayout::of(Some(drafting), width, rope_bytes, mask_token.is_some());
         let buffer = free_chain_buffer(
             &mut self.mtp_chain_buffers,
             &device.device,
             device.allocator.residency(),
             layout.bytes,
         );
-        layout.write(&drafting.chain, &buffer.0, |positions| {
-            model.metal_rope_rows(positions)
-        });
+        let rope_rows = |positions: &[u32]| model.metal_rope_rows(positions);
+        let placeholders = mask_token.zip(self.mask_hidden.as_deref());
+        layout.write(&drafting.chain, &buffer.0, rope_rows, placeholders);
         Ok(Some((layout, buffer, behind)))
+    }
+
+    /// A parallel-drafting head's mask token ([`PastFirst::Parallel`]): its pass 1 drafts every
+    /// token. `None` for a chained head, or none.
+    ///
+    /// [`PastFirst::Parallel`]: ::scratchy_serving_engine::spec_decode::PastFirst::Parallel
+    fn mask_token(&self) -> Option<u32> {
+        use ::scratchy_serving_engine::spec_decode::PastFirst;
+        self.mtp_drafter.as_ref().and_then(|d| match d.past_first {
+            PastFirst::Parallel { mask_token } => Some(mask_token),
+            PastFirst::Chained => None,
+        })
     }
 
     /// A step behind the speculative step before it (`spec_tail`), which is still in flight: the
@@ -2556,6 +2611,21 @@ impl MetalWorker {
             false => (slots, shifted),
         };
         let head_window: Vec<u32> = window.iter().map(|p| p + u32::from(target_kv)).collect();
+        // A parallel-drafting head's pass 1 runs on past the step's rows, a row a draft past the
+        // first: its own positions, `k - a` earlier, as the step's.
+        let one = passes.and_then(|p| p.drafting.as_ref()).map(|d| &d.one);
+        let (slots, useds, shifted, rows) = match (layout.parallel, one) {
+            (true, Some(one)) => {
+                let (positions, used) = (&one.positions, one.seqused_k[0]);
+                (
+                    variants(&|d| positions.iter().map(|&p| slot(p - d)).collect()),
+                    variants(&|d| vec![used - d]),
+                    variants(&|d| positions.iter().map(|&p| p - d).collect()),
+                    positions.len(),
+                )
+            }
+            _ => (slots, useds, shifted, rows),
+        };
         out.push(table(slots, rows, rows, to(), at(ChainLayout::ONE_SLOTS)));
         out.push(table(useds, 1, 1, to(), at(ChainLayout::ONE_USED)));
         out.push(match rope(head.metal_rope_rows(&head_window)) {
@@ -4292,11 +4362,19 @@ impl MetalWorker {
                 let (layout, buffer, behind) = match self.pending_chain.take() {
                     Some((layout, buffer, behind)) => (layout, Some(buffer), behind),
                     None => {
-                        let target = (self.model.as_deref())
-                            .ok_or_else(|| BackendError::Backend("target not loaded".into()))?;
-                        let width = target.hidden_size() as usize;
+                        let width = model.target_hidden_width() as usize;
                         let drafting = passes.drafting.as_ref();
-                        (ChainLayout::of(drafting, width, rope_bytes), None, false)
+                        let parallel = (self.mtp_drafter.as_ref()).is_some_and(|d| {
+                            matches!(
+                                d.past_first,
+                                ::scratchy_serving_engine::spec_decode::PastFirst::Parallel { .. }
+                            )
+                        });
+                        (
+                            ChainLayout::of(drafting, width, rope_bytes, parallel),
+                            None,
+                            false,
+                        )
                     }
                 };
                 // A head reading its target's KV runs on the target's pool, reading each layer's
@@ -4324,6 +4402,7 @@ impl MetalWorker {
                     layout,
                     device,
                     behind,
+                    reads_captures: self.head_reads_captures,
                 })))
             }
             _ => None,
@@ -4683,16 +4762,23 @@ struct ChainLayout {
     n: usize,
     /// The head's most drafts each: a sequence's room in the next-pass tables and the drafts.
     k: usize,
-    /// Head passes: the drafts each gets.
+    /// Head passes: pass 1 and the chained ones.
     passes: usize,
+    /// The rows a sequence each chained pass runs (one a draft it makes).
+    rows: usize,
     hidden_bytes: usize,
     /// An MRoPE head's rotary cos/sin row (0: its rope reads positions).
     rope_bytes: usize,
-    /// Pass 1's rows its argmax runs: its first token row through its last.
+    /// Pass 1's rows its argmax runs: its first token row through its last (a parallel-drafting
+    /// head's: every row).
     window: std::ops::Range<u32>,
+    /// A parallel-drafting head's: its pass 1 drafts every token, reading the rows the chain
+    /// lays out before it ([`Self::STAGED_IDS`]).
+    parallel: bool,
     /// Byte offsets: `[seqs, drafted, next, consts, picked, accepted, ids, positions, slots,
-    /// used, hidden, drafts, rope, next_rope, one_positions, one_slots, one_used, one_rope]`.
-    at: [usize; 18],
+    /// used, hidden, drafts, rope, next_rope, one_positions, one_slots, one_used, one_rope,
+    /// staged_ids, staged_hidden, mask_hidden]`.
+    at: [usize; 21],
     bytes: usize,
 }
 
@@ -4700,7 +4786,9 @@ impl ChainLayout {
     const SEQS: usize = 0;
     const DRAFTED: usize = 1;
     const NEXT: usize = 2;
-    /// Per argmax `batch`, then per chain pass its depth, then pass 1's window start.
+    /// Per argmax `batch`, then per chain pass its depth, then pass 1's window start, then the
+    /// rows a sequence a chained pass runs, then the depth of a parallel-drafting head's layout
+    /// before pass 1 (0).
     const CONSTS: usize = 3;
     const PICKED: usize = 4;
     const ACCEPTED: usize = 5;
@@ -4719,44 +4807,66 @@ impl ChainLayout {
     const ONE_SLOTS: usize = 15;
     const ONE_USED: usize = 16;
     const ONE_ROPE: usize = 17;
+    /// A parallel-drafting head's pass 1 rows' tokens and target hidden rows, laid out by the
+    /// chain before it, and the placeholder target hidden row the host writes.
+    const STAGED_IDS: usize = 18;
+    const STAGED_HIDDEN: usize = 19;
+    const MASK_HIDDEN: usize = 20;
 
     fn of(
         drafting: Option<&::scratchy_serving_engine::spec_decode::Drafting>,
         hidden: usize,
         rope_bytes: usize,
+        parallel: bool,
     ) -> Self {
         let token_rows = drafting.map_or(&[][..], |d| &d.one.token_rows);
         let rows = token_rows.iter().map(|&(row, _)| row);
-        let window = rows.clone().min().unwrap_or(0)..rows.max().map_or(0, |r| r + 1);
-        let (n, drafted, k, passes) = match drafting.map(|d| &d.chain) {
-            Some(c) => (c.num_seqs(), c.drafted.len(), c.drafts(), c.passes()),
-            None => (0, 0, 0, 0),
+        let one_rows = drafting.map_or(0, |d| d.one.positions.len());
+        let window = match parallel {
+            true => 0..one_rows as u32,
+            false => rows.clone().min().unwrap_or(0)..rows.max().map_or(0, |r| r + 1),
+        };
+        let (n, drafted, k, passes, rows) = match drafting.map(|d| &d.chain) {
+            Some(c) => (
+                c.num_seqs(),
+                c.drafted.len(),
+                c.drafts(),
+                c.passes(),
+                c.rows(),
+            ),
+            None => (0, 0, 0, 0, 1),
         };
         let hidden_bytes = hidden * 2;
-        let (rows, seqs) =
-            drafting.map_or((0, 0), |d| (d.one.positions.len(), d.one.seqused_k.len()));
+        // A chained pass's rows (a parallel-drafting head runs none); pass 1's sequences, and the
+        // rows a parallel-drafting head's chain lays out.
+        let chained = if parallel { 0 } else { n * rows };
+        let seqs = drafting.map_or(0, |d| d.one.seqused_k.len());
+        let laid_out = if parallel { one_rows } else { 0 };
         let u32s = |count: usize| count * size_of::<u32>();
         let sizes = [
             u32s(3 * n),
             u32s(drafted),
-            u32s(passes * n * (k + 1) * 3),
-            u32s(2 * passes + 1),
-            u32s((window.len()).max(n)),
+            u32s(passes * n * (k + 1) * rows * 3),
+            u32s(2 * passes + 3),
+            u32s((window.len()).max(chained)),
             u32s(n),
+            u32s(chained.max(n)),
+            u32s(chained),
+            u32s(chained),
             u32s(n),
-            u32s(n),
-            u32s(n),
-            u32s(n),
-            n * hidden_bytes,
+            chained * hidden_bytes,
             u32s(n * k),
             passes * n * (k + 1) * rope_bytes,
             n * rope_bytes,
-            u32s(rows),
-            u32s(rows),
+            u32s(one_rows),
+            u32s(one_rows),
             u32s(seqs),
-            rows * rope_bytes,
+            one_rows * rope_bytes,
+            u32s(laid_out),
+            laid_out * hidden_bytes,
+            if parallel { hidden_bytes } else { 0 },
         ];
-        let mut at = [0; 18];
+        let mut at = [0; 21];
         let mut bytes = 0;
         for (at, size) in at.iter_mut().zip(sizes) {
             *at = bytes;
@@ -4766,22 +4876,27 @@ impl ChainLayout {
             n,
             k,
             passes,
+            rows,
             hidden_bytes,
             rope_bytes,
             window,
+            parallel,
             at,
             bytes,
         }
     }
 
     /// The host's tables: the chain's sequences, drafted tokens and next-pass tables — with an
-    /// MRoPE head's rope rows at each next pass's positions (`rope_rows`) — and the constants each
+    /// MRoPE head's rope rows at each next pass's positions (`rope_rows`) — a parallel-drafting
+    /// head's `placeholders` (its mask token under every row of its pass 1, which the chain
+    /// overwrites through each newest, and its target hidden row), and the constants each
     /// dispatch reads.
     fn write(
         &self,
         chain: &::scratchy_serving_engine::spec_decode::Chain,
         buffer: &scratchy_target_metal::mtl4_dispatch::Buffer,
         rope_rows: impl Fn(&[u32]) -> Option<Vec<u8>>,
+        placeholders: Option<(u32, &[u8])>,
     ) {
         let put_bytes = |at: usize, bytes: &[u8]| {
             // SAFETY: the buffer holds `self.bytes`, every section sized for what it holds; no
@@ -4801,6 +4916,10 @@ impl ChainLayout {
         put(Self::SEQS, chain.seqs.as_flattened());
         put(Self::DRAFTED, &chain.drafted);
         put(Self::NEXT, &chain.next.concat());
+        if let (true, Some((mask_token, row))) = (self.parallel, placeholders) {
+            put(Self::STAGED_IDS, &vec![mask_token; self.window.len()]);
+            put_bytes(self.at[Self::MASK_HIDDEN], row);
+        }
         if self.rope_bytes > 0 {
             let table = self.n * (self.k + 1) * self.rope_bytes;
             for (d, next) in chain.next.iter().enumerate() {
@@ -4810,9 +4929,10 @@ impl ChainLayout {
             }
         }
         let batches = std::iter::once(self.window.len() as u32)
-            .chain((1..self.passes).map(|_| self.n as u32));
+            .chain((1..self.passes).map(|_| (self.n * self.rows) as u32));
         let depths = 1..=self.passes as u32;
-        let consts: Vec<u32> = batches.chain(depths).chain([self.window.start]).collect();
+        let tail = [self.window.start, self.rows as u32, 0];
+        let consts: Vec<u32> = batches.chain(depths).chain(tail).collect();
         put(Self::CONSTS, &consts);
     }
 
@@ -4967,11 +5087,28 @@ struct HeadPassesEncoder<'a> {
     /// The step is behind a speculative one in flight: pass 1 reads its positions, slots and used
     /// KV lengths from the chain buffer, where the device picked them.
     behind: bool,
+    /// Its target hidden rows are the layers the target captured for it, not its final hidden
+    /// states (`HeadRegistration::reads_captures`).
+    reads_captures: bool,
 }
 
 impl<'a> HeadPassesEncoder<'a> {
+    /// The target hidden rows the passes read of what the target left: the layers it captured
+    /// for the head, or its final hidden states.
+    fn target_hidden(
+        &self,
+        outputs: scratchy_target_metal::model::FollowupOutputs<'_>,
+    ) -> Result<scratchy_target_metal::mtl4_dispatch::Buffer, String> {
+        match self.reads_captures {
+            true => (outputs.captured)
+                .map(retained)
+                .ok_or_else(|| "the head reads its target's captured rows; it captured none".into()),
+            false => Ok(retained(outputs.hidden)),
+        }
+    }
+
     /// Encode the passes onto `enc` after the target's forward, which picked its tokens into
-    /// `tokens` (one `u32` a sampled row) and left its final hidden states in `hidden`.
+    /// `tokens` (one `u32` a sampled row) and left the target hidden rows they read in `hidden`.
     fn encode(
         &mut self,
         enc: &::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTL4ComputeCommandEncoder>,
@@ -4981,14 +5118,21 @@ impl<'a> HeadPassesEncoder<'a> {
         use scratchy_target_metal::interpreter::metal::DeviceInputInto as Into;
         let passes = self.passes;
         // Pass 1 over the rows no draft reads, for their KV alone; then over the rows a draft can
-        // read, whole — on the same worker, after the KV the first wrote.
-        let runs = [
-            (passes.prime.as_ref()).map(|prime| (prime, Reads::CacheWrites)),
-            (passes.drafting.as_ref()).map(|d| (&d.one, Reads::Outputs)),
-        ];
-        let mut onto = None;
-        for (pass, reads) in runs.into_iter().flatten() {
-            onto = Some(self.encode_pass(enc, onto, pass, reads, tokens, hidden)?);
+        // read, whole — on the same worker, after the KV the first wrote. A parallel-drafting
+        // head's reads the rows its chain lays out from what the target accepted.
+        let mut onto = match &passes.prime {
+            Some(prime) => {
+                let reads = Reads::CacheWrites;
+                Some(self.encode_pass(enc, None, prime, reads, tokens, hidden)?)
+            }
+            None => None,
+        };
+        if let Some(drafting) = &passes.drafting {
+            if self.layout.parallel {
+                self.lay_out_parallel(enc, tokens, hidden)?;
+            }
+            let reads = Reads::Outputs;
+            onto = Some(self.encode_pass(enc, onto, &drafting.one, reads, tokens, hidden)?);
         }
         let mut onto = onto.ok_or("MTP head passes with no row")?;
         let (Some(drafting), Some(buffer)) = (&passes.drafting, self.buffer.clone()) else {
@@ -5007,20 +5151,22 @@ impl<'a> HeadPassesEncoder<'a> {
         creq.sliding_block_tables = &ctable_refs;
         creq.sliding_slot_mappings = &cslot_refs;
         let n = layout.n;
+        // A chained pass's rows: `rows` a sequence.
+        let chained = n * layout.rows;
         // An MRoPE head reads its rope rows in place of positions, which index them.
         let position = match layout.rope_bytes {
-            0 => layout.input(buffer, ChainLayout::POSITIONS, n * 4, Into::Positions),
+            0 => layout.input(buffer, ChainLayout::POSITIONS, chained * 4, Into::Positions),
             rope => layout.input(buffer, ChainLayout::NEXT_ROPE, n * rope, Into::RopeRows),
         };
         let inputs = [
-            layout.input(buffer, ChainLayout::IDS, n * 4, Into::InputIds),
+            layout.input(buffer, ChainLayout::IDS, chained * 4, Into::InputIds),
             position,
-            layout.input(buffer, ChainLayout::SLOTS, n * 4, Into::SlotMapping),
+            layout.input(buffer, ChainLayout::SLOTS, chained * 4, Into::SlotMapping),
             layout.input(buffer, ChainLayout::USED, n * 4, Into::SeqUsedK),
             layout.input(
                 buffer,
                 ChainLayout::HIDDEN,
-                n * row_bytes,
+                chained * row_bytes,
                 Into::TargetHidden,
             ),
         ];
@@ -5031,7 +5177,7 @@ impl<'a> HeadPassesEncoder<'a> {
                 unsafe {
                     onto.then(
                         scratchy_target_metal::ForwardCtxHandle::new(&ctx),
-                        n as u64,
+                        chained as u64,
                         enc,
                     )
                 }?;
@@ -5040,7 +5186,11 @@ impl<'a> HeadPassesEncoder<'a> {
             let first = if depth == 1 { layout.window.start } else { 0 };
             let logits =
                 onto.logits().gpuAddress() + u64::from(first) * u64::from(onto.vocab()) * 2;
-            let batch = if depth == 1 { layout.window.len() } else { n };
+            let batch = if depth == 1 {
+                layout.window.len()
+            } else {
+                chained
+            };
             let consts = |i: usize| layout.address(buffer, ChainLayout::CONSTS) + (i * 4) as u64;
             let picked = layout.address(buffer, ChainLayout::PICKED);
             match self.suffix.filter(|_| drafting.wide) {
@@ -5070,7 +5220,7 @@ impl<'a> HeadPassesEncoder<'a> {
             }
             let at = |section| layout.address(buffer, section);
             let table = (depth - 1) * n * (layout.k + 1);
-            let next = at(ChainLayout::NEXT) + (table * 3 * 4) as u64;
+            let next = at(ChainLayout::NEXT) + (table * layout.rows * 3 * 4) as u64;
             let rope = at(ChainLayout::ROPE) + (table * layout.rope_bytes) as u64;
             let bindings = [
                 picked,
@@ -5090,6 +5240,8 @@ impl<'a> HeadPassesEncoder<'a> {
                 consts(2 * layout.passes),
                 rope,
                 at(ChainLayout::NEXT_ROPE),
+                consts(2 * layout.passes + 1),
+                at(ChainLayout::MASK_HIDDEN),
             ];
             let chain_table = argument_table(&self.device, &bindings)?;
             let n = n as u32;
@@ -5103,10 +5255,57 @@ impl<'a> HeadPassesEncoder<'a> {
         Ok(onto)
     }
 
-    /// A pass-1 forward over `pass`'s rows onto `enc`, reading the target's tokens and final hidden
-    /// states where `pass` names them: the head's first (`onto` `None`), or after the ones before
-    /// it on their worker. A drafting pass behind a speculative step in flight reads its positions,
-    /// slots and used KV lengths from the chain buffer, where the device picked them.
+    /// A parallel-drafting head's chain before its pass 1 (`mtp_chain.metal`, depth 0): each
+    /// drafting sequence's accepted count, from the target's tokens, and the rows the pass reads
+    /// — through the newest the target's tokens and its hidden rows in `hidden`, past it the
+    /// head's placeholders.
+    fn lay_out_parallel(
+        &self,
+        enc: &::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTL4ComputeCommandEncoder>,
+        tokens: &scratchy_target_metal::mtl4_dispatch::Buffer,
+        hidden: &scratchy_target_metal::mtl4_dispatch::Buffer,
+    ) -> Result<(), String> {
+        let buffer = (self.buffer.as_ref()).ok_or("a parallel-drafting head without its chain")?;
+        let kernel = (self.chain_kernel).ok_or("an MTP head without its chain kernel")?;
+        let layout = &self.layout;
+        let at = |section| layout.address(&buffer.0, section);
+        let consts = |i: usize| at(ChainLayout::CONSTS) + (i * 4) as u64;
+        let bindings = [
+            at(ChainLayout::PICKED),
+            hidden.gpuAddress(),
+            tokens.gpuAddress(),
+            at(ChainLayout::DRAFTED),
+            at(ChainLayout::SEQS),
+            at(ChainLayout::ACCEPTED),
+            at(ChainLayout::NEXT),
+            at(ChainLayout::STAGED_IDS),
+            at(ChainLayout::POSITIONS),
+            at(ChainLayout::SLOTS),
+            at(ChainLayout::USED),
+            at(ChainLayout::STAGED_HIDDEN),
+            at(ChainLayout::DRAFTS),
+            consts(2 * layout.passes + 2),
+            consts(2 * layout.passes),
+            at(ChainLayout::ROPE),
+            at(ChainLayout::NEXT_ROPE),
+            consts(2 * layout.passes + 1),
+            at(ChainLayout::MASK_HIDDEN),
+        ];
+        let table = argument_table(&self.device, &bindings)?;
+        scratchy_target_metal::mtp_chain::encode_mtp_chain_into_mtl4(
+            kernel,
+            enc,
+            &table,
+            layout.n as u32,
+        );
+        Ok(())
+    }
+
+    /// A pass-1 forward over `pass`'s rows onto `enc`, reading the target's tokens and hidden rows
+    /// where `pass` names them (a parallel-drafting head's drafting pass: the rows its chain laid
+    /// out): the head's first (`onto` `None`), or after the ones before it on their worker. A
+    /// drafting pass behind a speculative step in flight reads its positions, slots and used KV
+    /// lengths from the chain buffer, where the device picked them.
     fn encode_pass(
         &mut self,
         enc: &::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTL4ComputeCommandEncoder>,
@@ -5118,18 +5317,37 @@ impl<'a> HeadPassesEncoder<'a> {
     ) -> Result<Box<dyn scratchy_target_metal::model::MetalForwardOnto + 'a>, String> {
         use scratchy_target_metal::interpreter::metal::DeviceInputInto as Into;
         let row_bytes = self.layout.hidden_bytes;
-        // The target's token at a sampled row: `tokens` holds one a sampled row, in order.
-        let token_inputs = (pass.token_rows.iter()).map(|&(row, sampled)| {
-            DeviceInput::token(
-                tokens.clone(),
-                sampled as usize * size_of::<u32>(),
-                row as usize,
-            )
-        });
-        let hidden_inputs = (pass.hidden_rows.iter()).map(|&(row, step_row, rows)| {
-            let (row, step_row, rows) = (row as usize, step_row as usize, rows as usize);
-            DeviceInput::hidden_rows(hidden.clone(), step_row, row, rows, row_bytes)
-        });
+        let rows_in: Vec<DeviceInput> = match (self.layout.parallel, reads) {
+            (true, Reads::Outputs) => {
+                let b =
+                    (self.buffer.as_ref()).ok_or("a parallel-drafting head without its chain")?;
+                let rows = pass.positions.len();
+                vec![
+                    (self.layout).input(&b.0, ChainLayout::STAGED_IDS, rows * 4, Into::InputIds),
+                    (self.layout).input(
+                        &b.0,
+                        ChainLayout::STAGED_HIDDEN,
+                        rows * row_bytes,
+                        Into::TargetHidden,
+                    ),
+                ]
+            }
+            _ => {
+                // The target's token at a sampled row: `tokens` holds one a sampled row, in order.
+                let token_inputs = (pass.token_rows.iter()).map(|&(row, sampled)| {
+                    DeviceInput::token(
+                        tokens.clone(),
+                        sampled as usize * size_of::<u32>(),
+                        row as usize,
+                    )
+                });
+                let hidden_inputs = (pass.hidden_rows.iter()).map(|&(row, step_row, rows)| {
+                    let (row, step_row, rows) = (row as usize, step_row as usize, rows as usize);
+                    DeviceInput::hidden_rows(hidden.clone(), step_row, row, rows, row_bytes)
+                });
+                token_inputs.chain(hidden_inputs).collect()
+            }
+        };
         let behind = self.behind && reads == Reads::Outputs;
         let picked = (self.buffer.as_ref()).filter(|_| behind).map(|b| {
             let (l, rows, seqs) = (&self.layout, pass.positions.len(), pass.seqused_k.len());
@@ -5143,7 +5361,7 @@ impl<'a> HeadPassesEncoder<'a> {
                 l.input(&b.0, ChainLayout::ONE_USED, seqs * 4, Into::SeqUsedK),
             ]
         });
-        let device_inputs: Vec<DeviceInput> = (token_inputs.chain(hidden_inputs))
+        let device_inputs: Vec<DeviceInput> = (rows_in.into_iter())
             .chain(picked.into_iter().flatten())
             .collect();
         let mut req = pass.request();
@@ -5725,7 +5943,10 @@ impl<'a> HeadEncoder<'a> {
         outputs: scratchy_target_metal::model::FollowupOutputs<'_>,
     ) -> Result<Box<dyn scratchy_target_metal::model::MetalForwardOnto + 'a>, String> {
         match self {
-            Self::Mtp(h) => h.encode(enc, tokens, &retained(outputs.hidden)),
+            Self::Mtp(h) => {
+                let hidden = h.target_hidden(outputs)?;
+                h.encode(enc, tokens, &hidden)
+            }
             Self::Block(b) => b.encode(enc, tokens, outputs),
         }
     }

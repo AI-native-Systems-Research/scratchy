@@ -263,8 +263,8 @@ pub use arch_registry::{
 };
 pub mod heads;
 pub use heads::{
-    DFLASH2_BLOCK_LANES, HeadDrafting, HeadRegistration, PublishedDrafter, TargetShape,
-    compiles_any_head, draft_head, head_of, heads_of,
+    DFLASH2_BLOCK_LANES, HeadDrafting, HeadRegistration, ParallelDrafting, PublishedDrafter,
+    TargetShape, compiles_any_head, draft_head, head_of, heads_of,
 };
 // MM sibling names `scratchy-vision` (`MmMetadata`), so it's gated on the `vision` CAPABILITY.
 #[cfg(feature = "vision")]

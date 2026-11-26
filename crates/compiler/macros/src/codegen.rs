@@ -165,6 +165,7 @@ pub fn lent_weight_prefix(
         ))
     };
     match w {
+        LentWeight::EmbedTokens if !borrowed("embed_tokens") => None,
         LentWeight::LmHead if !borrowed("lm_head") => None,
         LentWeight::LmHead if !model.tie_word_embeddings => {
             let id = program.weights.find(&["lm_head"])?;

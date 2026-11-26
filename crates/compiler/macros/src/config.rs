@@ -850,9 +850,8 @@ fn load_dir_mode(
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or_default();
-        let target = compiled_head_targets(spec, mtp).find(|(s, _)| s == stem);
         mtp_heads
-            && target.is_some_and(|(_, target)| {
+            && (compiled_head_targets(spec, mtp).filter(|(s, _)| s == stem)).any(|(_, target)| {
                 let (arch, stem) = target.split_once('/').unwrap_or_default();
                 model_feature_enabled(arch, stem)
             })
@@ -891,14 +890,31 @@ fn load_dir_mode(
             };
             for config in &configs {
                 let head_path = arch_dir.join(format!("{config}.json"));
-                let (_, head_json) = read_json_file(&head_path)?;
-                let layers: Vec<u64> = crate::arch_spec::json_path(&head_json, path)
+                let (_, mut head_json) = read_json_file(&head_path)?;
+                apply_overrides_file(&arch_dir, config, &mut head_json, &mut Vec::new())?;
+                let named: Vec<u64> = crate::arch_spec::json_path(&head_json, path)
                     .and_then(|v| v.as_array())
                     .and_then(|a| a.iter().map(|v| v.as_u64()).collect())
                     .ok_or_else(|| ConfigError::ArchJson {
                         path: head_path.clone(),
                         reason: format!("`{path}` must be an array of layer indices"),
                     })?;
+                // The target captures layer outputs: a layer's input is the output of the one
+                // before it, and the first's — the embedding — no layer's.
+                let layers: Vec<u64> = match head.target_capture_at {
+                    crate::arch_spec::CaptureAt::Output => named,
+                    crate::arch_spec::CaptureAt::Input => (named.iter())
+                        .map(|&l| {
+                            l.checked_sub(1).ok_or_else(|| ConfigError::ArchJson {
+                                path: head_path.clone(),
+                                reason: format!(
+                                    "`{path}` names layer 0, whose input is the embedding no \
+                                     layer outputs"
+                                ),
+                            })
+                        })
+                        .collect::<Result<_, _>>()?,
+                };
                 match &facts.capture_layers {
                     Some(other) if *other != layers => {
                         return Err(ConfigError::ArchJson {
@@ -1925,6 +1941,10 @@ fn model_params_from_json(
         .map(|a| a.iter().filter_map(|v| v.as_u64()).collect::<Vec<_>>())
         .unwrap_or_default();
     layer_sets.insert(DRAFT_CAPTURE_LAYERS.to_string(), LayerSet::of(captured));
+    layer_sets.insert(
+        ATTENTION_BIAS_LAYERS.to_string(),
+        attention_bias_layers(json, &bounds),
+    );
     let mut scalars = extract_scalars(json);
     // Arch-declared scalar defaults (`SCALAR_DEFAULTS`): arch-constant
     // floats the checkpoint omits (Gemma-4's `attention_multiplier`).
@@ -2246,7 +2266,7 @@ pub fn load_arch_json(dir: &Path) -> Result<crate::arch_spec::DeclaredArchSpec, 
     }
     spec.vision_norm_eps = json.get("vision_norm_eps").and_then(|v| v.as_f64());
     spec.tie_default = json.get("tie_default").and_then(|v| v.as_bool());
-    spec.head_targets = str_str_pairs(&path, &json, "head_targets")?;
+    spec.head_targets = head_target_pairs(&path, &json)?;
     // A variant is its config's stem (dense) or `<config>-<preset>`, as the variant loop of
     // `load_dir_mode` names it.
     let presets = declared_preset_names(&dir.join("quantizations.json"))?;
@@ -2287,6 +2307,33 @@ pub fn load_arch_json(dir: &Path) -> Result<crate::arch_spec::DeclaredArchSpec, 
     spec.published_as = published_as;
     spec.checkpoint_prefix = as_str("checkpoint_prefix");
     spec.reads_target_kv = json.get("reads_target_kv").and_then(|v| v.as_bool()) == Some(true);
+    spec.parallel_drafting = match json.get("parallel_drafting") {
+        None => None,
+        Some(v) => {
+            let field = |key: &str| {
+                (v.get(key).and_then(|s| s.as_str()).map(str::to_string)).ok_or_else(|| {
+                    ConfigError::ArchJson {
+                        path: path.clone(),
+                        reason: format!("`parallel_drafting.{key}` must be a string"),
+                    }
+                })
+            };
+            Some(crate::arch_spec::ParallelDraftingSpec {
+                mask_token_key: field("mask_token")?,
+                mask_hidden: field("mask_hidden")?,
+            })
+        }
+    };
+    spec.target_capture_at = match as_str("target_capture_at").as_deref() {
+        None | Some("output") => crate::arch_spec::CaptureAt::Output,
+        Some("input") => crate::arch_spec::CaptureAt::Input,
+        Some(other) => {
+            return Err(ConfigError::ArchJson {
+                path: path.clone(),
+                reason: format!("`target_capture_at` is `input` or `output`, not `{other}`"),
+            });
+        }
+    };
     let strings = |key: &str| -> Result<Option<Vec<String>>, ConfigError> {
         crate::hf_config::string_list(&json, key).map_err(|reason| ConfigError::ArchJson {
             path: path.clone(),
@@ -2372,8 +2419,10 @@ const ARCH_JSON_KEYS: &[&str] = &[
     "checkpoint_of",
     "checkpoint_prefix",
     "reads_target_kv",
+    "parallel_drafting",
     "borrows",
     "target_capture_layers",
+    "target_capture_at",
     "top_level_weights",
     "scale_dtype",
     "tie_default",
@@ -2438,6 +2487,39 @@ fn str_f64_pairs(
         out.push((k.clone(), n));
     }
     out.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(out)
+}
+
+/// `head_targets`: each head config's target config, or a list of them, as `(config, target)`
+/// pairs — a config of several targets a pair each, in the list's order (P-EAGLE's 120B drafter
+/// drafts for gpt-oss-120b's quant presets and for its self-contained 3-bit config).
+fn head_target_pairs(
+    path: &Path,
+    json: &serde_json::Value,
+) -> Result<Vec<(String, String)>, ConfigError> {
+    let Some(obj) = json.get("head_targets") else {
+        return Ok(Vec::new());
+    };
+    let fail = |reason: String| ConfigError::ArchJson {
+        path: path.to_path_buf(),
+        reason,
+    };
+    let obj = (obj.as_object()).ok_or_else(|| fail("`head_targets` must be an object".into()))?;
+    let mut out: Vec<(String, String)> = Vec::new();
+    for (config, targets) in obj {
+        let targets: Vec<&serde_json::Value> = match targets {
+            serde_json::Value::Array(list) if !list.is_empty() => list.iter().collect(),
+            target => vec![target],
+        };
+        for target in targets {
+            let target = target.as_str().ok_or_else(|| {
+                fail(format!(
+                    "`head_targets.{config}` must be a target config or a list of them"
+                ))
+            })?;
+            out.push((config.clone(), target.to_string()));
+        }
+    }
     Ok(out)
 }
 
@@ -2885,6 +2967,20 @@ pub(crate) fn derive_layer_sets(
 }
 
 /// Returns each bound it derived, as the dim it derived it from.
+/// The layer set whose attention projections carry biases (`if layer in attention_bias_layers:`):
+/// every layer of a config with `attention_bias: true` (a Llama-family config's flag), none
+/// otherwise — so one DSL serves both (AWS's P-EAGLE drafters: 120B's has them, 20B's not).
+const ATTENTION_BIAS_LAYERS: &str = "attention_bias_layers";
+
+fn attention_bias_layers(json: &serde_json::Value, bounds: &BTreeMap<String, u64>) -> LayerSet {
+    let biased = json.get("attention_bias").and_then(|b| b.as_bool()) == Some(true);
+    let layers = match biased {
+        true => bounds.get("num_hidden_layers").copied().unwrap_or(0),
+        false => 0,
+    };
+    LayerSet::of(0..layers)
+}
+
 fn derive_implicit_bounds(bounds: &mut BTreeMap<String, u64>) -> BTreeMap<String, crate::dim::Dim> {
     use crate::dim::Dim;
     let mut derived = BTreeMap::new();

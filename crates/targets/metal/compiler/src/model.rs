@@ -191,7 +191,7 @@ fn arena_value_shape(
 fn metal_off_tape_tokens(
     width: u64,
     mc: &scratchy_ir::model_facts::ModelFacts,
-    head: Option<(u32, u32)>,
+    head: Option<(u32, u32, scratchy_target_metal::tape::kernel_constants::DraftsPastFirst)>,
     vocab_suffix: Option<scratchy_target_metal::off_tape::VocabSuffix>,
 ) -> TokenStream {
     use scratchy_target_metal::off_tape::{
@@ -209,9 +209,10 @@ fn metal_off_tape_tokens(
     let block_size = BlockSize(page.get());
     // A draft block: its anchor row and its drafts.
     let block_rows = 1 + mc.spec_drafts().map_or(0, |d| d.get());
-    let head = head.map(|(drafts, hidden)| MtpChainConstants {
+    let head = head.map(|(drafts, hidden, past_first)| MtpChainConstants {
         hidden: HiddenSize(hidden),
         drafts: NumDrafts(drafts),
+        past_first,
         // An MRoPE head reads a cos/sin row a token in place of its position, its rot window
         // wide. The kernel's ABI spells the 1-D positions' path as 0.
         rope: RotDim(
@@ -775,15 +776,19 @@ pub(crate) fn emit(cx: &ModelCx<'_>) -> ModelEmission {
                 _ => None,
             }
         });
-        let fused_mlp = l.input.ops.iter().all(|od| {
-            !matches!(
-                od.op,
-                scratchy_subtile::subtile_ir::SubOp::MatmulTile {
-                    weight: scratchy_subtile::lower::GemmWeight::Affine { .. },
-                    ..
-                }
-            )
-        });
+        // Whether the MLP's gate/up projections are dense — the pairs, not every matmul: a dense
+        // drafter borrowing its target's affine lm_head (P-EAGLE) still packs its dense pairs.
+        let fused_mlp = (0..l.input.ops.len())
+            .filter_map(|i| scratchy_forward_compiler_macro::weight_bindings::gate_up_pair(&l, i))
+            .all(|(_, gate, _)| {
+                !matches!(
+                    l.input.ops[gate].op,
+                    scratchy_subtile::subtile_ir::SubOp::MatmulTile {
+                        weight: scratchy_subtile::lower::GemmWeight::Affine { .. },
+                        ..
+                    }
+                )
+            });
         let weight_paths: Vec<Vec<String>> = (program.weights.ids())
             .map(|id| program.weights.path(id).to_vec())
             .collect();
@@ -1669,7 +1674,12 @@ pub(crate) fn emit(cx: &ModelCx<'_>) -> ModelEmission {
             let drafts =
                 u32::try_from(drafts.expect("an MTP head's spec_drafts")).expect("drafts fit u32");
             let hidden = u32::try_from(target_hidden_width).expect("hidden width fits u32");
-            (drafts, hidden)
+            use scratchy_target_metal::tape::kernel_constants::DraftsPastFirst;
+            let past_first = match model.arch.parallel_drafting {
+                Some(_) => DraftsPastFirst::Parallel,
+                None => DraftsPastFirst::Chained,
+            };
+            (drafts, hidden, past_first)
         });
         let vocab_suffix = metal_vocab_suffix(program, fuf, model, mc);
         metal_arena_bytes_statics.push(metal_off_tape_tokens(logits_width, mc, head, vocab_suffix));

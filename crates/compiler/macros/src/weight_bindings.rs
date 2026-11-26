@@ -117,7 +117,7 @@ fn fused_field_name(
 /// disagreement is a field the load body cannot resolve.
 ///
 /// Returns `(silu_or_gelu, gate, up)` as op indices.
-pub(crate) fn gate_up_pair(
+pub fn gate_up_pair(
     lowered: &LoweredDecode,
     mul_op: usize,
 ) -> Option<(usize, usize, usize)> {

@@ -50,6 +50,27 @@ pub struct PublishedAs {
     pub repo: String,
 }
 
+/// `parallel_drafting` (arch.json): where a parallel-drafting head's placeholders are — the config
+/// key naming its mask token (P-EAGLE's `ptd_token_id`) and the checkpoint tensor holding the
+/// target hidden row its mask rows read (`mask_hidden`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ParallelDraftingSpec {
+    pub mask_token_key: String,
+    pub mask_hidden: String,
+}
+
+/// Which residual stream of each `target_capture_layers` layer a head reads (arch.json
+/// `target_capture_at`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CaptureAt {
+    /// The stream a layer hands the next: its output (a DFlash2 drafter's `target_layer_ids`).
+    #[default]
+    Output,
+    /// The stream entering it — the output of the layer before (an EAGLE-3 drafter's
+    /// `eagle_aux_hidden_state_layer_ids`, as vLLM's targets export them).
+    Input,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct DeclaredArchSpec {
     pub safetensors: Option<VisionSafetensorsLayout>,
@@ -109,12 +130,18 @@ pub struct DeclaredArchSpec {
     /// writes none and has no KV pool of its own; each layer reads the target layer its config's
     /// overrides name for its class (`target_kv_sliding_layer`, `target_kv_full_layer`).
     pub reads_target_kv: bool,
+    /// The head drafts every token in pass 1 (P-EAGLE): its rows past a sequence's newest read a
+    /// placeholder token and target hidden row. `None`: it chains or drafts a block.
+    pub parallel_drafting: Option<ParallelDraftingSpec>,
     /// The weights a head borrows from its target (`embed_tokens`, `lm_head`); `None`: both.
     pub borrows: Option<Vec<String>>,
-    /// Where a head's own config lists the target layers whose output rows it reads
-    /// (`dflash_config.target_layer_ids`, a DFlash2 drafter's): its target captures those layers'
-    /// outputs (`draft_capture_layers`, the target's layer set). `None`: it reads none of them.
+    /// Where a head's own config lists the target layers whose rows it reads
+    /// (`dflash_config.target_layer_ids`, a DFlash2 drafter's): its target captures them
+    /// (`draft_capture_layers`, the target's layer set of the layers whose outputs it captures).
+    /// `None`: it reads none of them.
     pub target_capture_layers: Option<String>,
+    /// Which stream of each of those layers it reads ([`CaptureAt`]).
+    pub target_capture_at: CaptureAt,
     /// Weights at the checkpoint's top level beside the decoder root, as `lm_head` is.
     pub top_level_weights: Vec<String>,
     pub tie_default: Option<bool>,

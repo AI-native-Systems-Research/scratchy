@@ -57,6 +57,7 @@ arch-qwen3-5-dense-mtp = []
 arch-gemma4-assistant = []
 arch-dflash2 = []
 arch-qwen3-5-vl = ["arch-qwen3-5", "vision"]
+arch-p-eagle = []
 arch-qwen3-moe = []
 
 # The scope selects a vision arch (every arch-<X>-vl turns it on; nothing else
@@ -93,6 +94,7 @@ all-arches = [
     "arch-qwen3-5-dense-mtp",
     "arch-gemma4-assistant",
     "arch-dflash2",
+    "arch-p-eagle",
     "arch-qwen3-5-vl",
     "arch-qwen3-moe",
 ]
@@ -318,6 +320,9 @@ all-arches = [
 "qwen3.6-35b-a3b-dflash2" = ["arch-dflash2"]
 "qwen3.8-27b-dflash2" = ["arch-dflash2"]
 
+# p-eagle (1 config)
+"gpt-oss-20b-p-eagle" = ["arch-p-eagle"]
+
 # qwen3-5-vl (2 configs)
 "qwen3.5-9b" = ["arch-qwen3-5-vl"]
 "qwen3.5-9b-parity-tiny" = ["arch-qwen3-5-vl"]
@@ -524,6 +529,9 @@ all-arches = [
     "qwen3.6-35b-a3b-dflash2",
     "qwen3.8-27b-dflash2",
 ]
+"p-eagle" = [
+    "gpt-oss-20b-p-eagle",
+]
 "qwen3-5-vl" = [
     "qwen3.5-9b",
     "qwen3.5-9b-parity-tiny",
@@ -674,6 +682,7 @@ all = [
     "gemma-4-26b-a4b-it-qat-q4_0-unquantized-assistant",
     "qwen3.6-35b-a3b-dflash2",
     "qwen3.8-27b-dflash2",
+    "gpt-oss-20b-p-eagle",
     "qwen3.5-9b",
     "qwen3.5-9b-parity-tiny",
     "qwen3.6-27b",
@@ -708,7 +717,7 @@ all = [
 # only when `--speculative-model` names them. Reached as `spec/mtp` from
 # scratchy-cli through scratchy-spec (crates/models/spec), which forwards here:
 # like quant scope, it needs its own crate for its own CLI alias.
-mtp-heads = ["arch-qwen3-5-mtp", "arch-qwen3-5-dense-mtp", "arch-nemotron-h-mtp", "arch-gemma4-assistant", "arch-dflash2"]
+mtp-heads = ["arch-qwen3-5-mtp", "arch-qwen3-5-dense-mtp", "arch-nemotron-h-mtp", "arch-gemma4-assistant", "arch-dflash2", "arch-p-eagle"]
 mtp = ["mtp-heads"]
 
 # Shell tab-completion over REAL HuggingFace model ids. Off by default, and

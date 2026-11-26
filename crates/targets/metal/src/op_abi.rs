@@ -522,6 +522,7 @@ const SWEEP_ELEMENTWISE: &[FoldPattern<MetalFusion>] = &[
         gate_scale: None,
         add: SubOpKind::Add,
         gated: &[SubOpKind::Silu, SubOpKind::Gelu, SubOpKind::Mul],
+        grouped: None,
         kernel: MetalFusion::QmvEpilogue,
     },
     // A MoE block's input norm too: its router's logits, its shared expert's matvecs
@@ -667,22 +668,27 @@ const F_COMBINE_EPILOGUE: FoldPattern<MetalFusion> = FoldPattern::MatvecEpilogue
     gate_scale: Some(SubOpKind::GateScale),
     add: SubOpKind::Add,
     gated: &[],
+    // A grouped bake's combine stores its rows apart from its batched GEMMs: no ends.
+    grouped: Some(&ROUTED_WIDE_BANDS),
     kernel: MetalFusion::CombineEpilogue,
 };
 
-/// The wide band's routed-experts fold: through the verify-sized rows.
+/// The wide band's routed-experts bands: through the verify-sized rows.
+const ROUTED_WIDE_BANDS: RoutedBands = RoutedBands {
+    rows_through: METAL_VERIFY_ROWS,
+    grouped_pairs: METAL_SORTED_PAIRS,
+    grouped_bundles: METAL_GROUPED_EXPERTS,
+    sorted_per_expert: METAL_SORTED_PAIRS_PER_EXPERT,
+    grouped_per_expert: METAL_GROUPED_PAIRS_PER_EXPERT,
+    decode_rows: METAL_DECODE_GROUPED_ROWS,
+    lane_rows: METAL_LANE_VERIFY_ROWS,
+};
+
+/// The wide band's routed-experts fold.
 const F_ROUTED_WIDE: FoldPattern<MetalFusion> = FoldPattern::RoutedExperts {
     top_k: SubOpKind::RouteTopK,
     sort: SubOpKind::ExpertSort,
-    bands: &RoutedBands {
-        rows_through: METAL_VERIFY_ROWS,
-        grouped_pairs: METAL_SORTED_PAIRS,
-        grouped_bundles: METAL_GROUPED_EXPERTS,
-        sorted_per_expert: METAL_SORTED_PAIRS_PER_EXPERT,
-        grouped_per_expert: METAL_GROUPED_PAIRS_PER_EXPERT,
-        decode_rows: METAL_DECODE_GROUPED_ROWS,
-        lane_rows: METAL_LANE_VERIFY_ROWS,
-    },
+    bands: &ROUTED_WIDE_BANDS,
     kernel: MetalFusion::MoeRouted,
 };
 

@@ -67,6 +67,13 @@ pub trait ScratchyWeights: Send + Sync {
         false
     }
 
+    /// The width of each target hidden row a multi-token-prediction head reads (its
+    /// `backbone_hidden_size`): its target's residual width, or the layers its target captures for
+    /// it side by side (P-EAGLE's three). Emitted by the macro.
+    fn target_hidden_width(&self) -> u64 {
+        self.hidden_size()
+    }
+
     /// The on-disk prefix (no `.weight` / `.scales` / `.biases`) this model loads `w` from — a
     /// tied lm_head's is its embedding's — so a head can be lent its target's tensors under its
     /// own names. `None` when the model has no such weight. Emitted by the macro.

@@ -189,7 +189,9 @@ pub enum FoldPattern<K: 'static> {
     /// computed before the anchor. The chain folds into the anchor, which computes it as it
     /// stores its rows: the steps before the last are absorbed, the last is its epilogue. A chain
     /// without an add ends before a step of `gated` kinds (the gated folds take a matmul whole).
-    /// Only on a model whose matvecs take their ends ([`ModelFoldFacts::matvec_ends`]).
+    /// Only on a model whose matvecs take their ends ([`ModelFoldFacts::matvec_ends`]). An
+    /// expert combine anchor whose bake groups its pairs by expert by `grouped`'s rule (the
+    /// target's [`RoutedBands`]) takes none: the grouped bake's commands store their rows apart.
     MatvecEpilogue {
         anchor: SubOpKind,
         weights: Option<GemmWeightKind>,
@@ -198,6 +200,7 @@ pub enum FoldPattern<K: 'static> {
         gate_scale: Option<SubOpKind>,
         add: SubOpKind,
         gated: &'static [SubOpKind],
+        grouped: Option<&'static RoutedBands>,
         kernel: K,
     },
     /// A one-row step's decode `attention` — one that runs on a decode step, which every one-row
@@ -926,15 +929,21 @@ impl<K: Copy + PartialEq> Folder<'_, K> {
                 gate_scale,
                 add,
                 gated,
+                grouped,
                 kernel,
-            } => self.matvec_epilogue(
-                i,
-                (anchor, weights),
-                [bias, scale, gate_scale],
-                add,
-                gated,
-                kernel,
-            ),
+            } => {
+                if grouped.is_some_and(|bands| self.combine_grouped(i, bands)) {
+                    return Ok(());
+                }
+                self.matvec_epilogue(
+                    i,
+                    (anchor, weights),
+                    [bias, scale, gate_scale],
+                    add,
+                    gated,
+                    kernel,
+                )
+            }
             FoldPattern::RopedAttention {
                 rope,
                 writers,
@@ -1121,6 +1130,25 @@ impl<K: Copy + PartialEq> Folder<'_, K> {
             ops.args[c]
                 .iter()
                 .any(|a| matches!(a, Arg::Op(q) if *q == j))
+        })
+    }
+
+    /// Whether `i` is an expert combine whose bake groups its pairs by expert by `bands`' rule:
+    /// its rows come back through an unsort of the sort that names the bake's grouping.
+    fn combine_grouped(&self, i: usize, bands: &RoutedBands) -> bool {
+        let ops = &self.ops;
+        if !matches!(ops.op(i), SubOp::ExpertCombine { .. }) {
+            return false;
+        }
+        let unsort = ops.in_op(i, 0).ok().flatten();
+        let sort = unsort.and_then(|u| ops.in_op(u, 1).ok().flatten());
+        sort.is_some_and(|s| match *ops.op(s) {
+            SubOp::ExpertSort {
+                experts,
+                k,
+                bundle,
+            } => bands.groups_pairs(ops.rows[s], experts, k, bundle),
+            _ => false,
         })
     }
 
@@ -1812,6 +1840,7 @@ mod tests {
                     gate_scale: None,
                     add: K::Add,
                     gated: &[K::Gelu, K::Mul],
+                    grouped: None,
                     kernel: Kern::Epilogue,
                 },
                 FoldPattern::NormedMatvecs {

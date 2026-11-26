@@ -1,0 +1,4 @@
+{
+  "_comment": "The drafter compiles under its target's MLX preset, its lent lm_head the target's 4-bit/g64 (that variant's overrides).",
+  "quantizations": ["mlx-affine-b4-g64-qembed"]
+}

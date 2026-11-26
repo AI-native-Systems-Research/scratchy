@@ -169,6 +169,10 @@ pub mod gemma4_assistant;
 #[path = "arch/dflash2.rs"]
 pub mod dflash2;
 
+#[cfg(compiled_arch = "p_eagle")]
+#[path = "arch/p_eagle.rs"]
+pub mod p_eagle;
+
 #[cfg(compiled_arch = "qwen3_5_vl")]
 #[path = "arch/qwen3_5_vl.rs"]
 pub mod qwen3_5_vl;

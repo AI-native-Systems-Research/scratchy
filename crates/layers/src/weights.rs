@@ -419,6 +419,16 @@ impl<A: DeviceAllocator> GpuWeights<A> {
         TensorRefs(self.tensors.clone())
     }
 
+    /// Drop this store's own tensors under `prefix` (`<prefix>.<suffix>`), uploading nothing: a
+    /// head borrowing a weight its own checkpoint carries too (P-EAGLE's frozen copy of its
+    /// target's lm_head) reads its target's, lent there after. The tensors it dropped.
+    pub fn shadow(&mut self, prefix: &str) -> usize {
+        let before = self.tensors.len();
+        (self.tensors)
+            .retain(|name, _| scratchy_core_model::weight::under_prefix(name, prefix).is_none());
+        before - self.tensors.len()
+    }
+
     /// Lend `from`'s tensors under `from_prefix` to this store under `as_prefix`: every
     /// `<from_prefix>.<suffix>` is placed as `<as_prefix>.<suffix>` (as `<suffix>` for the empty
     /// prefix, the top level) — its leading `rows` rows when given (a draft head reading a prefix

@@ -1,0 +1,7 @@
+{
+  "_comment": "The target this drafter reads (openai/gpt-oss-120b: the gpt-oss `gpt-oss-120b` and `gpt-oss-120b-3bit` configs): its 36 layers, and the three whose input residual stream it fuses — vLLM's EAGLE-3 default for a config that names none, (2, n/2, n - 3), where vLLM reads a drafter's (`eagle_config`).",
+  "target_num_hidden_layers": 36,
+  "eagle_config": {
+    "eagle_aux_hidden_state_layer_ids": [2, 18, 33]
+  }
+}
