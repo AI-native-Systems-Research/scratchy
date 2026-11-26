@@ -1119,6 +1119,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         tail: Option<F>,
         writes: &InputWrites,
         deferred: Option<&Deferral>,
+        after: Option<&dyn super::forward::AfterForward>,
     ) -> Result<(), ForwardError>
     where
         W: BakedBuckets,
@@ -1147,7 +1148,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         let needs_serialized = worker.bucket_has_avg_pool_2d(bucket);
         if needs_serialized {
             assert!(
-                deferred.is_none(),
+                deferred.is_none() && after.is_none(),
                 "a serialized forward waits for each of its command buffers"
             );
             assert!(
@@ -1187,9 +1188,30 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             }
             Ok(())
         };
+        // A deferred forward, and the work after it behind it: the host waits for neither.
         if let Some(deferral) = deferred {
             let ((), committed) = self.commit(Some(writes), encode)?;
             deferral.committed(committed.in_flight);
+            if let Some(after) = after {
+                let ((), committed) = self.commit(None, |enc| {
+                    after.encode(enc).map_err(ForwardError::Followup)
+                })?;
+                after.committed(committed.in_flight);
+            }
+            return Ok(());
+        }
+        // Work after the forward, in a command buffer of its own committed behind it — so it
+        // starts once the forward is done — that the host does not wait for: the forward's
+        // outputs are read as soon as its own is done.
+        if let Some(after) = after {
+            let ((), forward) = self.commit(Some(writes), encode)?;
+            let committed = self.commit(None, |enc| {
+                after.encode(enc).map_err(ForwardError::Followup)
+            });
+            let waited = forward.in_flight.wait();
+            let ((), committed) = committed?;
+            after.committed(committed.in_flight);
+            waited?;
             return Ok(());
         }
         let ((), took) = self.submit(Some(writes), encode)?;
@@ -1509,6 +1531,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             tail,
             &writes,
             inputs.deferred,
+            inputs.after,
         )?;
 
         // DIAGNOSTIC: dump non-zero counts for each arena slot. Tells
@@ -1825,7 +1848,7 @@ impl<W: CanonicalParams + BakedBuckets> Onto<'_, W> {
     ) -> Result<(), ForwardError> {
         use objc2_metal::{MTL4VisibilityOptions, MTLStages};
         assert!(
-            inputs.deferred.is_none(),
+            inputs.deferred.is_none() && inputs.after.is_none(),
             "a forward played in another's command buffer is waited for with it"
         );
         let pool = self.guard.pool;
@@ -3039,6 +3062,7 @@ mod tests {
                 target_hidden: None,
                 device_inputs: &[],
                 deferred: None,
+                after: None,
                 reads,
                 backbone_rows: None,
             };
@@ -3124,6 +3148,7 @@ mod tests {
             mrope_cos_sin: None,
             device_inputs: &[],
             deferred: None,
+            after: None,
             reads: ForwardReads::Outputs,
             backbone_rows: None,
         }
@@ -3189,6 +3214,7 @@ mod tests {
             mrope_cos_sin: None,
             device_inputs: &[],
             deferred: None,
+            after: None,
             reads: ForwardReads::Outputs,
             backbone_rows: None,
         };
@@ -3290,6 +3316,7 @@ mod tests {
                 target_hidden: None,
                 device_inputs,
                 deferred: Some(&deferral),
+                after: None,
                 reads: ForwardReads::Outputs,
                 backbone_rows: None,
             };
@@ -3372,6 +3399,7 @@ mod tests {
             target_hidden: None,
             device_inputs: &[],
             deferred: Some(&deferral),
+            after: None,
             reads: ForwardReads::Outputs,
             backbone_rows: None,
         };
@@ -3430,6 +3458,7 @@ mod tests {
             target_hidden: None,
             device_inputs: &[token],
             deferred: None,
+            after: None,
             reads: ForwardReads::Outputs,
             backbone_rows: None,
         };
@@ -3513,6 +3542,7 @@ mod tests {
             target_hidden: None,
             device_inputs,
             deferred: None,
+            after: None,
             reads: ForwardReads::Outputs,
             backbone_rows: None,
         };
@@ -3619,6 +3649,7 @@ mod tests {
             mrope_cos_sin: None,
             device_inputs: &[],
             deferred: None,
+            after: None,
             reads: ForwardReads::Outputs,
             backbone_rows: None,
         };
@@ -3664,6 +3695,7 @@ mod tests {
             mrope_cos_sin: None,
             device_inputs: &[],
             deferred: None,
+            after: None,
             reads: ForwardReads::Outputs,
             backbone_rows: None,
         };
@@ -3719,6 +3751,7 @@ mod tests {
             mrope_cos_sin: None,
             device_inputs: &[],
             deferred: None,
+            after: None,
             reads: ForwardReads::Outputs,
             backbone_rows: None,
         };

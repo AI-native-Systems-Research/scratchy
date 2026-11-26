@@ -307,6 +307,7 @@ mod green_gate {
             draft: None,
             device_inputs: &[],
             deferred: None,
+            after: None,
             reads: scratchy_target_metal::ForwardReads::Outputs,
             backbone_rows: None,
         };

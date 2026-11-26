@@ -2489,6 +2489,7 @@ pub(crate) fn emit(cx: &ModelCx<'_>) -> ModelEmission {
                 draft: ctx.draft,
                 device_inputs: ctx.device_inputs,
                 deferred: ctx.deferred,
+                after: ctx.after,
                 reads: ctx.reads,
                 backbone_rows: ctx.backbone_rows,
             };

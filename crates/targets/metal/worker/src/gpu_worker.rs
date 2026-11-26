@@ -273,6 +273,16 @@ pub struct MetalWorker {
     /// The MTP head's target hidden rows are the layers its target captures for it
     /// (`HeadRegistration::reads_captures`), not the target's final hidden states.
     head_reads_captures: bool,
+    /// The command buffer an MTP head's passes run in after a step that gave a request its first
+    /// token ([`ForwardAfter`]), still on the device: the next step waits for it before it writes
+    /// anything those passes read.
+    ///
+    /// [`ForwardAfter`]: scratchy_target_metal::interpreter::metal::ForwardAfter
+    head_in_flight: Option<HeadAfter>,
+    /// An MTP head's passes have run: its pool is built. Its first forward builds it, waiting for
+    /// its buffers to be made resident on the GPU — behind the target's forward, that wait would
+    /// be the target's too — so the passes run after a step's own command buffer only from then.
+    head_ran: bool,
     /// Splash's DFlash2 drafter (a `draft_model` that drafts a block a pass), run at the end of a
     /// step the engine planned drafts for.
     dflash2: Option<Dflash2>,
@@ -1011,6 +1021,8 @@ impl MetalWorker {
             mtp_drafter: None,
             mask_hidden: None,
             head_reads_captures: false,
+            head_in_flight: None,
+            head_ran: false,
             dflash2: None,
             sampler_kernels: None,
             sampler_arena: None,
@@ -2141,6 +2153,21 @@ impl MetalWorker {
         Ok(())
     }
 
+    /// Whether a step's MTP head passes run after it, in a command buffer of their own
+    /// ([`ForwardAfter`]): when every request the head drafts for gets its first token from it.
+    /// That token is the target's alone, so its time to first token is the target's; the step
+    /// reads back no drafts — the next one decodes without — so it defers like any other. Its
+    /// head's pool must be built (`head_ran`): its first forward waits for its buffers' residency.
+    ///
+    /// [`ForwardAfter`]: scratchy_target_metal::interpreter::metal::ForwardAfter
+    fn head_after(&self, sched: &SchedulerOutput) -> bool {
+        self.mtp_drafter.is_some()
+            && self.head_ran
+            && !sched.spec_pipeline.behind
+            && !sched.draft_req_ids.is_empty()
+            && (sched.draft_req_ids.iter()).all(|r| self.input_batch.num_generated(r) == 0)
+    }
+
     /// Whether this step can be committed without waiting for it: its rows
     /// pick their tokens on the GPU from the logits alone, so nothing on the
     /// host needs its tokens before the next step is queued. Penalties (the
@@ -2170,7 +2197,11 @@ impl MetalWorker {
                     // does a step whose head only primes KV (`primes_only`) — no chain, nothing
                     // read back.
                     && match self.mtp_drafter {
-                        Some(_) => sched.draft_req_ids.is_empty() || sched.primes_only,
+                        Some(_) => {
+                            sched.draft_req_ids.is_empty()
+                                || sched.primes_only
+                                || self.head_after(sched)
+                        }
                         None => self.draft_model.is_none(),
                     }
                     && sched.num_scheduled_tokens.keys().all(|req_id| {
@@ -2316,6 +2347,7 @@ impl MetalWorker {
                 &req,
                 &[],
                 Some(then),
+                false,
             )
             .map_err(|e| ExecutorError::WorkerExecution(format!("prompt logprobs: {e}")))?;
             self.read_prompt_logprobs(req_ids, &step)?;
@@ -3646,6 +3678,7 @@ fn metal_chain_dispatch(
         sampled_rows: None,
         device_inputs: &[],
         deferred: None,
+        after: None,
         reads: Reads::Outputs,
         backbone_rows: None,
     };
@@ -3770,7 +3803,7 @@ impl ::scratchy_serving_engine::spec_decode::SpecDecodeBackend for MetalWorker {
         req: &::scratchy_serving_engine::spec_decode::ForwardArgmaxRequest<'_>,
         hidden_rows: &[u32],
     ) -> Result<(Vec<u32>, Vec<u8>), ::scratchy_serving_engine::spec_decode::BackendError> {
-        let out = self.forward_argmax_then(model, kv_pool, req, hidden_rows, None)?;
+        let out = self.forward_argmax_then(model, kv_pool, req, hidden_rows, None, false)?;
         Ok((out.tokens, out.hidden))
     }
 
@@ -3961,6 +3994,7 @@ impl MetalWorker {
         req: &::scratchy_serving_engine::spec_decode::ForwardArgmaxRequest<'_>,
         hidden_rows: &[u32],
         then: Option<Then<'_>>,
+        head_after: bool,
     ) -> Result<Forwarded, ::scratchy_serving_engine::spec_decode::BackendError> {
         use ::scratchy_serving_engine::spec_decode::{BackendError, KvPoolHandle, ModelHandle};
 
@@ -4233,7 +4267,7 @@ impl MetalWorker {
             ))
         });
         let hidden_capture = std::cell::RefCell::new(Vec::new());
-        let ctx = scratchy_target_metal::ForwardCtx {
+        let mut ctx = scratchy_target_metal::ForwardCtx {
             input_ids: view_input_ids,
             positions: view_positions,
             slot_mapping: view_slot_mapping,
@@ -4279,6 +4313,7 @@ impl MetalWorker {
             sampled_rows: view_sampled_rows,
             device_inputs: &device_inputs,
             deferred: deferral.as_ref(),
+            after: None,
             // A prompt-scoring tile plays its lm_head over the final hidden states it is handed.
             reads: match then {
                 Some(Then::ScorePrompt { .. }) => Reads::LmHead,
@@ -4516,6 +4551,9 @@ impl MetalWorker {
             .as_ref()
             .map(|k| k as *const scratchy_target_metal::sampling::SamplerKernels as usize);
         let (head_cell, head_onto_cell) = (&head, &head_onto);
+        // What the target left the head's passes after its command buffer (`head_after`).
+        let hidden_after = std::cell::RefCell::new(None);
+        let hidden_after_cell = &hidden_after;
         // A grammar mask overwrites the logits in place: the step's logprobs score the raw rows,
         // set aside before it.
         #[cfg(feature = "guided-decoding")]
@@ -4618,14 +4656,41 @@ impl MetalWorker {
                 if let Some(pass) = &logprobs {
                     pass.encode(&logprobs_device, enc, logits_addr, out_addr)?;
                 }
-                // The head's passes, reading the tokens just picked and what the target left.
-                if let Some(h) = head_cell.borrow_mut().as_mut() {
-                    let onto = h.encode(enc, &argmax_out_for_closure, outputs)?;
-                    *head_onto_cell.borrow_mut() = Some(onto);
+                // The head's passes, reading the tokens just picked and what the target left: on
+                // this command buffer, or — `head_after` — the one after it, reading what this
+                // one leaves.
+                match (head_after, head_cell.borrow_mut().as_mut()) {
+                    (true, Some(HeadEncoder::Mtp(h))) => {
+                        *hidden_after_cell.borrow_mut() = Some(h.target_hidden(outputs)?);
+                    }
+                    (true, Some(HeadEncoder::Block(_))) => {
+                        return Err(
+                            "a block drafter's passes ride its target's command buffer".into()
+                        );
+                    }
+                    (false, Some(h)) => {
+                        let onto = h.encode(enc, &argmax_out_for_closure, outputs)?;
+                        *head_onto_cell.borrow_mut() = Some(onto);
+                    }
+                    (_, None) => {}
                 }
                 Ok(())
             },
         );
+        let argmax_out_after = argmax_out.clone();
+        let mut after =
+            scratchy_target_metal::interpreter::metal::ForwardAfter::new(Box::new(move |enc| {
+                let hidden = (hidden_after_cell.borrow_mut().take())
+                    .ok_or("the head's passes after a forward that left no hidden rows")?;
+                if let Some(HeadEncoder::Mtp(h)) = head_cell.borrow_mut().as_mut() {
+                    let onto = h.encode(enc, &argmax_out_after, &hidden)?;
+                    *head_onto_cell.borrow_mut() = Some(onto);
+                }
+                Ok(())
+            }));
+        if head_after {
+            ctx.after = Some(&after);
+        }
         let forward_start = std::time::Instant::now();
         let logits = unsafe {
             model_ref.forward_with_metal_followup(
@@ -4637,6 +4702,22 @@ impl MetalWorker {
         }
         .map_err(|e| BackendError::Backend(e.0))?;
         let _ = logits; // argmax_out is what we read
+        // The passes after the forward hold their chain buffer until they are done: no step lays
+        // out a chain in it before.
+        if head_after {
+            let in_flight = after.take_in_flight().ok_or_else(|| {
+                BackendError::Backend("the head's passes after a forward went uncommitted".into())
+            })?;
+            let chain = match head.borrow().as_ref() {
+                Some(HeadEncoder::Mtp(h)) => h.buffer.clone(),
+                _ => None,
+            };
+            self.head_in_flight = Some(HeadAfter {
+                in_flight,
+                _chain: chain,
+            });
+        }
+        drop(after);
         // A blocking forward's time (its encoding and the GPU's run), and the host's since the last
         // one returned, which the GPU spent waiting.
         if deferral.is_none() {
@@ -4656,13 +4737,19 @@ impl MetalWorker {
             );
         }
         if let Some(deferral) = deferral.as_mut() {
+            tracing::debug!(
+                "deferred forward of {} rows committed in {:.2} ms (passes after it: {head_after})",
+                req.num_tokens,
+                forward_start.elapsed().as_secs_f64() * 1e3,
+            );
             let in_flight = deferral.take_in_flight().ok_or_else(|| {
                 BackendError::Backend("a deferred forward returned uncommitted".into())
             })?;
             self.committed = Some((in_flight, argmax));
-            // The head's worker goes back now: its staging slot outlives this step (`Onto`).
-            self.committed_chain = match head.borrow().as_ref() {
-                Some(HeadEncoder::Mtp(h)) => {
+            // The head's worker goes back now: its staging slot outlives this step (`Onto`). Passes
+            // after the step leave no chain a step behind it picks from.
+            self.committed_chain = match (head_after, head.borrow().as_ref()) {
+                (false, Some(HeadEncoder::Mtp(h))) => {
                     (h.buffer.clone()).map(|b| (h.layout.clone(), b, h.behind))
                 }
                 _ => None,
@@ -4719,9 +4806,15 @@ impl MetalWorker {
             });
         }
         self.sampler_logits = logits_capture.borrow_mut().take();
-        // What the passes left, once the command buffer is done; then the head's worker goes back.
+        // What the passes left, once the command buffer is done; then the head's worker goes back —
+        // after passes still on the device too (`head_after`), which leave nothing for this step:
+        // its staging slot outlives this step (`Onto`), and the next step waits for them before it
+        // writes what they read.
         let onto = head_onto.into_inner();
-        let head = (head.into_inner()).map(|h| h.outcome(onto.as_deref()));
+        let head = match head_after {
+            true => None,
+            false => (head.into_inner()).map(|h| h.outcome(onto.as_deref())),
+        };
         drop(onto);
         Ok(Forwarded {
             tokens: out,
@@ -5100,9 +5193,9 @@ impl<'a> HeadPassesEncoder<'a> {
         outputs: scratchy_target_metal::model::FollowupOutputs<'_>,
     ) -> Result<scratchy_target_metal::mtl4_dispatch::Buffer, String> {
         match self.reads_captures {
-            true => (outputs.captured)
-                .map(retained)
-                .ok_or_else(|| "the head reads its target's captured rows; it captured none".into()),
+            true => (outputs.captured).map(retained).ok_or_else(|| {
+                "the head reads its target's captured rows; it captured none".into()
+            }),
             false => Ok(retained(outputs.hidden)),
         }
     }
@@ -6091,6 +6184,7 @@ fn head_ctx<'c>(
         sampled_rows: req.sampled_rows.map(|r| view(r, &[r.len()])),
         device_inputs,
         deferred: None,
+        after: None,
         reads,
         backbone_rows: None,
     }
@@ -6408,6 +6502,14 @@ fn free_argmax_slot(
 
 /// A step committed without waiting for it: the tokens its rows sampled are on the device until it is
 /// resolved.
+/// An MTP head's passes committed after a step, in a command buffer of their own (`head_after`):
+/// that command buffer, and the chain buffer they draft into, held until they are done — no step
+/// lays out a chain in it before.
+struct HeadAfter {
+    in_flight: InFlight,
+    _chain: Option<Arc<ChainBuffer>>,
+}
+
 struct InFlightStep {
     done: Arc<InFlight>,
     argmax: Arc<ArgmaxSlot>,
@@ -8037,6 +8139,18 @@ impl Worker for MetalWorker {
         while self.in_flight.len() > usize::from(deferrable) {
             self.resolve_oldest()?;
         }
+        // The head's passes after the step before, still on the device, read what this step
+        // writes: a step the host waits for writes from the host, so it waits for them first; a
+        // deferred one writes on the device, queued behind them. Their chain buffer is held until
+        // they are done.
+        if let Some(head) = self.head_in_flight.take() {
+            match deferrable && !head.in_flight.is_done() {
+                true => self.head_in_flight = Some(head),
+                false => (head.in_flight.wait()).map_err(|e| {
+                    ExecutorError::WorkerExecution(format!("MTP head passes after a step: {e}"))
+                })?,
+            }
+        }
 
         if self.input_batch.num_active() == 0 {
             // Reactive KV (2c): batch fully idle → no live blocks. Defer the
@@ -8807,6 +8921,17 @@ impl Worker for MetalWorker {
                 w.saved[op.slot] = taken.iter().any(|t| t.block == block);
             }
         }
+        // A step that gives a request its first token runs the head's passes after it, in a command
+        // buffer the host does not wait for: that token is the target's alone, so its time to
+        // first token is the target's; the passes' prime over the prompt waits for the next step
+        // instead, which decodes without drafts.
+        let head_after = head_passes.is_some() && self.head_after(scheduler_output);
+        tracing::debug!(
+            "step of {num_reqs} sequences: head passes {}, after the step {head_after}, behind \
+             {behind}, deferred {}",
+            head_passes.is_some(),
+            self.deferral.is_some(),
+        );
         // The head's chain lays out here, where a step behind a speculative one in flight picks
         // into it, with the rest of what depends on that step's outcome.
         self.pending_chain = match &head_passes {
@@ -9185,6 +9310,7 @@ impl Worker for MetalWorker {
                             sampled_rows: None,
                             device_inputs: &[],
                             deferred: None,
+                            after: None,
                             reads: Reads::Outputs,
                             backbone_rows: None,
                         };
@@ -9388,10 +9514,12 @@ impl Worker for MetalWorker {
                         &req,
                         &prompt_hidden_rows,
                         then,
+                        head_after,
                     )
                     .map_err(|e| {
                         ExecutorError::WorkerExecution(format!("spec verify forward: {e}"))
                     })?;
+                self.head_ran |= head_passes.is_some();
                 prompt_hidden = std::mem::take(&mut out.hidden);
                 picked_drafts = std::mem::take(&mut out.head.drafts);
                 head_outcome = out.head;
@@ -9658,11 +9786,10 @@ impl Worker for MetalWorker {
         // ── 8. The head's drafts ────────────────────────────────
         // For the requests the engine planned, picked by the head's passes in the step's command
         // buffer, each from its newest row by the tokens just committed; the engine schedules them
-        // into the next step.
-        // TODO: the step's tokens wait for these passes, so a prompt's first token waits for the
-        // head's prime over every prompt row and its newest row's passes (`spec_decode::mtp`'s
-        // module docs).
+        // into the next step. A step whose head passes run after it (`head_after`) has none: the
+        // next step decodes without.
         let draft_token_ids = match (self.mtp_drafter, head_passes.as_ref()) {
+            (Some(_), Some(_)) if head_after => Some(Default::default()),
             (Some(drafter), Some(passes)) => {
                 let history: std::collections::HashMap<String, Vec<u32>> = (scheduler_output)
                     .draft_req_ids

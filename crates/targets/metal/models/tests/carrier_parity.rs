@@ -566,6 +566,7 @@ mod imp {
                 sampled_rows: Some(host_view(&lti, &[1], u32t)),
                 device_inputs: &[],
                 deferred: None,
+                after: None,
                 reads: scratchy_target_metal::ForwardReads::Outputs,
                 backbone_rows: None,
             };

@@ -369,6 +369,7 @@ impl<W: VisionArchWeights> MultimodalForward for VisionWrapper<W> {
             sampled_rows: None,
             device_inputs: &[],
             deferred: None,
+            after: None,
             reads: crate::ForwardReads::Outputs,
             backbone_rows: None,
         };

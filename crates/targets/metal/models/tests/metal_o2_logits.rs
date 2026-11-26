@@ -550,6 +550,7 @@ fn run_step(l: &mut Loaded, path: ExecPath, s: &StepInputs) -> (Vec<u8>, usize) 
         sampled_rows: Some(view(&s.sampled_rows, &[1], u32t)),
         device_inputs: &[],
         deferred: None,
+        after: None,
         reads: scratchy_target_metal::ForwardReads::Outputs,
         backbone_rows: None,
     };

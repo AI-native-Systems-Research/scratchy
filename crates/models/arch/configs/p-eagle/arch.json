@@ -28,11 +28,16 @@
   "scale_dtype": "bf16",
   "bound_defaults": {
     "spec_drafts": 2,
-    "spec_verify_rows": 8
+    "spec_verify_rows": 8,
+    "spec_wide_window": 4
   },
   "params": [
     {
       "name": "embed_vocab_size",
+      "from": "vocab_size"
+    },
+    {
+      "name": "target_vocab_size",
       "from": "vocab_size"
     },
     {
