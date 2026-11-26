@@ -25,6 +25,18 @@
 //! N includes the warmup's single decode step and the first-play cold
 //! outliers — they land in `max` where they belong; the steady-state read is
 //! the mean.
+//!
+//! ⭐ THE PROMPT-CHUNK TABLE, the same instrument over the prefill's own
+//! launches: every prompt chunk the card runs — a middle chunk (no suffix),
+//! the prompt-final chunk (its pick is read), a wave of tails on a packed
+//! rung — clocks its own submit half and flushes it through
+//! [`record_chunk`], printed by [`chunk_segment_table`] as one table per
+//! chunk kind beside the decode table. The depth row counts CHUNK
+//! submissions outstanding (its own population, never the decode table's);
+//! the busy row reads the same prior-read latch the decode arm's does. On
+//! the tree this was typed under, a chunk's door waits the card out before
+//! the host stages the next chunk, so the table's honest reading is depth 1
+//! and busy 0 — the BEFORE the pipelining front is measured against.
 
 use std::sync::Mutex;
 use std::time::Duration;
@@ -69,6 +81,74 @@ pub struct SubmitSegs {
 pub struct CollectSegs {
     pub fence: Duration,
     pub pick: Duration,
+}
+
+/// ⭐ THE PROMPT-CHUNK TABLE'S KIND — keyed by the launch's own facts, never by a
+/// model or a geometry: a chunk that runs no suffix and reads nothing back, the
+/// chunk that finishes its prompt (the suffix runs and its pick is read), and a
+/// wave of tails on a packed rung. The table prints one block per kind, so a
+/// kind that never ran is absent from the output by type, never as a zero row.
+///
+/// `pub` for the same reason [`SubmitSegs`] states: the only caller is a
+/// target's worker crate, which a build may not link.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChunkKind {
+    /// A middle chunk: no suffix runs, nothing is read back.
+    Middle,
+    /// The prompt-final chunk: the suffix runs and its pick is read in-call.
+    Final,
+    /// A wave of continuation tails on a packed rung: one launch, `s` windows.
+    Packed,
+}
+
+impl ChunkKind {
+    /// Every kind, in the order the table prints them — the accumulator's own
+    /// index law, stated once here and consumed by `record_chunk` alone.
+    const ALL: [ChunkKind; 3] = [ChunkKind::Middle, ChunkKind::Final, ChunkKind::Packed];
+
+    /// The kind's own words for its table's header line.
+    const fn label(self) -> &'static str {
+        match self {
+            ChunkKind::Middle => "middle — no suffix runs, nothing read",
+            ChunkKind::Final => "prompt-final — the suffix runs, its pick read",
+            ChunkKind::Packed => "a wave of tails on a packed rung",
+        }
+    }
+
+    /// The kind's slot in the accumulator — the ONE place a kind becomes an
+    /// index, so no caller can misfile one.
+    const fn slot(self) -> usize {
+        match self {
+            ChunkKind::Middle => 0,
+            ChunkKind::Final => 1,
+            ChunkKind::Packed => 2,
+        }
+    }
+}
+
+/// One prompt-chunk launch's SUBMIT-half segments, clocked by the chunk's eager
+/// door and flushed here in one lock. The spans are the door's own coarse
+/// halves — the tree this was typed under runs a chunk through one eager door
+/// (`run_bound`: bind, submit and the wait, inseparable without changing when a
+/// step waits), so the table states what that door costs as it stands:
+/// `stage` (everything the host staged before the door), `door` (the whole
+/// eager call), and `fence` (the pick read after it — prompt-final chunks only;
+/// `None` for a middle chunk, absent from that segment's mean, never a recorded
+/// zero). `depth` counts CHUNK submissions outstanding, this launch included —
+/// its own population, never the decode table's. `busy` is the same prior-read
+/// latch the decode arm's busy row reads: the previous DECODE step's stick read
+/// had not yet landed when this chunk's door was called — the one cross-population
+/// card-owed fact a non-blocking peek can state.
+///
+/// `pub` for the reason [`SubmitSegs`] states — the caller is a target's worker
+/// crate a build may not link.
+pub struct ChunkSegs {
+    pub kind: ChunkKind,
+    pub stage: Duration,
+    pub door: Duration,
+    pub fence: Option<Duration>,
+    pub depth: usize,
+    pub busy: bool,
 }
 
 /// One segment's running mean/max material: its own count (`stage` records one step
@@ -150,6 +230,31 @@ impl BusyStats {
     }
 }
 
+/// One chunk kind's own accumulator — the same segment/depth/busy shape the
+/// decode table's `Stats` states, per kind, with the chunk table's own span
+/// names. `n` is the kind's launch count (a middle chunk records no fence, so
+/// the fence accumulator's own count is the only one that can lag `n`).
+struct ChunkAcc {
+    n: u64,
+    stage: Acc,
+    door: Acc,
+    fence: Acc,
+    depth: DepthStats,
+    busy: BusyStats,
+}
+
+impl ChunkAcc {
+    /// The const initializer, same law as [`Acc::ZERO`].
+    const ZERO: ChunkAcc = ChunkAcc {
+        n: 0,
+        stage: Acc::ZERO,
+        door: Acc::ZERO,
+        fence: Acc::ZERO,
+        depth: DepthStats::ZERO,
+        busy: BusyStats::ZERO,
+    };
+}
+
 struct Stats {
     steps: u64,
     bind: Acc,
@@ -161,6 +266,8 @@ struct Stats {
     busy: BusyStats,
     fence: Acc,
     pick: Acc,
+    /// The prompt-chunk table's accumulators, one slot per [`ChunkKind`].
+    chunks: [ChunkAcc; 3],
 }
 
 impl Stats {
@@ -176,6 +283,7 @@ impl Stats {
         busy: BusyStats::ZERO,
         fence: Acc::ZERO,
         pick: Acc::ZERO,
+        chunks: [ChunkAcc::ZERO, ChunkAcc::ZERO, ChunkAcc::ZERO],
     };
 }
 
@@ -208,6 +316,21 @@ pub fn record_collect(s: CollectSegs) {
     let mut t = stats();
     t.fence.add(s.fence);
     t.pick.add(s.pick);
+}
+
+/// Flush one prompt-chunk launch's segments (`pub` for the reason [`ChunkSegs`]'s
+/// own doc states — the caller is a target's worker crate a build may not link).
+pub fn record_chunk(s: ChunkSegs) {
+    let mut t = stats();
+    let c = &mut t.chunks[s.kind.slot()];
+    c.n += 1;
+    c.stage.add(s.stage);
+    c.door.add(s.door);
+    if let Some(d) = s.fence {
+        c.fence.add(d);
+    }
+    c.depth.add(s.depth);
+    c.busy.add(s.busy);
 }
 
 /// The accumulated per-segment table, for the CLI to print under `--bench`.
@@ -291,4 +414,85 @@ pub fn step_segment_table() -> Option<String> {
         100.0 * t.busy.busy as f64 / t.busy.n.max(1) as f64,
     ));
     Some(out)
+}
+
+/// The accumulated prompt-chunk tables, one block per chunk kind that ran, for
+/// the CLI to print under `--bench` beside the decode table. `None` when no
+/// chunk ever recorded — the answer every backend that records no chunks (the
+/// emulator, every non-spyre target) and every decode-only run must give, by
+/// type, not by empty string.
+pub fn chunk_segment_table() -> Option<String> {
+    let t = stats();
+    let mut out = String::new();
+    for kind in ChunkKind::ALL {
+        let c = &t.chunks[kind.slot()];
+        if c.n == 0 {
+            continue;
+        }
+        out.push_str(&format!(
+            "[step-segs] {} prompt chunk(s) ({}): host time per segment \
+             (mean / max / total, ms)\n",
+            c.n,
+            kind.label(),
+        ));
+        let rows = [
+            (
+                "stage",
+                "the host staging before the door (the tape, the tables, the seat binds)",
+                &c.stage,
+            ),
+            (
+                "door",
+                "run_bound (bind + submit + the eager wait, inseparable today)",
+                &c.door,
+            ),
+            (
+                "fence",
+                "the pick read after the door (prompt-final chunks only)",
+                &c.fence,
+            ),
+        ];
+        for (name, what, a) in rows {
+            let mean = a.ns as f64 / 1e6 / a.n.max(1) as f64;
+            out.push_str(&format!(
+                "[step-segs]   {name:<6} ({}): {:>8.3} / {:>8.3} / {:>9.1}  over {} step(s)\n",
+                what,
+                mean,
+                a.max_ns as f64 / 1e6,
+                a.ns as f64 / 1e6,
+                a.n,
+            ));
+        }
+        // The depth row, the chunk table's own: chunk submissions outstanding at
+        // each submit — 1 everywhere is the serial BEFORE; ≥ 2 is chunks genuinely
+        // in flight. The distribution prints whole, same law as the decode table's.
+        let dist = c
+            .depth
+            .at_depth
+            .iter()
+            .enumerate()
+            .filter(|&(d, &n)| d >= 1 && n > 0)
+            .map(|(d, &n)| format!("{d}:{n}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        out.push_str(&format!(
+            "[step-segs]   depth  (chunk submissions outstanding at each submit): mean {:>5.2}, \
+             max {}, distribution {}\n",
+            c.depth.sum as f64 / c.depth.n.max(1) as f64,
+            c.depth.max,
+            dist,
+        ));
+        // The busy row, the depth row's honest twin over the same prior-read latch
+        // the decode arm's reads: the fraction of chunk submits that began with the
+        // previous decode read still un-landed. On a solo prefill this is 0 — the
+        // card owed nothing when each chunk queued, the measurement this table
+        // exists to state.
+        out.push_str(&format!(
+            "[step-segs]   busy   (card owed earlier work as the chunk queued): {}/{} = {:.0}%\n",
+            c.busy.busy,
+            c.busy.n,
+            100.0 * c.busy.busy as f64 / c.busy.n.max(1) as f64,
+        ));
+    }
+    (!out.is_empty()).then_some(out)
 }

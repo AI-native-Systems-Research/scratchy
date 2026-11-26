@@ -71,6 +71,33 @@ static PRIOR_READ: std::sync::Mutex<Option<scratchy_target_spyre_card::runtime::
 /// row counts exactly the submissions the pipeline has not yet collected.
 static OUTSTANDING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// ⭐ THE CHUNK TABLE'S OWN DEPTH COUNT: prompt-chunk submissions outstanding,
+/// incremented at each recorded chunk door and decremented the moment the door
+/// returns — its own population, never the decode table's, so a chunk depth of
+/// 1 states "the host waited this chunk out before staging the next" without
+/// the decode pipeline's count ever diluting it.
+static CHUNKS_OUTSTANDING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// ⭐ THE CHUNK TABLE'S KIND, keyed by the launch's own rows and want — never by
+/// a model or a geometry: a wave of tails is a packed launch whatever it wants;
+/// a sequence launch is a middle chunk when it wants nothing and the
+/// prompt-final chunk when it wants the last row. A decode batch (and a
+/// sequence the schedule deferred) is the DECODE table's own population —
+/// `None`, not recorded here, never a zero row.
+fn chunk_kind_of(
+    rows: &LaunchRows<'_>,
+    want: &LogitsWanted,
+) -> Option<scratchy_serving_worker::step_segs::ChunkKind> {
+    use scratchy_serving_worker::step_segs::ChunkKind;
+    match (rows, want) {
+        (LaunchRows::Packed { .. }, _) => Some(ChunkKind::Packed),
+        (LaunchRows::Sequence { .. }, LogitsWanted::None) => Some(ChunkKind::Middle),
+        (LaunchRows::Sequence { .. }, LogitsWanted::LastRow) => Some(ChunkKind::Final),
+        (LaunchRows::Batch { .. }, _)
+        | (LaunchRows::Sequence { .. }, LogitsWanted::PerRequestDeferred) => None,
+    }
+}
+
 /// ⭐ WHAT ONE CARD LAUNCH'S ROWS ARE, for the paged step: one sequence's rows — a prompt chunk, or
 /// the one-request decode — or one token of each of a decode batch's sequences. Each names its KV
 /// blocks as pool pages (`paged_step::page_of_block` of the scheduler's block table), which the
@@ -244,7 +271,7 @@ pub(crate) fn run_card_launch(
         )));
     }
     let seq_pos = rows_in.last_pos();
-    let _t_stage = std::time::Instant::now();
+    let t_stage = std::time::Instant::now();
     // ⭐ THE BODY THAT RUNS, AND ITS STEP.
     let body = pf.step_body(seq_pos).map_err(|e| {
         werr(format!(
@@ -476,7 +503,7 @@ pub(crate) fn run_card_launch(
         let elems: usize = acts.iter().map(|(_, v)| v.len()).sum();
         eprintln!(
             "[sdsc-host] card_stage={:.2} ms  ({} tables, {} acts, {} f32 built, {} int32 binds)",
-            _t_stage.elapsed().as_secs_f64() * 1e3,
+            t_stage.elapsed().as_secs_f64() * 1e3,
             tables.len(),
             acts.len(),
             elems,
@@ -498,6 +525,12 @@ pub(crate) fn run_card_launch(
     // Option and never an unwrap over a guard established lines earlier: a
     // launch whose suffix runs and whose bundle mints no draw is refused AT
     // THE ARM, before anything stages.
+    // ⭐ THE CHUNK TABLE'S PROBE, taken once ahead of the arms: the launch's own
+    // kind (a decode batch answers `None` — the decode table's population, not
+    // recorded here), staged before any arm runs so the eager doors below clock
+    // what this tree's path costs as it stands. Measurement only: no arm's
+    // waits, submits or reads move.
+    let chunk_kind = chunk_kind_of(&rows_in, &want_logits);
     let picked = match (want_logits, seat_launch) {
         // ⭐ THE ONE DECODE PATH, SUBMITTED: stage, launch, enqueue the idx-stick read, return. The
         // minted sampler consumes the `[rows, vocab]` result on the card and leaves the idx stick in
@@ -584,28 +617,78 @@ pub(crate) fn run_card_launch(
         }
         // A middle prompt chunk: no suffix runs and nothing is read back.
         (LogitsWanted::None, _) => {
-            pf.run_bound(&binds, mq, seq_pos, StepLogits::Discarded)
-                .map_err(|e| {
-                    werr(format!(
-                        "superdsc prefill run_step (mq={mq}, at={seq_pos}): {e}"
-                    ))
-                })?;
+            // ⭐ THE CHUNK TABLE'S ROW, measurement only: stage (everything the
+            // host staged before the door), the door itself, the depth of chunk
+            // submissions outstanding, and the card-busy peek — the same latch
+            // the decode arm's busy row reads. The counter is released the
+            // moment the door returns, before `?`, so an error leaves it
+            // balanced.
+            let probe = chunk_kind.map(|kind| {
+                let busy = PRIOR_READ
+                    .lock()
+                    .expect("the overlap probe's own lock")
+                    .as_ref()
+                    .is_some_and(|s| !s.fired());
+                let depth =
+                    CHUNKS_OUTSTANDING.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                (kind, t_stage.elapsed(), busy, depth)
+            });
+            let t_door = std::time::Instant::now();
+            let run = pf.run_bound(&binds, mq, seq_pos, StepLogits::Discarded);
+            CHUNKS_OUTSTANDING.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            run.map_err(|e| {
+                werr(format!(
+                    "superdsc prefill run_step (mq={mq}, at={seq_pos}): {e}"
+                ))
+            })?;
+            if let Some((kind, stage, busy, depth)) = probe {
+                scratchy_serving_worker::step_segs::record_chunk(
+                    scratchy_serving_worker::step_segs::ChunkSegs {
+                        kind,
+                        stage,
+                        door: t_door.elapsed(),
+                        fence: None,
+                        depth,
+                        busy,
+                    },
+                );
+            }
             None
         }
         // ⭐ THE PROMPT-FINAL CHUNK'S PICK — on the card, through the prefill rung's own minted
         // sampler: the suffix runs, the sampler consumes the folded lm-head row there, and the idx
         // stick comes back raw, exactly like a decode's.
         (LogitsWanted::LastRow, Some((seat, seat_width))) => {
-            pf.run_bound(&binds, mq, seq_pos, StepLogits::LeftOnDevice)
-                .map_err(|e| {
-                    werr(format!(
-                        "superdsc prefill run_step (mq={mq}, at={seq_pos}): {e}"
-                    ))
-                })?;
+            // ⭐ THE CHUNK TABLE'S ROW, the middle arm's own probe verbatim, plus
+            // the fence: the pick read this arm alone performs, clocked apart
+            // from the door. The counter is released the moment the door
+            // returns, before `?`, so an error — the door's or the read's —
+            // leaves it balanced.
+            let probe = chunk_kind.map(|kind| {
+                let busy = PRIOR_READ
+                    .lock()
+                    .expect("the overlap probe's own lock")
+                    .as_ref()
+                    .is_some_and(|s| !s.fired());
+                let depth =
+                    CHUNKS_OUTSTANDING.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                (kind, t_stage.elapsed(), busy, depth)
+            });
+            let t_door = std::time::Instant::now();
+            let run = pf.run_bound(&binds, mq, seq_pos, StepLogits::LeftOnDevice);
+            CHUNKS_OUTSTANDING.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            run.map_err(|e| {
+                werr(format!(
+                    "superdsc prefill run_step (mq={mq}, at={seq_pos}): {e}"
+                ))
+            })?;
+            let door = t_door.elapsed();
+            let t_fence = std::time::Instant::now();
             // The prompt-final width is the launch's one typed width — the
             // mint's verbatim prompt case, the same value the staging block
             // bound the seat's rows at.
             let picked = read_sampled_tokens(pf, seat, seat_width, b.result_id as u32, vocab)?;
+            let fence = t_fence.elapsed();
             log_seat_readback(
                 pf,
                 seat,
@@ -613,6 +696,18 @@ pub(crate) fn run_card_launch(
                 &picked,
                 &format!("prefill-final mq={mq} at={seq_pos}"),
             );
+            if let Some((kind, stage, busy, depth)) = probe {
+                scratchy_serving_worker::step_segs::record_chunk(
+                    scratchy_serving_worker::step_segs::ChunkSegs {
+                        kind,
+                        stage,
+                        door,
+                        fence: Some(fence),
+                        depth,
+                        busy,
+                    },
+                );
+            }
             Some(picked)
         }
         // A prompt-final pick whose bundle mints no draw — refused at the arm.
