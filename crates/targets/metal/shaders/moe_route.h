@@ -45,6 +45,9 @@
 
 using namespace metal;
 
+// Precision (#1283): the router logits picked from here are bf16, as HF transformers' Gemma 4
+// router; vLLM computes them in f32 and breaks exact ties on the lower expert index, so a near-tie
+// at the k-th pick can route a token differently. Measured on Gemma 4: no effect on the output.
 // Expert `e`'s score `v` as a key whose unsigned order is `LessThan`'s, with ties broken by index.
 template <typename T>
 METAL_FUNC uint route_key(T v, uint e) {
