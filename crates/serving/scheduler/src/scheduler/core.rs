@@ -26,7 +26,7 @@ use tracing::warn;
 use super::interface::{PauseState, SchedulerInterface};
 use super::output::{
     CachedKvOp, CachedRequestData, NewRequestData, RecurrentAdmissionOp, RecurrentStateOps,
-    SchedulerOutput, SharedMemoryOps, StateSnapshotOp, StepId,
+    SchedulerOutput, SharedMemoryOps, SnapshotDiskOps, SnapshotFill, StateSnapshotOp, StepId,
 };
 use super::recurrent_state::{SnapshotBudget, StateSnapshots};
 use super::request_queue::{RequestQueue, SchedulingPolicy, create_request_queue};
@@ -54,15 +54,42 @@ pub const GENERATION_PROMPT_ALLOWANCE: usize = 8;
 /// recurrent kernels carries two (`GdnSeqSlots::saves`), and a prompt has two save points.
 pub const MAX_STATE_SAVES_PER_STEP: usize = 2;
 
-/// Where a request with recurrent state resumes on admission — see
-/// [`KVCacheManagerOps::plan_recurrent_prefix`].
+/// Where a planned restore's snapshot is ([`KVCacheManagerOps::plan_recurrent_prefix`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RecurrentPrefixPlan {
+pub enum SnapshotAt {
+    /// A ready snapshot in this slot.
+    Slot(usize),
+    /// The disk tier, from which holding the plan reads it back into a slot
+    /// ([`KVCacheManagerOps::hold_recurrent_prefix`]), for the request to resume from once that
+    /// step comes back. `keep`: the KV granules of the hit it resumes over, which the request
+    /// does not hold until its allocation, and so which the slot's memory must not be taken from.
+    Disk { keep: Vec<usize> },
+    /// Being read back from disk, by a step that has not come back.
+    Filling,
+}
+
+/// What holding a plan comes to ([`KVCacheManagerOps::hold_recurrent_prefix`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Held {
+    /// Admit the request on this plan: its snapshot is in a slot, or it resumes cold.
+    Admit(RecurrentPrefixPlan),
+    /// ⛔ THE SNAPSHOT IT RESUMES FROM IS BEING READ BACK FROM DISK: it waits, first in line, for
+    /// the step that reads it. No request runs in the step that reads its snapshot back, so none
+    /// runs on one that failed to come back: that one is forgotten, and the request resumes as it
+    /// would have with no disk tier.
+    Wait,
+}
+
+/// Where a request with recurrent state resumes on admission — see
+/// [`KVCacheManagerOps::plan_recurrent_prefix`]. `At` is where the snapshot it restores is: a
+/// [`SnapshotAt`] as planned, a slot once held — the only plan a request is admitted on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecurrentPrefixPlan<At = usize> {
     /// Tokens the request skips: the deepest block-aligned position, within its KV hit and
     /// before its last token, that has a READY snapshot. 0 = cold.
     pub tokens: u32,
-    /// The snapshot to restore when `tokens > 0`: `(slot, key)`.
-    pub restore: Option<(usize, u64)>,
+    /// The snapshot to restore when `tokens > 0`: `(where, key)`.
+    pub restore: Option<(At, u64)>,
     /// Every ready snapshot slot on this request's prefix at or below `tokens`, `restore`
     /// included — touched on admission so a conversation's older snapshots age with its newest.
     /// An agent loop needs that: once the next user message arrives, the template re-renders the
@@ -72,6 +99,23 @@ pub struct RecurrentPrefixPlan {
     /// Positions whose state this request's prefill snapshots as its scan passes them,
     /// ascending: `(position, key)`.
     pub save_points: Vec<(u32, u64)>,
+}
+
+impl RecurrentPrefixPlan<SnapshotAt> {
+    /// This plan with its snapshot in the slot `slot` puts it in, or cold when `slot` finds none.
+    /// A cold request takes the save points planned past the snapshot all the same.
+    pub fn located(
+        self,
+        slot: impl FnOnce(SnapshotAt, u64) -> Option<usize>,
+    ) -> RecurrentPrefixPlan {
+        let restore = (self.restore).and_then(|(at, key)| slot(at, key).map(|s| (s, key)));
+        RecurrentPrefixPlan {
+            tokens: restore.map_or(0, |_| self.tokens),
+            restore,
+            prefix_slots: self.prefix_slots,
+            save_points: self.save_points,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -172,14 +216,25 @@ pub trait KVCacheManagerOps: Send {
         &self,
         _request: &Request,
         _kv_hit_tokens: u32,
-    ) -> Option<RecurrentPrefixPlan> {
+    ) -> Option<RecurrentPrefixPlan<SnapshotAt>> {
         None
     }
 
     /// Keep what a plan from [`Self::plan_recurrent_prefix`] restores from through this step,
     /// BEFORE the request's blocks are allocated: an allocation may take memory from the
-    /// snapshots, and must not take the one the request is about to resume from.
-    fn hold_recurrent_prefix(&mut self, _request_id: &str, _plan: &RecurrentPrefixPlan) {}
+    /// snapshots, and must not take the one the request is about to resume from. A snapshot on
+    /// disk is read back into a slot by this step, and the request waits for it ([`Held::Wait`]);
+    /// with no slot to be had, it resumes cold.
+    fn hold_recurrent_prefix(
+        &mut self,
+        _request_id: &str,
+        plan: RecurrentPrefixPlan<SnapshotAt>,
+    ) -> Held {
+        Held::Admit(plan.located(|at, _| match at {
+            SnapshotAt::Slot(slot) => Some(slot),
+            SnapshotAt::Disk { .. } | SnapshotAt::Filling => None,
+        }))
+    }
 
     /// Commit a plan from [`Self::plan_recurrent_prefix`] for a request that was just admitted.
     fn admit_recurrent_prefix(&mut self, _request_id: &str, _plan: &RecurrentPrefixPlan) {}
@@ -217,6 +272,19 @@ pub trait KVCacheManagerOps: Send {
     fn take_shared_memory_ops(&mut self) -> SharedMemoryOps {
         SharedMemoryOps::default()
     }
+
+    /// The snapshots this step moves between device memory and the disk tier (see
+    /// [`SnapshotDiskOps`]), taken once its scheduling is done.
+    fn take_snapshot_disk_ops(&mut self) -> SnapshotDiskOps {
+        SnapshotDiskOps::default()
+    }
+
+    /// The step that carried `fills` came back: the snapshots they read back from disk are hits.
+    fn commit_fills(&mut self, _fills: &[SnapshotFill]) {}
+
+    /// ⛔ `fills` NEVER CAME BACK OR FAILED: forget their snapshots, in their slots and on disk, so
+    /// the next hit on each prefix resumes cold.
+    fn forget_fills(&mut self, _fills: &[SnapshotFill]) {}
 }
 
 // ---------------------------------------------------------------------------
@@ -783,7 +851,7 @@ impl SimpleBlockTracker {
         self.free_queue.clear();
         self.num_free_blocks = 0;
         self.recurrent = Some(RecurrentTracking {
-            snapshots: StateSnapshots::new(budget.max_slots),
+            snapshots: StateSnapshots::new(budget.max_slots, budget.disk_slots),
             save_points: HashMap::new(),
             memory: SharedMemory::new(budget, self.total_blocks),
             block_age: vec![0; self.total_blocks],
@@ -1180,9 +1248,12 @@ impl SimpleBlockTracker {
     }
 
     /// ⭐ GROW BEFORE EVICTING — the next pop would evict a cached block: map a granule instead
-    /// while the budget has room for one, or while a snapshot unit is older than that block (one
-    /// LRU over both kinds of cached state). A cached block is evicted only when it is the oldest
-    /// thing there is to give up.
+    /// while the headroom has room for one. Past it, KV evicts its own oldest cached block: to
+    /// grow its CACHE it never takes a snapshot's memory. That trade (one LRU over both kinds)
+    /// crossed kinds on about every other eviction of a cache that turns over, each crossing an
+    /// unmap that can stall the server for seconds. Live KV still does, when no cached block can
+    /// give it a block ([`Self::make_room_for_kv`]), so the context a server can serve is the
+    /// whole budget's, as before.
     fn grow_before_evicting(&mut self) {
         let front = loop {
             match self.free_queue.front() {
@@ -1202,29 +1273,8 @@ impl SimpleBlockTracker {
         let Some(g) = rec.memory.unmapped_granules().next() else {
             return;
         };
-        let need = rec.memory.granule_bytes(g);
-        if rec.memory.headroom() < need {
-            let Some(front) = front else {
-                return;
-            };
-            let age = rec.block_age[front];
-            // Only if the units older than the block free enough: releasing one for nothing
-            // would throw a snapshot away and evict the block all the same.
-            let mut older: Vec<(usize, u64)> = (rec.memory.mapped_units())
-                .filter_map(|u| rec.snapshots.age_of(rec.memory.slots_of(u)).map(|a| (u, a)))
-                .filter(|&(_, a)| a < age)
-                .collect();
-            older.sort_by_key(|&(u, a)| (a, u));
-            let reach = older.len() as u64 * rec.memory.unit_bytes() + rec.memory.headroom();
-            if reach < need {
-                return;
-            }
-            for (u, _) in older {
-                if rec.memory.headroom() >= need {
-                    break;
-                }
-                rec.release_unit(u);
-            }
+        if rec.memory.headroom() < rec.memory.granule_bytes(g) {
+            return;
         }
         self.map_granule(g);
     }
@@ -2574,7 +2624,7 @@ impl KVCacheManagerOps for SimpleBlockTracker {
         &self,
         request: &Request,
         kv_hit_tokens: u32,
-    ) -> Option<RecurrentPrefixPlan> {
+    ) -> Option<RecurrentPrefixPlan<SnapshotAt>> {
         let rec = self.recurrent.as_ref()?;
         let bs = self.block_size.get();
         // ⛔ Span annotations RELOCATE KV, which a scan state cannot follow, and a vision prompt
@@ -2600,12 +2650,27 @@ impl KVCacheManagerOps for SimpleBlockTracker {
         let blocks = request.num_tokens().div_ceil(bs) as u64;
         let fits =
             blocks * rec.memory.block_bytes() + rec.memory.unit_bytes() <= rec.memory.limit();
+        // The deepest snapshot within the hit, in a slot or on disk. One on disk is read back
+        // into a slot, out of memory the hit's own KV is not in: the request holds none of it yet.
         let hit = (1..=resumable).rev().filter(|_| fits).find_map(|b| {
-            rec.snapshots
-                .ready_slot(hashes[b - 1])
-                .map(|slot| (b, slot))
+            let key = hashes[b - 1];
+            let at = match rec.snapshots.ready_slot(key) {
+                Some(slot) => SnapshotAt::Slot(slot),
+                None if rec.snapshots.filling(key) => SnapshotAt::Filling,
+                None if rec.snapshots.fillable(key) => {
+                    let mut keep: Vec<usize> = (hashes[..b].iter())
+                        .filter_map(|h| self.block_hash_to_id.get(h))
+                        .map(|&block| rec.memory.granule_of(block))
+                        .collect();
+                    keep.sort_unstable();
+                    keep.dedup();
+                    SnapshotAt::Disk { keep }
+                }
+                None => return None,
+            };
+            Some((b, at))
         });
-        let hit_blocks = hit.map_or(0, |(b, _)| b);
+        let hit_blocks = hit.as_ref().map_or(0, |(b, _)| *b);
         let tokens = (hit_blocks * bs) as u32;
         let prefix_slots = hashes[..hit_blocks]
             .iter()
@@ -2650,34 +2715,59 @@ impl KVCacheManagerOps for SimpleBlockTracker {
             }
         }
         tracing::info!(
-            "[CACHE] req={} recurrent state: resume at {} (KV hit {}), snapshot at {:?} ({}/{} slots ready)",
+            "[CACHE] req={} recurrent state: resume at {}{} (KV hit {}), snapshot at {:?} ({}/{} slots ready, {} on disk)",
             request.request_id,
             tokens,
+            match hit {
+                Some((_, SnapshotAt::Disk { .. })) => " once read back from disk",
+                Some((_, SnapshotAt::Filling)) => " once its read from disk comes back",
+                _ => "",
+            },
             kv_hit_tokens,
             save_points.iter().map(|&(p, _)| p).collect::<Vec<_>>(),
             rec.snapshots.num_ready(),
             rec.snapshots.num_slots(),
+            rec.snapshots.num_on_disk(),
         );
         Some(RecurrentPrefixPlan {
             tokens,
-            restore: hit.map(|(b, slot)| (slot, hashes[b - 1])),
+            restore: hit.map(|(b, at)| (at, hashes[b - 1])),
             prefix_slots,
             save_points,
         })
     }
 
-    fn hold_recurrent_prefix(&mut self, request_id: &str, plan: &RecurrentPrefixPlan) {
-        let Some(rec) = self.recurrent.as_mut() else {
-            return;
-        };
+    fn hold_recurrent_prefix(
+        &mut self,
+        request_id: &str,
+        plan: RecurrentPrefixPlan<SnapshotAt>,
+    ) -> Held {
         // The restored slot is READ before this step's forward, so it is pinned for the step;
-        // its ancestors only age with it.
-        for &slot in &plan.prefix_slots {
-            rec.snapshots.touch(slot);
+        // its ancestors only age with it. One on disk is read back into a slot by this step, and
+        // the request waits for it.
+        if let Some(rec) = self.recurrent.as_mut() {
+            for &slot in &plan.prefix_slots {
+                rec.snapshots.touch(slot);
+            }
         }
-        if let Some((slot, _)) = plan.restore {
+        let waits = match &plan.restore {
+            Some((SnapshotAt::Filling, _)) => true,
+            Some((SnapshotAt::Disk { keep }, key)) => {
+                self.fill_snapshot(*key, request_id, keep).is_some()
+            }
+            Some((SnapshotAt::Slot(_), _)) | None => false,
+        };
+        if waits {
+            return Held::Wait;
+        }
+        let plan = plan.located(|at, _| match at {
+            SnapshotAt::Slot(slot) => Some(slot),
+            SnapshotAt::Disk { .. } | SnapshotAt::Filling => None,
+        });
+        if let (Some((slot, _)), Some(rec)) = (plan.restore, self.recurrent.as_mut()) {
             rec.snapshots.pin(slot, request_id);
         }
+        Held::Admit(plan)
     }
 
     fn admit_recurrent_prefix(&mut self, request_id: &str, plan: &RecurrentPrefixPlan) {
@@ -2780,25 +2870,39 @@ impl KVCacheManagerOps for SimpleBlockTracker {
     fn take_shared_memory_ops(&mut self) -> SharedMemoryOps {
         (self.recurrent.as_mut()).map_or_else(SharedMemoryOps::default, |rec| rec.memory.take_ops())
     }
+
+    fn take_snapshot_disk_ops(&mut self) -> SnapshotDiskOps {
+        (self.recurrent.as_mut()).map_or_else(SnapshotDiskOps::default, |rec| {
+            rec.snapshots.take_disk_ops()
+        })
+    }
+
+    fn commit_fills(&mut self, fills: &[SnapshotFill]) {
+        if let Some(rec) = self.recurrent.as_mut() {
+            for f in fills {
+                rec.snapshots.commit(f.slot, f.key, &f.req_id);
+            }
+        }
+    }
+
+    fn forget_fills(&mut self, fills: &[SnapshotFill]) {
+        if let Some(rec) = self.recurrent.as_mut() {
+            for f in fills {
+                rec.snapshots.forget_fill(f);
+            }
+        }
+    }
 }
 
 impl SimpleBlockTracker {
-    /// ⭐ A SLOT FOR `key`'s NEW SNAPSHOT, written by `writer`'s step: an empty one already
-    /// mapped; else a unit mapped for it ([`Self::map_snapshot_unit`]); else the slot of the
-    /// snapshot it evicts. `None` when `key` has one, or every snapshot is read or written this
-    /// step and no memory can be had.
+    /// ⭐ A SLOT FOR `key`'s NEW SNAPSHOT, written by `writer`'s step ([`Self::snapshot_slot`]).
+    /// `None` when `key` has one, or every snapshot is read or written this step and no memory
+    /// can be had.
     fn reserve_snapshot(&mut self, key: u64, position: u32, writer: &str) -> Option<usize> {
-        let rec = self.recurrent.as_ref()?;
-        if rec.snapshots.contains(key) {
+        if self.recurrent.as_ref()?.snapshots.contains(key) {
             return None;
         }
-        let slot = match rec.snapshots.empty_slot(|s| rec.memory.slot_mapped(s)) {
-            Some(empty) => empty,
-            None => match self.map_snapshot_unit(writer) {
-                Some(first) => first,
-                None => self.recurrent.as_ref()?.snapshots.victim(writer)?.0,
-            },
-        };
+        let slot = self.snapshot_slot(writer, &[])?;
         self.recurrent
             .as_mut()?
             .snapshots
@@ -2806,12 +2910,43 @@ impl SimpleBlockTracker {
         Some(slot)
     }
 
-    /// Map a snapshot unit for a save by `writer`, if the budget has it: out of the headroom, or
-    /// out of KV granules no request holds — oldest first, and only those older than the
-    /// snapshot the save would otherwise evict (one LRU over both kinds of cached state). Taken
-    /// only if they free a whole unit: a granule released for nothing is cache thrown away.
-    /// The unit's first slot.
-    fn map_snapshot_unit(&mut self, writer: &str) -> Option<usize> {
+    /// ⭐ READ `key`'s SNAPSHOT BACK FROM THE DISK TIER for `reader` to restore once the step comes
+    /// back, into a slot ([`Self::snapshot_slot`]) whose memory is not taken from the KV granules
+    /// `keep` of the hit it resumes over. `None` when no slot can be had.
+    fn fill_snapshot(&mut self, key: u64, reader: &str, keep: &[usize]) -> Option<usize> {
+        let slot = self.snapshot_slot(reader, keep)?;
+        self.recurrent.as_mut()?.snapshots.fill(slot, key, reader);
+        Some(slot)
+    }
+
+    /// ⭐ A SLOT FOR A SNAPSHOT `writer`'s step writes or restores: an empty one already mapped;
+    /// else a unit mapped out of the headroom; else, with a disk tier, the slot of the snapshot it
+    /// evicts — written out to disk, not lost, where a KV granule released is; else a unit
+    /// mapped out of KV granules ([`Self::map_snapshot_unit`]); else the victim's slot.
+    fn snapshot_slot(&mut self, writer: &str, keep: &[usize]) -> Option<usize> {
+        let rec = self.recurrent.as_ref()?;
+        if let Some(empty) = rec.snapshots.empty_slot(|s| rec.memory.slot_mapped(s)) {
+            return Some(empty);
+        }
+        let headroom = rec.memory.headroom() >= rec.memory.unit_bytes();
+        if rec.snapshots.spills()
+            && !headroom
+            && let Some((victim, _)) = rec.snapshots.victim(writer)
+        {
+            return Some(victim);
+        }
+        match self.map_snapshot_unit(writer, keep) {
+            Some(first) => Some(first),
+            None => Some(self.recurrent.as_ref()?.snapshots.victim(writer)?.0),
+        }
+    }
+
+    /// Map a snapshot unit for a save or fill by `writer`, if the budget has it: out of the
+    /// headroom, or out of KV granules no request holds but `keep` — oldest first, and only those
+    /// older than the snapshot the save would otherwise evict (one LRU over both kinds of cached
+    /// state). Taken only if they free a whole unit: a granule released for nothing is cache
+    /// thrown away. The unit's first slot.
+    fn map_snapshot_unit(&mut self, writer: &str, keep: &[usize]) -> Option<usize> {
         let rec = self.recurrent.as_ref()?;
         let u = rec.memory.lowest_unmapped_unit()?;
         let need = rec.memory.unit_bytes();
@@ -2819,7 +2954,8 @@ impl SimpleBlockTracker {
             let evicts = rec.snapshots.victim(writer).map(|(_, age)| age);
             let mut reach = rec.memory.headroom();
             let mut take = Vec::new();
-            for (g, age) in rec.memory.free_granules() {
+            let free = rec.memory.free_granules();
+            for (g, age) in free.into_iter().filter(|(g, _)| !keep.contains(g)) {
                 if reach >= need || evicts.is_some_and(|evicts| age >= evicts) {
                     break;
                 }
@@ -3292,17 +3428,32 @@ impl Scheduler {
     pub fn commit_step(&mut self, step: &SchedulerOutput) {
         self.kv_cache
             .commit_state_saves(&step.recurrent_state.saves);
+        self.kv_cache.commit_fills(&step.recurrent_state.disk.fills);
         self.kv_cache.commit_written(step.step);
     }
 
     /// ⛔ THE STEP `failed` SCHEDULED NEVER CAME BACK, so the KV it was to write may not exist. Its
     /// blocks went into the prefix cache when it was scheduled, for the steps behind it to hit, and
-    /// now stop being hits ([`KVCacheManagerOps::forget_unwritten`]). Returns the requests that
-    /// cannot run on: the step's own, and any a step behind it admitted onto those blocks. The
-    /// caller aborts them.
+    /// now stop being hits ([`KVCacheManagerOps::forget_unwritten`]). So do the snapshots it was to
+    /// read back from disk. Returns the requests that cannot run on: the step's own, and any a step
+    /// behind it admitted onto those blocks. The caller aborts them.
     pub fn forget_unwritten(&mut self, failed: &SchedulerOutput) -> Vec<String> {
+        self.kv_cache
+            .forget_fills(&failed.recurrent_state.disk.fills);
         let requests: Vec<String> = failed.num_scheduled_tokens.keys().cloned().collect();
         self.kv_cache.forget_unwritten(failed.step, &requests)
+    }
+
+    /// ⛔ STEP `step` CAME BACK, BUT THE WORKER COULD NOT READ BACK THE SNAPSHOTS IN `slots` FROM
+    /// DISK (`ModelRunnerOutput::failed_fills`). Each is forgotten, in its slot and on disk, before
+    /// the step is committed. No request ran on one ([`Held::Wait`]): the one waiting for it
+    /// resumes as it would have with no disk tier, and so does the next hit on its prefix.
+    pub fn forget_failed_fills(&mut self, step: &SchedulerOutput, slots: &[usize]) {
+        let failed: Vec<SnapshotFill> = (step.recurrent_state.disk.fills.iter())
+            .filter(|f| slots.contains(&f.slot))
+            .cloned()
+            .collect();
+        self.kv_cache.forget_fills(&failed);
     }
 
     ///
@@ -3640,12 +3791,18 @@ impl SchedulerInterface for Scheduler {
                 // cache holds it (`CachedKvOp`) — a cached block is never rewritten, so every
                 // request that reads it reads the same KV.
                 let kv_hit_tokens = num_cached_tokens;
-                let recurrent = self
-                    .kv_cache
-                    .plan_recurrent_prefix(&request, num_cached_tokens);
-                if let Some(plan) = &recurrent {
-                    self.kv_cache.hold_recurrent_prefix(&request_id, plan);
-                }
+                let planned = (self.kv_cache).plan_recurrent_prefix(&request, num_cached_tokens);
+                let held =
+                    planned.map(|plan| self.kv_cache.hold_recurrent_prefix(&request_id, plan));
+                let recurrent = match held {
+                    Some(Held::Admit(plan)) => Some(plan),
+                    // Its snapshot is being read back from disk: first in line for the step after.
+                    Some(Held::Wait) => {
+                        self.waiting.prepend_request(request);
+                        break;
+                    }
+                    None => None,
+                };
                 let num_cached_tokens = recurrent
                     .as_ref()
                     .map_or(num_cached_tokens, |plan| plan.tokens);
@@ -3926,6 +4083,7 @@ impl SchedulerInterface for Scheduler {
                 cached_kv,
                 saves: state_saves,
                 memory: self.kv_cache.take_shared_memory_ops(),
+                disk: self.kv_cache.take_snapshot_disk_ops(),
             },
             step,
         };
@@ -4024,7 +4182,7 @@ impl SchedulerInterface for Scheduler {
 
 #[cfg(test)]
 mod tests {
-    use super::super::output::{KvGranule, SnapshotUnit};
+    use super::super::output::{KvGranule, SnapshotMove, SnapshotUnit};
     use super::*;
     use scratchy_core_common::SamplingParams;
     use scratchy_core_config::SchedulerConfig;
@@ -8144,6 +8302,7 @@ mod tests {
             slot_bytes: 0,
             unit_slots: std::num::NonZeroUsize::MIN,
             max_slots: slots,
+            disk_slots: 0,
         }
     }
 
@@ -8156,6 +8315,7 @@ mod tests {
             slot_bytes: 20,
             unit_slots: std::num::NonZeroUsize::MIN,
             max_slots: 4,
+            disk_slots: 0,
         })
     }
 
@@ -8294,9 +8454,11 @@ mod tests {
         );
     }
 
+    /// KV grows its cache only out of the headroom: past it, a fresh allocation evicts KV's own
+    /// cached blocks, whatever a snapshot's age — an older snapshot stays, and no memory moves.
     #[test]
-    fn a_cached_block_outlives_an_older_snapshot_and_gives_way_to_a_newer_one() {
-        // The snapshot is older than a's cached blocks: c's granule comes out of the snapshot.
+    fn kv_evicts_its_own_cached_blocks_rather_than_take_an_older_snapshots_memory() {
+        // The snapshot is older than a's cached blocks: c still evicts a's, and the snapshot stays.
         let mut t = shared();
         assert_eq!(t.reserve_snapshot(9, 16, "w"), Some(0));
         t.new_step_starts();
@@ -8306,18 +8468,12 @@ mod tests {
         t.new_step_starts();
         assert_eq!(
             alloc(&mut t, &prompt_blocks("c", 4, 2)),
-            Some(vec![4, 5, 6, 7])
+            Some(vec![3, 2, 1, 0]),
+            "a's blocks, tail first"
         );
-        let ops = t.take_shared_memory_ops();
-        assert_eq!(
-            (ops.release_snapshots, ops.map_kv),
-            (vec![SnapshotUnit(0)], vec![KvGranule(1)])
-        );
-        assert_eq!(
-            KVCacheManagerOps::num_cached_blocks(&t),
-            4,
-            "a's blocks stay cached"
-        );
+        assert!(t.take_shared_memory_ops().is_empty(), "no memory moved");
+        assert_eq!(KVCacheManagerOps::num_cached_blocks(&t), 0);
+        assert!(holds_snapshot(&t, 9), "the older snapshot stays");
 
         // The snapshot is newer: c evicts a's cached blocks and the snapshot stays.
         let mut t = shared();
@@ -8339,6 +8495,10 @@ mod tests {
 
     /// A caching tracker over a uniform pool that tracks `slots` recurrent-state snapshots.
     fn recurrent_scheduler(slots: usize, budget: usize) -> Scheduler {
+        recurrent_scheduler_over(apart(slots), budget)
+    }
+
+    fn recurrent_scheduler_over(snapshots: SnapshotBudget, budget: usize) -> Scheduler {
         let cfg = SchedulerConfig {
             max_num_batched_tokens: budget,
             max_num_seqs: 4,
@@ -8347,7 +8507,7 @@ mod tests {
             ..Default::default()
         };
         let kv: Box<dyn KVCacheManagerOps> = Box::new(
-            SimpleBlockTracker::with_caching(1000, kbt(16)).with_state_snapshots(apart(slots)),
+            SimpleBlockTracker::with_caching(1000, kbt(16)).with_state_snapshots(snapshots),
         );
         Scheduler::new(&cfg, 8192, kv)
     }
@@ -8796,6 +8956,7 @@ mod tests {
             slot_bytes: 30,
             unit_slots: std::num::NonZeroUsize::MIN,
             max_slots: 3,
+            disk_slots: 0,
         };
         let kv = SimpleBlockTracker::with_caching(10, kbt(16)).with_state_snapshots(budget);
         let mut sched = Scheduler::new(&cfg, 8192, Box::new(kv));
@@ -8878,6 +9039,175 @@ mod tests {
         assert_eq!(out.recurrent_state.saves[0].req_id, "r1");
         // floor((600 - GENERATION_PROMPT_ALLOWANCE) / 16) * 16 = 592.
         assert_eq!(out.recurrent_state.saves[0].position, 592);
+    }
+
+    /// Run steps until `id` is admitted: its admission step, and every disk fill on the way.
+    fn admit(sched: &mut Scheduler, id: &str) -> (SchedulerOutput, usize) {
+        let mut fills = 0;
+        for _ in 0..4 {
+            let out = run_step(sched);
+            fills += out.recurrent_state.disk.fills.len();
+            if out.scheduled_new_reqs.iter().any(|r| r.req_id == id) {
+                return (out, fills);
+            }
+        }
+        panic!("{id} never admitted");
+    }
+
+    /// ⭐ A WORKLOAD THAT COMES BACK TO MORE PROMPTS THAN THE SLOTS HOLD. Without a disk tier, LRU
+    /// evicts each prompt's snapshot just before the prompt comes back, and every one resumes
+    /// cold over a full KV hit. With one, each is read back from disk and resumes at its end.
+    #[test]
+    fn recurrent_prompts_past_the_slots_come_back_from_disk() {
+        let pass = |sched: &mut Scheduler, tag: &str| -> Vec<(u32, usize)> {
+            (0..4u32)
+                .map(|p| {
+                    let id = format!("{tag}{p}");
+                    sched.add_request(prompt_blocks(&id, 10, p + 1));
+                    let (out, fills) = admit(sched, &id);
+                    prefill_and_finish(sched, &id);
+                    (out.scheduled_new_reqs[0].num_computed_tokens, fills)
+                })
+                .collect()
+        };
+        for (disk_slots, back) in [(0, (0, 0)), (4, (144, 1))] {
+            let mut sched = recurrent_scheduler_over(
+                SnapshotBudget {
+                    disk_slots,
+                    ..apart(2)
+                },
+                4096,
+            );
+            assert_eq!(
+                pass(&mut sched, "a"),
+                vec![(0, 0); 4],
+                "cold the first time"
+            );
+            assert_eq!(
+                pass(&mut sched, "b"),
+                vec![back; 4],
+                "{disk_slots} disk slots: where each prompt resumes the second time, and its fills"
+            );
+        }
+    }
+
+    /// A scheduler of 1 slot and 2 disk slots where `a`'s snapshot went to disk, then `a2`'s first
+    /// step, which reads it back from disk.
+    fn reading_back_a() -> (Scheduler, SchedulerOutput) {
+        let mut sched = recurrent_scheduler_over(
+            SnapshotBudget {
+                disk_slots: 2,
+                ..apart(1)
+            },
+            4096,
+        );
+        for (id, seed) in [("a", 1), ("b", 2)] {
+            sched.add_request(prompt_blocks(id, 10, seed));
+            run_step(&mut sched);
+            prefill_and_finish(&mut sched, id);
+        }
+        // `b`'s save took `a`'s slot: `a`'s snapshot went to disk.
+        sched.add_request(prompt_blocks("a2", 10, 1));
+        let out = sched.schedule();
+        assert_eq!(out.recurrent_state.disk.fills.len(), 1);
+        (sched, out)
+    }
+
+    /// ⭐ A HIT ON DISK WAITS ONE STEP: the step reads the snapshot back and runs no request on it.
+    /// Once that step comes back, the request resumes from the slot, and so does the next one.
+    #[test]
+    fn recurrent_a_hit_on_disk_resumes_once_its_fill_comes_back() {
+        let (mut sched, out) = reading_back_a();
+        let fill = out.recurrent_state.disk.fills[0].clone();
+        assert!(
+            out.num_scheduled_tokens.is_empty(),
+            "nothing runs on the fill"
+        );
+        assert!(out.recurrent_state.restores.is_empty());
+        assert_eq!(
+            out.recurrent_state.disk.spills,
+            vec![SnapshotMove {
+                slot: fill.slot,
+                disk: 1,
+                key: out.recurrent_state.disk.spills[0].key,
+            }],
+            "`b`'s snapshot, out of the slot the fill takes, into the other disk slot"
+        );
+        // Scheduled before the fill came back: it waits still, and reads nothing back twice.
+        let behind = sched.schedule();
+        assert!(behind.num_scheduled_tokens.is_empty());
+        assert!(behind.recurrent_state.disk.is_empty());
+        sched.commit_step(&out);
+        sched.commit_step(&behind);
+        let out = run_step(&mut sched);
+        assert_eq!(
+            out.recurrent_state.restores,
+            vec![StateSnapshotOp {
+                req_id: "a2".into(),
+                slot: fill.slot,
+                position: 144,
+                key: fill.key,
+            }]
+        );
+        assert!(out.recurrent_state.saves.is_empty(), "its end is on disk");
+        prefill_and_finish(&mut sched, "a2");
+        sched.add_request(prompt_blocks("a3", 10, 1));
+        let out = run_step(&mut sched);
+        assert!(out.recurrent_state.disk.is_empty(), "a hit in its slot");
+        assert_eq!(out.recurrent_state.restores[0].position, 144);
+    }
+
+    /// `id`, waiting for a fill that failed, resumes cold: it reads nothing back, restores nothing
+    /// and saves its end anew.
+    fn assert_resumes_cold(sched: &mut Scheduler, id: &str) {
+        let out = run_step(sched);
+        assert!(
+            out.recurrent_state.restores.is_empty(),
+            "{id} restores nothing"
+        );
+        assert!(
+            out.recurrent_state.disk.fills.is_empty(),
+            "{id} reads nothing back"
+        );
+        assert_eq!(out.scheduled_new_reqs[0].req_id, id);
+        assert_eq!(out.scheduled_new_reqs[0].num_computed_tokens, 0);
+        let saved: Vec<u32> = (out.recurrent_state.saves.iter())
+            .map(|op| op.position)
+            .collect();
+        assert_eq!(saved, vec![144], "{id} saves its end anew");
+    }
+
+    /// ⛔ THE WORKER COULD NOT READ A SNAPSHOT BACK FROM DISK. No request ran on it; the snapshot is
+    /// forgotten, in its slot and on disk; and the request that waited for it, like the next one
+    /// for its prefix, resumes cold: a disk error costs latency, not an answer.
+    #[test]
+    fn recurrent_a_failed_fill_costs_its_waiting_request_a_cold_prefill() {
+        let (mut sched, out) = reading_back_a();
+        let behind = sched.schedule();
+        let slot = out.recurrent_state.disk.fills[0].slot;
+        sched.forget_failed_fills(&out, &[slot]);
+        sched.commit_step(&out);
+        sched.commit_step(&behind);
+        assert_resumes_cold(&mut sched, "a2");
+        prefill_and_finish(&mut sched, "a2");
+        sched.add_request(prompt_blocks("a3", 10, 1));
+        let out = run_step(&mut sched);
+        assert_eq!(
+            out.recurrent_state.restores[0].position, 144,
+            "a2's own save serves the prefix again"
+        );
+    }
+
+    /// ⛔ THE STEP THAT READ A SNAPSHOT BACK NEVER CAME BACK: the snapshot is forgotten, no request
+    /// is lost with it, and the one that waited for it resumes cold.
+    #[test]
+    fn recurrent_a_fill_whose_step_failed_is_forgotten() {
+        let (mut sched, out) = reading_back_a();
+        assert!(
+            sched.forget_unwritten(&out).is_empty(),
+            "no request ran in it"
+        );
+        assert_resumes_cold(&mut sched, "a2");
     }
 
     #[test]

@@ -211,6 +211,7 @@ mod tests {
             slot_bytes: 3,
             unit_slots: NonZeroUsize::new(2).unwrap(),
             max_slots: 6,
+            disk_slots: 0,
         };
         SharedMemory::new(budget, 10)
     }
