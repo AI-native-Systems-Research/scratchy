@@ -280,15 +280,188 @@ fn request<'a>(
     }
 }
 
+/// What a block drafter's cycle reads (GiB), the line its verify budget prices rows by — `fixed +
+/// per_row · rows`, its target's verify and its drafter's passes, weight bytes at the block's
+/// bucket, compiled facts — and the drafter's share of `fixed`.
+///
+/// Drafting is priced by what it adds: the drafter's passes and its drafts' rows. The step it
+/// replaces is the same forward verifying its newest token alone, without the drafter (`fixed -
+/// drafter + per_row`), at the same bucket. A plain step's own bucket would price its rows' bytes
+/// and miss its fixed latency (qwen3.6-35b-a3b on a base M5: its one-row bucket reads 1.49 GiB in
+/// 16 ms, a two-row verify 2.86 GiB in 22) and stop drafting where it pays.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CycleCosts {
+    pub fixed: f64,
+    pub per_row: f64,
+    pub drafter: f64,
+}
+
+impl CycleCosts {
+    /// A cycle's reads when its target verifies `rows`.
+    fn cycle(self, rows: u32) -> f64 {
+        self.fixed + self.per_row * f64::from(rows)
+    }
+
+    /// The step a cycle replaces: its newest token alone, no drafter.
+    fn plain(self) -> f64 {
+        self.fixed - self.drafter + self.per_row
+    }
+}
+
+/// Whether a sequence's drafting pays: the tokens its target retained of the cycles it drafted,
+/// per byte those cycles read, against the plain step's one token per its bytes.
+///
+/// The verify budget (`draft_verify_rows`) chooses how many of a block's rows a cycle verifies,
+/// down to its newest token alone — but every one of its choices runs the drafter's pass, so none
+/// is the plain step. A sequence whose text the drafter guesses badly (an answer forced past where
+/// it would have ended: #1208's MuSiQue padding, about a fifth of its drafts accepted) pays the
+/// drafter for tokens the plain step would have given cheaper. The gate pauses such a sequence's
+/// drafting — its steps run plain, every one still committing its rows to the drafter's rings, so
+/// a probe can draft again at any step — and probes again after a wait that doubles while probes
+/// keep not paying, up to [`Self::PROBE_CAP`] steps.
+///
+/// ⛔ A STEP ASKS BEFORE IT HEARS. A step drafts its lanes' next blocks in the same command as it
+/// verifies their last ones, so the worker asks [`Self::drafts`] for a step before it
+/// [`Self::observe`]s the cycle that step verifies: whatever the gate decides on a cycle's
+/// evidence takes effect a step late. A probe therefore drafts one cycle and waits for its verdict
+/// ([`Lane::Probing`]), and a lane that stops paying has one more cycle in flight, whose evidence
+/// counts but does not double the wait a second time. A probe's verdict is never missing: the gate
+/// is asked only on a step that can draft a block ([`BlockDrafter::passes`]), and a cycle that
+/// comes back with none of its drafts to verify is heard as the miss it is
+/// ([`Self::verified_nothing`]).
+#[derive(Debug)]
+pub struct DraftGate {
+    costs: CycleCosts,
+    seqs: HashMap<String, SequenceGate>,
+}
+
+/// One sequence's evidence and where its drafting stands ([`DraftGate`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct SequenceGate {
+    /// Its drafted cycles' retained tokens and their reads, each cycle weighing [`DraftGate::DECAY`]
+    /// times the next: what its text gives a cycle now, not what its earlier text did.
+    tokens: f64,
+    reads: f64,
+    lane: Lane,
+}
+
+/// Where a sequence's drafting stands ([`DraftGate`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+enum Lane {
+    /// Drafting every step: its cycles pay, or none has been heard of yet.
+    #[default]
+    Drafting,
+    /// Not drafting for `wait` more steps, then a probe; `backoff` the wait it sat out last.
+    Paused { wait: u32, backoff: u32 },
+    /// One cycle drafted as a probe, its verdict not heard yet: no more until it is.
+    Probing { backoff: u32 },
+}
+
+impl DraftGate {
+    /// The weight a cycle's evidence keeps at each later cycle's: about the last five cycles count.
+    /// A request's text can change what the drafter guesses within one answer — its answer, then
+    /// text forced past it (#1208's padding, some forty cycles) — so the estimate must follow it,
+    /// but prose dips for a cycle or two and recovers, and an estimate of the last two cycles
+    /// (0.5) paused through those dips (qwen3.6-35b-a3b prose on a base M5: four of eight requests
+    /// 2-7% slower than drafting through them).
+    pub const DECAY: f64 = 0.8;
+    /// The longest wait between probes: Splash's `kExploreCycles` (VerifyBudget.hpp), the cycles
+    /// between its own explorations of the rows its budget would not choose.
+    pub const PROBE_CAP: u32 = 32;
+
+    pub fn new(costs: CycleCosts) -> Self {
+        Self {
+            costs,
+            seqs: HashMap::new(),
+        }
+    }
+
+    /// A cycle `req_id` drafted, verified at `rows` rows, retained `retained` tokens.
+    pub fn observe(&mut self, req_id: &str, rows: u32, retained: u32) {
+        let (reads, plain) = (self.costs.cycle(rows), self.costs.plain());
+        let s = self.seqs.entry(req_id.to_string()).or_default();
+        s.tokens = Self::DECAY * s.tokens + f64::from(retained);
+        s.reads = Self::DECAY * s.reads + reads;
+        let pays = s.tokens * plain >= s.reads;
+        s.lane = match (pays, s.lane) {
+            (true, _) => Lane::Drafting,
+            // The first cycle that does not pay: a step's pause.
+            (false, Lane::Drafting) => Lane::Paused {
+                wait: 1,
+                backoff: 1,
+            },
+            // The cycle drafted before the pause took effect: its evidence counts, the wait
+            // stands.
+            (false, paused @ Lane::Paused { .. }) => paused,
+            // A probe that does not pay: twice the wait.
+            (false, Lane::Probing { backoff }) => {
+                let backoff = (2 * backoff).min(Self::PROBE_CAP);
+                Lane::Paused {
+                    wait: backoff,
+                    backoff,
+                }
+            }
+        };
+    }
+
+    /// A cycle `req_id` drafted came back with none of its drafts to verify because its verify
+    /// budget chose its newest token alone: the drafter's pass paid for one token — a cycle of one
+    /// row, heard as any other, so a probe's verdict is never missing.
+    pub fn verified_nothing(&mut self, req_id: &str) {
+        self.observe(req_id, 1, 1);
+    }
+
+    /// A cycle `req_id` drafted whose drafts the next step dropped (it ran past the budget): it
+    /// says nothing of what the drafter guesses, so it is no evidence, and a probe it was is tried
+    /// again at the next step that drafts.
+    pub fn dropped(&mut self, req_id: &str) {
+        if let Some(s) = self.seqs.get_mut(req_id)
+            && let Lane::Probing { backoff } = s.lane
+        {
+            s.lane = Lane::Paused { wait: 0, backoff };
+        }
+    }
+
+    /// Whether `req_id` drafts at this step, one call a step it decodes in, before the step's
+    /// verify is observed: drafting, or a paused lane's wait run out — a probe, after which it
+    /// drafts nothing until the probe is heard.
+    pub fn drafts(&mut self, req_id: &str) -> bool {
+        let Some(s) = self.seqs.get_mut(req_id) else {
+            return true;
+        };
+        let (drafts, lane) = match s.lane {
+            Lane::Drafting => (true, Lane::Drafting),
+            Lane::Paused { wait: 0, backoff } => (true, Lane::Probing { backoff }),
+            Lane::Paused { wait, backoff } => (
+                false,
+                Lane::Paused {
+                    wait: wait - 1,
+                    backoff,
+                },
+            ),
+            probing @ Lane::Probing { .. } => (false, probing),
+        };
+        s.lane = lane;
+        drafts
+    }
+
+    /// A finished request's evidence goes with it.
+    pub fn forget(&mut self, req_id: &str) {
+        self.seqs.remove(req_id);
+    }
+}
+
 impl BlockDrafter {
     /// The drafter's passes over the rows of `step` that the requests in `plan` run, each sequence's
     /// prompt context by `contexts` (by its index in the step; a sequence past them resumed at 0 and
-    /// snapshots nothing). `None` when none is planned.
+    /// snapshots nothing), drafting a block only while `gate` finds a lane's drafting pays. `None`
+    /// when none is planned.
     pub fn passes(
         &self,
         step: &StepRows<'_>,
         plan: &HashSet<String>,
         contexts: &[SequenceContext<'_>],
+        gate: &mut DraftGate,
     ) -> Result<Option<BlockPasses>, DraftContextError> {
         let seqs: Vec<usize> = (0..step.req_ids.len())
             .filter(|&i| plan.contains(&step.req_ids[i]))
@@ -400,9 +573,25 @@ impl BlockDrafter {
         // A cycle's commit reads a retained count a lane: every sequence is one, in one commit.
         commits[0].cycle &= commits.len() == 1 && lanes.len() == commits[0].steps.len();
         let cycle = commits[0].cycle;
-        let drafts = self.budget.drafts_at(step.req_ids.len()) > 0
-            && (lanes.iter()).all(|l| self.fits(l, block_rows))
-            && !lanes.is_empty();
+        // ⛔ THE GATE IS ASKED ONLY ON A STEP THAT CAN DRAFT A BLOCK — within the budget, every lane
+        // fitting. A step past either drafts nothing whatever the gate says, and asking it there
+        // would count a wait down, or turn a paused lane into a probe, for a cycle no step drafts:
+        // a probe that never comes back to be heard.
+        //
+        // ⛔ AND ONLY FOR ONE LANE. Its break-even is a lane's own cycle against its own plain step;
+        // lanes drafting together share the drafter's pass and their target's fixed reads, a
+        // batch's economics the gate does not price — charged as if each lane's own, it paused
+        // lanes whose drafting paid (qwen3.6-35b-a3b, `--max-num-seqs 4`, forced MuSiQue at 4
+        // users: 6% slower end to end than drafting every step). A step of several lanes drafts as
+        // it always has; their verifies are still heard, so a lane alone again decides on them.
+        let can_draft = self.budget.drafts_at(step.req_ids.len()) > 0
+            && !lanes.is_empty()
+            && (lanes.iter()).all(|l| self.fits(l, block_rows));
+        let drafts = can_draft
+            && match &lanes[..] {
+                [lane] => gate.drafts(&step.req_ids[lane.step]),
+                _ => true,
+            };
         let block = (drafts || cycle).then(|| self.block(step, lanes, drafts));
         Ok(Some(BlockPasses {
             rebuild,
@@ -487,6 +676,250 @@ mod tests {
         window: 2048,
     };
 
+    /// qwen3.6-35b-a3b's cycle line as its worker reads it (GiB): 2.29 fixed, 0.49 of it its
+    /// drafter's, and 0.527 a verify row.
+    fn costs() -> CycleCosts {
+        CycleCosts {
+            fixed: 2.29,
+            per_row: 0.527,
+            drafter: 0.49,
+        }
+    }
+
+    /// `steps` decode steps of lane "a" in the worker's order (`execute_model`): each step asks the
+    /// gate whether it drafts, then — its verify — hears the cycle the step before drafted, which
+    /// retains `retained(cycle)` tokens of 4 rows. The steps it drafted at, from 1.
+    fn drafted_steps(
+        gate: &mut DraftGate,
+        steps: usize,
+        retained: impl Fn(usize) -> u32,
+    ) -> Vec<usize> {
+        let (mut drafted, mut in_flight) = (Vec::new(), None);
+        for step in 1..=steps {
+            let drafts = gate.drafts("a");
+            if let Some(cycle) = in_flight.take() {
+                gate.observe("a", 4, retained(cycle));
+            }
+            if drafts {
+                in_flight = Some(drafted.len());
+                drafted.push(step);
+            }
+        }
+        drafted
+    }
+
+    /// The steps between two drafted steps.
+    fn gaps(steps: &[usize]) -> Vec<usize> {
+        steps.windows(2).map(|w| w[1] - w[0] - 1).collect()
+    }
+
+    /// A cycle verifying 4 rows reads 4.398 GiB against the 2.327 of the step it replaces, so it
+    /// pays from 1.89 tokens. A lane none of whose cycles pays, in the worker's order: the step
+    /// after its first miss had drafted already, so it sits out one step and probes; each probe
+    /// drafts one cycle, waits the step its verdict takes, and sits out twice the wait before,
+    /// capped at the probe cap.
+    #[test]
+    fn a_gate_pauses_a_lane_whose_cycles_stop_paying() {
+        let mut gate = gate();
+        let drafted = drafted_steps(&mut gate, 120, |_| 1);
+        assert_eq!(gaps(&drafted), [0, 1, 3, 5, 9, 17, 33, 33]);
+        gate.forget("a");
+        assert!(gate.drafts("a"), "a forgotten lane starts over");
+    }
+
+    /// A lane whose cycles pay drafts every step; one whose probe pays drafts every step again.
+    #[test]
+    fn a_probe_that_pays_drafts_every_step_again() {
+        let mut paying = gate();
+        assert_eq!(drafted_steps(&mut paying, 6, |_| 3), [1, 2, 3, 4, 5, 6]);
+        let mut recovering = gate();
+        // Five cycles that do not pay, then every one gives 5 tokens.
+        let drafted = drafted_steps(&mut recovering, 40, |cycle| if cycle < 5 { 1 } else { 5 });
+        let resumed = drafted
+            .windows(2)
+            .position(|w| w[1] == w[0] + 1 && w[0] > 2);
+        let last = *drafted.last().expect("drafted");
+        assert!(
+            resumed.is_some() && drafted.ends_with(&(last - 4..=last).collect::<Vec<_>>()),
+            "drafts every step once a probe pays: {drafted:?}"
+        );
+    }
+
+    /// The evidence decays over cycles, not at once: a lane whose text gave its drafter 5 tokens a
+    /// cycle drafts through a dip of two cycles that would not pay alone, and pauses once the dip
+    /// outlasts its history.
+    #[test]
+    fn a_gate_rides_out_a_short_dip() {
+        let dip = |from: usize, len: usize| {
+            move |c: usize| {
+                if (from..from + len).contains(&c) {
+                    1
+                } else {
+                    5
+                }
+            }
+        };
+        let mut short = gate();
+        let drafted = drafted_steps(&mut short, 20, dip(4, 2));
+        assert_eq!(drafted, (1..=20).collect::<Vec<_>>(), "a two-cycle dip");
+        let mut long = gate();
+        let drafted = drafted_steps(&mut long, 30, dip(4, 26));
+        assert!(gaps(&drafted).iter().any(|&g| g > 0), "a long one pauses");
+    }
+
+    /// A lane its gate pauses drafts no block: its step commits its rows and runs the block only
+    /// for the acceptance of the block it verifies.
+    #[test]
+    fn a_paused_lane_drafts_no_block() {
+        let step = Step {
+            req_ids: vec!["a".into()],
+            input_ids: (500..508).collect(),
+            positions: (40..48).collect(),
+            cu: vec![0, 8],
+            history: vec![41],
+            sampled: SampledRows::of(&[0, 8], |_| true).expect("rows"),
+        };
+        let mut paused = gate();
+        paused.observe("a", 8, 1);
+        let passes = DRAFTER
+            .passes(&step.rows(), &plan(&["a"]), &[], &mut paused)
+            .expect("a valid plan")
+            .expect("planned");
+        assert!(
+            passes.commits[0].cycle,
+            "it still commits its retained rows"
+        );
+        let block = passes.block.expect("the verified block's acceptance");
+        assert!(!block.drafts, "and drafts no next block");
+        let passes = DRAFTER
+            .passes(&step.rows(), &plan(&["a"]), &[], &mut paused)
+            .expect("a valid plan")
+            .expect("planned");
+        assert!(passes.block.expect("a block").drafts, "its probe drafts");
+    }
+
+    /// `id` verifying a block of 8 rows at positions 40..48, its next block drafted from 48.
+    fn verifying(id: &str) -> Step {
+        Step {
+            req_ids: vec![id.into()],
+            input_ids: (500..508).collect(),
+            positions: (40..48).collect(),
+            cu: vec![0, 8],
+            history: vec![41],
+            sampled: SampledRows::of(&[0, 8], |_| true).expect("rows"),
+        }
+    }
+
+    /// Whether `drafter`'s passes over `step` draft a next block.
+    fn drafts_block(drafter: &BlockDrafter, step: &Step, gate: &mut DraftGate) -> bool {
+        let ids: Vec<&str> = step.req_ids.iter().map(String::as_str).collect();
+        (drafter.passes(&step.rows(), &plan(&ids), &[], gate))
+            .expect("a valid plan")
+            .and_then(|p| p.block)
+            .is_some_and(|b| b.drafts)
+    }
+
+    /// A step that cannot draft a block — past BLOCK_LANES sequences, or a lane whose next block
+    /// would pass the context — does not ask the gate: a paused lane whose wait ran out keeps its
+    /// probe for the next step that can draft, instead of probing with no cycle to be heard.
+    #[test]
+    fn a_step_that_cannot_draft_leaves_a_paused_lane_s_probe() {
+        let five: Vec<String> = (0..5).map(|i| format!("s{i}")).collect();
+        let wide = Step {
+            req_ids: five,
+            input_ids: vec![7; 5],
+            positions: vec![30; 5],
+            cu: (0..=5).collect(),
+            history: vec![31; 5],
+            sampled: SampledRows::of(&[0, 1, 2, 3, 4, 5], |_| false).expect("rows"),
+        };
+        let mut paused = gate();
+        paused.observe("s0", 8, 1);
+        assert!(
+            !drafts_block(&DRAFTER, &verifying("s0"), &mut paused),
+            "its pause"
+        );
+        for _ in 0..3 {
+            assert!(
+                !drafts_block(&DRAFTER, &wide, &mut paused),
+                "past the budget"
+            );
+        }
+        let short = BlockDrafter {
+            max_model_len: 50,
+            ..DRAFTER
+        };
+        assert!(
+            !drafts_block(&short, &verifying("s0"), &mut paused),
+            "its block would pass the context"
+        );
+        assert!(
+            drafts_block(&DRAFTER, &verifying("s0"), &mut paused),
+            "its probe, at the first step that can draft"
+        );
+    }
+
+    /// A drafted cycle that comes back with none of its drafts verified is a miss — the drafter's
+    /// pass for one token — and a probe's verdict like any other.
+    #[test]
+    fn a_cycle_that_verifies_nothing_is_heard_as_a_miss() {
+        let mut gate = gate();
+        gate.verified_nothing("a");
+        assert!(!gate.drafts("a"), "a drafting lane's miss pauses it");
+        assert!(gate.drafts("a"), "its probe");
+        gate.verified_nothing("a");
+        assert_eq!(
+            (0..3).map(|_| gate.drafts("a")).collect::<Vec<_>>(),
+            [false, false, true],
+            "a probe that verified nothing: twice the wait"
+        );
+    }
+
+    /// Lanes drafting together draft as they always have, whatever their gates say — the gate
+    /// prices one lane's cycle — and a paused lane's wait is not counted down beside others.
+    #[test]
+    fn a_step_of_several_lanes_drafts_whatever_the_gate_says() {
+        let two = Step {
+            req_ids: vec!["a".into(), "b".into()],
+            input_ids: vec![7, 8],
+            positions: vec![30, 12],
+            cu: vec![0, 1, 2],
+            history: vec![31, 13],
+            sampled: SampledRows::of(&[0, 1, 2], |_| false).expect("rows"),
+        };
+        let mut gate = gate();
+        gate.observe("a", 8, 1);
+        gate.observe("b", 8, 1);
+        assert!(
+            drafts_block(&DRAFTER, &two, &mut gate),
+            "both paused, drafted"
+        );
+        assert!(
+            !drafts_block(&DRAFTER, &verifying("a"), &mut gate),
+            "alone again, a's pause is still ahead of it"
+        );
+    }
+
+    /// A cycle whose drafts a step past the budget dropped is no evidence: a drafting lane drafts
+    /// on, and a probe it cut short is tried again at the next step, its wait unchanged.
+    #[test]
+    fn a_dropped_cycle_is_no_evidence_and_its_probe_is_tried_again() {
+        let mut gate = gate();
+        gate.dropped("a");
+        assert!(gate.drafts("a") && gate.drafts("a"), "drafting on");
+        gate.observe("a", 4, 1);
+        assert!(!gate.drafts("a"), "a miss: paused a step");
+        assert!(gate.drafts("a"), "its probe");
+        gate.dropped("a");
+        assert!(gate.drafts("a"), "the probe again, at once");
+        gate.observe("a", 4, 1);
+        assert_eq!(
+            (0..3).map(|_| gate.drafts("a")).collect::<Vec<_>>(),
+            [false, false, true],
+            "its verdict doubles the wait it had"
+        );
+    }
+
     struct Step {
         req_ids: Vec<String>,
         input_ids: Vec<u32>,
@@ -516,6 +949,11 @@ mod tests {
         }
     }
 
+    /// A gate that has observed nothing: every lane drafts.
+    fn gate() -> DraftGate {
+        DraftGate::new(costs())
+    }
+
     fn plan(ids: &[&str]) -> HashSet<String> {
         ids.iter().map(|s| s.to_string()).collect()
     }
@@ -534,7 +972,7 @@ mod tests {
             sampled: SampledRows::of(&[0, 8], |_| true).expect("rows"),
         };
         let passes = DRAFTER
-            .passes(&step.rows(), &plan(&["a"]), &[])
+            .passes(&step.rows(), &plan(&["a"]), &[], &mut gate())
             .expect("a valid plan")
             .expect("planned");
         assert!(passes.commits[0].cycle);
@@ -592,12 +1030,12 @@ mod tests {
         };
         assert_eq!(
             drafter
-                .passes(&chunk(0, 16).rows(), &plan(&["a"]), &[])
+                .passes(&chunk(0, 16).rows(), &plan(&["a"]), &[], &mut gate())
                 .expect("a valid plan"),
             None
         );
         let middle = (drafter
-            .passes(&chunk(16, 32).rows(), &plan(&["a"]), &[])
+            .passes(&chunk(16, 32).rows(), &plan(&["a"]), &[], &mut gate())
             .expect("a valid plan"))
         .expect("commits");
         assert_eq!(middle.commits[0].positions, (24..32).collect::<Vec<_>>());
@@ -608,7 +1046,7 @@ mod tests {
             "a chunk short of its end drafts nothing"
         );
         let last = (drafter
-            .passes(&chunk(32, 40).rows(), &plan(&["a"]), &[])
+            .passes(&chunk(32, 40).rows(), &plan(&["a"]), &[], &mut gate())
             .expect("a valid plan"))
         .expect("commits");
         assert_eq!(last.commits[0].positions, (32..40).collect::<Vec<_>>());
@@ -629,7 +1067,7 @@ mod tests {
             sampled: SampledRows::of(&[0, 3], |_| true).expect("rows"),
         };
         let passes = DRAFTER
-            .passes(&step.rows(), &plan(&["a"]), &[])
+            .passes(&step.rows(), &plan(&["a"]), &[], &mut gate())
             .expect("a valid plan")
             .expect("planned");
         assert!(passes.commits[0].cycle);
@@ -652,7 +1090,7 @@ mod tests {
             sampled: SampledRows::of(&[0, 5], |_| false).expect("rows"),
         };
         let passes = DRAFTER
-            .passes(&last.rows(), &plan(&["a"]), &[])
+            .passes(&last.rows(), &plan(&["a"]), &[], &mut gate())
             .expect("a valid plan")
             .expect("planned");
         assert!(!passes.commits[0].cycle);
@@ -675,7 +1113,7 @@ mod tests {
             sampled: SampledRows::of(&[0, 1, 2], |_| false).expect("rows"),
         };
         let passes = (DRAFTER
-            .passes(&decoding.rows(), &plan(&["a", "b"]), &[])
+            .passes(&decoding.rows(), &plan(&["a", "b"]), &[], &mut gate())
             .expect("a valid plan"))
         .expect("planned");
         assert!(!passes.commits[0].cycle, "a decode step commits every row");
@@ -720,7 +1158,7 @@ mod tests {
         let ids: Vec<&str> = five.iter().map(String::as_str).collect();
         assert_eq!(
             (DRAFTER
-                .passes(&wide.rows(), &plan(&ids), &[])
+                .passes(&wide.rows(), &plan(&ids), &[], &mut gate())
                 .expect("a valid plan"))
             .and_then(|p| p.block),
             None,
@@ -728,7 +1166,7 @@ mod tests {
         );
         assert_eq!(
             DRAFTER
-                .passes(&decoding.rows(), &plan(&[]), &[])
+                .passes(&decoding.rows(), &plan(&[]), &[], &mut gate())
                 .expect("a valid plan"),
             None
         );
@@ -757,7 +1195,7 @@ mod tests {
             ..SequenceContext::default()
         }];
         let short = resumed(40);
-        let passes = (drafter.passes(&short.rows(), &plan(&["a"]), &restored))
+        let passes = (drafter.passes(&short.rows(), &plan(&["a"]), &restored, &mut gate()))
             .expect("a valid plan")
             .expect("planned");
         let rebuild = passes.rebuild.expect("rebuilds");
@@ -769,7 +1207,7 @@ mod tests {
         assert_eq!(passes.commits.len(), 1);
         assert_eq!(passes.commits[0].positions, (32..40).collect::<Vec<_>>());
         let long = resumed(48);
-        let passes = (drafter.passes(&long.rows(), &plan(&["a"]), &restored))
+        let passes = (drafter.passes(&long.rows(), &plan(&["a"]), &restored, &mut gate()))
             .expect("a valid plan")
             .expect("planned");
         assert_eq!(
@@ -828,7 +1266,7 @@ mod tests {
             saves: &saves,
             ..SequenceContext::default()
         }];
-        let passes = (drafter.passes(&prompt.rows(), &plan(&["a"]), &context))
+        let passes = (drafter.passes(&prompt.rows(), &plan(&["a"]), &context, &mut gate()))
             .expect("a valid plan")
             .expect("planned");
         assert_eq!(passes.commits.len(), 2);

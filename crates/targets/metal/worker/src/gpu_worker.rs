@@ -1571,14 +1571,20 @@ impl MetalWorker {
                 .map(|b| b.weight_bytes)
                 .map_err(|e| init(&format!("{rows} verify rows: {e}")))
         };
-        let cost = scratchy_target_metal::dflash2::VerifyLine::of(
-            weight_bytes(target)?,
-            weight_bytes(model)?,
-        );
+        let drafter = weight_bytes(model)?;
+        let cost = scratchy_target_metal::dflash2::VerifyLine::of(weight_bytes(target)?, drafter);
+        // What its drafting adds to the step it replaces: the drafter's share of the cycle's line.
+        let costs = ::scratchy_serving_engine::spec_decode::block::CycleCosts {
+            fixed: f64::from(cost.fixed),
+            per_row: f64::from(cost.per_row),
+            drafter: drafter.fixed as f64 / (1u64 << 30) as f64,
+        };
         info!(
-            "ScratchyWorker(metal): DFlash2 cycle reads {:.2} GiB of weights and {:.3} GiB a verify row",
-            cost.fixed, cost.per_row
+            "ScratchyWorker(metal): DFlash2 cycle reads {:.2} GiB of weights ({:.2} its drafter's) \
+             and {:.3} GiB a verify row",
+            cost.fixed, costs.drafter, cost.per_row
         );
+        let gate = ::scratchy_serving_engine::spec_decode::block::DraftGate::new(costs);
         let accept =
             scratchy_target_metal::dflash2::DraftAcceptKernel::new(&gpu_device.device, kernels)
                 .map_err(|e| init(&format!("acceptance compile: {e:?}")))?
@@ -1646,6 +1652,7 @@ impl MetalWorker {
             captured_row_bytes: taps * target.hidden_size() as usize * elem_bytes,
             cycle_buffer: None,
             cost,
+            gate,
             window: scratchy_target_metal::dflash2::WindowLayout {
                 window: window as u32,
                 hidden,
@@ -5427,6 +5434,9 @@ struct BlockStep {
 struct Cycle {
     candidates: Vec<u32>,
     q_probs: Vec<f32>,
+    /// The drafts its verify budget chose for the next verify to check: 0 when it chose the
+    /// newest token alone.
+    chosen: u32,
 }
 
 /// A ring slot a request (Splash's `DFlashDraftRing` a lane): taken at its first step, given back
@@ -5479,6 +5489,8 @@ struct Dflash2 {
     cycle_buffer: Option<scratchy_target_metal::residency::Pinned>,
     /// What a cycle costs by the rows it verifies, which its verify budget prices rows by.
     cost: scratchy_target_metal::dflash2::VerifyLine,
+    /// Whether each request's drafting pays against the step a cycle replaces.
+    gate: ::scratchy_serving_engine::spec_decode::block::DraftGate,
     /// A ring slot's context window.
     window: scratchy_target_metal::dflash2::WindowLayout,
     /// Each request's admission: where its prefill resumed and the positions it snapshots
@@ -5530,6 +5542,7 @@ impl Dflash2 {
         self.slots.release(req_id);
         self.cycles.remove(req_id);
         self.contexts.remove(req_id);
+        self.gate.forget(req_id);
     }
 }
 
@@ -8621,8 +8634,30 @@ impl Worker for MetalWorker {
                     })
                     .collect();
                 let passes = (d.drafter)
-                    .passes(&step_rows, &scheduler_output.draft_req_ids, &contexts)
+                    .passes(
+                        &step_rows,
+                        &scheduler_output.draft_req_ids,
+                        &contexts,
+                        &mut d.gate,
+                    )
                     .map_err(|e| ExecutorError::WorkerExecution(format!("DFlash2: {e}")))?;
+                // A cycle drafted for a request that verifies none of its drafts this step goes,
+                // heard after the gate was asked, as every cycle is: when its verify budget chose
+                // the newest token alone, the drafter's pass paid for one token, a miss; when its
+                // drafts were dropped (the step past the budget), nothing was learned of the text,
+                // and a probe it cuts short is tried again.
+                for r in &req_ids_in_order {
+                    let verifies = (scheduler_output.scheduled_spec_decode_tokens.get(r))
+                        .is_some_and(|t| !t.is_empty());
+                    if verifies {
+                        continue;
+                    }
+                    match d.cycles.remove(r) {
+                        Some(cycle) if cycle.chosen == 0 => d.gate.verified_nothing(r),
+                        Some(_) => d.gate.dropped(r),
+                        None => {}
+                    }
+                }
                 match passes {
                     Some(passes) => {
                         let mut slots_of = |steps: &[usize]| {
@@ -8749,9 +8784,11 @@ impl Worker for MetalWorker {
                             let Cycle {
                                 candidates,
                                 q_probs,
+                                ..
                             } = cycle.unwrap_or(Cycle {
                                 candidates: vec![u32::MAX; candidates_a_lane],
                                 q_probs: vec![0.0; candidates_a_lane],
+                                chosen: 0,
                             });
                             step.candidates.extend(candidates);
                             step.q_probs.extend(q_probs);
@@ -9587,6 +9624,10 @@ impl Worker for MetalWorker {
                             req_slice.spec_token_ids.len()
                         );
                         let retained = (retained as usize).clamp(1, target_ids.len());
+                        if let Some(d) = self.dflash2.as_mut() {
+                            d.gate
+                                .observe(req_id, target_ids.len() as u32, retained as u32);
+                        }
                         (target_ids[..retained].to_vec(), retained - 1)
                     }
                     None => {
@@ -9686,6 +9727,9 @@ impl Worker for MetalWorker {
                             let cycle = Cycle {
                                 candidates: head_outcome.candidates[span(candidates)].to_vec(),
                                 q_probs: head_outcome.q_probs[span(candidates)].to_vec(),
+                                chosen: (head_outcome.verify_rows.get(lane).copied())
+                                    .unwrap_or(1)
+                                    .saturating_sub(1),
                             };
                             d.cycles.insert(req_ids_in_order[l.step].clone(), cycle);
                         }
