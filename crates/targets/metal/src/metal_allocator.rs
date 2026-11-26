@@ -11,7 +11,7 @@ use objc2::runtime::ProtocolObject;
 use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions};
 
 use crate::residency::Pinned;
-use crate::tape::kernel_constants::{AffineCodes, AffineCodesTarget};
+use crate::tape::kernel_constants::AffineCodes;
 use scratchy_tensors::DeviceAllocator;
 
 pub type Buffer = Retained<ProtocolObject<dyn MTLBuffer>>;
@@ -340,7 +340,8 @@ impl U128Lossy for serde_json::Value {
 /// source address.
 #[derive(Default)]
 struct BoundAffineCodes {
-    /// (length, how every reader reads it) — two readers can never disagree.
+    /// (length, how it is stored) — every command binding it bakes the same codes, which the bake
+    /// asserts (`tape::typed::codes_agree`).
     reads: std::collections::BTreeMap<usize, (usize, AffineCodes)>,
     /// Ranges of a sidecar-served region its blob lacks offset-8: source
     /// address → the stored copy's address.
@@ -352,12 +353,6 @@ struct BoundAffineCodes {
 pub enum AffineCodesBindError {
     /// The range lies in none of this allocator's buffers.
     NotAllocated { addr: usize },
-    /// Two commands read one range differently.
-    ReadersDisagree {
-        addr: usize,
-        first: AffineCodes,
-        then: AffineCodes,
-    },
     /// The range partially overlaps one bound before it.
     Overlap {
         addr: usize,
@@ -376,12 +371,6 @@ impl std::fmt::Display for AffineCodesBindError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NotAllocated { addr } => write!(f, "affine codes {addr:#x} are in no arena"),
-            Self::ReadersDisagree { addr, first, then } => {
-                write!(
-                    f,
-                    "affine codes {addr:#x}: one command reads them {first:?}, another {then:?}"
-                )
-            }
             Self::Overlap {
                 addr,
                 len,
@@ -855,15 +844,11 @@ impl MetalAllocator {
         None
     }
 
-    /// How this device's kernels read MLX-affine codes.
-    fn affine_codes_target(&self) -> AffineCodesTarget {
-        AffineCodesTarget::of(Some(&crate::device::profile_for_device(&self.device)))
-    }
-
-    /// How this device's kernels read `bits`-bit MLX-affine codes: what a command binding them
-    /// by [`Self::bind_affine_codes`] reads them as.
+    /// How this device stores `bits`-bit MLX-affine codes a row at a time
+    /// ([`AffineCodes::rows`] on its class).
     pub fn affine_codes(&self, bits: crate::tape::ids::AffineBits) -> AffineCodes {
-        self.affine_codes_target().for_bits(bits.get())
+        let generation = crate::device::profile_for_device(&self.device).generation;
+        AffineCodes::rows(crate::tape::lowered::GenClass::of(generation), bits)
     }
 
     /// After a pool has bound every codes range its tapes read (`ptrs`, through
@@ -910,16 +895,7 @@ impl MetalAllocator {
             .next_back()
             .map(|(&a, &r)| (a, r));
         let first = match prev {
-            Some((a, (l, first))) if a == p && l == len => {
-                if first != codes {
-                    return Err(AffineCodesBindError::ReadersDisagree {
-                        addr: p,
-                        first,
-                        then: codes,
-                    });
-                }
-                false
-            }
+            Some((a, (l, _))) if a == p && l == len => false,
             Some((a, (l, _))) if a + l > p => {
                 return Err(AffineCodesBindError::Overlap {
                     addr: p,
@@ -1145,7 +1121,8 @@ impl MetalAllocator {
             .map(|m| m.cache_bin_path());
         if let (Some(cf), Some(m)) = (cache_file.as_ref(), meta.as_ref())
             && let Some(offset8) = m.offset8_if_valid_on_disk().filter(|o| {
-                o.is_empty() || self.affine_codes_target().for_bits(4) != AffineCodes::AsWritten
+                o.is_empty()
+                    || self.affine_codes(crate::tape::ids::AffineBits::B4) != AffineCodes::AsWritten
             })
         {
             match Self::register_from_aligned_cache(
@@ -2416,8 +2393,8 @@ mod tests {
     }
 
     /// Codes in a weight arena are stored offset-8 once, however many
-    /// commands bind them; a reader that disagrees, a partially overlapping
-    /// range and a foreign pointer are refused; codes read as written stay.
+    /// commands bind them; a partially overlapping range and a foreign
+    /// pointer are refused; codes read as written stay.
     #[test]
     fn affine_codes_store_offset8_once_in_a_weight_arena() {
         let Some(device) = try_device() else {
@@ -2442,10 +2419,6 @@ mod tests {
             );
             assert_eq!(read(a), flipped);
         }
-        assert!(matches!(
-            alloc.bind_affine_codes(a, codes.len(), AffineCodes::AsWritten),
-            Err(AffineCodesBindError::ReadersDisagree { .. })
-        ));
         assert!(matches!(
             alloc.bind_affine_codes(a.wrapping_add(16), 16, AffineCodes::Offset8),
             Err(AffineCodesBindError::Overlap { .. })
@@ -2484,8 +2457,8 @@ mod tests {
         assert_eq!(sorted, codes, "a permutation of the bytes");
     }
 
-    /// A planes reader stores its range once, XOR 0x88 and regrouped; a reader of the same range
-    /// stored any other way refuses the bind.
+    /// A planes reader stores its range once, XOR 0x88 and regrouped, however many commands bind
+    /// it.
     #[test]
     fn affine_codes_store_planes_once_in_a_weight_arena() {
         let Some(device) = try_device() else {
@@ -2509,16 +2482,6 @@ mod tests {
         for _ in 0..2 {
             assert!(alloc.bind_affine_codes(a, codes.len(), planes).is_ok());
             assert_eq!(read(a), want);
-        }
-        for other in [
-            AffineCodes::Offset8,
-            AffineCodes::AsWritten,
-            AffineCodes::Planes { k: 64 },
-        ] {
-            assert!(matches!(
-                alloc.bind_affine_codes(a, codes.len(), other),
-                Err(AffineCodesBindError::ReadersDisagree { .. })
-            ));
         }
     }
 

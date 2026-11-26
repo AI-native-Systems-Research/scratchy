@@ -650,9 +650,73 @@ pub const AFFINE_PLANE_ROW_BYTES: usize = 32;
 /// `AFFINE_CODES_PLANES`' constant slot (`affine_codes.h`).
 pub const AFFINE_CODES_PLANES_SLOT: ConstSlot = ConstSlot(24);
 
+/// What one MLX-affine codes tensor is to the model: only a projection's codes may be regrouped
+/// into planes; every other role is read a row at a time — a head past its prefix (a drafter's
+/// vocabulary suffix), an embedding table by its gather, an expert bank by the expert kernels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum CodesRole {
+    Projection,
+    Head,
+    Table,
+    ExpertBank,
+}
+
 impl AffineCodes {
-    pub fn of(profile: Option<&crate::targets::MetalTargetProfile>, bits: u32) -> Self {
-        AffineCodesTarget::of(profile).for_bits(bits)
+    /// ⭐ THE ONE DECISION: how a tensor of `role`, `bits` wide in groups of `group`, rows of `k`
+    /// inputs, is stored on `class`, for a model that is a drafter when `drafter` is — evaluated by
+    /// the lowering for every command reading the tensor and by its slot's type
+    /// ([`crate::tape::typed::Codes`]) for its store, so the two are one value.
+    ///
+    /// Row-whole ([`Self::rows`]) unless every law below lets the tensor be regrouped into planes,
+    /// which the wide class's W4A8 small-M GEMMs read (Qwen3.8-27B's verify shapes, 16 rows, µs
+    /// row-whole / planes: gate/up 149 / 139, down 144 / 137, gdn qkv 88 / 80, lm_head 1356 /
+    /// 1256; the one-row matvec within ±4%). Hand-tuned to those measurements, not derived:
+    /// - a projection only; the wide class only;
+    /// - never a drafter's: a DFlash2 drafter's projections stored as planes miscompute
+    ///   (Qwen3.8-27B, replies 6-14 of 16 identical) — stated by hand, its cause not found;
+    /// - offset-8 codes in whole 64-input chunks, of a group the matrix-unit kernels take (a
+    ///   weight of group 32 has no W4A8 GEMM: its small-M steps take the bf16 twin, row-major).
+    pub const fn of(
+        class: crate::tape::lowered::GenClass,
+        role: CodesRole,
+        bits: crate::tape::ids::AffineBits,
+        k: KDim,
+        group: crate::tape::ids::AffineGroupSize,
+        drafter: Option<scratchy_ir::model_facts::Drafter>,
+    ) -> Self {
+        let rows = Self::rows(class, bits);
+        let planes = matches!(role, CodesRole::Projection)
+            && matches!(class, crate::tape::lowered::GenClass::M5Wide)
+            && drafter.is_none()
+            && matches!(rows, AffineCodes::Offset8)
+            && k.0.is_multiple_of(64)
+            && group.nax().is_some();
+        match planes {
+            true => AffineCodes::Planes { k: k.0 },
+            false => rows,
+        }
+    }
+
+    /// How `class` stores `bits`-bit codes a row at a time: offset-8 for 4-bit codes on a class
+    /// storing them so, as written otherwise.
+    pub const fn rows(
+        class: crate::tape::lowered::GenClass,
+        bits: crate::tape::ids::AffineBits,
+    ) -> Self {
+        match class.stores_affine_b4_offset8() && bits.get() == 4 {
+            true => AffineCodes::Offset8,
+            false => AffineCodes::AsWritten,
+        }
+    }
+
+    /// `self == other`, in a const context.
+    pub const fn eq(self, other: Self) -> bool {
+        match (self, other) {
+            (AffineCodes::AsWritten, AffineCodes::AsWritten)
+            | (AffineCodes::Offset8, AffineCodes::Offset8) => true,
+            (AffineCodes::Planes { k: a }, AffineCodes::Planes { k: b }) => a == b,
+            _ => false,
+        }
     }
 
     /// Slot 5, set on `Offset8` and `Planes`, so every other pipeline keeps its key.
@@ -678,18 +742,10 @@ impl AffineCodes {
         matches!(self, AffineCodes::Offset8 | AffineCodes::Planes { .. })
     }
 
-    /// The same codes regrouped into planes, for rows of `k` inputs: offset-8 storage only
-    /// (the planes kernels read signed codes), whole 64-input chunks only.
-    pub fn planes(self, k: u32) -> Self {
-        match self {
-            AffineCodes::Offset8 if k.is_multiple_of(64) => AffineCodes::Planes { k },
-            codes => codes,
-        }
-    }
-
     /// What a command whose kernel reads codes declares, from its baked
     /// constants (slot 5 is `bool` only on such kernels; slot 24 likewise, with its input
-    /// count at slot 0, `QMM_K` / `IN_VEC_SIZE`).
+    /// count at slot 0, `QMM_K` / `IN_VEC_SIZE`): what the bake checks against the codes of the
+    /// slot it binds.
     pub fn of_constants(constants: &[ConstantValue]) -> Self {
         let has = |c: ConstantValue| constants.contains(&c);
         let planes = ConstantValue::boolean(AFFINE_CODES_PLANES_SLOT, true);
@@ -702,31 +758,6 @@ impl AffineCodes {
             }
             Some(c) if has(c) => AffineCodes::Offset8,
             _ => AffineCodes::AsWritten,
-        }
-    }
-}
-
-/// A target's code storage, before a weight's width picks its [`AffineCodes`]
-/// (only 4-bit codes are ever stored offset-8).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct AffineCodesTarget {
-    offset8_b4: bool,
-}
-
-impl AffineCodesTarget {
-    pub fn of(profile: Option<&crate::targets::MetalTargetProfile>) -> Self {
-        Self {
-            offset8_b4: profile.is_some_and(|t| {
-                crate::tape::lowered::GenClass::of(t.generation).stores_affine_b4_offset8()
-            }),
-        }
-    }
-
-    pub fn for_bits(self, bits: u32) -> AffineCodes {
-        if self.offset8_b4 && bits == 4 {
-            AffineCodes::Offset8
-        } else {
-            AffineCodes::AsWritten
         }
     }
 }

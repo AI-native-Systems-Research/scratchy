@@ -708,8 +708,8 @@ pub(crate) fn emit(cx: &ModelCx<'_>) -> ModelEmission {
     // The head weight the model's logits read — the one statement of which weight the head is
     // (`codegen::head_weight`, the terminal walk `backbone_layout` classifies by): the weight a
     // drafter borrows of its target (`LentWeight::LmHead`) and a tied head shares with the
-    // embedding table, so its family's codes vote the way every reader of it reads them
-    // (`MetalStepFacts::head_weight` → `MetalStepTape::as_stored_sources`).
+    // embedding table, so its family's codes are the head's
+    // (`MetalStepFacts::head_weight` → `MetalStepTape::head_source`).
     let head_weight = scratchy_forward_compiler_macro::codegen::head_weight(fuf, program);
     for (canonical, (_, ns_field, bb_slot_field, term_field, slots_dec)) in
         canonical_lowered.iter_mut()
@@ -1650,8 +1650,27 @@ pub(crate) fn emit(cx: &ModelCx<'_>) -> ModelEmission {
     };
 
     {
+        // The table a tied head is, through the tie's one door (`is_tied_head`, `tied_table_role`):
+        // the source family of its gather, if a gather reads it.
+        use scratchy_forward_compiler_macro::quantization as q;
+        let tied_table =
+            q::is_tied_head(model, scratchy_forward_compiler_macro::config::LM_HEAD_ROLE)
+                .then(|| {
+                    let role = q::tied_table_role(program, &q::embed_table_role(program, fuf));
+                    let id = program.weights.find(&role.split('.').collect::<Vec<_>>())?;
+                    metal_sources.family(&scratchy_subtile::handoff::WeightSlot {
+                        kind: scratchy_subtile::handoff::WeightKind::AffineQuantEmbedding,
+                        base: program.weights.path(id).join("_"),
+                    })
+                })
+                .flatten();
         let table = metal_tape_cmds
-            .into_tokens(&resolver.typed, &resolver.named, &dims.weight_markers)
+            .into_tokens(
+                &resolver.typed,
+                &resolver.named,
+                &dims.weight_markers,
+                tied_table,
+            )
             .unwrap_or_else(|e| {
                 panic!(
                     "[metal static tape] {}: command table: {e}",

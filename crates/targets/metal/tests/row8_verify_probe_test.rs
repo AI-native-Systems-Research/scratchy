@@ -116,7 +116,10 @@ fn small_m_steps_in_the_eight_row_bucket_at_qwen38_27b_shapes() {
     let device = di.device.clone();
     let cache = SpecializedPipelineCache::new(device.clone(), &[]).expect("pipeline cache");
     let (act, scale) = (DequantDtype::Bf16, ScaleDtype::Bf16);
-    let codes = AffineCodes::of(Some(&di.profile), 4);
+    let codes = AffineCodes::rows(
+        scratchy_target_metal::tape::lowered::GenClass::of(di.profile.generation),
+        scratchy_target_metal::tape::ids::AffineBits::B4,
+    );
     let twin = SmallMTile::for_bucket(BUCKET).expect("a small-M bucket");
     for live in LIVE {
         println!("µs (GB/s) a dispatch, {live} live rows in the {BUCKET}-row bucket");

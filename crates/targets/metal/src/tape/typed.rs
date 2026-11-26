@@ -678,6 +678,131 @@ where
     };
 }
 
+/// A chip class as a type: the class a tape is baked for ([`GenClass`]), which a pool picks at
+/// load — so what a class stores is a constant of the class, never a value looked up by it.
+///
+/// [`GenClass`]: crate::tape::lowered::GenClass
+pub trait Class {
+    const CLASS: crate::tape::lowered::GenClass;
+}
+
+/// The chip classes ([`Class`]).
+pub mod class {
+    use crate::tape::lowered::GenClass;
+    macro_rules! classes {
+        ($($c:ident),*) => {
+            $(
+                pub enum $c {}
+                impl super::Class for $c {
+                    const CLASS: GenClass = GenClass::$c;
+                }
+            )*
+            /// Every class, in order: the list each class's marker is one of.
+            pub const ALL: [GenClass; [$(GenClass::$c),*].len()] = [$(GenClass::$c),*];
+        };
+    }
+    classes!(M1, Mid, M5, M5Wide);
+}
+
+/// A DFlash2 drafter's geometry: the model fact a slot's codes depend on ([`CodesSlot::DRAFTER`]).
+pub use scratchy_ir::model_facts::Drafter;
+
+/// An affine slot's codes role ([`CodesRole`]), stated by the bake per slot (a head's slot, an
+/// embedding table's, a projection's).
+///
+/// [`CodesRole`]: crate::tape::kernel_constants::CodesRole
+pub trait CodesSlot: AffineSlot {
+    const ROLE: crate::tape::kernel_constants::CodesRole;
+    /// The slot's model's drafter ([`ModelFacts::drafter`]), `None` for a model that is none.
+    ///
+    /// [`ModelFacts::drafter`]: scratchy_ir::model_facts::ModelFacts::drafter
+    const DRAFTER: Option<scratchy_ir::model_facts::Drafter>;
+}
+
+/// ⭐ HOW SLOT `S`'s CODES ARE STORED ON CLASS `C`: the one decision
+/// ([`AffineCodes::of`](crate::tape::kernel_constants::AffineCodes::of)) on the slot's own type —
+/// its role, its handle's width, input count and group, its model's drafter. The load stores the
+/// slot's tensors so, and the bake asserts every command binding them baked this (`codes_agree`).
+pub const fn codes<S: CodesSlot, C: Class>() -> crate::tape::kernel_constants::AffineCodes {
+    let w = S::WEIGHT;
+    crate::tape::kernel_constants::AffineCodes::of(
+        C::CLASS,
+        S::ROLE,
+        w.bits,
+        crate::tape::ids::KDim(w.k),
+        w.group,
+        S::DRAFTER,
+    )
+}
+
+/// Every command binding slot `S`'s codes on class `C` baked `baked`: the slot's own codes
+/// ([`codes`]) — a compile error where not. A head's 4-bit codes are offset-8 rows on the wide
+/// class:
+///
+/// ```
+/// # use scratchy_target_metal::tape::ids::{LayerId, SourceIx};
+/// # use scratchy_target_metal::tape::kernel_constants::{AffineCodes, CodesRole};
+/// # use scratchy_target_metal::tape::typed::{class, codes_agree, CodesSlot, Source};
+/// # use scratchy_tensors::typed::{B4, Dim, G64, Q2};
+/// # enum Hidden {}
+/// # impl Dim for Hidden { type Num = scratchy_tensors::typed::typenum::U2048; }
+/// # enum Vocab {}
+/// # impl Dim for Vocab { type Num = scratchy_tensors::typed::typenum::Prod<scratchy_tensors::typed::typenum::U1002, scratchy_tensors::typed::typenum::U128>; }
+/// # struct Layer;
+/// # type Head = Q2<Hidden, Vocab, B4, G64, Layer>;
+/// # struct Weights { lm_head: Head }
+/// # enum LmHead {}
+/// # impl Source for LmHead {
+/// #     type Model = Weights;
+/// #     type Handle = Head;
+/// #     type Weights = ();
+/// #     const IX: SourceIx = SourceIx(0);
+/// #     fn at(w: &Weights, _: LayerId) -> &Head { &w.lm_head }
+/// # }
+/// impl CodesSlot for LmHead {
+///     const ROLE: CodesRole = CodesRole::Head;
+///     const DRAFTER: Option<scratchy_ir::model_facts::Drafter> = None;
+/// }
+/// const _: () = codes_agree::<LmHead, class::M5Wide>(AffineCodes::Offset8);
+/// ```
+///
+/// and a command baking them as planes does not compile (E0080):
+///
+/// ```compile_fail,E0080
+/// # use scratchy_target_metal::tape::ids::{LayerId, SourceIx};
+/// # use scratchy_target_metal::tape::kernel_constants::{AffineCodes, CodesRole};
+/// # use scratchy_target_metal::tape::typed::{class, codes_agree, CodesSlot, Source};
+/// # use scratchy_tensors::typed::{B4, Dim, G64, Q2};
+/// # enum Hidden {}
+/// # impl Dim for Hidden { type Num = scratchy_tensors::typed::typenum::U2048; }
+/// # enum Vocab {}
+/// # impl Dim for Vocab { type Num = scratchy_tensors::typed::typenum::Prod<scratchy_tensors::typed::typenum::U1002, scratchy_tensors::typed::typenum::U128>; }
+/// # struct Layer;
+/// # type Head = Q2<Hidden, Vocab, B4, G64, Layer>;
+/// # struct Weights { lm_head: Head }
+/// # enum LmHead {}
+/// # impl Source for LmHead {
+/// #     type Model = Weights;
+/// #     type Handle = Head;
+/// #     type Weights = ();
+/// #     const IX: SourceIx = SourceIx(0);
+/// #     fn at(w: &Weights, _: LayerId) -> &Head { &w.lm_head }
+/// # }
+/// impl CodesSlot for LmHead {
+///     const ROLE: CodesRole = CodesRole::Head;
+///     const DRAFTER: Option<scratchy_ir::model_facts::Drafter> = None;
+/// }
+/// const _: () = codes_agree::<LmHead, class::M5Wide>(AffineCodes::Planes { k: 2048 });
+/// ```
+pub const fn codes_agree<S: CodesSlot, C: Class>(
+    baked: crate::tape::kernel_constants::AffineCodes,
+) {
+    assert!(
+        codes::<S, C>().eq(baked),
+        "a command binding this slot bakes codes its type does not store"
+    );
+}
+
 /// The bake's codes for slot `S` are `S`'s: `B` and `G` the markers the bake minted, which must
 /// be the slot's handle's (E0271 where they are not).
 pub const fn affine_codes_agree<S: AffineSlot<Bits = B, Group = G>, B, G>() {}

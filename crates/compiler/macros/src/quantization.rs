@@ -1349,7 +1349,7 @@ pub fn is_tied_head(model: &crate::config::ModelParams, role: &str) -> bool {
 /// The table role a tied head reads: the head's `weight_leaf_renames` entry when the arch
 /// renames it onto a table of its own (Gemma 4's drafter embeds with its target's lent table,
 /// its logits its own), else the embedding's role. The one statement of the tie's target.
-fn tied_table_role(program: &Program, embed_role: &str) -> String {
+pub fn tied_table_role(program: &Program, embed_role: &str) -> String {
     match program.rename_dotted(crate::config::LM_HEAD_ROLE) {
         renamed if renamed != crate::config::LM_HEAD_ROLE => renamed,
         _ => embed_role.to_string(),

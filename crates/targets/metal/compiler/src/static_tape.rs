@@ -14,10 +14,11 @@
 use proc_macro2::TokenStream;
 use quote::quote;
 use scratchy_target_metal::tape::ids::{BlockSize, MaxBlocksPerSeq, MaxPositions, SourceIx};
+use scratchy_target_metal::tape::kernel_constants::AffineCodes;
 use scratchy_target_metal::tape::lowered::{
     Activation, Binding, CommandTableBuilder, CommandTableParts, GatedCommand, Gemm, GenClass,
     KvAddressing, LoweredCommand, LoweredMetalTape, LoweringError, MetalDtype, PackedKind,
-    TapeCommand, TapeCommands, baked,
+    TapeCommand, TapeCommands, WeightTensor, baked, codes_tensor,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -67,6 +68,22 @@ pub struct CommandPool {
     affine_weights: BTreeMap<u32, BTreeSet<u32>>,
     /// Each weight family any command binds a tensor of, with the DSL weights its rows' ops read.
     sources: SourceReads,
+    /// Each MLX-affine codes tensor a class's commands bind, with the codes they bake: one per
+    /// tensor, or the bake refuses ([`Self::read_codes`]).
+    codes: Vec<BakedCodes>,
+    /// The model's head family (`MetalStepTape::head_source`).
+    head: Option<SourceIx>,
+}
+
+/// The codes the commands of class `class` bind tensor `which` of family `ix` (a `kind` family)
+/// at `layer` with.
+struct BakedCodes {
+    class: GenClass,
+    ix: SourceIx,
+    which: WeightTensor,
+    layer: scratchy_target_metal::tape::ids::LayerId,
+    kind: scratchy_subtile::handoff::WeightKind,
+    codes: AffineCodes,
 }
 
 /// The DSL weights row `row` of `half`'s op reads through a site of family `ix`.
@@ -286,6 +303,68 @@ impl CommandPool {
         Ok(())
     }
 
+    /// Note the codes each command of `tape` — class `class`'s, lowered from `rows` of `steps` —
+    /// binds each codes tensor with ([`lowered::codes_tensor`]): one per tensor and class, the
+    /// bake refusing two. Typed slots' are asserted their type's ([`TypedGemms::markers`]).
+    ///
+    /// [`lowered::codes_tensor`]: scratchy_target_metal::tape::lowered::codes_tensor
+    fn read_codes(
+        &mut self,
+        class: GenClass,
+        tape: &LoweredMetalTape,
+        rows: &[tl::CommandRows],
+        steps: &MetalStepTape,
+    ) -> Result<(), BakeDefect> {
+        self.head = steps.head_source;
+        for (c, rows) in tape.commands.iter().zip(rows) {
+            let TapeCommand::Dispatch(d) = c.command else {
+                continue;
+            };
+            let sites = match rows.half {
+                TapeHalf::Backbone => &steps.backbone_sources,
+                TapeHalf::LmHead => &steps.lm_head_sources,
+            };
+            for b in d.bindings {
+                let Binding::Source {
+                    ix, which, layer, ..
+                } = *b
+                else {
+                    continue;
+                };
+                let kind = (rows.rows.iter())
+                    .flat_map(|&r| sites.get(r as usize).into_iter().flatten())
+                    .find(|s| s.ix == ix)
+                    .map(|s| s.kind.clone());
+                let Some(kind) = kind.filter(|k| codes_tensor(k, which)) else {
+                    continue;
+                };
+                let codes = AffineCodes::of_constants(d.constants);
+                let same = |b: &&BakedCodes| {
+                    (b.class, b.ix, b.which, b.layer) == (class, ix, which, layer)
+                };
+                match self.codes.iter().find(same) {
+                    Some(b) if b.codes != codes => {
+                        return Err(BakeDefect(format!(
+                            "{class:?}: family {} {which:?} of layer {} is bound {:?} by one \
+                             command and {codes:?} by {:?}",
+                            ix.0, layer.0, b.codes, d.kernel
+                        )));
+                    }
+                    Some(_) => {}
+                    None => self.codes.push(BakedCodes {
+                        class,
+                        ix,
+                        which,
+                        layer,
+                        kind,
+                        codes,
+                    }),
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn intern(&mut self, cmd: GatedCommand) -> Result<TokenStream, BakeDefect> {
         let ix = self.table.intern(cmd).map_err(|e| {
             BakeDefect(format!(
@@ -334,6 +413,9 @@ impl CommandPool {
         typed: &std::collections::HashSet<SourceIx>,
         named: &std::collections::HashSet<SourceIx>,
         weight_markers: &BTreeMap<u32, String>,
+        // The family of the table a tied head is (`quantization::is_tied_head`, `tied_table_role`);
+        // `None` for an untied head, or one tied to a table no gather reads.
+        tied_table: Option<SourceIx>,
     ) -> Result<TokenStream, BakeDefect> {
         // A model metal lowers no tape for (a dense MoE has no metal realization) names nothing.
         if self.table.is_empty() && self.kernels.is_empty() {
@@ -415,6 +497,7 @@ impl CommandPool {
             })
             .collect();
         let markers = gemms.markers();
+        let codes = codes_tokens(&self.codes, &gemms, typed, self.head, tied_table);
         let operands = self.operands.tokens()?;
         let statics = [
             array("COMMANDS", commands, quote!(__tl::PackedCommand)),
@@ -510,6 +593,7 @@ impl CommandPool {
                 #operands
                 #gemm_helpers
                 #command_helper
+                #codes
                 #(#statics)*
                 pub(super) static TABLE: __tl::CommandTable = __tl::CommandTable {
                     commands: &COMMANDS,
@@ -1045,6 +1129,76 @@ impl TypedGemms {
     }
 }
 
+/// ⭐ THE CODES EVERY COMMAND BAKES ARE ITS SLOT'S TYPE'S: each typed MLX-affine slot a command
+/// binds codes of — a matmul's weight, an embedding table — states its role ([`CodesSlot`]), and
+/// for each class its commands' codes are asserted the slot's own ([`codes_agree`]); a tied head's
+/// codes are asserted its table's. So every reader of a tensor, and the load storing it, take one
+/// value, which rustc proves.
+///
+/// [`CodesSlot`]: scratchy_target_metal::tape::typed::CodesSlot
+/// [`codes_agree`]: scratchy_target_metal::tape::typed::codes_agree
+fn codes_tokens(
+    baked: &[BakedCodes],
+    gemms: &TypedGemms,
+    typed: &std::collections::HashSet<SourceIx>,
+    head: Option<SourceIx>,
+    tied_table: Option<SourceIx>,
+) -> TokenStream {
+    use scratchy_subtile::handoff::WeightKind as K;
+    let tt = quote!(::scratchy_target_metal::tape::typed);
+    let kc = quote!(::scratchy_target_metal::tape::kernel_constants);
+    // The typed affine slots: an affine matmul's (`TypedGemms::affine`), an embedding table's.
+    let role = |b: &BakedCodes| match b.kind {
+        K::Linear if gemms.affine.contains_key(&b.ix.0) => Some(match Some(b.ix) == head {
+            true => quote!(Head),
+            false => quote!(Projection),
+        }),
+        K::AffineQuantEmbedding if typed.contains(&b.ix) => Some(quote!(Table)),
+        _ => None,
+    };
+    let class = |c: GenClass| quote::format_ident!("{c:?}");
+    let codes = |c: AffineCodes| match c {
+        AffineCodes::AsWritten => quote!(#kc::AffineCodes::AsWritten),
+        AffineCodes::Offset8 => quote!(#kc::AffineCodes::Offset8),
+        AffineCodes::Planes { k } => quote!(#kc::AffineCodes::Planes { k: #k }),
+    };
+    let slots: BTreeMap<u32, TokenStream> = (baked.iter())
+        .filter_map(|b| Some((b.ix.0, role(b)?)))
+        .collect();
+    let roles = slots.iter().map(|(&ix, role)| {
+        let s = crate::canonical::slot(SourceIx(ix));
+        quote!(impl #tt::CodesSlot for super::#s {
+            const ROLE: #kc::CodesRole = #kc::CodesRole::#role;
+            const DRAFTER: Option<#tt::Drafter> =
+                <super::Weights as ::scratchy_forward_compiler::CanonicalParams>::FACTS.drafter();
+        })
+    });
+    // A typed slot's codes are one type's, every layer's: one assert a slot, class and codes.
+    let mut agreed: Vec<(SourceIx, GenClass, AffineCodes)> = Vec::new();
+    for b in baked.iter().filter(|b| slots.contains_key(&b.ix.0)) {
+        if !agreed.contains(&(b.ix, b.class, b.codes)) {
+            agreed.push((b.ix, b.class, b.codes));
+        }
+    }
+    let agree = agreed.into_iter().map(|(ix, c, v)| {
+        let (s, c, v) = (crate::canonical::slot(ix), class(c), codes(v));
+        quote!(const _: () = #tt::codes_agree::<super::#s, #tt::class::#c>(#v);)
+    });
+    // A tied head is its table's weight: one tensor, one codes, on every class.
+    let tie = (head.zip(tied_table))
+        .filter(|(h, t)| slots.contains_key(&h.0) && slots.contains_key(&t.0))
+        .map(|(h, t)| {
+            let (h, t) = (crate::canonical::slot(h), crate::canonical::slot(t));
+            let classes = scratchy_target_metal::tape::typed::class::ALL.map(class);
+            quote!(#(const _: () = assert!(
+                #tt::codes::<super::#h, #tt::class::#classes>()
+                    .eq(#tt::codes::<super::#t, #tt::class::#classes>()),
+                "a tied head is stored as its table"
+            );)*)
+        });
+    quote!(#(#roles)* #(#agree)* #tie)
+}
+
 /// `n` as its type-level number (`scratchy_tensors::typed::unsigned_path`).
 fn unsigned(n: u32) -> TokenStream {
     (scratchy_tensors::typed::unsigned_path(u64::from(n)).parse())
@@ -1407,7 +1561,7 @@ pub fn bake_bucket_tapes(
     if let Some(wide) = &input.wide_band {
         pool.read_affine(wide.steps, wide.operands)?;
     }
-    let classes = [GenClass::M1, GenClass::Mid, GenClass::M5, GenClass::M5Wide];
+    let classes = scratchy_target_metal::tape::typed::class::ALL;
     let mut entries: Vec<TokenStream> = Vec::new();
     let mut body_statics: Vec<TokenStream> = Vec::new();
     // Dedupe: identical bodies share ONE hoisted static — every labelled variant would otherwise
@@ -1464,6 +1618,11 @@ pub fn bake_bucket_tapes(
             ended = Some((class, addressing));
             continue;
         };
+        let steps = match (class, input.wide_band.as_ref()) {
+            (GenClass::M5Wide, Some(wide)) => wide.steps,
+            _ => input.steps,
+        };
+        pool.read_codes(class, &tape, &rows, steps)?;
         // The band the rung lowered under, whose colouring its arena operands are named in.
         let (wide, band) = match (class, input.wide_band.as_ref()) {
             (GenClass::M5Wide, Some(wide)) => (true, (wide.steps, wide.operands, wide.arena)),

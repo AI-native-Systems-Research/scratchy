@@ -235,7 +235,10 @@ fn qmv_wide_against_small_m_twin_by_bucket() {
         let mut line = format!("{:<22}", s.name);
         // Both kernels read the codes as the tape's do on this device (offset-8 wherever the twin
         // exists).
-        let codes = AffineCodes::of(Some(&di.profile), s.bits);
+        let codes = AffineCodes::rows(
+            scratchy_target_metal::tape::lowered::GenClass::of(di.profile.generation),
+            scratchy_target_metal::tape::ids::AffineBits::new(s.bits).expect("affine bits"),
+        );
         let (k_dim, n_dim) = (KDimI32(s.k as i32), NDimI32(s.n as i32));
         let mut cells = Vec::new();
         for bucket in [4u32, 8] {
@@ -346,7 +349,10 @@ fn norm_folded_into_its_readers_on_a_chip_emulated_by_width() {
         .get() as usize;
     let width = 40 / cores;
     let cache = SpecializedPipelineCache::new(device.clone(), &[]).expect("pipeline cache");
-    let codes = AffineCodes::of(Some(&di.profile), 4);
+    let codes = AffineCodes::rows(
+        scratchy_target_metal::tape::lowered::GenClass::of(di.profile.generation),
+        scratchy_target_metal::tape::ids::AffineBits::B4,
+    );
     let hidden = 2048u32;
     let normed = QmvEnds {
         norm: Some(RowNorm {
@@ -534,7 +540,10 @@ fn narrow_projection_at_verify_buckets() {
     }
     let device = di.device.clone();
     let cache = SpecializedPipelineCache::new(device.clone(), &[]).expect("pipeline cache");
-    let codes = AffineCodes::of(Some(&di.profile), 4);
+    let codes = AffineCodes::rows(
+        scratchy_target_metal::tape::lowered::GenClass::of(di.profile.generation),
+        scratchy_target_metal::tape::ids::AffineBits::B4,
+    );
     for &(n, k) in NARROW_SHAPES {
         let bytes = (n * k / 2) as usize;
         let copies = ROTATED_BYTES / bytes + 1;

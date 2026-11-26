@@ -1794,8 +1794,9 @@ impl ResolvedSources {
                 let bundle = weights
                     .source(ix, layer)
                     .ok_or(miss(SourceMiss::NoFamily))?;
-                // MLX-affine packed codes bind stored the way each reading command's kernel
-                // reads them — every reader, so two that disagree refuse the load.
+                // MLX-affine packed codes bind stored the way the command reading them baked —
+                // the codes of the tensor's type, which every command binding it bakes
+                // (`tape::typed::codes_agree`, asserted at the bake).
                 if bundle.is_affine_codes(which) {
                     let tensor = bundle.tensor(which).ok_or(miss(SourceMiss::NoTensor))?;
                     let codes = crate::tape::kernel_constants::AffineCodes::of_constants(constants);
