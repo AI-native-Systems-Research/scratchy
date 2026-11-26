@@ -10,7 +10,9 @@
 use crate::weights::GpuWeights;
 use anyhow::Result;
 use rayon::prelude::*;
-use scratchy_tensors::{DType, DeviceAllocator, GpuTensor, WeightSource};
+use scratchy_tensors::{
+    DType, DeviceAllocator, GpuTensor, HeadDim, RopeTheta, RotDim, WeightSource,
+};
 
 // ---------------------------------------------------------------------------
 // Config
@@ -258,6 +260,56 @@ fn cos_sin_rows<const N: usize>(
                 }
             }
         });
+}
+
+/// The denominator of the inverse frequency's exponent (`1 / θ^(2i / d)`): the rotated width, or,
+/// for a proportional class, the head's full width (HF `_compute_proportional_rope_parameters`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RopeFreqDim {
+    /// The rotated width, `rot_dim`.
+    Rot(RotDim),
+    /// The head's full width, `head_dim`.
+    Head(HeadDim),
+}
+
+impl RopeFreqDim {
+    /// The denominator as a number.
+    pub const fn get(self) -> u32 {
+        match self {
+            RopeFreqDim::Rot(d) => d.get(),
+            RopeFreqDim::Head(d) => d.get(),
+        }
+    }
+}
+
+/// Pair `i`'s inverse frequency: `1 / theta^(2i / freq_dim)`.
+pub fn rope_inv_freq(i: usize, freq_dim: RopeFreqDim, theta: RopeTheta) -> f64 {
+    1.0 / theta.get().powf(2.0 * i as f64 / f64::from(freq_dim.get()))
+}
+
+/// THE ROTARY TABLE'S ROWS, target-neutral: for each token `t` of `n_tokens` and each pair `i` of
+/// `rot_dim / 2`, the angle `pos(t, i) · rope_inv_freq(i, freq_dim, theta)` in f64, its `cos` and
+/// `sin` each rounded once to f32, handed to `put(t, i, cos, sin)`. A target lays the row out
+/// (`[cos(0..R/2) | sin(0..R/2)]`) and rounds the f32 to its element type; `pos` gives each pair
+/// its position (one per token, or MRoPE's band of the pair). Metal's per-token table and CUDA's
+/// rotary rows are this one builder.
+pub fn rotary_table_rows(
+    n_tokens: usize,
+    rot_dim: RotDim,
+    freq_dim: RopeFreqDim,
+    theta: RopeTheta,
+    pos: impl Fn(usize, usize) -> u32,
+    mut put: impl FnMut(usize, usize, f32, f32),
+) {
+    let inv_freqs: Vec<f64> = (0..rot_dim.get() as usize / 2)
+        .map(|i| rope_inv_freq(i, freq_dim, theta))
+        .collect();
+    for t in 0..n_tokens {
+        for (i, &inv_f) in inv_freqs.iter().enumerate() {
+            let angle = f64::from(pos(t, i)) * inv_f;
+            put(t, i, angle.cos() as f32, angle.sin() as f32);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
