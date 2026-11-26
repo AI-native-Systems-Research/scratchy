@@ -6,14 +6,12 @@
 //! Qwen3.8-27B's shapes and a narrow one. The weights are random offset-8 codes; each kernel runs
 //! once on the rows and once on the regrouped planes, and every output element must match.
 
-mod common;
-
 use half::bf16;
 use objc2_metal::{MTLBuffer as _, MTLSize};
 use scratchy_target_metal::aot::baked_build;
 use scratchy_target_metal::detect_device;
 use scratchy_target_metal::mtl4_dispatch::{
-    Device, Mtl4DispatchBatch, shared_slice, shared_zeroed,
+    Device, Mtl4DispatchBatch, ThreadgroupGrid, shared_slice, shared_zeroed,
 };
 use scratchy_target_metal::specialized_pipeline_cache::{
     ConstantValue, PipelineKey, SpecializedPipelineCache,
@@ -98,23 +96,34 @@ struct Cell {
     quant_rows: Option<u32>,
 }
 
-/// Run `symbol` with `constants` (the codes' own appended per layout), its buffers from `bind`
-/// (given the weight's codes buffer), `grid` x `threads`; the output buffer's bf16 bits.
-#[allow(clippy::too_many_arguments)]
+/// A kernel under test: `symbol` of `library` at `constants` (the codes' own appended per layout),
+/// dispatched over `grid`.
+struct Kernel<'a> {
+    library: &'static str,
+    symbol: &'static str,
+    constants: &'a [ConstantValue],
+    codes: AffineCodes,
+    grid: ThreadgroupGrid,
+}
+
+/// Run `kernel` with its buffers from `bind` (given the weight's codes buffer); the output
+/// buffer's bf16 bits.
 fn run(
     device: &Device,
     cache: &SpecializedPipelineCache,
-    library: &'static str,
-    symbol: &'static str,
-    constants: &[ConstantValue],
-    codes: AffineCodes,
+    kernel: Kernel<'_>,
     pre: &[PrePass<'_>],
     bind: &dyn Fn() -> Vec<(Buf, usize)>,
     out: &Buf,
     out_len: usize,
-    grid: MTLSize,
-    threads: MTLSize,
 ) -> Vec<u16> {
+    let Kernel {
+        library,
+        symbol,
+        constants,
+        codes,
+        grid,
+    } = kernel;
     let mut cs = constants.to_vec();
     cs.extend(codes.constants());
     let pso = baked_build(cache, &PipelineKey::new(library, symbol, cs)).expect(symbol);
@@ -122,12 +131,22 @@ fn run(
     for (sym, c, b, g, t) in pre {
         let p = baked_build(cache, &PipelineKey::new(library, sym, c.clone())).expect(sym);
         let b: Vec<(&Buf, usize)> = b.to_vec();
-        batch.encode(&p, &b, &[], &[], &[], *g, *t);
+        batch.encode(
+            &p,
+            &b,
+            &[],
+            &[],
+            &[],
+            ThreadgroupGrid {
+                threadgroups: *g,
+                threads_per_threadgroup: *t,
+            },
+        );
         batch.barrier();
     }
     let owned = bind();
     let bufs: Vec<(&Buf, usize)> = owned.iter().map(|(b, i)| (b, *i)).collect();
-    batch.encode(&pso, &bufs, &[], &[], &[], grid, threads);
+    batch.encode(&pso, &bufs, &[], &[], &[], grid);
     batch.commit(true);
     unsafe { std::slice::from_raw_parts(out.contents().as_ptr() as *const u16, out_len) }.to_vec()
 }
@@ -379,10 +398,17 @@ fn every_planes_reader_matches_its_rows_twin_bit_for_bit() {
                         } else {
                             mu * nu
                         };
-                        let a = run(
-                            &device, &cache, lib, sym, &cs, *codes, &pre, &bind, &y, out_len, grid,
-                            threads,
-                        );
+                        let kernel = Kernel {
+                            library: lib,
+                            symbol: sym,
+                            constants: &cs,
+                            codes: *codes,
+                            grid: ThreadgroupGrid {
+                                threadgroups: grid,
+                                threads_per_threadgroup: threads,
+                            },
+                        };
+                        let a = run(&device, &cache, kernel, &pre, &bind, &y, out_len);
                         let b = unsafe {
                             std::slice::from_raw_parts(
                                 y2.contents().as_ptr() as *const u16,

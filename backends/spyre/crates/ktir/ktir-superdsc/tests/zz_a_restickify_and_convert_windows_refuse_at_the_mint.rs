@@ -27,6 +27,7 @@ use ktir_superdsc::emit::{
     EmittedOp, assemble_convert, assemble_convert_col, assemble_restickify_kt_2d, rb_df,
     try_assemble_restickify_transpose_2d,
 };
+use ktir_superdsc::emit::{OpDecl, RestickifyKt2d};
 use ktir_superdsc::place::PlaceId;
 use ktir_superdsc::placement::{BundleLayout, SegRole, TensorPlacement};
 use ktir_superdsc::sdsc_abstract::{
@@ -89,13 +90,17 @@ fn kt_2d(
 > {
     let mut sym = 0i64;
     assemble_restickify_kt_2d(
-        "rk_test",
-        KtTileSlots::of_row_window(RowWindow::ROWS),
-        KtTileFeats::of_head_dim(ktir_superdsc::sdsc_abstract::HeadWidth::of_whole_sticks(64)),
-        in_,
-        in_off,
-        o,
-        out_off,
+        RestickifyKt2d {
+            op_name: "rk_test",
+            slots: KtTileSlots::of_row_window(RowWindow::ROWS),
+            feats: KtTileFeats::of_head_dim(
+                ktir_superdsc::sdsc_abstract::HeadWidth::of_whole_sticks(64),
+            ),
+            in_,
+            in_off,
+            o,
+            out_off,
+        },
         &mut sym,
         layout,
     )
@@ -175,10 +180,12 @@ fn the_last_slots_convert_fits_exactly_through_the_column_door() {
     let mut sym = 0i64;
     for s in 0..pairs {
         let op = assemble_convert_col::<ktir_superdsc::collective::TpWorld<1>>(
-            &format!("fq_p{s}_op"),
-            "qfp8ch",
-            m,
-            inn_pad,
+            OpDecl {
+                op_name: &format!("fq_p{s}_op"),
+                op_func: "qfp8ch",
+                rows: m,
+                cols: inn_pad,
+            },
             &cl,
             ktir_superdsc::addr::col_of(m, cl_reach, s * inn, Df::Fp16),
             &afp8,
@@ -206,10 +213,12 @@ fn a_piece_convert_handle_refuses_the_last_slot() {
     let r = {
         let mut sym = 0i64;
         assemble_convert_col(
-            "fq_p1",
-            "qfp8ch",
-            m,
-            inn_pad,
+            OpDecl {
+                op_name: "fq_p1",
+                op_func: "qfp8ch",
+                rows: m,
+                cols: inn_pad,
+            },
             &piece,
             ktir_superdsc::addr::col_of(m, cl_reach, inn, Df::Fp16),
             &rb_df("afp8", m, pairs * inn_pad, Df::Fp8),
@@ -244,10 +253,12 @@ fn an_fp16_annotated_fp8_output_overstates_its_window_and_refuses() {
     );
     let mut sym = 0i64;
     let built = assemble_convert_col::<ktir_superdsc::collective::TpWorld<1>>(
-        "fq_df",
-        "qfp8ch",
-        m,
-        inn_pad,
+        OpDecl {
+            op_name: "fq_df",
+            op_func: "qfp8ch",
+            rows: m,
+            cols: inn_pad,
+        },
         &cl,
         ktir_superdsc::addr::col_of(m, cl_reach, inn, Df::Fp16),
         &afp8_true,
@@ -263,10 +274,12 @@ fn an_fp16_annotated_fp8_output_overstates_its_window_and_refuses() {
     let r = {
         let mut sym = 0i64;
         assemble_convert_col(
-            "fq_df",
-            "qfp8ch",
-            m,
-            inn_pad,
+            OpDecl {
+                op_name: "fq_df",
+                op_func: "qfp8ch",
+                rows: m,
+                cols: inn_pad,
+            },
             &cl,
             ktir_superdsc::addr::col_of(m, cl_reach, inn, Df::Fp16),
             &afp8_annotated,
@@ -290,7 +303,16 @@ fn a_whole_tensor_convert_past_its_handle_refuses() {
     let (act, afp8) = (rbl("act", 1, 128), rb_df("afp8", 1, 128, Df::Fp8));
     let mut sym = 0i64;
     let built = assemble_convert::<ktir_superdsc::collective::TpWorld<1>>(
-        "fq", "qfp8ch", 1, 128, &act, &afp8, &mut sym, None,
+        OpDecl {
+            op_name: "fq",
+            op_func: "qfp8ch",
+            rows: 1,
+            cols: 128,
+        },
+        &act,
+        &afp8,
+        &mut sym,
+        None,
     );
     assert!(
         built.as_ref().is_ok_and(|e| e.op.is_some()),
@@ -300,7 +322,18 @@ fn a_whole_tensor_convert_past_its_handle_refuses() {
     let small = rbl("act", 1, 64);
     let r = {
         let mut sym = 0i64;
-        assemble_convert("fq", "qfp8ch", 1, 128, &small, &afp8, &mut sym, None)
+        assemble_convert(
+            OpDecl {
+                op_name: "fq",
+                op_func: "qfp8ch",
+                rows: 1,
+                cols: 128,
+            },
+            &small,
+            &afp8,
+            &mut sym,
+            None,
+        )
     };
     let msg = refused(r);
     assert!(

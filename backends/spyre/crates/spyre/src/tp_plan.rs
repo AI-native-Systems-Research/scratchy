@@ -399,7 +399,7 @@ mod tests {
     fn rank_group_cores<T: Tp>(ops: &[ktir_superdsc::emit::EmittedOp<T>], rank: u32) -> Vec<u64> {
         ops.iter()
             .filter(|e| e.tp_consume.is_some_and(|c| c.plays_at.get() == rank))
-            .filter_map(|e| e.op.as_ref().map(|d| u64::from(d.numCoresUsed_)))
+            .filter_map(|e| e.op.as_ref().map(|d| u64::from(d.num_cores_used)))
             .collect()
     }
 

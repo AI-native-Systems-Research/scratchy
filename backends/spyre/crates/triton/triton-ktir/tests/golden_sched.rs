@@ -12,9 +12,7 @@
 //! wide, so it is not a contiguous flat block"), and stage 3 runs on stage 2's output.
 //! That refusal is asserted here so the absence is a measurement.
 
-mod common;
-
-use common::*;
+use crate::common::*;
 use triton_ktir::text::{diff, parse};
 
 /// Configs whose C++ chain produced a `3_sched.mlir`.

@@ -31,6 +31,7 @@
 //! cut's OWN properties (the row window, the per-leg entry base, the residency `N_`).
 
 use ktir_superdsc::emit as superdsc;
+use ktir_superdsc::emit::EwSpec;
 use ktir_superdsc::emit::{In, PointwiseGather, assemble_pointwise_broadcast_gather};
 use ktir_superdsc::ir::island::tile_op::{TileOp, TileOpKind};
 use ktir_superdsc::sdsc_abstract::{CopyDims, RowBlockedTag, StickLayout, Stk};
@@ -328,14 +329,14 @@ fn a_one_row_lookup_is_the_vendors_own_one_core_gather() {
         .as_ref()
         .expect("a gathered pointwise has a descriptor");
     assert_eq!(
-        op.numCoresUsed_, 1,
+        op.num_cores_used, 1,
         "one entry runs on one core — the other 31 idle, never filled by a split"
     );
     assert!(
-        op.numWkSlicesPerDim_.values().all(|&s| s == 1),
+        op.num_wk_slices_per_dim.values().all(|&s| s == 1),
         "`out` is never the filler: whole, all {COLS_STICKS} sticks, and `mb`'s one entry unsplit — \
          every dim's split is 1. Got {:?}",
-        op.numWkSlicesPerDim_
+        op.num_wk_slices_per_dim
     );
 }
 
@@ -375,13 +376,15 @@ fn the_same_op_without_a_gather_declares_none() {
     let inputs = [In::full(&table).ew(), In::scalar(&scale).ew()];
     let op = ktir_superdsc::ir::bridge::tiled_op_sdsc_op::pointwise_broadcast_opspec_from_tile(
         &t,
-        ROWS,
-        COLS,
-        superdsc::op_func_from_str("multiply"),
-        &inputs,
-        out.name(),
-        ktir_superdsc::addr::OutCorner::ZERO,
-        false,
+        EwSpec {
+            op: superdsc::op_func_from_str("multiply"),
+            rows: ROWS,
+            cols: COLS,
+            inputs: &inputs,
+            o_name: out.name(),
+            out_offset: ktir_superdsc::addr::OutCorner::ZERO,
+            head_major: false,
+        },
         None,
         ktir_superdsc::work::CoreDivision::Ew(ktir_superdsc::work::EwDivision::Law),
     )

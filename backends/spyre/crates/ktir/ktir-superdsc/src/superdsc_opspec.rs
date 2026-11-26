@@ -35,8 +35,6 @@
 //! crate this leaf must not depend on, so this could not be a link; it has since moved in, so it is
 //! one again.)
 
-#![allow(non_snake_case)]
-
 use crate::superdsc_error::SuperDscError;
 use std::collections::BTreeMap;
 use std::marker::PhantomData;
@@ -2403,6 +2401,20 @@ pub struct TensorArg<const D: usize> {
     device_order: Option<DeviceOrder<D>>,
 }
 
+/// What a [`TensorArg`] is declared with — the fields [`TensorArg::new`] checks and stores: whether
+/// it is an input, its name and role, each dim's scale and iteration symbol, its layout and stick
+/// dim, and where it is allocated.
+pub struct TensorArgDecl<const D: usize> {
+    pub is_input: bool,
+    pub name: String,
+    pub role: Role,
+    pub scale: [Scale; D],
+    pub device_dims: [IterSym; D],
+    pub layout: [&'static str; D],
+    pub stick: &'static str,
+    pub allocation: Allocation,
+}
+
 impl<const D: usize> TensorArg<D> {
     /// The SOLE constructor (fields are private). Enforces the **MaterializedStick**
     /// invariant: `stick` MUST be one of `layout`, and its `scale` MUST be
@@ -2411,16 +2423,17 @@ impl<const D: usize> TensorArg<D> {
     /// "Incorrect chunk size in bytes"). Returns `Err` (a `cargo build` failure)
     /// otherwise — so a non-128-multiple LX chunk is unrepresentable, not a
     /// runtime crash.
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
-        is_input: bool,
-        name: String,
-        role: Role,
-        scale: [Scale; D],
-        device_dims: [IterSym; D],
-        layout: [&'static str; D],
-        stick: &'static str,
-        allocation: Allocation,
+        TensorArgDecl {
+            is_input,
+            name,
+            role,
+            scale,
+            device_dims,
+            layout,
+            stick,
+            allocation,
+        }: TensorArgDecl<D>,
     ) -> Result<TensorArg<D>, SuperDscError> {
         let stick_idx = layout.iter().position(|&d| d == stick).ok_or_else(|| {
             SuperDscError(format!(
@@ -4660,22 +4673,13 @@ impl OpSpec {
             1 => {
                 let layout = [pins[0].0];
                 AnyTensorArg::R1(
-                    TensorArg::<1>::new(
-                        true,
-                        index_name,
-                        // ⛔ `Role::Index`, NOT `Role::Input` — see [`Role::Index`]. Under `Input` the
+                    TensorArg::<1>::new(TensorArgDecl { is_input: true, name: index_name, role: // ⛔ `Role::Index`, NOT `Role::Input` — see [`Role::Index`]. Under `Input` the
                         // index shares `primaryDsInfo_["INPUT"]` with the activation, which wins by
                         // insertion order, so the index's own layout and stick size are never emitted.
                         // Both defects are pinned by
                         // `the_index_operand_carries_the_vendors_own_dtype_and_its_own_layout`,
                         // fail-first-verified by reverting each one.
-                        Role::Index,
-                        [Scale::Active],
-                        self.iter.iter_syms(layout),
-                        layout,
-                        stick,
-                        Allocation::Hbm,
-                    )
+                        Role::Index, scale: [Scale::Active], device_dims: self.iter.iter_syms(layout), layout, stick, allocation: Allocation::Hbm })
                     .ok()?
                     .with_df(df)
                     // ⭐ THIS OP'S RUN OF THE TABLE — see [`EntryBase`]. Zero for every uncut gather,
@@ -4686,17 +4690,8 @@ impl OpSpec {
             2 => {
                 let layout = [pins[0].0, pins[1].0];
                 AnyTensorArg::R2(
-                    TensorArg::<2>::new(
-                        true,
-                        index_name,
-                        // `Role::Index` — same reason as the rank-1 arm above.
-                        Role::Index,
-                        [Scale::Active; 2],
-                        self.iter.iter_syms(layout),
-                        layout,
-                        stick,
-                        Allocation::Hbm,
-                    )
+                    TensorArg::<2>::new(TensorArgDecl { is_input: true, name: index_name, role: // `Role::Index` — same reason as the rank-1 arm above.
+                        Role::Index, scale: [Scale::Active; 2], device_dims: self.iter.iter_syms(layout), layout, stick, allocation: Allocation::Hbm })
                     .ok()?
                     .with_df(df)
                     .with_offset(first_entry.entries()),

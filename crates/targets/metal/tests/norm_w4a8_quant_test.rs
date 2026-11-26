@@ -12,7 +12,7 @@ use half::{bf16, f16};
 use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions, MTLSize};
 use scratchy_target_metal::aot::baked_build;
 use scratchy_target_metal::detect_device;
-use scratchy_target_metal::mtl4_dispatch::Mtl4DispatchBatch;
+use scratchy_target_metal::mtl4_dispatch::{Mtl4DispatchBatch, ThreadgroupGrid};
 use scratchy_target_metal::quantized::{
     DequantDtype, W4a8Rows, w4a8_quant_static_name, w4a8_scratch_bytes,
 };
@@ -198,8 +198,10 @@ fn case(
                 &[],
                 &[],
                 &[],
-                size(m, 1),
-                size(threads as usize, 1),
+                ThreadgroupGrid {
+                    threadgroups: size(m, 1),
+                    threads_per_threadgroup: size(threads as usize, 1),
+                },
             );
         } else {
             batch.encode(
@@ -208,8 +210,10 @@ fn case(
                 &[],
                 &[],
                 &[],
-                size(m, 1),
-                size(threads as usize, 1),
+                ThreadgroupGrid {
+                    threadgroups: size(m, 1),
+                    threads_per_threadgroup: size(threads as usize, 1),
+                },
             );
             batch.barrier();
             // The pre-pass reads the normed rows: RmsNorm's output, FusedAdd's delta (both `a`).
@@ -219,8 +223,10 @@ fn case(
                 &[],
                 &[],
                 &[],
-                size((k / 64).div_ceil(16), m),
-                size(128, 1),
+                ThreadgroupGrid {
+                    threadgroups: size((k / 64).div_ceil(16), m),
+                    threads_per_threadgroup: size(128, 1),
+                },
             );
         }
         batch.commit(true);

@@ -1,8 +1,3 @@
-#![allow(
-    clippy::needless_range_loop,
-    clippy::type_complexity,
-    clippy::approx_constant
-)]
 // Copyright 2025 The Torch-Spyre Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License").
@@ -45,6 +40,8 @@
 mod common;
 
 use common::Ops;
+use ktir_emulator::affine::{AffineExpr, AffineMap};
+use ktir_emulator::arena::Arena;
 use ktir_emulator::attrkey::AttrKey;
 use ktir_emulator::context::CoreContext;
 use ktir_emulator::dialects::Dispatch;
@@ -52,14 +49,48 @@ use ktir_emulator::dtypes::DType;
 use ktir_emulator::env::{ExecutionEnv, GridExecutor};
 use ktir_emulator::interpreter::{execute_op, single_core_context};
 use ktir_emulator::ir::{Attr, Operation, Scalar, Value};
+use ktir_emulator::irtype::IrType;
 use ktir_emulator::memory::{STICK_BYTES, SpyreMemoryHierarchy};
 use ktir_emulator::opkind::OpKind;
 use ktir_emulator::tile::Tile;
+use std::f32::consts::{FRAC_PI_2, PI};
 use std::rc::Rc;
 
 // ===========================================================================
 // Harness
 // ===========================================================================
+
+/// The `common::Ops` builders only these dialect tests use: typed results, integer lists and
+/// permutation maps.
+impl Ops {
+    /// Set an op's result type directly (bypassing inference) — for tests that
+    /// assert on a specific `result_type` (e.g. a cast's declared output dtype).
+    fn ty(&self, op: Operation<'static>, ty: IrType<'static>) -> Operation<'static> {
+        Operation {
+            result_type: Some(ty),
+            ..op
+        }
+    }
+
+    fn int_list(&self, v: Vec<i64>) -> Attr<'static> {
+        Attr::IntList(Arena::global().ints(v))
+    }
+
+    /// A rank-`n` identity affine map: `(d0..dn) -> (d0..dn)`.
+    fn identity_map(&self, n: usize) -> AffineMap<'static> {
+        self.perm_map(n, &(0..n).collect::<Vec<_>>())
+    }
+
+    /// A rank-`num_dims` affine map selecting/permuting dims by index.
+    fn perm_map(&self, num_dims: usize, perm: &[usize]) -> AffineMap<'static> {
+        let exprs: Vec<AffineExpr<'static>> = perm.iter().map(|&d| AffineExpr::Dim(d)).collect();
+        AffineMap {
+            num_dims,
+            num_syms: 0,
+            exprs: Arena::global().exprs(exprs),
+        }
+    }
+}
 
 /// Build `%r = kind operands...` and dispatch its handler directly (the Python
 /// `_call` path), seeding operands first. Returns the produced `Value`.
@@ -926,7 +957,7 @@ fn sitofp_scalar() {
 fn sitofp_respects_result_type_f16() {
     let mut ir_ops = Ops::new();
     let o = ir_ops.op(Some("%r"), OpKind::ArithSitofp, &["%a"]);
-    let o = ir_ops.ty(o, ktir_emulator::irtype::IrType::Scalar(DType::F16));
+    let o = ir_ops.ty(o, IrType::Scalar(DType::F16));
     let r = run_built(&mut ir_ops, &o, &[("%a", idx(3))]);
     // Scalar path returns an F32 scalar; the dtype is carried on tiles only.
     close(as_f32(&r), 3.0, 1e-2);
@@ -936,7 +967,7 @@ fn sitofp_respects_result_type_f16() {
 fn sitofp_respects_result_type_f32() {
     let mut ir_ops = Ops::new();
     let o = ir_ops.op(Some("%r"), OpKind::ArithSitofp, &["%a"]);
-    let o = ir_ops.ty(o, ktir_emulator::irtype::IrType::Scalar(DType::F32));
+    let o = ir_ops.ty(o, IrType::Scalar(DType::F32));
     let r = run_built(
         &mut ir_ops,
         &o,
@@ -1240,11 +1271,11 @@ fn math_sin_tile() {
     let r = run_op(
         OpKind::MathSin,
         &["%x"],
-        &[("%x", f16_tile(&[0.0, 1.5708, 3.1416]))],
+        &[("%x", f16_tile(&[0.0, FRAC_PI_2, PI]))],
     );
     data_close(
         &as_tile(&r).as_f32(),
-        &[0.0, 1.5708f32.sin(), 3.1416f32.sin()],
+        &[0.0, FRAC_PI_2.sin(), PI.sin()],
         2e-2,
     );
 }
@@ -1260,11 +1291,11 @@ fn math_cos_tile() {
     let r = run_op(
         OpKind::MathCos,
         &["%x"],
-        &[("%x", f16_tile(&[0.0, 1.5708, 3.1416]))],
+        &[("%x", f16_tile(&[0.0, FRAC_PI_2, PI]))],
     );
     data_close(
         &as_tile(&r).as_f32(),
-        &[1.0, 1.5708f32.cos(), 3.1416f32.cos()],
+        &[1.0, FRAC_PI_2.cos(), PI.cos()],
         2e-2,
     );
 }

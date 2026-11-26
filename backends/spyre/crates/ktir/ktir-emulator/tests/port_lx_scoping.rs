@@ -109,7 +109,7 @@ fn next_ptr(ctx: &CoreContext) -> i64 {
 fn write_to_lx_f16(ctx: &mut CoreContext, n_elems: i64) {
     let size = n_elems * 2; // f16 = 2 bytes/elem
     let lx = ctx.get_lx(None);
-    let lxm = lx.borrow_mut();
+    let mut lxm = lx.borrow_mut();
     let ptr = lxm.next_ptr;
     let advanced = ptr + size;
     lxm.next_ptr = (advanced + STICK_BYTES - 1) & !(STICK_BYTES - 1);

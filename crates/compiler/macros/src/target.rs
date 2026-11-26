@@ -94,6 +94,55 @@ pub struct LoadCx<'a> {
     pub rope_context_init: &'a TokenStream,
 }
 
+/// The parameters of every target's `Weights::load(gw, stream, max_model_len, tp_rank)`: one
+/// `body` reads keeps its name, and one it doesn't (the stream, a rank no weight shards by) is `_`.
+pub fn load_params(body: &TokenStream) -> TokenStream {
+    let names = ["stream", "max_model_len", "tp_rank"];
+    let reads = named(body, names);
+    let [stream, max_model_len, tp_rank]: [syn::Ident; 3] = std::array::from_fn(|i| {
+        let name = if reads[i] { names[i] } else { "_" };
+        syn::Ident::new(name, proc_macro2::Span::call_site())
+    });
+    quote::quote! {
+        gw: &mut crate::__gpu::weights::GpuWeights,
+        #stream: crate::__gpu::LoadStream,
+        #max_model_len: usize,
+        #tp_rank: u8,
+    }
+}
+
+/// Which of `names` `body` mentions, at any depth: an emitted item names what it reads and
+/// nothing else.
+pub fn named<const N: usize>(body: &TokenStream, names: [&str; N]) -> [bool; N] {
+    fn mark<const N: usize>(tokens: &TokenStream, names: &[&str; N], seen: &mut [bool; N]) {
+        for tree in tokens.clone() {
+            match tree {
+                proc_macro2::TokenTree::Ident(ident) => {
+                    for (name, seen) in names.iter().zip(seen.iter_mut()) {
+                        *seen |= ident == name;
+                    }
+                }
+                proc_macro2::TokenTree::Group(group) => mark(&group.stream(), names, seen),
+                proc_macro2::TokenTree::Punct(_) | proc_macro2::TokenTree::Literal(_) => {}
+            }
+        }
+    }
+    let mut seen = [false; N];
+    mark(body, &names, &mut seen);
+    seen
+}
+
+/// The `use` items of `uses` (each beside the name it brings into scope) whose names `body`
+/// mentions, in `uses`' order: an emitted block imports what it names and nothing else.
+pub fn uses_named<const N: usize>(
+    body: &TokenStream,
+    uses: [(&str, TokenStream); N],
+) -> TokenStream {
+    let seen = named(body, uses.each_ref().map(|(name, _)| *name));
+    let items = (uses.into_iter().zip(seen)).filter_map(|((_, item), seen)| seen.then_some(item));
+    quote::quote!(#(#items)*)
+}
+
 /// What a target's emission of one canonical model reads: the model, its facts and fused graph,
 /// the workload points it compiles, and the shared emission of its weights struct and its
 /// `CanonicalParams` impl.

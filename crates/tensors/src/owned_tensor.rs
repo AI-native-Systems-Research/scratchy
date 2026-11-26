@@ -73,22 +73,39 @@ impl OwnedTensor {
         t
     }
 
+    /// Reinterpret the owned allocation with a new shape and dtype (metadata
+    /// only).
+    ///
+    /// # Safety
+    /// `shape` × `dtype` must not describe more bytes than the allocation's
+    /// `size_bytes`.
     pub unsafe fn reshape(&mut self, shape: &[usize], dtype: DType) {
-        self.inner = GpuTensor::new(self.inner.raw_ptr(), shape, dtype);
+        // SAFETY: the pointer is this allocation's own; the caller guarantees
+        // the new shape and dtype stay within it.
+        self.inner = unsafe { GpuTensor::new(self.inner.raw_ptr(), shape, dtype) };
     }
 
     pub fn view(&self) -> TensorView<'_> {
         unsafe { TensorView::from_raw(self.inner) }
     }
 
+    /// Borrow a sub-view starting `byte_offset` bytes into the allocation.
+    ///
+    /// # Safety
+    /// `byte_offset` plus `new_shape` × `dtype` must stay within the
+    /// allocation's `size_bytes`.
     pub unsafe fn view_offset(
         &self,
         byte_offset: usize,
         new_shape: &[usize],
         dtype: DType,
     ) -> TensorView<'_> {
-        let inner = GpuTensor::new(self.inner.raw_ptr().add(byte_offset), new_shape, dtype);
-        TensorView::from_raw(inner)
+        // SAFETY: the caller guarantees the offset view stays within this
+        // allocation, which outlives the returned borrow of `self`.
+        unsafe {
+            let inner = GpuTensor::new(self.inner.raw_ptr().add(byte_offset), new_shape, dtype);
+            TensorView::from_raw(inner)
+        }
     }
 }
 

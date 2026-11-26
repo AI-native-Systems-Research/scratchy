@@ -10,14 +10,12 @@
 //! Run: cargo test -p scratchy-target-metal --release --test verify_packed_attention_test -- \
 //!     --ignored --nocapture
 
-mod common;
-
 use half::bf16;
 use objc2_metal::{MTLBuffer, MTLSize};
 use scratchy_target_metal::aot::baked_build;
 use scratchy_target_metal::detect_device;
 use scratchy_target_metal::mtl4_dispatch::{
-    Mtl4DispatchBatch, read_slice, shared_slice, shared_zeroed,
+    Mtl4DispatchBatch, ThreadgroupGrid, read_slice, shared_slice, shared_zeroed,
 };
 use scratchy_target_metal::specialized_pipeline_cache::{
     ConstantValue, PipelineKey, SpecializedPipelineCache,
@@ -162,8 +160,10 @@ fn split_verify_attention_matches_the_plain_tile() {
             &[],
             &[],
             &[&k, &v],
-            size(1, NQ, seqs),
-            size(256, 1, 1),
+            ThreadgroupGrid {
+                threadgroups: size(1, NQ, seqs),
+                threads_per_threadgroup: size(256, 1, 1),
+            },
         );
         b.encode(
             &pack,
@@ -171,8 +171,10 @@ fn split_verify_attention_matches_the_plain_tile() {
             &[],
             &[],
             &[],
-            size(tile.bq() as usize, NKV, seqs),
-            size(HD, 1, 1),
+            ThreadgroupGrid {
+                threadgroups: size(tile.bq() as usize, NKV, seqs),
+                threads_per_threadgroup: size(HD, 1, 1),
+            },
         );
         b.barrier();
         let mut bind = paged(&o_split, &qp).to_vec();
@@ -183,8 +185,10 @@ fn split_verify_attention_matches_the_plain_tile() {
             &[],
             &[],
             &[&k, &v],
-            size(SPLITS, NKV, seqs),
-            size(256, 1, 1),
+            ThreadgroupGrid {
+                threadgroups: size(SPLITS, NKV, seqs),
+                threads_per_threadgroup: size(256, 1, 1),
+            },
         );
         b.barrier();
         b.encode(
@@ -193,8 +197,10 @@ fn split_verify_attention_matches_the_plain_tile() {
             &[],
             &[],
             &[],
-            size(tokens, NQ, 1),
-            size(32 * combine_groups as usize, 1, 1),
+            ThreadgroupGrid {
+                threadgroups: size(tokens, NQ, 1),
+                threads_per_threadgroup: size(32 * combine_groups as usize, 1, 1),
+            },
         );
         b.commit(true);
         let a: Vec<u16> = read_slice(&o_plain, tokens * NQ * HD);

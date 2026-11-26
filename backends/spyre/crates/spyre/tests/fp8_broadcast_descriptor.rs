@@ -10,6 +10,7 @@
 
 use emit::In;
 use ktir_superdsc::emit;
+use ktir_superdsc::emit::OpDecl;
 use ktir_superdsc::sdsc_abstract::{BlockCols, Lanes, RowBlockedTag, RowCount, StickLayout, Stk};
 /// The one-stick handle — the TRUE shape of a `[1,1]` const read in the scalar broadcast
 /// mode (one RedStick IS its whole swept window).
@@ -48,10 +49,12 @@ fn wide_scalar_broadcast_descriptor_matches_proven_forms() {
 
     let mut s = 0i64;
     let wide_scalar = emit::assemble_pointwise_broadcast(
-        "wide_scalar",
-        "mul",
-        m,
-        k,
+        OpDecl {
+            op_name: "wide_scalar",
+            op_func: "mul",
+            rows: m,
+            cols: k,
+        },
         &[
             In::full(&wide("t_act", 31, 2048)).ew(),
             In::scalar(&h("t_inv448")).ew(),
@@ -63,10 +66,12 @@ fn wide_scalar_broadcast_descriptor_matches_proven_forms() {
     .expect("assemble_pointwise_broadcast builds");
     let mut s = 0i64;
     let wide_col = emit::assemble_pointwise_broadcast(
-        "wide_col",
-        "mul",
-        m,
-        k,
+        OpDecl {
+            op_name: "wide_col",
+            op_func: "mul",
+            rows: m,
+            cols: k,
+        },
         &[
             In::full(&wide("t_act", 31, 2048)).ew(),
             In::col(&wide("t_invs", 31, 64)).ew(),
@@ -78,10 +83,12 @@ fn wide_scalar_broadcast_descriptor_matches_proven_forms() {
     .expect("assemble_pointwise_broadcast builds");
     let mut s = 0i64;
     let wide_mb = emit::assemble_pointwise_broadcast(
-        "wide_mb",
-        "mul",
-        m,
-        k,
+        OpDecl {
+            op_name: "wide_mb",
+            op_func: "mul",
+            rows: m,
+            cols: k,
+        },
         &[
             In::full(&wide("t_xn", 31, 2048)).ew(),
             In::mb(&wide("t_gamma", 1, 2048)).ew(),
@@ -93,10 +100,12 @@ fn wide_scalar_broadcast_descriptor_matches_proven_forms() {
     .expect("assemble_pointwise_broadcast builds");
     let mut s = 0i64;
     let narrow_scalar = emit::assemble_pointwise_broadcast(
-        "narrow_scalar",
-        "mul",
-        m,
-        stk,
+        OpDecl {
+            op_name: "narrow_scalar",
+            op_func: "mul",
+            rows: m,
+            cols: stk,
+        },
         &[
             In::full(&wide("t_msum", 31, 64)).ew(),
             In::scalar(&h("t_invcols")).ew(),

@@ -139,6 +139,38 @@ impl ExpertBits {
     }
 }
 
+/// A routed expert bank's geometry, as a target's MoE loader takes it: its experts, the experts
+/// each token routes to, and each expert's MLP extents.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExpertBank {
+    pub num_experts: usize,
+    pub top_k: usize,
+    /// Each expert's MLP inner width (`moe_intermediate_size` where a config splits it from the
+    /// dense MLP's).
+    pub intermediate_size: usize,
+    pub hidden_size: usize,
+}
+
+/// How an MLX-affine expert bank stores its codes: the group width, each projection's bits, and
+/// the bits of the router gate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AffineExperts {
+    pub group_size: u32,
+    pub bits: ExpertBits,
+    pub gate_bits: u32,
+}
+
+/// A DeepSeek-V2 router's grouped top-k: whether the top-k weights renormalize, the routed
+/// scale, sigmoid or softmax scores, and the expert groups the top-k draws from.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GroupedRouting {
+    pub norm_topk_prob: bool,
+    pub routed_scaling_factor: f32,
+    pub use_sigmoid: bool,
+    pub n_expert_group: usize,
+    pub topk_group: usize,
+}
+
 // ---------------------------------------------------------------------------
 // Gemma-4 MoE (gemma_moe op): separate router + router-less SwitchGLU experts
 // ---------------------------------------------------------------------------

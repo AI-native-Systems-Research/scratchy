@@ -25,7 +25,7 @@ def k(x, y, o, N: tl.constexpr):
     od.store([0], a + b)
 "#;
 
-mod common;
+use crate::common;
 
 use triton_frontend::codegen::{self, KernelSpec};
 use triton_frontend::semantic::Val;

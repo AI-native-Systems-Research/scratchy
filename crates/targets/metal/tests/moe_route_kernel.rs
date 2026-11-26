@@ -9,6 +9,7 @@ use half::bf16;
 use objc2_metal::MTLSize;
 use scratchy_target_metal::aot::{BakedPipeline, baked_pipeline};
 use scratchy_target_metal::device::detect_device;
+use scratchy_target_metal::mtl4_dispatch::ThreadgroupGrid;
 use scratchy_target_metal::tape::constants::{ConstSlot, ConstantValue};
 use scratchy_target_metal::tape::ids::{ElementCount, NumExperts, TopK};
 use scratchy_target_metal::tape::kernel_constants::{
@@ -65,7 +66,17 @@ fn run<'a>(
         let mut batch = common::Mtl4DispatchBatch::begin(device).expect("an MTL4 queue");
         for _ in 0..n {
             for d in chain() {
-                batch.encode(d.pso, &d.buffers, &[], &[], &[], d.groups, d.threads);
+                batch.encode(
+                    d.pso,
+                    &d.buffers,
+                    &[],
+                    &[],
+                    &[],
+                    ThreadgroupGrid {
+                        threadgroups: d.groups,
+                        threads_per_threadgroup: d.threads,
+                    },
+                );
                 batch.barrier();
             }
         }
@@ -495,8 +506,10 @@ fn gpt_oss_biased_routing_matches_the_reference() {
         &[],
         &[],
         &[],
-        size(n, 1, 1),
-        size(256, 1, 1),
+        ThreadgroupGrid {
+            threadgroups: size(n, 1, 1),
+            threads_per_threadgroup: size(256, 1, 1),
+        },
     );
     batch.commit(true);
     let want: Vec<u16> = common::read_slice(&want_scores, n * k);

@@ -32,7 +32,7 @@
 //! raw-op count is NOT a measure of the work in a fused kernel; the post-pass count is, and
 //! there the inliner duplicates the body (143 -> 260).
 
-mod common;
+use crate::common;
 
 use triton_frontend::codegen;
 use triton_frontend::target::Target;

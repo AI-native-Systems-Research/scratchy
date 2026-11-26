@@ -23,28 +23,90 @@ use quote::quote;
 /// MEASURED on llama-3.2-1b: 266,503 rendered operations. Aliasing collapses each path to a single
 /// token, which is a ~5x cut in both the generated source's size and the token count rustc parses
 /// and name-resolves.
-pub fn preamble() -> proc_macro2::TokenStream {
-    quote! {
-        #[allow(unused_imports)]
-        use ::scratchy_target_spyre::ktir::{
-            affine::{
-                AffineExpr as __KExpr, AffineMap as __KMap, AffineSet as __KSet,
-                Constraint as __KConstraint, ConstraintKind as __KSetKind,
-            },
-            attrkey::AttrKey as __KAttrKey,
-            dtypes::DType as __KDTy,
-            ir::{Attr as __KAttr, IRFunction as __KFn, Operation as __KOp, Ssa as __KSsa},
-            irtype::IrType as __KTy,
-            opkind::OpKind as __KOpKind,
-        };
-        #[allow(unused_imports)]
-        use ::scratchy_target_spyre::bundle_code::{
-            Elementwise as __KElem, LaunchProgram as __KProg, PlaceId as __KPlace,
-            Program as __KProgram, SynthRole as __KRole,
-        };
-        #[allow(unused_imports)]
-        use ::std::borrow::Cow::Borrowed as __KCow;
-    }
+///
+/// It opens only the aliases `body` (the rendered items it precedes) names.
+pub fn preamble(body: &proc_macro2::TokenStream) -> proc_macro2::TokenStream {
+    scratchy_forward_compiler_macro::target::uses_named(
+        body,
+        [
+            (
+                "__KExpr",
+                quote! { use ::scratchy_target_spyre::ktir::affine::AffineExpr as __KExpr; },
+            ),
+            (
+                "__KMap",
+                quote! { use ::scratchy_target_spyre::ktir::affine::AffineMap as __KMap; },
+            ),
+            (
+                "__KSet",
+                quote! { use ::scratchy_target_spyre::ktir::affine::AffineSet as __KSet; },
+            ),
+            (
+                "__KConstraint",
+                quote! { use ::scratchy_target_spyre::ktir::affine::Constraint as __KConstraint; },
+            ),
+            (
+                "__KSetKind",
+                quote! { use ::scratchy_target_spyre::ktir::affine::ConstraintKind as __KSetKind; },
+            ),
+            (
+                "__KAttrKey",
+                quote! { use ::scratchy_target_spyre::ktir::attrkey::AttrKey as __KAttrKey; },
+            ),
+            (
+                "__KDTy",
+                quote! { use ::scratchy_target_spyre::ktir::dtypes::DType as __KDTy; },
+            ),
+            (
+                "__KAttr",
+                quote! { use ::scratchy_target_spyre::ktir::ir::Attr as __KAttr; },
+            ),
+            (
+                "__KFn",
+                quote! { use ::scratchy_target_spyre::ktir::ir::IRFunction as __KFn; },
+            ),
+            (
+                "__KOp",
+                quote! { use ::scratchy_target_spyre::ktir::ir::Operation as __KOp; },
+            ),
+            (
+                "__KSsa",
+                quote! { use ::scratchy_target_spyre::ktir::ir::Ssa as __KSsa; },
+            ),
+            (
+                "__KTy",
+                quote! { use ::scratchy_target_spyre::ktir::irtype::IrType as __KTy; },
+            ),
+            (
+                "__KOpKind",
+                quote! { use ::scratchy_target_spyre::ktir::opkind::OpKind as __KOpKind; },
+            ),
+            (
+                "__KElem",
+                quote! { use ::scratchy_target_spyre::bundle_code::Elementwise as __KElem; },
+            ),
+            (
+                "__KProg",
+                quote! { use ::scratchy_target_spyre::bundle_code::LaunchProgram as __KProg; },
+            ),
+            (
+                "__KPlace",
+                quote! { use ::scratchy_target_spyre::bundle_code::PlaceId as __KPlace; },
+            ),
+            (
+                "__KProgram",
+                quote! { use ::scratchy_target_spyre::bundle_code::Program as __KProgram; },
+            ),
+            (
+                "__KRole",
+                quote! { use ::scratchy_target_spyre::bundle_code::SynthRole as __KRole; },
+            ),
+            (
+                "__KCow",
+                quote! { use ::std::borrow::Cow::Borrowed as __KCow; },
+            ),
+        ],
+    )
 }
 
 fn variant(name: String) -> proc_macro2::TokenStream {

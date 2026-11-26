@@ -311,10 +311,10 @@ fn index_run_base(
     let dsc = op.dsc();
     let dsc = dsc.dscs_.first()?.values().next()?;
     let node = dsc
-        .scheduleTree_
+        .schedule_tree
         .iter()
-        .find(|n| n.nodeType_ == "allocate" && n.indirectAllocType_ == "index_tensor")?;
-    node.startAddressCoreCorelet_
+        .find(|n| n.node_type == "allocate" && n.indirect_alloc_type == "index_tensor")?;
+    node.start_address_core_corelet
         .data_
         .get("[0, 0, 0]")?
         .parse()
@@ -329,10 +329,10 @@ fn value_tensor_address(
     let dsc = op.dsc();
     let dsc = dsc.dscs_.first()?.values().next()?;
     let node = dsc
-        .scheduleTree_
+        .schedule_tree
         .iter()
-        .find(|n| n.nodeType_ == "allocate" && n.indirectAllocType_ == "value_tensor")?;
-    node.startAddressCoreCorelet_
+        .find(|n| n.node_type == "allocate" && n.indirect_alloc_type == "value_tensor")?;
+    node.start_address_core_corelet
         .data_
         .get("[0, 0, 0]")?
         .parse()
@@ -347,12 +347,12 @@ fn alloc_address(
 ) -> Option<u64> {
     let dsc = op.dsc();
     let dsc = dsc.dscs_.first()?.values().next()?;
-    let idx = dsc.labeledDs_.iter().find(|ds| ds.dsType_ == tag)?.ldsIdx_;
+    let idx = dsc.labeled_ds.iter().find(|ds| ds.ds_type == tag)?.lds_idx;
     let node = dsc
-        .scheduleTree_
+        .schedule_tree
         .iter()
-        .find(|n| n.ldsIdx_ == idx && n.nodeType_ == "allocate")?;
-    node.startAddressCoreCorelet_
+        .find(|n| n.lds_idx == idx && n.node_type == "allocate")?;
+    node.start_address_core_corelet
         .data_
         .get("[0, 0, 0]")?
         .parse()
@@ -427,7 +427,7 @@ fn two_tables_through_one_ids_each_matmul_gathers_its_own() {
                 .dscs_
                 .first()
                 .and_then(|m| m.values().next())
-                .is_some_and(|d| d.computeOp_.iter().any(|c| c.opFuncName == "batchmatmul"))
+                .is_some_and(|d| d.compute_op.iter().any(|c| c.op_func_name == "batchmatmul"))
         })
         .collect();
     assert_eq!(

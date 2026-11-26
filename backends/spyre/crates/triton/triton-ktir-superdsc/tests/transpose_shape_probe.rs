@@ -110,6 +110,7 @@
 //! INSTALL rather than a source checkout dies earlier, on a missing template.
 
 use ktir_superdsc::emit::EmittedOp;
+use ktir_superdsc::emit::RestickifyKt2d;
 use ktir_superdsc::emit::{assemble_restickify_kt_2d, try_assemble_transpose};
 
 /// The shapes, and why each one is in the list.
@@ -140,8 +141,11 @@ fn output_stick(
         .expect("a relayout carries a SuperDSC descriptor");
     let one = dsc.dscs_.first().expect("one dsc");
     let body = one.values().next().expect("one op in the dsc");
-    let out = body.primaryDsInfo_.get("OUTPUT").expect("an OUTPUT layout");
-    (out.stickDimOrder_.clone(), out.stickSize_.clone())
+    let out = body
+        .primary_ds_info
+        .get("OUTPUT")
+        .expect("an OUTPUT layout");
+    (out.stick_dim_order.clone(), out.stick_size.clone())
 }
 
 fn write_probe_dir(label: &str, op: &EmittedOp<ktir_superdsc::collective::TpWorld<1>>) {
@@ -197,7 +201,7 @@ fn every_transpose_shape_carries_the_two_dim_block_stick_that_dxp_refuses() {
         let (order, sizes) = output_stick(&op);
         println!(
             "BAKED    {label:16} [mb {mb}, out {out}]  numWkSlicesPerDim_={:?}  OUTPUT stick {order:?} {sizes:?}",
-            dsc.numWkSlicesPerDim_,
+            dsc.num_wk_slices_per_dim,
         );
         assert_eq!(
             (order.as_slice(), sizes.as_slice()),
@@ -257,19 +261,9 @@ fn the_restickify_door_carries_a_one_dim_output_stick_for_the_same_relayout() {
     );
 
     let mut sid = -1i64;
-    let op = assemble_restickify_kt_2d(
-        "rk",
-        slots,
-        feats,
-        // TRUE handles for the whole buffers the mint bounds each tile's flat run against — here a
+    let op = assemble_restickify_kt_2d(RestickifyKt2d { op_name: "rk", slots, feats, in_: // TRUE handles for the whole buffers the mint bounds each tile's flat run against — here a
         // `[64, 64]` pair, the exact tile.
-        &ktir_superdsc::emit::rb("k_nat", 64, 64),
-        DevOff::ZERO,
-        &ktir_superdsc::emit::rb("k_t", 64, 64),
-        DevOff::ZERO,
-        &mut sid,
-        None,
-    )
+        &ktir_superdsc::emit::rb("k_nat", 64, 64), in_off: DevOff::ZERO, o: &ktir_superdsc::emit::rb("k_t", 64, 64), out_off: DevOff::ZERO }, &mut sid, None)
     .expect("assemble_restickify_kt_2d builds");
     let dsc = op
         .op
@@ -278,7 +272,7 @@ fn the_restickify_door_carries_a_one_dim_output_stick_for_the_same_relayout() {
     let (order, sizes) = output_stick(&op);
     println!(
         "BAKED    restickify_kt    [slots 64, feats 64]  numWkSlicesPerDim_={:?}  OUTPUT stick {order:?} {sizes:?}",
-        dsc.numWkSlicesPerDim_,
+        dsc.num_wk_slices_per_dim,
     );
     assert_eq!(
         (order.len(), sizes.as_slice()),
@@ -337,14 +331,17 @@ fn the_rerouted_ktir_door_transposes_with_a_one_dim_output_stick_at_every_shape(
             .expect("a relayout carries a SuperDSC descriptor");
         let body = dsc.dscs_[0].values().next().expect("one op in the dsc");
         let (inp, outp) = (
-            &body.primaryDsInfo_["INPUT"],
-            &body.primaryDsInfo_["OUTPUT"],
+            &body.primary_ds_info["INPUT"],
+            &body.primary_ds_info["OUTPUT"],
         );
         let (order, sizes) = output_stick(&op);
         println!(
             "REROUTED {label:16} [mb {mb}, out {out}]  numWkSlicesPerDim_={:?}  \
              INPUT {:?} stick {:?}  OUTPUT {:?} stick {order:?} {sizes:?}",
-            dsc.numWkSlicesPerDim_, inp.layoutDimOrder_, inp.stickDimOrder_, outp.layoutDimOrder_,
+            dsc.num_wk_slices_per_dim,
+            inp.layout_dim_order,
+            inp.stick_dim_order,
+            outp.layout_dim_order,
         );
         assert_eq!(
             order.len(),
@@ -355,15 +352,15 @@ fn the_rerouted_ktir_door_transposes_with_a_one_dim_output_stick_at_every_shape(
         );
         assert_eq!(
             (
-                inp.layoutDimOrder_.as_slice(),
-                outp.layoutDimOrder_.as_slice()
+                inp.layout_dim_order.as_slice(),
+                outp.layout_dim_order.as_slice()
             ),
             (["y", "out"].as_slice(), ["out", "y"].as_slice()),
             "{label} [mb {mb}, out {out}]: the two roles' dim orders must be SWAPPED — that swap IS \
              the transposition",
         );
         assert_eq!(
-            (inp.stickDimOrder_.as_slice(), order.as_slice()),
+            (inp.stick_dim_order.as_slice(), order.as_slice()),
             (["out"].as_slice(), ["y"].as_slice()),
             "{label} [mb {mb}, out {out}]: the INPUT sticks on `out` (the feature axis, its LAST dim — \
              the slab-major read a rank-2 pointwise producer writes) and the OUTPUT on `y` (the slot \
@@ -428,7 +425,7 @@ fn an_over_lx_transpose_is_refused_and_the_half_size_control_is_accepted() {
     let (order, _) = output_stick(&op);
     println!(
         "ACCEPTED [4096, 2048] control: numWkSlicesPerDim_={:?}  OUTPUT stick {order:?}",
-        op.op.as_ref().expect("a descriptor").numWkSlicesPerDim_,
+        op.op.as_ref().expect("a descriptor").num_wk_slices_per_dim,
     );
     assert_eq!(
         order.len(),

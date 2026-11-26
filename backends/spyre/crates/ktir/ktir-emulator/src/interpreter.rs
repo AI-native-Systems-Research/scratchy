@@ -668,14 +668,14 @@ pub fn execute_function_seeded(
     // the byte address is elem*bytes_per_elem(dtype) for BOTH spaces. LX takes an
     // optional next_ptr bump (a byte pointer) so kernel staging won't trample it.
     {
-        let hbm = mem.hbm.borrow_mut();
+        let mut hbm = mem.hbm.borrow_mut();
         for s in seeds {
             let byte_addr = s.elem * s.dtype.bytes_per_elem() as i64;
             match s.lx_core {
                 None => hbm.write_bytes(byte_addr, &s.bytes),
                 Some(core) => {
                     let lx = mem.get_lx(core);
-                    let lx = lx.borrow_mut();
+                    let mut lx = lx.borrow_mut();
                     lx.write_bytes(byte_addr, &s.bytes);
                     if let Some(np) = s.next_ptr {
                         lx.next_ptr = np;
@@ -745,7 +745,7 @@ fn marshal_inputs(
         dtype: DType,
     ) {
         let stick = {
-            let hbm = mem.hbm.borrow_mut();
+            let mut hbm = mem.hbm.borrow_mut();
             let stick = hbm.allocate(bytes.len() as i64);
             hbm.write_bytes(stick * STICK_BYTES, &bytes);
             stick
@@ -911,7 +911,6 @@ fn try_combine_matmul(
     ctxs: &mut [CoreContext],
     gemm: &crate::metal::NaxGemm,
 ) -> Result<bool, String> {
-    use crate::metal::Epilogue;
     use crate::tile::Tile;
 
     let Some(result) = op.result else {
@@ -947,14 +946,15 @@ fn try_combine_matmul(
     let ub = gemm.unified_from(&shared_b)?;
     let mut uc = gemm.unified(ctxs.len() * m * n)?;
     gemm.matmul_unified(
-        ctxs.len() * m,
-        k,
-        n,
+        crate::metal::GemmDims {
+            m: ctxs.len() * m,
+            k,
+            n,
+        },
         &ua,
         &ub,
         &mut uc,
-        None,
-        Epilogue::NONE,
+        crate::metal::FusedEpilogue::NONE,
         false,
     )?;
 

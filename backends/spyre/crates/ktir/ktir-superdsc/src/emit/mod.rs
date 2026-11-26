@@ -30,7 +30,7 @@ use crate::superdsc_error::SuperDscError;
 use crate::superdsc_opspec::{
     Allocation, AnyTensorArg, ArgView, DataFormat, DeviceTileLayout, Df, Fp8, Fp16, Fp32,
     IndirectRole, ItDim, OpFunc, OpInfo, OpSpec, Role, Scale, SdscFoldSet, StickExtent, TensorArg,
-    USABLE_LX_BYTES, WorkPlan, assert_df_stick_multiple,
+    TensorArgDecl, USABLE_LX_BYTES, WorkPlan, assert_df_stick_multiple,
 };
 use crate::wire::{
     AllocNode, ComputeAttrs, ComputeOp, Dsc, FoldFunc, FoldProp, IterSpace, LabeledDs, LayoutInfo,
@@ -1083,6 +1083,29 @@ pub fn pointwise_untiled_slice_bytes_divided(
         })
 }
 
+/// An op's declaration: its descriptor name, its `opFuncName`, and the `rows × cols` it sweeps —
+/// typed ([`crate::sdsc_abstract::RowCount`] / [`crate::sdsc_abstract::BlockCols`]) at the
+/// handle-flow doors, raw counts at the name-keyed ones.
+#[derive(Clone, Copy, Debug)]
+pub struct OpDecl<'a, R = crate::sdsc_abstract::RowCount, C = crate::sdsc_abstract::BlockCols> {
+    pub op_name: &'a str,
+    pub op_func: &'static str,
+    pub rows: R,
+    pub cols: C,
+}
+
+/// What one elementwise descriptor states: its function over `[rows, cols]`, its inputs, the output
+/// it writes from `out_offset`, and whether it is a head-major (per-head attention) op.
+pub struct EwSpec<'a> {
+    pub op: OpFunc,
+    pub rows: u32,
+    pub cols: u32,
+    pub inputs: &'a [EwOperand<'a>],
+    pub o_name: &'a str,
+    pub out_offset: crate::addr::OutCorner,
+    pub head_major: bool,
+}
+
 /// Build the typed [`OpSpec`] for ONE elementwise op over `[rows, cols]` with
 /// PER-OPERAND broadcast (the generalization of [`pointwise_opspec`], which is the
 /// all-`full` case). Inputs may broadcast over `mb` or `out` ([`EwOperand`]); the
@@ -1094,15 +1117,16 @@ pub fn pointwise_untiled_slice_bytes_divided(
 /// `df` is `Df::Fp16` (the 64-stick default) for every caller but the torch-spyre fp32 RMSNorm.
 /// `layout` is the bundle's, so the division can see which operands are core-local LX pins, and
 /// `division` is [`crate::work::EwDivision::Law`] for every shipped op (see there).
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn pointwise_broadcast_opspec_df(
-    op: OpFunc,
-    rows: u32,
-    cols: u32,
-    inputs: &[EwOperand<'_>],
-    o_name: &str,
-    out_offset: crate::addr::OutCorner,
-    head_major: bool,
+    EwSpec {
+        op,
+        rows,
+        cols,
+        inputs,
+        o_name,
+        out_offset,
+        head_major,
+    }: EwSpec<'_>,
     df: Df,
     layout: Option<&BundleLayout>,
     division: crate::work::EwDivision,
@@ -1146,15 +1170,16 @@ pub(crate) fn pointwise_broadcast_opspec_df(
     );
     pointwise_broadcast_opspec_from_tile(
         &tile_op,
-        rows,
-        cols,
-        op,
-        inputs,
-        o_name,
-        out_offset,
-        head_major,
-        layout,
-        // This door is the ungathered family's: the elementwise law, wrapped for the shared
+        EwSpec {
+            op,
+            rows,
+            cols,
+            inputs,
+            o_name,
+            out_offset,
+            head_major,
+        },
+        layout, // This door is the ungathered family's: the elementwise law, wrapped for the shared
         // builder's `CoreDivision` (a gathered op's own split is a `GatherSplit`, minted by its
         // leg — see `one_gathered_leg`).
         crate::work::CoreDivision::Ew(division),
@@ -1194,16 +1219,16 @@ fn sfp_rank1_opspec(
     let plan = WorkPlan::divide(&dims, crate::device_gen::whole(), distribute_cores)?;
     let device_dims = plan.iter_syms(["out"]);
     let mk = |is_input: bool, name: &str| {
-        TensorArg::<1>::new(
+        TensorArg::<1>::new(TensorArgDecl {
             is_input,
-            name.to_string(),
-            Role::Output,
-            [Scale::Active],
+            name: name.to_string(),
+            role: Role::Output,
+            scale: [Scale::Active],
             device_dims,
-            ["out"],
-            "out",
-            Allocation::Hbm,
-        )
+            layout: ["out"],
+            stick: "out",
+            allocation: Allocation::Hbm,
+        })
         .map_err(|e| e.0)
     };
     let (input, output) = (mk(true, in_name)?, mk(false, out_name)?);
@@ -1235,14 +1260,10 @@ pub fn assemble_sfp_rank1<T: crate::collective::Tp>(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn assemble_pointwise_broadcast<T: crate::collective::Tp>(
-    op_name: &str,
-    op_func: &'static str,
     // TYPED row/width slots, same contract as `assemble_pointwise_broadcast_off`: every caller
     // states WHICH row quantity and WHICH width fills the slot through the types' named doors.
-    rows: crate::sdsc_abstract::RowCount,
-    cols: crate::sdsc_abstract::BlockCols,
+    op: OpDecl<'_>,
     inputs: &[EwOperand<'_>],
     o: &Stk<RowBlockedTag>,
     sym_id_base: &mut i64,
@@ -1250,42 +1271,7 @@ pub fn assemble_pointwise_broadcast<T: crate::collective::Tp>(
 ) -> Result<EmittedOp<T>, crate::superdsc_error::SuperDscError> {
     // RowBlocked output ⇒ residual token stream (not head-major). head_major is derived from the type.
     assemble_pointwise_broadcast_off(
-        op_name,
-        op_func,
-        rows,
-        cols,
-        inputs,
-        o,
-        crate::addr::DevOff::ZERO,
-        sym_id_base,
-        layout,
-    )
-}
-
-/// [`assemble_pointwise_broadcast`] for a PER-HEAD / row-structured attention op (`head_major`):
-/// forces the legacy rank-3 flat layout regardless of `SCRATCHY_SUPERDSC_STICKMAJOR`, so the
-/// stick-major residual seam fix NEVER rewrites an attention per-head pointwise (its `mb` axis is
-/// heads/head·rows, NOT the residual token count). Byte-identical to the plain assembler on the
-/// OFF path; on the ON path it keeps the attention path rank-3 (the fix targets residual ops only).
-#[allow(clippy::too_many_arguments)]
-pub fn assemble_pointwise_broadcast_hm<T: crate::collective::Tp>(
-    op_name: &str,
-    op_func: &'static str,
-    // TYPED row/width slots — the head-major caller states its own row structure through the doors
-    // (head-major rows, mask rows) exactly as the plain assembler's callers do.
-    rows: crate::sdsc_abstract::RowCount,
-    cols: crate::sdsc_abstract::BlockCols,
-    inputs: &[EwOperand<'_>],
-    o: &Stk<FlatTag>,
-    sym_id_base: &mut i64,
-    layout: Option<&BundleLayout>,
-) -> Result<EmittedOp<T>, crate::superdsc_error::SuperDscError> {
-    // Flat output ⇒ head-major (per-head attention) op; the builder derives head_major from the type.
-    assemble_pointwise_broadcast_off(
-        op_name,
-        op_func,
-        rows,
-        cols,
+        op,
         inputs,
         o,
         crate::addr::DevOff::ZERO,
@@ -1295,12 +1281,8 @@ pub fn assemble_pointwise_broadcast_hm<T: crate::collective::Tp>(
 }
 
 /// The operands and geometry of a GATHERED pointwise op — the parameter list of
-/// [`assemble_pointwise_broadcast_gather`], carried as a struct.
-///
-/// A struct rather than nine positional parameters because the sibling assemblers below predate that
-/// convention and each carries an `#[allow(clippy::too_many_arguments)]`; this follows
-/// [`lower_ktir_to_superdsc::rope_at`]'s `RopeAt` instead, which is the newer shape in this crate and
-/// adds no sixteenth `allow`.
+/// [`assemble_pointwise_broadcast_gather`], carried as a struct (the shape of
+/// [`lower_ktir_to_superdsc::rope_at`]'s `RopeAt`).
 pub struct PointwiseGather<'a, O: KindTag> {
     /// The descriptor's name.
     pub op_name: &'a str,
@@ -1603,8 +1585,7 @@ pub fn assemble_pointwise_broadcast_gather<T: crate::collective::Tp, O: KindTag>
 
 /// ONE LEG of a gathered pointwise op — the whole node when the index fits one stick, and one index
 /// stick's worth of rows when it does not. See [`assemble_pointwise_broadcast_gather`], whose body this
-/// is; it takes a struct because the leg carries fourteen quantities and the sibling assemblers'
-/// `#[allow(clippy::too_many_arguments)]` is not a convention worth extending.
+/// is; it takes a struct because the leg carries fourteen quantities.
 struct GatherLeg<'a> {
     /// The NODE's descriptor name — used in refusals, so a leg's diagnostic names the op the program
     /// stated and not only the synthetic leg spelling.
@@ -1697,17 +1678,11 @@ fn one_gathered_leg<T: crate::collective::Tp>(
     .map_err(|e| SuperDscError(format!("{op_name}: leg `{leg_name}`: {e}")))?;
     let mut op = pointwise_broadcast_opspec_from_tile(
         &leg_tile,
-        leg_rows,
-        cols,
-        op_func_from_str(op_func),
-        inputs,
-        o_name,
-        // ⛔ ZERO, ALWAYS — the row-window base is applied BELOW and not here. See
+        EwSpec { op: op_func_from_str(op_func), rows: leg_rows, cols, inputs, o_name, out_offset: // ⛔ ZERO, ALWAYS — the row-window base is applied BELOW and not here. See
         // `AnyTensorArg::set_offset_elems`: this builder reads `out_offset` to decide the operand
         // RANK, and a row window is not the whole-block shift its stick-major (rank-2) form requires,
         // so passing it here would drop the leg to the rank-3 flat presentation.
-        crate::addr::OutCorner::ZERO,
-        head_major,
+        crate::addr::OutCorner::ZERO, head_major },
         layout,
         crate::work::CoreDivision::Gathered(split),
     )
@@ -1825,7 +1800,7 @@ fn one_gathered_leg<T: crate::collective::Tp>(
     {
         for dsc_map in dsc.dscs_.iter_mut() {
             for d in dsc_map.values_mut() {
-                set_iter_dim(&mut d.N_, entry_axis, node_rows);
+                set_iter_dim(&mut d.n, entry_axis, node_rows);
             }
         }
     }
@@ -2091,17 +2066,18 @@ fn note_lx_touches(
 
 /// [`assemble_pointwise_broadcast`] that writes the output to a COLUMN-BLOCK OFFSET
 /// (`out_offset` elements into the output tensor) — see [`pointwise_chunk_out_offset`].
-#[allow(clippy::too_many_arguments)]
 pub fn assemble_pointwise_broadcast_off<T: crate::collective::Tp, O: KindTag>(
-    op_name: &str,
-    op_func: &'static str,
     // TYPED row/width slots. Every caller states WHICH row quantity (`RowCount`'s doors: mask rows,
     // chunk rows, padded rows, pad remainder, token rows) and WHICH width (`BlockCols`'s doors: one
     // stick, the new block's `mq_pad`, the head dim, feature cols) fills the slot — the quantities
     // are numerically equal across whole rung families (64 == 64 at mq<=2, hd == stick at hd=64),
     // so a bare `u32` could carry any of them without anything noticing.
-    rows: crate::sdsc_abstract::RowCount,
-    cols: crate::sdsc_abstract::BlockCols,
+    OpDecl {
+        op_name,
+        op_func,
+        rows,
+        cols,
+    }: OpDecl<'_>,
     inputs: &[EwOperand<'_>],
     o: &Stk<O>,
     // TYPED, like the inputs' `In::sliced`. A write offset is a DEVICE address, so it must come from
@@ -2132,8 +2108,8 @@ pub fn assemble_pointwise_broadcast_off<T: crate::collective::Tp, O: KindTag>(
 }
 
 /// The parameter list of [`assemble_pointwise_broadcast_divided`], carried as a struct — the
-/// [`PointwiseGather`] / `RopeAt` shape, which adds no `#[allow(clippy::too_many_arguments)]`. Every field
-/// but `division` is [`assemble_pointwise_broadcast_off`]'s, with the same contract.
+/// [`PointwiseGather`] / `RopeAt` shape. Every field but `division` is
+/// [`assemble_pointwise_broadcast_off`]'s, with the same contract.
 pub struct PointwiseDivided<'a, O: KindTag> {
     pub op_name: &'a str,
     pub op_func: &'static str,
@@ -2270,13 +2246,15 @@ fn assemble_pointwise_stated<T: crate::collective::Tp, O: KindTag>(
         )));
     }
     let mut op = pointwise_broadcast_opspec_df(
-        func,
-        rows,
-        cols,
-        inputs,
-        o_name,
-        out_offset,
-        head_major,
+        EwSpec {
+            op: func,
+            rows,
+            cols,
+            inputs,
+            o_name,
+            out_offset,
+            head_major,
+        },
         Df::Fp16,
         layout,
         division,
@@ -2291,48 +2269,6 @@ fn assemble_pointwise_stated<T: crate::collective::Tp, O: KindTag>(
     let folds = SdscFoldSet::new(op.iter.cores_used());
     emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout).map_err(|e| {
         crate::superdsc_error::SuperDscError(format!("assemble_pointwise_broadcast {op_name}: {e}"))
-    })
-}
-
-/// fp32 elementwise (the torch-spyre RMSNorm island): every operand IEEE_FP32 (`df`), whole-tensor,
-/// non-head-major. Callers must upcast ALL operands via `dl16tofp32` first (no mixed [fp16,fp32] op).
-#[allow(clippy::too_many_arguments)]
-pub fn assemble_pointwise_broadcast_df<T: crate::collective::Tp>(
-    op_name: &str,
-    op_func: &'static str,
-    rows: u32,
-    cols: u32,
-    inputs: &[EwOperand<'_>],
-    o_name: &str,
-    df: Df,
-    sym_id_base: &mut i64,
-    layout: Option<&BundleLayout>,
-) -> Result<EmittedOp<T>, crate::superdsc_error::SuperDscError> {
-    // head_major=TRUE ⇒ rank-3 flat (NOT rank-2 stick-major). The fp32 rmsnorm island runs FLAT so it
-    // agrees with the fp16↔fp32 converts (which MUST be rank-3 — the narrowing convert crashes dxp in
-    // rank-2). Consistent flat inside the island; only the x-read / out-write boundaries touch RowBlocked.
-    let op = pointwise_broadcast_opspec_df(
-        op_func_from_str(op_func),
-        rows,
-        cols,
-        inputs,
-        o_name,
-        crate::addr::OutCorner::ZERO,
-        true,
-        df,
-        layout,
-        crate::work::EwDivision::Law,
-    )
-    .map_err(|e| {
-        crate::superdsc_error::SuperDscError(format!(
-            "assemble_pointwise_broadcast_df {op_name}: {e}"
-        ))
-    })?;
-    let folds = SdscFoldSet::new(op.iter.cores_used());
-    emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout).map_err(|e| {
-        crate::superdsc_error::SuperDscError(format!(
-            "assemble_pointwise_broadcast_df {op_name}: {e}"
-        ))
     })
 }
 
@@ -2358,10 +2294,12 @@ pub fn assemble_broadcast_mul_gate<T: crate::collective::Tp>(
     // "multiply" is the INTERNAL op_func_from_str key (→ OpFunc::Multiply, whose
     // wire name() is "mul"); passing "mul" would miss the match and default to Add.
     assemble_pointwise_broadcast(
-        op_name,
-        "multiply",
-        rows,
-        cols,
+        OpDecl {
+            op_name,
+            op_func: "multiply",
+            rows,
+            cols,
+        },
         &[
             In::full(&rb(x_name, r, c)).ew(),
             EwOperand {
@@ -2426,16 +2364,16 @@ fn slice_add_gate_opspec(rows: u32, half: u32, x: &str, o: &str) -> Result<OpSpe
     let plan = WorkPlan::divide(&dims, crate::device_gen::whole(), distribute_cores)?;
     let dd = plan.iter_syms(["mb", "out", "y"]);
     let mk = |is_input: bool, name: &str| {
-        TensorArg::<3>::new(
+        TensorArg::<3>::new(TensorArgDecl {
             is_input,
-            name.to_string(),
-            Role::Output,
-            [Scale::Active, Scale::Active, Scale::Active],
-            dd,
-            ["mb", "out", "y"],
-            "out",
-            Allocation::Hbm,
-        )
+            name: name.to_string(),
+            role: Role::Output,
+            scale: [Scale::Active, Scale::Active, Scale::Active],
+            device_dims: dd,
+            layout: ["mb", "out", "y"],
+            stick: "out",
+            allocation: Allocation::Hbm,
+        })
         .map_err(|e| e.0)
     };
     let x_lo = mk(true, x)?; // offset 0
@@ -2725,7 +2663,7 @@ impl<T: crate::collective::Tp> EmittedOp<T> {
                 let mut op = self.dsc().clone();
                 for dsc_map in op.dscs_.iter_mut() {
                     for dsc in dsc_map.values_mut() {
-                        for mut node in dsc.scheduleTree_.edit() {
+                        for mut node in dsc.schedule_tree.edit() {
                             let ti = node.operand();
                             let Some(stride) =
                                 self.affine_strides.get(ti).and_then(|m| m.get("out"))
@@ -2760,7 +2698,7 @@ impl<T: crate::collective::Tp> EmittedOp<T> {
         if let Some(op) = e.op.as_mut() {
             for dsc_map in op.dscs_.iter_mut() {
                 for dsc in dsc_map.values_mut() {
-                    for mut node in dsc.scheduleTree_.edit().filter(|n| n.component() == "hbm") {
+                    for mut node in dsc.schedule_tree.edit().filter(|n| n.component() == "hbm") {
                         for v in node.start_addrs().values_mut() {
                             if let Ok(a) = v.parse::<u64>()
                                 && window.contains(&a)
@@ -2837,7 +2775,7 @@ impl<T: crate::collective::Tp> EmittedOp<T> {
                             continue; // non-tiled / LX / INPUT tensor — OK.
                         }
                         assert!(
-                            dsc.scheduleTree_.iter().any(|n| n.ldsIdx_ as usize == ti),
+                            dsc.schedule_tree.iter().any(|n| n.lds_idx as usize == ti),
                             "EmittedOp {op_name}: tiled tensor {ti} has a non-empty stride but no \
                              allocate node to bump per trip (TiledHasStrideAndNode witness)"
                         );
@@ -2977,7 +2915,7 @@ fn rewrite_op_for_time_tile<T: crate::collective::Tp>(
     let time = tile.count();
     let tiled_dim = tile.dim().name();
     let views: Vec<ArgView<'_>> = op.args().iter().map(|a| a.view()).collect();
-    let cores = inner.numCoresUsed_.max(1);
+    let cores = inner.num_cores_used.max(1);
     let eps = Fp16::ELEMS_PER_STICK as i64;
     let per_core_out = op.iter.per_core_extent(tiled_dim) as i64;
     let out_per_time = per_core_out / time as i64;
@@ -2992,14 +2930,14 @@ fn rewrite_op_for_time_tile<T: crate::collective::Tp>(
     let per_time_full_out = full_out / time as i64;
     for dsc_map in inner.dscs_.iter_mut() {
         for dsc in dsc_map.values_mut() {
-            set_iter_dim_i(&mut dsc.N_, tiled_dim, per_time_full_out);
+            set_iter_dim_i(&mut dsc.n, tiled_dim, per_time_full_out);
             set_iter_dim_i(
-                &mut dsc.dataStageParam_.get_mut("0").unwrap().ss_,
+                &mut dsc.data_stage_param.get_mut("0").unwrap().ss_,
                 tiled_dim,
                 out_per_time,
             );
             set_iter_dim_i(
-                &mut dsc.dataStageParam_.get_mut("0").unwrap().el_,
+                &mut dsc.data_stage_param.get_mut("0").unwrap().el_,
                 tiled_dim,
                 out_per_time,
             );
@@ -3214,7 +3152,7 @@ fn rewrite_op_for_time_tile<T: crate::collective::Tp>(
         // the stick's, at the split it was built with.
         for dsc_map in inner.dscs_.iter_mut() {
             for dsc in dsc_map.values_mut() {
-                if let Some(mut node) = dsc.scheduleTree_.edit().find(|n| n.operand() == ti) {
+                if let Some(mut node) = dsc.schedule_tree.edit().find(|n| n.operand() == ti) {
                     node.divide_stick(out_per_time, eps);
                 }
             }
@@ -3572,15 +3510,15 @@ pub fn emit_sdsc(
     let mut output_refs: Vec<String> = Vec::new();
     for (i, v) in views.iter().enumerate() {
         labeled.push(LabeledDs {
-            ldsIdx_: i as u32,
-            dsName_: format!("Tensor{i}"),
-            dsType_: v.role.ds_type(),
+            lds_idx: i as u32,
+            ds_name: format!("Tensor{i}"),
+            ds_type: v.role.ds_type(),
             // In the order this tensor's dims go to dxp (its proven `DeviceOrder`).
             scale_: match v.device_order {
                 Some(o) => o.positions.iter().map(|&j| v.scale[j].to_i64()).collect(),
                 None => v.scale.iter().map(|s| s.to_i64()).collect(),
             },
-            wordLength: v.df.word_length(),
+            word_length: v.df.word_length(),
             // Per-tensor dtype from the arg's typed `Df` (`v.df`, the SINGLE source of truth) — NOT a name
             // suffix. `Df::Fp32` → IEEE_FP32 (4-byte, the KSPLIT fp32-SFP-merge partials); `Df::Fp8` →
             // SEN143_FP8 (1-byte, the packed fp8 W8A8 path); `Df::Bf16` → BF16E; else SEN169_FP16. INERT for
@@ -3591,7 +3529,7 @@ pub fn emit_sdsc(
             // only `bmm_sen1p5.ddl` binds IEEE_FP32). NOTE: SEN169_FP16 is 1-6-9 (6-bit exp, bias 31) ⇒ max
             // finite ≈ 4.3e9, NOT 65504 (that is IEEE-fp16's 5-bit-exp max). Kani-proven
             // (`sen169_holds_attention_score_no_overflow`): a ~1e5 score is a NORMAL SEN169 value.
-            dataFormat_: v.df.dataformat(),
+            data_format: v.df.dataformat(),
             // ⛔⛔⛔⛔⛔ A GATHER'S INDEX IS **HBM-ONLY** — no LX residency — and the scheduler refuses
             // the bake otherwise.
             //
@@ -3611,7 +3549,7 @@ pub fn emit_sdsc(
             // `MemOrg::hbm_only()` has existed in `wire.rs` since the gather's first port with ZERO
             // call sites and the doc comment "index tensors must reside in HBM — no LX indirect
             // addressing". This is that call site.
-            memOrg_: match (v.allocation.is_lx(), &v.role) {
+            mem_org: match (v.allocation.is_lx(), &v.role) {
                 (true, _) => MemOrg::lx_only(),
                 (false, Role::Index) => MemOrg::hbm_only(),
                 (false, _) => MemOrg::hbm_lx(),
@@ -3630,21 +3568,21 @@ pub fn emit_sdsc(
         primary.entry(v.role.ds_type()).or_insert_with(|| {
             if is_transpose_out {
                 LayoutInfo {
-                    layoutDimOrder_: v.device_dims_order().to_vec(),
-                    stickDimOrder_: vec!["out", "mb"],
-                    stickSize_: vec![8, 8],
+                    layout_dim_order: v.device_dims_order().to_vec(),
+                    stick_dim_order: vec!["out", "mb"],
+                    stick_size: vec![8, 8],
                 }
             } else if is_fp8_kernel {
                 LayoutInfo {
-                    layoutDimOrder_: v.device_dims_order().to_vec(),
-                    stickDimOrder_: vec!["in", "out"],
-                    stickSize_: vec![2, 64],
+                    layout_dim_order: v.device_dims_order().to_vec(),
+                    stick_dim_order: vec!["in", "out"],
+                    stick_size: vec![2, 64],
                 }
             } else {
                 LayoutInfo {
-                    layoutDimOrder_: v.device_dims_order().to_vec(),
-                    stickDimOrder_: vec![v.stick],
-                    stickSize_: vec![v.df.elems_per_stick()], // fp16/bf16: 64; fp32: 32; fp8/int8: 128
+                    layout_dim_order: v.device_dims_order().to_vec(),
+                    stick_dim_order: vec![v.stick],
+                    stick_size: vec![v.df.elems_per_stick()], // fp16/bf16: 64; fp32: 32; fp8/int8: 128
                 }
             }
         });
@@ -4034,10 +3972,10 @@ pub fn emit_sdsc(
         // only where it is not `v.layout`'s, and a proven permutation of it (`DeviceOrder`).
         let device_from = v.device_order;
         Ok(AllocNode {
-            nodeType_: "allocate",
+            node_type: "allocate",
             name_: name,
             prev_: String::new(),
-            ldsIdx_: i as u32,
+            lds_idx: i as u32,
             component_: comp,
             // ⛔⛔⛔⛔⛔ A GATHERED VALUE TENSOR IS **NOT** SYMBOLIC — `Some(0)`, IBM's paged fixture's
             // own value, and this was `Some(1)`.
@@ -4064,7 +4002,7 @@ pub fn emit_sdsc(
             // so the plane / kv-head / slot / feature terms the score leg bakes into its offset SURVIVE
             // and the index supplies only the PAGE term. That is exactly the arithmetic
             // `gather_entries_per_page` assumes.
-            isStartAddrSymbolic_: match &indirect_role {
+            is_start_addr_symbolic: match &indirect_role {
                 Some(IndirectRole::Value { .. }) => Some(0),
                 None | Some(IndirectRole::Index { .. }) => None,
             },
@@ -4074,7 +4012,7 @@ pub fn emit_sdsc(
             // stick-major walk (`element_torchspyre_parity`). Reordering here DIVERGES from the golden.
             // A view that states its own device order (two row dims, read innermost-first by dxp) is
             // the one exception, and states it on the view.
-            layoutDimOrder_: v.device_dims_order().to_vec(),
+            layout_dim_order: v.device_dims_order().to_vec(),
             // ── The ON-CARD WALK, DERIVED from the SAME `sl` the per-core START uses (`StickLayout::
             // max_dim_sizes`) so the two cannot disagree. Stick-blocked (`RowBlocked`/`Kernel`) ⇒ `-1` per
             // dim (dxp reconstructs the RowBlocked device_size from N_/layoutDimOrder_/stickSize_ and
@@ -4102,7 +4040,7 @@ pub fn emit_sdsc(
             //
             // `Span::Swept` with NO declaration reproduces `op.iter.extent(d)` exactly, and no
             // operand in any shipped bundle declares one — so every existing bundle is byte-identical.
-            maxDimSizes_: {
+            max_dim_sizes: {
                 let swept: Vec<usize> = v.layout.iter().map(|&d| iter.extent(d) as usize).collect();
                 let stick_pos = v
                     .layout
@@ -4170,12 +4108,12 @@ pub fn emit_sdsc(
             //
             // `None` (every op today) yields exactly the previous three values, so this is
             // byte-identical for every shipped bundle. A test asserts that rather than trusting it.
-            indirectAllocType_: match &indirect_role {
+            indirect_alloc_type: match &indirect_role {
                 None => "no_indirection",
                 Some(IndirectRole::Index { .. }) => "index_tensor",
                 Some(IndirectRole::Value { .. }) => "value_tensor",
             },
-            relatedIndirectAccessAlloc_: indirect_role.as_ref().map(|r| {
+            related_indirect_access_alloc: indirect_role.as_ref().map(|r| {
                 // The partner's node name, built by the SAME `format!` as `name` above so the
                 // cross-link cannot drift from the node it points at.
                 let partner = match r {
@@ -4212,12 +4150,12 @@ pub fn emit_sdsc(
             // (init_binary grows by 185,856 B over 128 gathered sdscs — the idx2addr programs). The
             // fp32 mint must NOT compute the addresses itself: the base needs 26+ bits and fp32
             // carries 24.
-            indexTensorType_: match &indirect_role {
+            index_tensor_type: match &indirect_role {
                 Some(IndirectRole::Index { .. }) => Some("index"),
                 None | Some(IndirectRole::Value { .. }) => None,
             },
-            startAddressCoreCorelet_: addr,
-            backGapCore_: None,
+            start_address_core_corelet: addr,
+            back_gap_core: None,
             coordinates_: coordinates,
         })
     })?;
@@ -4328,13 +4266,13 @@ pub fn emit_sdsc(
             let out_ref = format!("Tensor{out_idx}-idx{out_idx}");
             let epi_ref = format!("Tensor{arg_idx}-idx{arg_idx}");
             vec![ComputeOp {
-                exUnit: "sfp",
-                opFuncName: op_func.name().to_string(),
+                ex_unit: "sfp",
+                op_func_name: op_func.name().to_string(),
                 // Matches the golden's biasadd entry exactly: plain fp16, regular fidelity — the
                 // epilogue's own operand is always fp16 (mask/bias/residual), independent of whatever
                 // dtype the matmul itself ran in.
                 attributes_: ComputeAttrs {
-                    dataFormat_: Fp16::NAME,
+                    data_format: Fp16::NAME,
                     fidelity_: "regular",
                 },
                 // The golden's biasadd entry historically carried `"location": "invalid"`, mirrored
@@ -4344,10 +4282,10 @@ pub fn emit_sdsc(
                 // runs in the same loop nest as its matmul, so "Inner" — the same location every
                 // other computeOp in a bundle carries — is also the semantically right value.
                 location: "Inner",
-                inputLabeledDs: vec![out_ref.clone(), epi_ref],
-                interimLabeledDs: vec![],
-                outputLabeledDs: vec![out_ref],
-                indirectAccessIndexLabeledDs: vec![],
+                input_labeled_ds: vec![out_ref.clone(), epi_ref],
+                interim_labeled_ds: vec![],
+                output_labeled_ds: vec![out_ref],
+                indirect_access_index_labeled_ds: vec![],
             }]
         }
         _ => Vec::new(),
@@ -4355,25 +4293,25 @@ pub fn emit_sdsc(
 
     let (core_fold, corelet_fold) = (tree.core_fold(), tree.corelet_fold());
     let dsc = Dsc {
-        numCoresUsed_: cores,
-        numCoreletsUsed_: folds.corelet_fold(),
-        coreIdsUsed_: (0..cores).collect(),
-        N_: n_space,
-        coordinateMasking_: coordinate_masking,
-        maskingConstId_: masking_const_id,
-        dataStageParam_: BTreeMap::from([("0".to_string(), stage)]),
-        primaryDsInfo_: primary,
-        scheduleTree_: tree,
-        labeledDs_: labeled,
-        constantInfo_: constant_info,
-        computeOp_: {
+        num_cores_used: cores,
+        num_corelets_used: folds.corelet_fold(),
+        core_ids_used: (0..cores).collect(),
+        n: n_space,
+        coordinate_masking,
+        masking_const_id,
+        data_stage_param: BTreeMap::from([("0".to_string(), stage)]),
+        primary_ds_info: primary,
+        schedule_tree: tree,
+        labeled_ds: labeled,
+        constant_info,
+        compute_op: {
             let mut ops = vec![ComputeOp {
-                exUnit: op.ex_unit().as_str(),
+                ex_unit: op.ex_unit().as_str(),
                 // Dtype-suffixed matmul opFuncName per DDL bmm.ddl (batchmatmulfp8/int8, matmulfp8/int8): a
                 // quantized matmul's OPERANDS carry the dtype (fp8/int8 via each arg's typed `Df`; its OUTPUT is
                 // fp16, so read an operand, not the output). Same-dtype kernels only (the DDL pairs operands
                 // same-dtype). fp16 matmul + every non-matmul op keep the bare `OpFunc::name`.
-                opFuncName: {
+                op_func_name: {
                     let base = op.op().name();
                     if matches!(op.op(), OpFunc::Matmul | OpFunc::BatchMatmul) {
                         match views
@@ -4397,7 +4335,7 @@ pub fn emit_sdsc(
                     // bmm.ddl `%ptsum_fp`, but the `batchmatmulfp8` kernel is selected by this SEN143_FP8
                     // marker + the fp8 operand layouts; SEN169_FP16 here is "no suitable op mapping"). Else the
                     // dormant bf16 score path is BF16E, and every other op is SEN169_FP16 (byte-identical).
-                    dataFormat_: if fp8_matmul {
+                    data_format: if fp8_matmul {
                         <Fp8 as DataFormat>::NAME
                     } else if views.get(out_idx).is_some_and(|o| matches!(o.df, Df::Bf16)) {
                         "BF16E"
@@ -4456,9 +4394,9 @@ pub fn emit_sdsc(
                 // predate the validator). The pair's ONE surviving divergence is
                 // `constantInfo_` ([`OpFunc::is_topk_pair`]) — and it has no NR refine for
                 // an explicit `auxLoopName` to suppress.
-                inputLabeledDs: input_refs,
-                interimLabeledDs: vec![],
-                outputLabeledDs: output_refs,
+                input_labeled_ds: input_refs,
+                interim_labeled_ds: vec![],
+                output_labeled_ds: output_refs,
                 // ── THE THIRD FIELD OF THE GATHER: the op names the INDEX side ──
                 // Same `Tensor{i}-idx{i}` spelling the labeled-DS refs above are built with, and the
                 // same operand position the two allocate nodes cross-link through, so all three
@@ -4467,7 +4405,7 @@ pub fn emit_sdsc(
                 //
                 // Empty for every op that declares no gather, which is all of them today — so this
                 // is byte-identical for every shipped bundle.
-                indirectAccessIndexLabeledDs: op.indirect().map_or_else(Vec::new, |ia| {
+                indirect_access_index_labeled_ds: op.indirect().map_or_else(Vec::new, |ia| {
                     vec![format!("Tensor{}-idx{}", ia.index, ia.index)]
                 }),
             }];
@@ -4477,11 +4415,11 @@ pub fn emit_sdsc(
     };
 
     Ok(SdscOp {
-        sdscFoldProps_: vec![FoldProp {
+        sdsc_fold_props: vec![FoldProp {
             factor_: folds.time_fold() as i64,
             label_: "time",
         }],
-        sdscFolds_: SdscFolds {
+        sdsc_folds: SdscFolds {
             dim_prop_func: vec![FoldFunc::Affine {
                 alpha_: 1,
                 beta_: 0,
@@ -4493,19 +4431,19 @@ pub fn emit_sdsc(
             data_: BTreeMap::from([("[0]".to_string(), "0".to_string())]),
         },
         // Off the tree its allocate nodes were minted from — one fold set for both.
-        coreFoldProp_: core_fold,
-        coreletFoldProp_: corelet_fold,
-        numCoresUsed_: cores,
+        core_fold_prop: core_fold,
+        corelet_fold_prop: corelet_fold,
+        num_cores_used: cores,
         // coreIdToDsc_ MUST span exactly the cores the op USES (`cores`), NOT a fixed
         // core count — torch-spyre uses `range(num_cores)` (compute_ops.py:527). With
         // every core listed, an op using <32 cores lists phantom cores 18..31 here while
         // coreIdToDscSchedule (below) covers only 0..cores, so the multi-op stitcher
         // derives units for cores absent from the schedule → DtException "expecting a
         // valid entry in core schedule" (ModuleStitcher.cpp:216). Keep them consistent.
-        coreIdToDsc_: (0..cores).map(|c| (c.to_string(), 0u32)).collect(),
-        numWkSlicesPerDim_: all_dims.iter().map(|&d| (d, op.iter.split_of(d))).collect(),
-        coreIdToWkSlice_: wk_slice,
-        coreIdToDscSchedule: core_dsc_schedule(cores),
+        core_id_to_dsc: (0..cores).map(|c| (c.to_string(), 0u32)).collect(),
+        num_wk_slices_per_dim: all_dims.iter().map(|&d| (d, op.iter.split_of(d))).collect(),
+        core_id_to_wk_slice: wk_slice,
+        core_id_to_dsc_schedule: core_dsc_schedule(cores),
         dscs_: vec![BTreeMap::from([(op_name.to_string(), dsc)])],
     })
 }
@@ -4579,7 +4517,6 @@ pub struct In<'a, K: KindTag> {
     col_window: Option<crate::addr::ColWindow>,
     row_window: Option<crate::addr::RowWindow>,
 }
-#[allow(dead_code)] // ctors are used as the pointwise builders migrate to handle-flow (rmsnorm first)
 impl<'a, K: KindTag> In<'a, K> {
     pub fn full(h: &'a Stk<K>) -> Self {
         In {
@@ -4764,40 +4701,22 @@ impl<'a, K: KindTag> In<'a, K> {
 /// One-input pointwise `o = f(a)` with TYPED handles — the handle-flow entry point. The input kind `A`
 /// flows from whatever produced `a`; the output `o`'s kind drives head_major (see
 /// [`assemble_pointwise_broadcast_off`]). Byte-identical to the slice builder (it IS the slice builder).
-#[allow(clippy::too_many_arguments)]
 pub fn pw1<T: crate::collective::Tp, A: KindTag, O: KindTag>(
-    op_name: &str,
-    op_func: &'static str,
     // TYPED row/width slots — the handle-flow entry point demands the same named-door quantities
     // as `assemble_pointwise_broadcast_off`, so a caller states its extent's meaning here too.
-    rows: crate::sdsc_abstract::RowCount,
-    cols: crate::sdsc_abstract::BlockCols,
+    op: OpDecl<'_>,
     a: In<A>,
     o: &Stk<O>,
     sym: &mut i64,
     layout: Option<&BundleLayout>,
 ) -> Result<EmittedOp<T>, crate::superdsc_error::SuperDscError> {
-    assemble_pointwise_broadcast_off(
-        op_name,
-        op_func,
-        rows,
-        cols,
-        &[a.ew()],
-        o,
-        crate::addr::DevOff::ZERO,
-        sym,
-        layout,
-    )
+    assemble_pointwise_broadcast_off(op, &[a.ew()], o, crate::addr::DevOff::ZERO, sym, layout)
 }
 
 /// Two-input pointwise `o = f(a, b)` with TYPED handles — each input carries its own kind.
-#[allow(clippy::too_many_arguments)]
 pub fn pw2<T: crate::collective::Tp, A: KindTag, B: KindTag, O: KindTag>(
-    op_name: &str,
-    op_func: &'static str,
     // TYPED row/width slots — same contract as `pw1`.
-    rows: crate::sdsc_abstract::RowCount,
-    cols: crate::sdsc_abstract::BlockCols,
+    op: OpDecl<'_>,
     a: In<A>,
     b: In<B>,
     o: &Stk<O>,
@@ -4805,10 +4724,7 @@ pub fn pw2<T: crate::collective::Tp, A: KindTag, B: KindTag, O: KindTag>(
     layout: Option<&BundleLayout>,
 ) -> Result<EmittedOp<T>, crate::superdsc_error::SuperDscError> {
     assemble_pointwise_broadcast_off(
-        op_name,
-        op_func,
-        rows,
-        cols,
+        op,
         &[a.ew(), b.ew()],
         o,
         crate::addr::DevOff::ZERO,
@@ -4913,10 +4829,12 @@ pub fn lx_op_local_pair<T: crate::collective::Tp, O: KindTag>(
     let pin = rb(&name, shape.rows(), shape.cols());
     let rows = crate::sdsc_abstract::RowCount::of_token_rows(shape.rows());
     let written = assemble_pointwise_broadcast_off(
-        &writer.op_name,
-        writer.op_func,
-        rows,
-        crate::sdsc_abstract::BlockCols::of_one_stick(crate::sdsc_abstract::Lanes::FP16),
+        OpDecl {
+            op_name: &writer.op_name,
+            op_func: writer.op_func,
+            rows,
+            cols: crate::sdsc_abstract::BlockCols::of_one_stick(crate::sdsc_abstract::Lanes::FP16),
+        },
         &writer.inputs,
         &pin,
         crate::addr::DevOff::ZERO,
@@ -4933,10 +4851,12 @@ pub fn lx_op_local_pair<T: crate::collective::Tp, O: KindTag>(
         .chain(reader.after)
         .collect();
     let read = assemble_pointwise_broadcast_off(
-        &reader.op_name,
-        reader.op_func,
-        rows,
-        reader.cols,
+        OpDecl {
+            op_name: &reader.op_name,
+            op_func: reader.op_func,
+            rows,
+            cols: reader.cols,
+        },
         &inputs,
         reader.out,
         crate::addr::DevOff::ZERO,
@@ -5098,32 +5018,32 @@ fn convert_opspec(
         let rb_arg = rb;
         if stickmajor {
             Ok(AnyTensorArg::R2(
-                TensorArg::<2>::new(
+                TensorArg::<2>::new(TensorArgDecl {
                     is_input,
-                    name.to_string(),
+                    name: name.to_string(),
                     role,
-                    [Scale::Active, Scale::Active],
-                    device_dims_r2,
-                    ["mb", "out"],
+                    scale: [Scale::Active, Scale::Active],
+                    device_dims: device_dims_r2,
+                    layout: ["mb", "out"],
                     stick,
-                    Allocation::Hbm,
-                )
+                    allocation: Allocation::Hbm,
+                })
                 .map_err(|e| e.0)?
                 .with_df(df)
                 .with_row_blocked(rb_arg),
             ))
         } else {
             Ok(AnyTensorArg::R3(
-                TensorArg::<3>::new(
+                TensorArg::<3>::new(TensorArgDecl {
                     is_input,
-                    name.to_string(),
+                    name: name.to_string(),
                     role,
-                    [Scale::Active, Scale::Active, Scale::Active],
+                    scale: [Scale::Active, Scale::Active, Scale::Active],
                     device_dims,
-                    ["mb", "out", "y"],
+                    layout: ["mb", "out", "y"],
                     stick,
-                    Allocation::Hbm,
-                )
+                    allocation: Allocation::Hbm,
+                })
                 .map_err(|e| e.0)?
                 .with_df(df)
                 .with_row_blocked(rb_arg),
@@ -5139,12 +5059,13 @@ fn convert_opspec(
 
 /// Assemble a dtype-convert op (see [`convert_opspec`]). Emit-time panic on a malformed spec = a `cargo build`
 /// error (guard-every-crash), same as the other `assemble_*`.
-#[allow(clippy::too_many_arguments)]
 pub fn assemble_convert<T: crate::collective::Tp>(
-    op_name: &str,
-    op_func: &str,
-    rows: u32,
-    cols: u32,
+    OpDecl {
+        op_name,
+        op_func,
+        rows,
+        cols,
+    }: OpDecl<'_, u32, u32>,
     in_: &Stk<RowBlockedTag>,
     o: &Stk<RowBlockedTag>,
     sym_id_base: &mut i64,
@@ -5205,12 +5126,13 @@ pub fn assemble_convert<T: crate::collective::Tp>(
 /// used to serve it (`assemble_convert_off`, flat offsets with no nest behind them) is deleted —
 /// there is no convert door left that takes an offset no nest minted. Emit-time panic on a
 /// malformed spec = a `cargo build` error (guard-every-crash), same as the other `assemble_*`.
-#[allow(clippy::too_many_arguments)]
 pub fn assemble_convert_col<T: crate::collective::Tp>(
-    op_name: &str,
-    op_func: &str,
-    rows: u32,
-    cols: u32,
+    OpDecl {
+        op_name,
+        op_func,
+        rows,
+        cols,
+    }: OpDecl<'_, u32, u32>,
     in_: &Stk<RowBlockedTag>,
     in_off: crate::addr::DevOff,
     o: &Stk<RowBlockedTag>,
@@ -5389,10 +5311,12 @@ pub fn assemble_pointwise<T: crate::collective::Tp>(
 ) -> Result<EmittedOp<T>, crate::superdsc_error::SuperDscError> {
     let mut sym_id_base: i64 = 0;
     assemble_pointwise_seeded(
-        op_name,
-        op_func,
-        rows,
-        cols,
+        OpDecl {
+            op_name,
+            op_func,
+            rows,
+            cols,
+        },
         in_names,
         o_name,
         &mut sym_id_base,
@@ -5401,12 +5325,13 @@ pub fn assemble_pointwise<T: crate::collective::Tp>(
 }
 
 /// [`assemble_pointwise`] with an explicit running symbol-id counter (risk #1).
-#[allow(clippy::too_many_arguments)]
 pub fn assemble_pointwise_seeded<T: crate::collective::Tp>(
-    op_name: &str,
-    op_func: &'static str,
-    rows: u32,
-    cols: u32,
+    OpDecl {
+        op_name,
+        op_func,
+        rows,
+        cols,
+    }: OpDecl<'_, u32, u32>,
     in_names: &[&str],
     o_name: &str,
     sym_id_base: &mut i64,
@@ -5625,27 +5550,27 @@ fn transpose_opspec(mb: u32, out: u32, in_name: &str, o_name: &str) -> Result<Op
         ));
     }
     let device_dims = plan.iter_syms(["mb", "out", "y"]);
-    let input = TensorArg::<3>::new(
-        true,
-        in_name.to_string(),
-        Role::Input,
-        [Scale::Active, Scale::Active, Scale::Active],
+    let input = TensorArg::<3>::new(TensorArgDecl {
+        is_input: true,
+        name: in_name.to_string(),
+        role: Role::Input,
+        scale: [Scale::Active, Scale::Active, Scale::Active],
         device_dims,
-        ["mb", "out", "y"],
-        "out",
-        Allocation::Hbm,
-    )
+        layout: ["mb", "out", "y"],
+        stick: "out",
+        allocation: Allocation::Hbm,
+    })
     .map_err(|e| e.0)?;
-    let output = TensorArg::<3>::new(
-        false,
-        o_name.to_string(),
-        Role::Output,
-        [Scale::Active, Scale::Active, Scale::Active],
+    let output = TensorArg::<3>::new(TensorArgDecl {
+        is_input: false,
+        name: o_name.to_string(),
+        role: Role::Output,
+        scale: [Scale::Active, Scale::Active, Scale::Active],
         device_dims,
-        ["mb", "out", "y"],
-        "out",
-        Allocation::Hbm,
-    )
+        layout: ["mb", "out", "y"],
+        stick: "out",
+        allocation: Allocation::Hbm,
+    })
     .map_err(|e| e.0)?;
     Ok(OpSpec::new(
         OpFunc::Transpose,
@@ -5684,7 +5609,6 @@ pub fn assemble_transpose<T: crate::collective::Tp>(
 /// core-division law is no longer among them: `transpose_core_split` builds only whole-block
 /// divisions, so its guard is a net and not a reachable refusal.) So the fallible form exists and the
 /// door uses it; `assemble_transpose` keeps its signature and its panic for every existing caller.
-#[allow(clippy::too_many_arguments)]
 pub fn try_assemble_transpose<T: crate::collective::Tp>(
     op_name: &str,
     mb: u32,
@@ -5764,17 +5688,17 @@ mod transpose_tests {
         let op = assemble_transpose("tr", MB, 128, "t1", "t2", &mut sid, None)
             .expect("the transpose builds");
         let d = dsc(&op, "tr");
-        let inp = &d.primaryDsInfo_["INPUT"];
-        let out = &d.primaryDsInfo_["OUTPUT"];
+        let inp = &d.primary_ds_info["INPUT"];
+        let out = &d.primary_ds_info["OUTPUT"];
         // Verbatim from the fixture's OUTPUT entry.
-        assert_eq!(out.stickDimOrder_, vec!["out", "mb"]);
-        assert_eq!(out.stickSize_, vec![8, 8]);
+        assert_eq!(out.stick_dim_order, vec!["out", "mb"]);
+        assert_eq!(out.stick_size, vec![8, 8]);
         // Verbatim from the fixture's INPUT entry.
-        assert_eq!(inp.stickDimOrder_, vec!["out"]);
-        assert_eq!(inp.stickSize_, vec![64]);
+        assert_eq!(inp.stick_dim_order, vec!["out"]);
+        assert_eq!(inp.stick_size, vec![64]);
         // The fixture states `["mb","out","y"]` for BOTH roles.
-        assert_eq!(inp.layoutDimOrder_, vec!["mb", "out", "y"]);
-        assert_eq!(out.layoutDimOrder_, vec!["mb", "out", "y"]);
+        assert_eq!(inp.layout_dim_order, vec!["mb", "out", "y"]);
+        assert_eq!(out.layout_dim_order, vec!["mb", "out", "y"]);
     }
 
     /// `exUnit "pt"` + `opFuncName "interslicetranspose_fp16"` — verbatim from the fixture's
@@ -5786,13 +5710,13 @@ mod transpose_tests {
         let op = assemble_transpose("tr", MB, 128, "t1", "t2", &mut sid, None)
             .expect("the transpose builds");
         let d = dsc(&op, "tr");
-        let c = &d.computeOp_[0];
-        assert_eq!(c.opFuncName, "interslicetranspose_fp16");
-        assert_eq!(c.exUnit, "pt");
+        let c = &d.compute_op[0];
+        assert_eq!(c.op_func_name, "interslicetranspose_fp16");
+        assert_eq!(c.ex_unit, "pt");
         // NOT fixture-backed: the golden's computeOp carries no `attributes_` at all. This is our
         // emitter's own field, which `ComputeOp`'s doc ties to torch-spyre's real frontend; it is
         // asserted as a regression pin on the fp16 marker, not as parity with the golden.
-        assert_eq!(c.attributes_.dataFormat_, "SEN169_FP16");
+        assert_eq!(c.attributes_.data_format, "SEN169_FP16");
     }
 
     /// The op's ITERATION SPACE is the fixture's, at the fixture's own extents: `out_ 3072`, `mb_ 384`,
@@ -5819,13 +5743,13 @@ mod transpose_tests {
             .expect("the transpose builds");
         let d = dsc(&op, "tr");
         assert_eq!(
-            d.primaryDsInfo_.keys().copied().collect::<Vec<_>>(),
+            d.primary_ds_info.keys().copied().collect::<Vec<_>>(),
             vec!["INPUT", "OUTPUT"],
             "exactly two roles, so the OUTPUT override is reached"
         );
-        assert_eq!(d.labeledDs_.len(), 2, "one input tensor, one output tensor");
+        assert_eq!(d.labeled_ds.len(), 2, "one input tensor, one output tensor");
         assert_eq!(
-            d.labeledDs_.iter().map(|l| l.dsType_).collect::<Vec<_>>(),
+            d.labeled_ds.iter().map(|l| l.ds_type).collect::<Vec<_>>(),
             vec!["INPUT", "OUTPUT"]
         );
     }
@@ -6116,22 +6040,22 @@ mod transpose_tests {
         );
         let d = dsc(op, "transpose_o102");
         assert_eq!(
-            d.primaryDsInfo_["OUTPUT"].stickDimOrder_,
+            d.primary_ds_info["OUTPUT"].stick_dim_order,
             vec!["y"],
             "the OUTPUT stick must be ONE dim — the only property the V3 translator's limit is a \
              function of",
         );
-        assert_eq!(d.primaryDsInfo_["OUTPUT"].stickSize_, vec![64]);
+        assert_eq!(d.primary_ds_info["OUTPUT"].stick_size, vec![64]);
         assert_eq!(
             (
-                d.primaryDsInfo_["INPUT"].layoutDimOrder_.clone(),
-                d.primaryDsInfo_["OUTPUT"].layoutDimOrder_.clone(),
+                d.primary_ds_info["INPUT"].layout_dim_order.clone(),
+                d.primary_ds_info["OUTPUT"].layout_dim_order.clone(),
             ),
             (vec!["y", "out"], vec!["out", "y"]),
             "the two roles' dim orders must be SWAPPED — that swap IS the transposition, and equal \
              orders would be a re-stick that copies",
         );
-        assert_eq!(d.computeOp_[0].opFuncName, "ReStickifyOpHBM");
+        assert_eq!(d.compute_op[0].op_func_name, "ReStickifyOpHBM");
     }
 
     /// A column extent that is not a whole stick is refused at the entry point too, and the message
@@ -6196,8 +6120,8 @@ mod transpose_tests {
             panic!("a transpose is ONE descriptor, got {}", ops.len());
         };
         let d = dsc(op, "transpose_o102");
-        assert_eq!(d.primaryDsInfo_["OUTPUT"].stickDimOrder_, vec!["y"]);
-        assert_eq!(d.computeOp_[0].opFuncName, "ReStickifyOpHBM");
+        assert_eq!(d.primary_ds_info["OUTPUT"].stick_dim_order, vec!["y"]);
+        assert_eq!(d.compute_op[0].op_func_name, "ReStickifyOpHBM");
     }
 
     // ── (iii) the byte-identity control ──────────────────────────────────────────────────────────
@@ -6217,28 +6141,38 @@ mod transpose_tests {
     #[test]
     fn a_non_transpose_op_still_sticks_one_64_element_stick_on_its_only_role() {
         let mut sid = 0i64;
-        let op =
-            assemble_pointwise_seeded("pw", "add", 64, 128, &["t1", "t2"], "t3", &mut sid, None)
-                .expect("the add builds");
+        let op = assemble_pointwise_seeded(
+            OpDecl {
+                op_name: "pw",
+                op_func: "add",
+                rows: 64,
+                cols: 128,
+            },
+            &["t1", "t2"],
+            "t3",
+            &mut sid,
+            None,
+        )
+        .expect("the add builds");
         let d = dsc(&op, "pw");
         assert_eq!(
-            d.primaryDsInfo_.keys().copied().collect::<Vec<_>>(),
+            d.primary_ds_info.keys().copied().collect::<Vec<_>>(),
             vec!["OUTPUT"],
             "a pointwise puts EVERY operand at Role::Output, so it shares the key the transpose \
              override is written under"
         );
-        let p = &d.primaryDsInfo_["OUTPUT"];
+        let p = &d.primary_ds_info["OUTPUT"];
         assert_eq!(
-            p.stickDimOrder_,
+            p.stick_dim_order,
             vec!["out"],
             "still the plain single-stick layout — the 8x8 override is Transpose-only"
         );
-        assert_eq!(p.stickSize_, vec![64]);
+        assert_eq!(p.stick_size, vec![64]);
         assert_eq!(
-            d.computeOp_[0].opFuncName, "add",
+            d.compute_op[0].op_func_name, "add",
             "and it is still an add on the sfp unit"
         );
-        assert_eq!(d.computeOp_[0].exUnit, "sfp");
+        assert_eq!(d.compute_op[0].ex_unit, "sfp");
     }
 }
 
@@ -6543,27 +6477,27 @@ fn topk_opspec(
             crate::superdsc_opspec::VENDOR_LX_SCHED_BYTES
         ));
     }
-    let input = TensorArg::<2>::new(
-        true,
-        in_name.to_string(),
-        Role::Input,
-        [Scale::Active, Scale::Active],
-        plan.iter_syms(["in", "y"]),
-        ["in", "y"],
-        "y",
-        Allocation::Hbm,
-    )
+    let input = TensorArg::<2>::new(TensorArgDecl {
+        is_input: true,
+        name: in_name.to_string(),
+        role: Role::Input,
+        scale: [Scale::Active, Scale::Active],
+        device_dims: plan.iter_syms(["in", "y"]),
+        layout: ["in", "y"],
+        stick: "y",
+        allocation: Allocation::Hbm,
+    })
     .map_err(|e| e.0)?;
-    let output = TensorArg::<2>::new(
-        false,
-        o_name.to_string(),
-        Role::Output,
-        [Scale::Active, Scale::Active],
-        plan.iter_syms(["out", "y"]),
-        ["out", "y"],
-        "y",
-        Allocation::Hbm,
-    )
+    let output = TensorArg::<2>::new(TensorArgDecl {
+        is_input: false,
+        name: o_name.to_string(),
+        role: Role::Output,
+        scale: [Scale::Active, Scale::Active],
+        device_dims: plan.iter_syms(["out", "y"]),
+        layout: ["out", "y"],
+        stick: "y",
+        allocation: Allocation::Hbm,
+    })
     .map_err(|e| e.0)?;
     Ok(OpSpec::new(
         member,
@@ -6667,30 +6601,30 @@ fn restickify_kt_opspec_2d(
     // device_size `[hd/64,cap,64]` = the SLAB-MAJOR store the cachewr writes (`dev_off([cap,hd],1,·)`) ⇒
     // reads K[slot][d] correctly at ANY head_dim (at hd==64 the single slab IS the flat `slot*hd+d`).
     // `dev_off` keys on stick POSITION + sizes (not names), so this is identical addressing to pre-rename.
-    let input = TensorArg::<2>::new(
-        true,
-        in_name.to_string(),
-        Role::Input,
-        [Scale::Active, Scale::Active],
-        plan.iter_syms(["y", "out"]),
-        ["y", "out"],
-        "out",
-        Allocation::Hbm,
-    )
+    let input = TensorArg::<2>::new(TensorArgDecl {
+        is_input: true,
+        name: in_name.to_string(),
+        role: Role::Input,
+        scale: [Scale::Active, Scale::Active],
+        device_dims: plan.iter_syms(["y", "out"]),
+        layout: ["y", "out"],
+        stick: "out",
+        allocation: Allocation::Hbm,
+    })
     .map_err(|e| e.0)?
     .with_offset(in_off);
     // OUTPUT: Kᵀ kernel view `[out=hd, y=cap]` sticked on `y` (=cap, dim 1 = LAST) ⇒ device_size
     // `[cap/64,hd,64]` = the exact cap-sticked layout the score matmul reads (`PagedKvPool::kt_write_off`).
-    let output = TensorArg::<2>::new(
-        false,
-        o_name.to_string(),
-        Role::Output,
-        [Scale::Active, Scale::Active],
-        plan.iter_syms(["out", "y"]),
-        ["out", "y"],
-        "y",
-        Allocation::Hbm,
-    )
+    let output = TensorArg::<2>::new(TensorArgDecl {
+        is_input: false,
+        name: o_name.to_string(),
+        role: Role::Output,
+        scale: [Scale::Active, Scale::Active],
+        device_dims: plan.iter_syms(["out", "y"]),
+        layout: ["out", "y"],
+        stick: "y",
+        allocation: Allocation::Hbm,
+    })
     .map_err(|e| e.0)?
     .with_offset(out_off);
     OpSpec::new(
@@ -6700,6 +6634,18 @@ fn restickify_kt_opspec_2d(
         AnyTensorArg::R2(output),
     )
     .map_err(|e| e.0)
+}
+
+/// What one 2-D Kᵀ restickify states: its descriptor name, the tile (slots × features) it moves,
+/// and each side's handle with the corner the tile starts at.
+pub struct RestickifyKt2d<'a> {
+    pub op_name: &'a str,
+    pub slots: crate::sdsc_abstract::KtTileSlots,
+    pub feats: crate::sdsc_abstract::KtTileFeats,
+    pub in_: &'a Stk<RowBlockedTag>,
+    pub in_off: crate::addr::DevOff,
+    pub o: &'a Stk<RowBlockedTag>,
+    pub out_off: crate::addr::DevOff,
 }
 
 /// Assemble ONE per-head Kᵀ restickify (natural `[slots,feats]` → slot-sticked `[feats,slots]`).
@@ -6717,15 +6663,16 @@ fn restickify_kt_opspec_2d(
 /// run would cross the tensor's end — the Kᵀ restickify writing past the `[nkvh, hd, mq_pad]`
 /// scratch into the next intermediate's bytes, read back as keys with a clean bake — is a `cargo
 /// build` failure at this door instead.
-#[allow(clippy::too_many_arguments)]
 pub fn assemble_restickify_kt_2d<T: crate::collective::Tp>(
-    op_name: &str,
-    slots: crate::sdsc_abstract::KtTileSlots,
-    feats: crate::sdsc_abstract::KtTileFeats,
-    in_: &Stk<RowBlockedTag>,
-    in_off: crate::addr::DevOff,
-    o: &Stk<RowBlockedTag>,
-    out_off: crate::addr::DevOff,
+    RestickifyKt2d {
+        op_name,
+        slots,
+        feats,
+        in_,
+        in_off,
+        o,
+        out_off,
+    }: RestickifyKt2d<'_>,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
 ) -> Result<EmittedOp<T>, crate::superdsc_error::SuperDscError> {
@@ -6900,29 +6847,29 @@ pub(crate) fn restickify_transpose_opspec_batched(
         ));
     }
     let active = [Scale::Active, Scale::Active, Scale::Active];
-    let input = TensorArg::<3>::new(
-        true,
-        in_name.to_string(),
-        Role::Input,
-        active,
-        plan.iter_syms(["mb", "y", "out"]),
-        ["mb", "y", "out"],
-        "out",
-        Allocation::Hbm,
-    )
+    let input = TensorArg::<3>::new(TensorArgDecl {
+        is_input: true,
+        name: in_name.to_string(),
+        role: Role::Input,
+        scale: active,
+        device_dims: plan.iter_syms(["mb", "y", "out"]),
+        layout: ["mb", "y", "out"],
+        stick: "out",
+        allocation: Allocation::Hbm,
+    })
     .map_err(|e| e.0)?
     .with_device_order(["y", "out", "mb"])
     .map_err(|e| e.0)?;
-    let output = TensorArg::<3>::new(
-        false,
-        o_name.to_string(),
-        Role::Output,
-        active,
-        plan.iter_syms(["mb", "out", "y"]),
-        ["mb", "out", "y"],
-        "y",
-        Allocation::Hbm,
-    )
+    let output = TensorArg::<3>::new(TensorArgDecl {
+        is_input: false,
+        name: o_name.to_string(),
+        role: Role::Output,
+        scale: active,
+        device_dims: plan.iter_syms(["mb", "out", "y"]),
+        layout: ["mb", "out", "y"],
+        stick: "y",
+        allocation: Allocation::Hbm,
+    })
     .map_err(|e| e.0)?
     .with_device_order(["out", "y", "mb"])
     .map_err(|e| e.0)?;
@@ -7494,7 +7441,7 @@ mod indirect_access_baseline {
     #[test]
     fn every_alloc_node_declares_no_indirection() {
         let (sdsc, json) = non_gather_sdsc();
-        let nodes = &dsc_of(&sdsc).scheduleTree_;
+        let nodes = &dsc_of(&sdsc).schedule_tree;
 
         // ⛔ ANTI-VACUITY FIRST. A `for` over an empty vec asserts nothing, and every claim below
         // this line is quantified over these nodes. Three distinct operand names → three nodes.
@@ -7507,7 +7454,7 @@ mod indirect_access_baseline {
 
         for n in nodes {
             assert_eq!(
-                n.indirectAllocType_, "no_indirection",
+                n.indirect_alloc_type, "no_indirection",
                 "alloc node {} declares no indirection",
                 n.name_
             );
@@ -7533,28 +7480,32 @@ mod indirect_access_baseline {
         let (sdsc, json) = non_gather_sdsc();
         let dsc = dsc_of(&sdsc);
 
-        for n in &dsc.scheduleTree_ {
+        for n in &dsc.schedule_tree {
             assert_eq!(
-                n.relatedIndirectAccessAlloc_, None,
+                n.related_indirect_access_alloc, None,
                 "{}: no cross-link partner",
                 n.name_
             );
-            assert_eq!(n.indexTensorType_, None, "{}: not an index tensor", n.name_);
+            assert_eq!(
+                n.index_tensor_type, None,
+                "{}: not an index tensor",
+                n.name_
+            );
             // A time=1 concrete-address op: the symbolic-start path a gathered value tensor takes
             // is not entered here either.
             assert_eq!(
-                n.isStartAddrSymbolic_, None,
+                n.is_start_addr_symbolic, None,
                 "{}: start address is concrete",
                 n.name_
             );
         }
 
-        assert!(!dsc.computeOp_.is_empty(), "there is a compute op to check");
-        for c in &dsc.computeOp_ {
+        assert!(!dsc.compute_op.is_empty(), "there is a compute op to check");
+        for c in &dsc.compute_op {
             assert!(
-                c.indirectAccessIndexLabeledDs.is_empty(),
+                c.indirect_access_index_labeled_ds.is_empty(),
                 "compute op '{}' names no index dataspace",
-                c.opFuncName
+                c.op_func_name
             );
         }
 
@@ -7583,11 +7534,11 @@ mod indirect_access_baseline {
     #[test]
     fn omission_is_the_serializer_not_the_spelling() {
         let (sdsc, _) = non_gather_sdsc();
-        let mut node = dsc_of(&sdsc).scheduleTree_[0].clone();
+        let mut node = dsc_of(&sdsc).schedule_tree[0].clone();
 
-        node.relatedIndirectAccessAlloc_ = Some("allocate-Tensor1_hbm".to_string());
-        node.indexTensorType_ = Some("index");
-        node.isStartAddrSymbolic_ = Some(1);
+        node.related_indirect_access_alloc = Some("allocate-Tensor1_hbm".to_string());
+        node.index_tensor_type = Some("index");
+        node.is_start_addr_symbolic = Some(1);
         let set = serde_json::to_string(&node).expect("AllocNode serializes");
 
         for key in [
@@ -7605,9 +7556,9 @@ mod indirect_access_baseline {
 
         // Same node, fields back to None: the keys go away again. Present-vs-absent on ONE node,
         // which is the property `skip_serializing_if` actually provides.
-        node.relatedIndirectAccessAlloc_ = None;
-        node.indexTensorType_ = None;
-        node.isStartAddrSymbolic_ = None;
+        node.related_indirect_access_alloc = None;
+        node.index_tensor_type = None;
+        node.is_start_addr_symbolic = None;
         let cleared = serde_json::to_string(&node).expect("AllocNode serializes");
         for key in [
             "relatedIndirectAccessAlloc_",
@@ -7638,7 +7589,7 @@ mod indirect_access_baseline {
         );
 
         let (sdsc, json) = non_gather_sdsc();
-        let n_ds = dsc_of(&sdsc).labeledDs_.len();
+        let n_ds = dsc_of(&sdsc).labeled_ds.len();
         assert_eq!(n_ds, 3, "one labeledDs per operand");
         // Every dataspace this op emits is hbm+lx, so the hbm-only form appears nowhere. Counted
         // against the dataspace total: a single one flipping would drop the count.
@@ -7756,12 +7707,12 @@ mod gather_cut {
     /// `[scale, table, index, output]` — the index is INSERTED before the output, so the output is 3.
     fn starts(op: &EmittedOp<crate::collective::TpWorld<1>>, lds: u32) -> Vec<u64> {
         let node = body(op)
-            .scheduleTree_
+            .schedule_tree
             .iter()
-            .find(|n| n.nodeType_ == "allocate" && n.ldsIdx_ == lds)
+            .find(|n| n.node_type == "allocate" && n.lds_idx == lds)
             .expect("an allocate node per operand");
         let mut v: Vec<u64> = node
-            .startAddressCoreCorelet_
+            .start_address_core_corelet
             .data_
             .values()
             .map(|s| s.parse::<u64>().expect("a decimal address"))
@@ -7811,29 +7762,29 @@ mod gather_cut {
             let dsc = op.op.as_ref().expect("a descriptor");
             let d = body(op);
             assert_eq!(
-                d.N_.mb_, ROWS as i64,
+                d.n.mb_, ROWS as i64,
                 "leg {k}: N_ carries the TENSOR's rows"
             );
-            assert_eq!(d.N_.out_, COLS as i64, "leg {k}: N_ `out` is untouched");
+            assert_eq!(d.n.out_, COLS as i64, "leg {k}: N_ `out` is untouched");
             // The WORK is the leg's own: `cap` rows over `cap` cores, one row each.
             assert_eq!(
-                dsc.numWkSlicesPerDim_["mb"],
+                dsc.num_wk_slices_per_dim["mb"],
                 cap(),
                 "leg {k}: the leg's own row split"
             );
             assert_eq!(
-                d.dataStageParam_["0"].ss_.mb_, 1,
+                d.data_stage_param["0"].ss_.mb_, 1,
                 "leg {k}: one row per core"
             );
             assert_eq!(
-                d.dataStageParam_["0"].el_.mb_, 1,
+                d.data_stage_param["0"].el_.mb_, 1,
                 "leg {k}: one row per core"
             );
         }
         // ⛔ AND AN UNCUT OP IS UNTOUCHED, which is what keeps the m32 descriptor byte-identical: with
         // one stick there is no window, so `N_` is the plan's own extent exactly as before the cut.
         assert_eq!(
-            body(&legs(cap())[0]).N_.mb_,
+            body(&legs(cap())[0]).n.mb_,
             cap() as i64,
             "an uncut op's N_ is its own extent"
         );
@@ -8140,10 +8091,12 @@ mod time_tiled_broadcast_operand_is_address_stable {
         let cap = rb("tsc_cap", 1, Fp16::ELEMS_PER_STICK);
         let out = rb("tsc_o", ROWS, COLS);
         assemble_pointwise_broadcast_off(
-            "tscdiv_t2326",
-            "realdiv",
-            RowCount::of_token_rows(ROWS),
-            BlockCols::of_feature_cols(COLS),
+            OpDecl {
+                op_name: "tscdiv_t2326",
+                op_func: "realdiv",
+                rows: RowCount::of_token_rows(ROWS),
+                cols: BlockCols::of_feature_cols(COLS),
+            },
             &[In::full(&x).ew(), In::scalar(&cap).ew()],
             &out,
             crate::addr::DevOff::ZERO,
@@ -8160,11 +8113,11 @@ mod time_tiled_broadcast_operand_is_address_stable {
             .values()
             .next()
             .expect("one dsc")
-            .scheduleTree_
+            .schedule_tree
             .iter()
-            .find(|n| n.nodeType_ == "allocate" && n.ldsIdx_ == lds)
+            .find(|n| n.node_type == "allocate" && n.lds_idx == lds)
             .expect("an allocate node per operand");
-        node.startAddressCoreCorelet_
+        node.start_address_core_corelet
             .data_
             .values()
             .next()
@@ -8287,10 +8240,12 @@ mod time_tiled_mb_operand_advances_per_trip {
         let gamma = rb("mb_gamma", 1, COLS);
         let out = rb("mb_o", ROWS, COLS);
         assemble_pointwise_broadcast_off(
-            "mbdiv_t2326",
-            "realdiv",
-            RowCount::of_token_rows(ROWS),
-            BlockCols::of_feature_cols(COLS),
+            OpDecl {
+                op_name: "mbdiv_t2326",
+                op_func: "realdiv",
+                rows: RowCount::of_token_rows(ROWS),
+                cols: BlockCols::of_feature_cols(COLS),
+            },
             &[In::full(&x).ew(), In::mb(&gamma).ew()],
             &out,
             crate::addr::DevOff::ZERO,
@@ -8307,11 +8262,11 @@ mod time_tiled_mb_operand_advances_per_trip {
             .values()
             .next()
             .expect("one dsc")
-            .scheduleTree_
+            .schedule_tree
             .iter()
-            .find(|n| n.nodeType_ == "allocate" && n.ldsIdx_ == lds)
+            .find(|n| n.node_type == "allocate" && n.lds_idx == lds)
             .expect("an allocate node per operand");
-        node.startAddressCoreCorelet_
+        node.start_address_core_corelet
             .data_
             .values()
             .next()
@@ -8492,16 +8447,16 @@ mod time_tiled_segment_law {
                  own geometry",
             );
         let mk = |is_input: bool, name: &str, scales: [Scale; 3]| {
-            TensorArg::<3>::new(
+            TensorArg::<3>::new(TensorArgDecl {
                 is_input,
-                name.to_string(),
-                if is_input { Role::Input } else { Role::Output },
-                scales,
-                dd,
-                ["mb", "out", "y"],
-                "out",
-                Allocation::Hbm,
-            )
+                name: name.to_string(),
+                role: if is_input { Role::Input } else { Role::Output },
+                scale: scales,
+                device_dims: dd,
+                layout: ["mb", "out", "y"],
+                stick: "out",
+                allocation: Allocation::Hbm,
+            })
             .expect("a well-formed tensor arg")
         };
         let mut gamma = mk(
@@ -8790,13 +8745,13 @@ mod embed_row_gather_tests {
             .as_ref()
             .expect("the slab gather carries a descriptor");
         assert_eq!(
-            slabg.numWkSlicesPerDim_.get("mb"),
+            slabg.num_wk_slices_per_dim.get("mb"),
             Some(&1),
             "one live entry: the degenerate's `mb` does not split"
         );
-        assert_eq!(slabg.numCoresUsed_, 1, "one entry, one core");
+        assert_eq!(slabg.num_cores_used, 1, "one entry, one core");
         assert_eq!(
-            slab_body(&ops).dataStageParam_["0"].ss_.mb_,
+            slab_body(&ops).data_stage_param["0"].ss_.mb_,
             HIDDEN,
             "the per-core `mb` is the whole hidden — the splat's own geometry"
         );
@@ -8811,13 +8766,13 @@ mod embed_row_gather_tests {
             .as_ref()
             .expect("the row gather carries a descriptor");
         assert_eq!(
-            rowg.numWkSlicesPerDim_.get("mb"),
+            rowg.num_wk_slices_per_dim.get("mb"),
             Some(&2),
             "the row gather's `mb` splits by its 2 one-stick entries (the flat read shows 1)"
         );
-        assert_eq!(rowg.numCoresUsed_, 2, "2 entries, one core each");
+        assert_eq!(rowg.num_cores_used, 2, "2 entries, one core each");
         assert_eq!(
-            row_body(&ops).dataStageParam_["0"].ss_.mb_,
+            row_body(&ops).data_stage_param["0"].ss_.mb_,
             1,
             "the per-core `mb` IS the page — one stick per entry"
         );
@@ -8867,16 +8822,16 @@ mod embed_row_gather_tests {
             .as_ref()
             .expect("the slab gather carries a descriptor");
         assert_eq!(
-            slabg.numWkSlicesPerDim_.get("mb"),
+            slabg.num_wk_slices_per_dim.get("mb"),
             Some(&4),
             "the slab gather's `mb` splits by its 4 live entries (the unsplit spelling shows 1)"
         );
         assert_eq!(
-            slabg.numCoresUsed_, 4,
+            slabg.num_cores_used, 4,
             "4 entries, one core each — the gather's whole-entry division"
         );
         assert_eq!(
-            slab_body(&ops).dataStageParam_["0"].ss_.mb_,
+            slab_body(&ops).data_stage_param["0"].ss_.mb_,
             512,
             "the per-core `mb` IS the page — one 512-position entry per core"
         );
@@ -8889,13 +8844,13 @@ mod embed_row_gather_tests {
             .as_ref()
             .expect("the row gather carries a descriptor");
         assert_eq!(
-            rowg.numWkSlicesPerDim_.get("mb"),
+            rowg.num_wk_slices_per_dim.get("mb"),
             Some(&32),
             "the row gather's `mb` splits by its 32 one-stick entries (the flat read shows 1)"
         );
-        assert_eq!(rowg.numCoresUsed_, 32, "32 entries, one core each");
+        assert_eq!(rowg.num_cores_used, 32, "32 entries, one core each");
         assert_eq!(
-            row_body(&ops).dataStageParam_["0"].ss_.mb_,
+            row_body(&ops).data_stage_param["0"].ss_.mb_,
             1,
             "the per-core `mb` IS the page — one stick per entry"
         );

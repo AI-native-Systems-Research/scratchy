@@ -21,6 +21,7 @@ mod common;
 use half::{bf16, f16};
 use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions, MTLSize};
 use scratchy_target_metal::aot::baked_build;
+use scratchy_target_metal::cpu_golden::QkvRows;
 use scratchy_target_metal::detect_device;
 use scratchy_target_metal::specialized_pipeline_cache::{
     ConstantValue, PipelineKey, SpecializedPipelineCache,
@@ -148,17 +149,15 @@ fn read_t<T: Store>(buf: &Buffer, n: usize) -> Vec<f32> {
 /// paged layout `[block, kv_head, tok_in_block, head_dim]` with an identity
 /// block table, plus — `Some(sinks)` — the extra sink column: the RAW
 /// per-head logit appended after qk·scale, dropped before ·V.
-#[allow(clippy::too_many_arguments)]
 fn sink_attn_ref(
-    q: &[f32],
-    k: &[f32],
-    v: &[f32],
+    qkv: QkvRows<'_>,
     case: &Case,
     block_size: usize,
     q_positions: &[usize],
     scale: f32,
     sinks: Option<&[f32]>,
 ) -> Vec<f32> {
+    let QkvRows { q, k, v } = qkv;
     let &Case {
         num_q_heads,
         num_kv_heads,
@@ -356,9 +355,11 @@ fn decode_case<T: Store>(name: &str, case: Case, sinks: bool) {
 
     let got = read_t::<T>(&out_buf, case.num_q_heads * case.head_dim);
     let want = sink_attn_ref(
-        &q_r,
-        &pool.k_r,
-        &pool.v_r,
+        QkvRows {
+            q: &q_r,
+            k: &pool.k_r,
+            v: &pool.v_r,
+        },
         &case,
         block_size,
         &[case.kv_len - 1],
@@ -433,9 +434,11 @@ fn prefill_sdpa_case<T: Store>(name: &str, case: Case) {
 
     let got = read_t::<T>(&out_buf, total_q * case.num_q_heads * case.head_dim);
     let want = sink_attn_ref(
-        &q_r,
-        &pool.k_r,
-        &pool.v_r,
+        QkvRows {
+            q: &q_r,
+            k: &pool.k_r,
+            v: &pool.v_r,
+        },
         &case,
         block_size,
         &(0..total_q).collect::<Vec<_>>(),
@@ -513,9 +516,11 @@ fn prefill_gqa_shared_case<T: Store>(name: &str, case: Case) {
 
     let got = read_t::<T>(&out_buf, total_q * case.num_q_heads * case.head_dim);
     let want = sink_attn_ref(
-        &q_r,
-        &pool.k_r,
-        &pool.v_r,
+        QkvRows {
+            q: &q_r,
+            k: &pool.k_r,
+            v: &pool.v_r,
+        },
         &case,
         block_size,
         &(0..total_q).collect::<Vec<_>>(),
@@ -601,9 +606,11 @@ fn prefill_steel_case<T: Store>(
 
     let got = read_t::<T>(&out_buf, total_q * case.num_q_heads * case.head_dim);
     let want = sink_attn_ref(
-        &q_r,
-        &pool.k_r,
-        &pool.v_r,
+        QkvRows {
+            q: &q_r,
+            k: &pool.k_r,
+            v: &pool.v_r,
+        },
         &case,
         block_size,
         &(0..total_q).collect::<Vec<_>>(),

@@ -9,6 +9,7 @@ use ktir_superdsc::emit::rb;
 use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::{SharedKernelBmmForm, assemble_matmul_off};
 use ktir_superdsc::sdsc_abstract::{KernelTag, MatK, MatM, MatN, MatY, QueryRowCount, Stk};
 use scratchy_target_spyre::lower_subtile_tape_to_superdsc::concrete_trips;
+use scratchy_target_spyre::lower_subtile_tape_to_superdsc::{MatmulDims, MatmulOperands};
 
 /// granite-3.1-2b's tail: hidden 2048 -> the padded 51200-wide logits placement.
 fn lm_head_trips(m: u32) -> usize {
@@ -16,18 +17,21 @@ fn lm_head_trips(m: u32) -> usize {
     let mut sym = 0i64;
     let e = assemble_matmul_off::<ktir_superdsc::collective::TpWorld<1>, _>(
         "lmhead",
-        MatM::of_token_rows(m),
-        MatN::of_out_features(n),
-        MatK::of_in_features(k),
-        MatY::unbatched(),
-        // Token rows, never a request batch: the row-kind boundary yields the proven walk.
+        MatmulDims {
+            m: MatM::of_token_rows(m),
+            n: MatN::of_out_features(n),
+            k: MatK::of_in_features(k),
+        },
+        MatY::unbatched(), // Token rows, never a request batch: the row-kind boundary yields the proven walk.
         SharedKernelBmmForm::of_attn_rows(false, QueryRowCount::of_mq(1)),
-        &rb("a", m, k),
-        ktir_superdsc::addr::DevOff::ZERO,
-        &Stk::<KernelTag>::kernel(k as usize, n as usize, "w"),
-        ktir_superdsc::addr::DevOff::ZERO,
-        &rb("o", m, n),
-        ktir_superdsc::addr::DevOff::ZERO,
+        MatmulOperands {
+            a: &rb("a", m, k),
+            a_at: ktir_superdsc::addr::DevOff::ZERO,
+            w: &Stk::<KernelTag>::kernel(k as usize, n as usize, "w"),
+            w_off: ktir_superdsc::addr::DevOff::ZERO,
+            o: &rb("o", m, n),
+            o_at: ktir_superdsc::addr::DevOff::ZERO,
+        },
         &mut sym,
         None,
     )

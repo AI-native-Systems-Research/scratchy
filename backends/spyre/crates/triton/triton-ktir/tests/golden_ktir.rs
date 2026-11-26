@@ -10,9 +10,7 @@
 //! `refusals.rs` for the two that are refused and why a port that ACCEPTS them is
 //! wrong.
 
-mod common;
-
-use common::*;
+use crate::common::*;
 use triton_ktir::text::{diff, parse};
 
 /// Every config whose C++ chain produced a `1_ktir.mlir`.

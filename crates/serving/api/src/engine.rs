@@ -178,6 +178,16 @@ fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
 // RequestState
 // ---------------------------------------------------------------------------
 
+/// The output side of a request being submitted: where its deltas stream and
+/// the detokenizer and parsers that shape them.
+struct RequestOutput {
+    stream_tx: Option<mpsc::UnboundedSender<StreamDelta>>,
+    detokenizer: Option<IncrementalDetokenizer>,
+    tool_parser_state: Option<Box<dyn StreamingToolParserState + Send>>,
+    tool_calls: ToolCallStream,
+    reasoning_parser_state: Option<Box<dyn StreamingReasoningParserState + Send>>,
+}
+
 /// Tracks the state of an in-flight request.
 struct RequestState {
     /// Accumulated generated token IDs.
@@ -347,6 +357,15 @@ struct EmbedRequest {
     reply: tokio::sync::oneshot::Sender<ServeResult<Vec<Vec<f32>>>>,
 }
 
+/// The engine client and the step loop's channel receivers, held until
+/// `spawn_step_loop` moves them into the background task.
+type PendingStepLoop = (
+    Box<dyn EngineCoreClient + Send>,
+    mpsc::UnboundedReceiver<EngineCoreRequest>,
+    mpsc::UnboundedReceiver<EmbedRequest>,
+    mpsc::UnboundedReceiver<ControlMessage>,
+);
+
 /// Maximum time the step loop can run with pending requests but no output
 /// tokens before aborting all requests. Acts as a safety net for scheduler
 /// bugs where requests get stuck without making forward progress.
@@ -396,15 +415,7 @@ pub struct AsyncEngine {
     control_tx: mpsc::UnboundedSender<ControlMessage>,
     /// The engine client + channel receivers, held until `spawn_step_loop`
     /// moves them into the background task. `None` after the loop starts.
-    #[allow(clippy::type_complexity)]
-    pending_loop: std::sync::Mutex<
-        Option<(
-            Box<dyn EngineCoreClient + Send>,
-            mpsc::UnboundedReceiver<EngineCoreRequest>,
-            mpsc::UnboundedReceiver<EmbedRequest>,
-            mpsc::UnboundedReceiver<ControlMessage>,
-        )>,
-    >,
+    pending_loop: std::sync::Mutex<Option<PendingStepLoop>>,
     model_name: String,
     max_model_len: usize,
     /// Whether the worker scores prompt rows (`Worker::scores_prompts`, set at init through
@@ -912,15 +923,17 @@ impl AsyncEngine {
                 child_id.clone(),
                 ec_req,
                 num_prompt_tokens,
-                None,
-                detokenizer,
                 Choice {
                     index: i as u32,
                     prompt: PromptIndex(0),
                 },
-                None, // no streaming tool parser for non-streaming requests
-                ToolCallStream::default(),
-                None, // no streaming reasoning parser for non-streaming requests
+                RequestOutput {
+                    stream_tx: None,
+                    detokenizer,
+                    tool_parser_state: None, // no streaming tool parser for non-streaming requests
+                    tool_calls: ToolCallStream::default(),
+                    reasoning_parser_state: None, // no streaming reasoning parser for non-streaming requests
+                },
                 request.include_reasoning,
             )
             .await?;
@@ -1250,15 +1263,17 @@ impl AsyncEngine {
                 child_id,
                 ec_req,
                 num_prompt_tokens,
-                Some(tx.clone()),
-                detokenizer,
                 Choice {
                     index: i as u32,
                     prompt: PromptIndex(0),
                 },
-                tool_state,
-                ToolCallStream::new(forced_tool.clone(), limit),
-                reasoning_state,
+                RequestOutput {
+                    stream_tx: Some(tx.clone()),
+                    detokenizer,
+                    tool_parser_state: tool_state,
+                    tool_calls: ToolCallStream::new(forced_tool.clone(), limit),
+                    reasoning_parser_state: reasoning_state,
+                },
                 request.include_reasoning,
             )
             .await?;
@@ -1367,15 +1382,17 @@ impl AsyncEngine {
                     child_id.clone(),
                     ec_req,
                     num_prompt_tokens,
-                    None,
-                    detokenizer,
                     Choice {
                         index: choice_index,
                         prompt: PromptIndex(p_idx as u32),
                     },
-                    None, // no tool parsing for completions
-                    ToolCallStream::default(),
-                    None, // no reasoning parsing for completions
+                    RequestOutput {
+                        stream_tx: None,
+                        detokenizer,
+                        tool_parser_state: None, // no tool parsing for completions
+                        tool_calls: ToolCallStream::default(),
+                        reasoning_parser_state: None, // no reasoning parsing for completions
+                    },
                     true,
                 )
                 .await?;
@@ -1565,15 +1582,17 @@ impl AsyncEngine {
                     child_id,
                     ec_req,
                     num_prompt_tokens,
-                    Some(tx.clone()),
-                    detokenizer,
                     Choice {
                         index: choice_index,
                         prompt: PromptIndex(p_idx as u32),
                     },
-                    None, // no tool parsing for completions
-                    ToolCallStream::default(),
-                    None, // no reasoning parsing for completions
+                    RequestOutput {
+                        stream_tx: Some(tx.clone()),
+                        detokenizer,
+                        tool_parser_state: None, // no tool parsing for completions
+                        tool_calls: ToolCallStream::default(),
+                        reasoning_parser_state: None, // no reasoning parsing for completions
+                    },
                     true,
                 )
                 .await?;
@@ -1657,12 +1676,14 @@ impl AsyncEngine {
                     request_id.clone(),
                     ec_request,
                     num_prompt_tokens,
-                    None,
-                    None,
                     Choice::default(),
-                    None,
-                    ToolCallStream::default(),
-                    None,
+                    RequestOutput {
+                        stream_tx: None,
+                        detokenizer: None,
+                        tool_parser_state: None,
+                        tool_calls: ToolCallStream::default(),
+                        reasoning_parser_state: None,
+                    },
                     true,
                 )
                 .await?;
@@ -2577,20 +2598,22 @@ impl AsyncEngine {
     /// Note: `requests_total` and `prompt_tokens_total` metrics are the
     /// caller's responsibility (once per HTTP request). This method only
     /// increments `requests_active` (once per engine-core request).
-    #[allow(clippy::too_many_arguments)]
     async fn submit_request(
         &self,
         request_id: String,
         ec_request: EngineCoreRequest,
         num_prompt_tokens: u32,
-        stream_tx: Option<mpsc::UnboundedSender<StreamDelta>>,
-        detokenizer: Option<IncrementalDetokenizer>,
         choice: Choice,
-        tool_parser_state: Option<Box<dyn StreamingToolParserState + Send>>,
-        tool_calls: ToolCallStream,
-        reasoning_parser_state: Option<Box<dyn StreamingReasoningParserState + Send>>,
+        output: RequestOutput,
         include_reasoning: bool,
     ) -> ServeResult<()> {
+        let RequestOutput {
+            stream_tx,
+            detokenizer,
+            tool_parser_state,
+            tool_calls,
+            reasoning_parser_state,
+        } = output;
         // ⛔ A PROMPT LONGER THAN THE MODEL'S CONTEXT IS REJECTED HERE, ALONE.
         //
         // `max_model_len` is already capped to what the backend's paged attention can ADDRESS
@@ -3337,7 +3360,6 @@ impl AsyncEngine {
 
         // Tokenize the text, or fall back to byte-value IDs.
         let mut cache_breakpoints = Vec::new();
-        #[allow(unused_mut)]
         let mut token_ids = if let Some(tok) = &self.tokenizer {
             if text.is_empty() {
                 vec![]

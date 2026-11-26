@@ -19,7 +19,7 @@ use scratchy_target_metal::dflash2::{
     PROPOSALS, SAMPLING_SHARDS, UNIFORM_ACCEPTANCE, UNIFORM_PROPOSALS, VERIFY_COST_SEED,
     VerifyCost, VerifyLane, VerifyLine, VerifyRows, draft_uniform,
 };
-use scratchy_target_metal::mtl4_dispatch::Mtl4DispatchBatch;
+use scratchy_target_metal::mtl4_dispatch::{Mtl4DispatchBatch, ThreadgroupGrid};
 use scratchy_target_metal::specialized_pipeline_cache::{
     ComputePipelineState, PipelineKey, SpecializedPipelineCache,
 };
@@ -224,8 +224,10 @@ fn draft_conv_is_exact_cpu_arithmetic() {
                 &[],
                 &[],
                 &[],
-                tg((ROWS * HIDDEN).div_ceil(256) as usize, lanes as usize, 1),
-                tg(256, 1, 1),
+                ThreadgroupGrid {
+                    threadgroups: tg((ROWS * HIDDEN).div_ceil(256) as usize, lanes as usize, 1),
+                    threads_per_threadgroup: tg(256, 1, 1),
+                },
             );
             batch.commit(true);
             let got: Vec<u16> = read(&out, rows * hidden);
@@ -313,8 +315,10 @@ fn draft_prepare_and_reorder_match_reference() {
             &[],
             &[],
             &[],
-            tg(prepare_groups as usize, lanes as usize, 1),
-            tg(256, 1, 1),
+            ThreadgroupGrid {
+                threadgroups: tg(prepare_groups as usize, lanes as usize, 1),
+                threads_per_threadgroup: tg(256, 1, 1),
+            },
         );
         batch.barrier();
         batch.encode(
@@ -323,8 +327,10 @@ fn draft_prepare_and_reorder_match_reference() {
             &[],
             &[],
             &[],
-            tg((ROWS * ATTENTION).div_ceil(256) as usize, lanes as usize, 1),
-            tg(256, 1, 1),
+            ThreadgroupGrid {
+                threadgroups: tg((ROWS * ATTENTION).div_ceil(256) as usize, lanes as usize, 1),
+                threads_per_threadgroup: tg(256, 1, 1),
+            },
         );
         batch.commit(true);
         assert_eq!(
@@ -537,8 +543,10 @@ fn attention_case(gpu: &Gpu, lengths: &[u32]) {
         &[],
         &[],
         &[],
-        tg(KV_HEADS as usize, lanes, ATTENTION_SPLITS as usize),
-        tg(256, 1, 1),
+        ThreadgroupGrid {
+            threadgroups: tg(KV_HEADS as usize, lanes, ATTENTION_SPLITS as usize),
+            threads_per_threadgroup: tg(256, 1, 1),
+        },
     );
     batch.barrier();
     batch.encode(
@@ -547,8 +555,10 @@ fn attention_case(gpu: &Gpu, lengths: &[u32]) {
         &[],
         &[],
         &[],
-        tg(KV_HEADS as usize, lanes, 1),
-        tg(256, 1, 1),
+        ThreadgroupGrid {
+            threadgroups: tg(KV_HEADS as usize, lanes, 1),
+            threads_per_threadgroup: tg(256, 1, 1),
+        },
     );
     batch.commit(true);
     let output: Vec<u16> = read(&b_queries, queries.len());
@@ -716,8 +726,10 @@ fn prefill_draft_context_writes_each_sequence_into_its_ring() {
         &[],
         &[],
         &[],
-        tg((padded * KV_HEADS) as usize, 1, 1),
-        tg(256, 1, 1),
+        ThreadgroupGrid {
+            threadgroups: tg((padded * KV_HEADS) as usize, 1, 1),
+            threads_per_threadgroup: tg(256, 1, 1),
+        },
     );
     batch.commit(true);
     let keys: Vec<u16> = read(&b_keys, pool.len());
@@ -801,9 +813,11 @@ fn draft_context_commit_writes_each_lanes_retained_rows() {
         &[],
         &[],
         &[],
-        // The grid of a bucket of three whole blocks.
-        tg(lanes * ROWS as usize * KV_HEADS as usize, 1, 1),
-        tg(256, 1, 1),
+        ThreadgroupGrid {
+            // The grid of a bucket of three whole blocks.
+            threadgroups: tg(lanes * ROWS as usize * KV_HEADS as usize, 1, 1),
+            threads_per_threadgroup: tg(256, 1, 1),
+        },
     );
     batch.commit(true);
     let keys: Vec<u16> = read(&b_keys, pool.len());
@@ -860,8 +874,10 @@ fn capture_rows_copies_into_its_block() {
             &[],
             &[],
             &[],
-            tg((rows * hidden).div_ceil(256) + 1, 1, 1),
-            tg(256, 1, 1),
+            ThreadgroupGrid {
+                threadgroups: tg((rows * hidden).div_ceil(256) + 1, 1, 1),
+                threads_per_threadgroup: tg(256, 1, 1),
+            },
         );
         batch.commit(true);
         assert_eq!(read::<u16>(&out, want.len()), want, "{symbol}");
@@ -984,8 +1000,10 @@ impl Selector {
             &[],
             &[],
             &[],
-            tg(positions * SAMPLING_SHARDS as usize, 1, 1),
-            tg(256, 1, 1),
+            ThreadgroupGrid {
+                threadgroups: tg(positions * SAMPLING_SHARDS as usize, 1, 1),
+                threads_per_threadgroup: tg(256, 1, 1),
+            },
         );
         batch.barrier();
         batch.encode(
@@ -1004,8 +1022,10 @@ impl Selector {
             &[],
             &[],
             &[],
-            tg(positions, 1, 1),
-            tg(EDGE_THREADS as usize, 1, 1),
+            ThreadgroupGrid {
+                threadgroups: tg(positions, 1, 1),
+                threads_per_threadgroup: tg(EDGE_THREADS as usize, 1, 1),
+            },
         );
         batch.barrier();
         batch.encode(
@@ -1023,8 +1043,10 @@ impl Selector {
             &[],
             &[],
             &[],
-            tg(lanes as usize, 1, 1),
-            tg(1, 1, 1),
+            ThreadgroupGrid {
+                threadgroups: tg(lanes as usize, 1, 1),
+                threads_per_threadgroup: tg(1, 1, 1),
+            },
         );
         batch.commit(true);
     }
@@ -1357,8 +1379,10 @@ fn draft_verify_rows_choose_the_best_assignment() {
                 &[],
                 &[],
                 &[],
-                tg(1, 1, 1),
-                tg(1, 1, 1),
+                ThreadgroupGrid {
+                    threadgroups: tg(1, 1, 1),
+                    threads_per_threadgroup: tg(1, 1, 1),
+                },
             );
             batch.commit(true);
             let chosen: Vec<u32> = read(&b_rows, lanes);
@@ -1501,8 +1525,10 @@ impl Acceptance {
             &[],
             &[],
             &[],
-            tg(lanes, 1, 1),
-            tg(1, 1, 1),
+            ThreadgroupGrid {
+                threadgroups: tg(lanes, 1, 1),
+                threads_per_threadgroup: tg(1, 1, 1),
+            },
         );
         batch.commit(true);
         Accepted {
@@ -1781,8 +1807,10 @@ fn a_context_window_reads_back_what_splash_stores() {
             &[],
             &[],
             &[],
-            tg(threadgroups, 1, 1),
-            tg(256, 1, 1),
+            ThreadgroupGrid {
+                threadgroups: tg(threadgroups, 1, 1),
+                threads_per_threadgroup: tg(256, 1, 1),
+            },
         );
         batch.commit(true);
     }
@@ -2236,8 +2264,10 @@ impl Targets {
             &[],
             &[],
             &[],
-            tg(rows * TARGET_SHARDS, 1, 1),
-            tg(256, 1, 1),
+            ThreadgroupGrid {
+                threadgroups: tg(rows * TARGET_SHARDS, 1, 1),
+                threads_per_threadgroup: tg(256, 1, 1),
+            },
         );
         batch.barrier();
         batch.encode(
@@ -2251,8 +2281,10 @@ impl Targets {
             &[],
             &[],
             &[],
-            tg(rows, 1, 1),
-            tg(VOCABULARY_THREADS, 1, 1),
+            ThreadgroupGrid {
+                threadgroups: tg(rows, 1, 1),
+                threads_per_threadgroup: tg(VOCABULARY_THREADS, 1, 1),
+            },
         );
         batch.barrier();
         batch.encode(
@@ -2271,8 +2303,10 @@ impl Targets {
             &[],
             &[],
             &[],
-            tg(rows * VOCABULARY_GROUPS, 1, 1),
-            tg(VOCABULARY_THREADS, 1, 1),
+            ThreadgroupGrid {
+                threadgroups: tg(rows * VOCABULARY_GROUPS, 1, 1),
+                threads_per_threadgroup: tg(VOCABULARY_THREADS, 1, 1),
+            },
         );
         batch.commit(true);
         Drawn {

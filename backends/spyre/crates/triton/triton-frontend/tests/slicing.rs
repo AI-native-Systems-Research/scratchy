@@ -25,7 +25,7 @@
 //! that NAMES the construct, and these are its tests -- including the two accepting forms,
 //! without which a blanket refusal of every subscript would also pass.
 
-mod common;
+use crate::common;
 
 use triton_frontend::codegen;
 use triton_frontend::target::Target;

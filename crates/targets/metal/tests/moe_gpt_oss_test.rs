@@ -13,8 +13,10 @@ mod common;
 use half::bf16;
 use objc2_metal::MTLSize;
 use scratchy_target_metal::aot::{BakedPipeline, baked_pipeline};
+use scratchy_target_metal::cpu_reference::AffineMatmul;
 use scratchy_target_metal::cpu_reference::affine_qmv_b2_bf16_s_bf16;
 use scratchy_target_metal::device::detect_device;
+use scratchy_target_metal::mtl4_dispatch::ThreadgroupGrid;
 use scratchy_target_metal::tape::constants::{ConstSlot, ConstantValue};
 use scratchy_target_metal::tape::ids::{KDimI32, NDimI32, NumExperts, TopK};
 use scratchy_target_metal::tape::kernel_constants::{
@@ -228,7 +230,17 @@ struct Dispatch<'a> {
 fn run(device: &common::Device, chain: Vec<Dispatch<'_>>) {
     let mut batch = common::Mtl4DispatchBatch::begin(device).expect("an MTL4 queue");
     for d in &chain {
-        batch.encode(d.pso, &d.buffers, &[], &[], &[], d.groups, d.threads);
+        batch.encode(
+            d.pso,
+            &d.buffers,
+            &[],
+            &[],
+            &[],
+            ThreadgroupGrid {
+                threadgroups: d.groups,
+                threads_per_threadgroup: d.threads,
+            },
+        );
         batch.barrier();
     }
     batch.commit(true);
@@ -540,16 +552,16 @@ fn gpt_oss_linear_biases_match_the_reference() {
         let (n, e) = (p / TOP_K, e as usize);
         let matvec = |proj: &Experts| {
             let (w, s, b) = slab(proj, e);
-            affine_qmv_b2_bf16_s_bf16(
-                w,
-                s,
-                b,
-                &block.x_host[n * HIDDEN..(n + 1) * HIDDEN],
-                1,
-                proj.n_out,
-                proj.k_in,
-                GS,
-            )
+            affine_qmv_b2_bf16_s_bf16(AffineMatmul {
+                packed: w,
+                scales: s,
+                biases: b,
+                x: &block.x_host[n * HIDDEN..(n + 1) * HIDDEN],
+                m: 1,
+                n: proj.n_out,
+                k: proj.k_in,
+                group_size: GS,
+            })
         };
         let (g_raw, u_raw) = (matvec(&block.gate), matvec(&block.up));
         let bias = &block.gate_up_bias.host[e * 2 * INTER..(e + 1) * 2 * INTER];
@@ -587,16 +599,16 @@ fn gpt_oss_linear_biases_match_the_reference() {
                 let p = n * TOP_K + k;
                 let e = indices[p] as usize;
                 let (w, s, b) = slab(&block.down, e);
-                let row = affine_qmv_b2_bf16_s_bf16(
-                    w,
-                    s,
-                    b,
-                    &act[p * INTER..(p + 1) * INTER],
-                    1,
-                    HIDDEN,
-                    INTER,
-                    GS,
-                );
+                let row = affine_qmv_b2_bf16_s_bf16(AffineMatmul {
+                    packed: w,
+                    scales: s,
+                    biases: b,
+                    x: &act[p * INTER..(p + 1) * INTER],
+                    m: 1,
+                    n: HIDDEN,
+                    k: INTER,
+                    group_size: GS,
+                });
                 let r = row[col].to_f32() + block.down_bias.host[e * HIDDEN + col].to_f32();
                 acc = f32::mul_add(r, scores[p].to_f32(), acc);
             }

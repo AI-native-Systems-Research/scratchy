@@ -32,14 +32,33 @@ use std::fmt;
 ///
 /// Emitted at the top of the same block as the tape (see `metal_static_tape`), so the aliases
 /// and the paths [`module_of`] hands out are defined in ONE place and cannot drift apart.
-pub(crate) fn alias_preamble() -> TokenStream {
-    quote! {
-        use ::scratchy_target_metal::tape::lowered as __tl;
-        use ::scratchy_target_metal::tape::constants as __tc;
-        use ::scratchy_target_metal::tape::ids as __ti;
-        use ::scratchy_target_metal::dflash2 as __td;
-    }
+///
+/// It opens only the aliases `body` (the block's other items) names.
+pub(crate) fn alias_preamble(body: &TokenStream) -> TokenStream {
+    uses_named(
+        body,
+        [
+            (
+                "__tl",
+                quote! { use ::scratchy_target_metal::tape::lowered as __tl; },
+            ),
+            (
+                "__tc",
+                quote! { use ::scratchy_target_metal::tape::constants as __tc; },
+            ),
+            (
+                "__ti",
+                quote! { use ::scratchy_target_metal::tape::ids as __ti; },
+            ),
+            (
+                "__td",
+                quote! { use ::scratchy_target_metal::dflash2 as __td; },
+            ),
+        ],
+    )
 }
+
+pub(crate) use scratchy_forward_compiler_macro::target::uses_named;
 
 /// The module each tape type lives in — the single per-type fact the
 /// emitter needs. A type missing here is a macro-time error naming it.

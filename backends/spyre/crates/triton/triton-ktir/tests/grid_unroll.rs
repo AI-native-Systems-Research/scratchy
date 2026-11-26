@@ -14,9 +14,7 @@
 //! regions and per-core work slices, never a load-tile corner), or the arm is
 //! touching kernels whose emission is pinned to bytes.
 
-mod common;
-
-use common::*;
+use crate::common::*;
 use triton_ktir::Module;
 use triton_ktir::text::parse;
 

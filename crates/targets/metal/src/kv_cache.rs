@@ -11,3 +11,4 @@
 //! needed (unlike the cuda target, whose `driver`-DMA methods ride a
 //! `CudaKvCacheExt`).
 pub type KvCachePool<M = crate::PoolMem> = scratchy_layers::kv_cache::KvCachePool<M>;
+pub use scratchy_layers::kv_cache::ChunkedKvLayout;

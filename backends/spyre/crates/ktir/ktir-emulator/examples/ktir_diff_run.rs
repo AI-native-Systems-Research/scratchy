@@ -279,7 +279,6 @@ fn sanitize(id: &str) -> String {
 /// region at its stick, binds the scalar args, runs `execute_function_seeded`,
 /// and reads back every `hbm_read` region. On error, records a per-case error so
 /// the driver asserts a matched failure against Python; never aborts the batch.
-#[allow(clippy::too_many_arguments)]
 fn handle_seeded_case(
     id: &str,
     function: &str,

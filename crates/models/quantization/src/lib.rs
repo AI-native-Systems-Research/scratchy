@@ -16,7 +16,7 @@ mod presets;
 
 pub use presets::enabled_presets;
 
-pub use affine::affine_dequant_b4_to_dtype;
+pub use affine::{AffineWeight, affine_dequant_b4_to_dtype};
 pub use ggml_quant::{GgmlDType, GgmlStorage};
 pub use layers_quant::{AffineQuantEmbedding, AffineQuantLinear, Nvfp4Linear};
 

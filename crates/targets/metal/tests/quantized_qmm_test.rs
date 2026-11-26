@@ -24,6 +24,7 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions};
 use scratchy_target_metal::aot::{BakedPipeline, baked_pipeline};
+use scratchy_target_metal::cpu_reference::AffineMatmul;
 use scratchy_target_metal::cpu_reference::affine_qmm_t_b4_bf16 as cpu_qmm_t_bf16;
 use scratchy_target_metal::device::detect_device;
 use scratchy_target_metal::quantized::{
@@ -38,25 +39,37 @@ mod common;
 type Buffer = Retained<ProtocolObject<dyn MTLBuffer>>;
 type Device = Retained<ProtocolObject<dyn MTLDevice>>;
 
+/// How an affine weight is stored: its group width and bits, and the activation and scale dtypes
+/// a kernel reads it at.
+#[derive(Clone, Copy)]
+struct AffineFormat {
+    group_size: u32,
+    bits: u32,
+    dtype: DequantDtype,
+    scale_dtype: ScaleDtype,
+}
+
 /// Build the qmm_t compute pipeline exactly as
 /// `MetalAffineQmmT::execute_with_kernel` does — same symbol name
 /// (`qmm_t_kernel_name`) and the same K/N/M (+ `k_partition_size` for
 /// SplitK) function constants on slots 0/1/2(/3). The MTL4 dispatch
 /// helper then binds the buffers + grid; this mirrors the production
 /// `bake_mtl4_steps` path instead of the classic `MetalStream` encoder.
-#[allow(clippy::too_many_arguments)]
 fn build_qmm_t_pipeline(
     device: &common::Device,
     kernel: QmmTKernel,
     m: u32,
     n: u32,
     k: u32,
-    group_size: u32,
-    bits: u32,
-    dtype: DequantDtype,
-    scale_dtype: ScaleDtype,
+    format: AffineFormat,
     codes: AffineCodes,
 ) -> BakedPipeline {
+    let AffineFormat {
+        group_size,
+        bits,
+        dtype,
+        scale_dtype,
+    } = format;
     let aligned_n = match kernel {
         QmmTKernel::Nax(_) => n.is_multiple_of(64),
         _ => n.is_multiple_of(32),
@@ -157,18 +170,21 @@ fn make_inputs_bf16(
 // `scratchy_target_metal::cpu_reference::affine_qmm_t_b4_bf16`,
 // imported above as `cpu_qmm_t_bf16`.
 
-#[allow(clippy::too_many_arguments)]
 fn run_qmm_t_bf16(
-    packed: &[u8],
-    scales: &[half::f16],
-    biases: &[half::f16],
-    x: &[half::bf16],
-    m: usize,
-    n: usize,
-    k: usize,
-    group_size: u32,
+    mm: AffineMatmul<'_, half::bf16, half::f16>,
     expected_kernel: QmmTKernel,
 ) -> Option<Vec<half::bf16>> {
+    let AffineMatmul {
+        packed,
+        scales,
+        biases,
+        x,
+        m,
+        n,
+        k,
+        group_size,
+    } = mm;
+    let group_size = group_size as u32;
     run_qmm_t_bf16_codes(
         packed,
         scales,
@@ -223,10 +239,12 @@ fn run_qmm_t_bf16_codes(
         m as u32,
         n as u32,
         k as u32,
-        group_size,
-        4,
-        DequantDtype::Bf16,
-        ScaleDtype::F16,
+        AffineFormat {
+            group_size,
+            bits: 4,
+            dtype: DequantDtype::Bf16,
+            scale_dtype: ScaleDtype::F16,
+        },
         codes,
     );
     let (tg, tpg) = qmm_t_dispatch_shape(expected_kernel, m as u32, n as u32, 1 /* B */);
@@ -341,16 +359,27 @@ fn affine_qmm_t_aligned_b4_bf16_matches_cpu_reference() {
 
     let (packed, scales, biases, x) =
         make_inputs_bf16(0xA1A1_u64 ^ group_size as u64, n, k, m, group_size);
-    let expected = cpu_qmm_t_bf16(&packed, &scales, &biases, &x, m, n, k, group_size);
-    let Some(metal) = run_qmm_t_bf16(
-        &packed,
-        &scales,
-        &biases,
-        &x,
+    let expected = cpu_qmm_t_bf16(AffineMatmul {
+        packed: &packed,
+        scales: &scales,
+        biases: &biases,
+        x: &x,
         m,
         n,
         k,
-        group_size as u32,
+        group_size,
+    });
+    let Some(metal) = run_qmm_t_bf16(
+        AffineMatmul {
+            packed: &packed,
+            scales: &scales,
+            biases: &biases,
+            x: &x,
+            m,
+            n,
+            k,
+            group_size,
+        },
         expected_kernel,
     ) else {
         return;
@@ -397,16 +426,27 @@ fn affine_qmm_t_unaligned_b4_bf16_matches_cpu_reference() {
 
     let (packed, scales, biases, x) =
         make_inputs_bf16(0xB2B2_u64 ^ group_size as u64, n, k, m, group_size);
-    let expected = cpu_qmm_t_bf16(&packed, &scales, &biases, &x, m, n, k, group_size);
-    let Some(metal) = run_qmm_t_bf16(
-        &packed,
-        &scales,
-        &biases,
-        &x,
+    let expected = cpu_qmm_t_bf16(AffineMatmul {
+        packed: &packed,
+        scales: &scales,
+        biases: &biases,
+        x: &x,
         m,
         n,
         k,
-        group_size as u32,
+        group_size,
+    });
+    let Some(metal) = run_qmm_t_bf16(
+        AffineMatmul {
+            packed: &packed,
+            scales: &scales,
+            biases: &biases,
+            x: &x,
+            m,
+            n,
+            k,
+            group_size,
+        },
         expected_kernel,
     ) else {
         return;
@@ -454,16 +494,27 @@ fn affine_qmm_t_b4_bf16_llama_3_2_1b_q_proj_prefill_shape() {
 
     let (packed, scales, biases, x) =
         make_inputs_bf16(0x11B_u64 ^ group_size as u64, n, k, m, group_size);
-    let expected = cpu_qmm_t_bf16(&packed, &scales, &biases, &x, m, n, k, group_size);
-    let Some(metal) = run_qmm_t_bf16(
-        &packed,
-        &scales,
-        &biases,
-        &x,
+    let expected = cpu_qmm_t_bf16(AffineMatmul {
+        packed: &packed,
+        scales: &scales,
+        biases: &biases,
+        x: &x,
         m,
         n,
         k,
-        group_size as u32,
+        group_size,
+    });
+    let Some(metal) = run_qmm_t_bf16(
+        AffineMatmul {
+            packed: &packed,
+            scales: &scales,
+            biases: &biases,
+            x: &x,
+            m,
+            n,
+            k,
+            group_size,
+        },
         expected_kernel,
     ) else {
         return;
@@ -504,16 +555,27 @@ fn affine_qmm_t_b4_bf16_llama_3_2_1b_kv_proj_prefill_shape() {
 
     let (packed, scales, biases, x) =
         make_inputs_bf16(0x11C_u64 ^ group_size as u64, n, k, m, group_size);
-    let expected = cpu_qmm_t_bf16(&packed, &scales, &biases, &x, m, n, k, group_size);
-    let Some(metal) = run_qmm_t_bf16(
-        &packed,
-        &scales,
-        &biases,
-        &x,
+    let expected = cpu_qmm_t_bf16(AffineMatmul {
+        packed: &packed,
+        scales: &scales,
+        biases: &biases,
+        x: &x,
         m,
         n,
         k,
-        group_size as u32,
+        group_size,
+    });
+    let Some(metal) = run_qmm_t_bf16(
+        AffineMatmul {
+            packed: &packed,
+            scales: &scales,
+            biases: &biases,
+            x: &x,
+            m,
+            n,
+            k,
+            group_size,
+        },
         expected_kernel,
     ) else {
         return;
@@ -554,16 +616,27 @@ fn affine_qmm_t_b4_bf16_llama_3_2_1b_gate_up_prefill_shape() {
 
     let (packed, scales, biases, x) =
         make_inputs_bf16(0x11D_u64 ^ group_size as u64, n, k, m, group_size);
-    let expected = cpu_qmm_t_bf16(&packed, &scales, &biases, &x, m, n, k, group_size);
-    let Some(metal) = run_qmm_t_bf16(
-        &packed,
-        &scales,
-        &biases,
-        &x,
+    let expected = cpu_qmm_t_bf16(AffineMatmul {
+        packed: &packed,
+        scales: &scales,
+        biases: &biases,
+        x: &x,
         m,
         n,
         k,
-        group_size as u32,
+        group_size,
+    });
+    let Some(metal) = run_qmm_t_bf16(
+        AffineMatmul {
+            packed: &packed,
+            scales: &scales,
+            biases: &biases,
+            x: &x,
+            m,
+            n,
+            k,
+            group_size,
+        },
         expected_kernel,
     ) else {
         return;
@@ -603,16 +676,27 @@ fn affine_qmm_t_b4_bf16_llama_3_2_1b_down_proj_prefill_shape() {
 
     let (packed, scales, biases, x) =
         make_inputs_bf16(0x11E_u64 ^ group_size as u64, n, k, m, group_size);
-    let expected = cpu_qmm_t_bf16(&packed, &scales, &biases, &x, m, n, k, group_size);
-    let Some(metal) = run_qmm_t_bf16(
-        &packed,
-        &scales,
-        &biases,
-        &x,
+    let expected = cpu_qmm_t_bf16(AffineMatmul {
+        packed: &packed,
+        scales: &scales,
+        biases: &biases,
+        x: &x,
         m,
         n,
         k,
-        group_size as u32,
+        group_size,
+    });
+    let Some(metal) = run_qmm_t_bf16(
+        AffineMatmul {
+            packed: &packed,
+            scales: &scales,
+            biases: &biases,
+            x: &x,
+            m,
+            n,
+            k,
+            group_size,
+        },
         expected_kernel,
     ) else {
         return;
@@ -657,16 +741,27 @@ fn affine_qmm_t_splitk_b4_bf16_matches_cpu_reference() {
 
     let (packed, scales, biases, x) =
         make_inputs_bf16(0xC3C3_u64 ^ group_size as u64, n, k, m, group_size);
-    let expected = cpu_qmm_t_bf16(&packed, &scales, &biases, &x, m, n, k, group_size);
-    let Some(metal) = run_qmm_t_bf16(
-        &packed,
-        &scales,
-        &biases,
-        &x,
+    let expected = cpu_qmm_t_bf16(AffineMatmul {
+        packed: &packed,
+        scales: &scales,
+        biases: &biases,
+        x: &x,
         m,
         n,
         k,
-        group_size as u32,
+        group_size,
+    });
+    let Some(metal) = run_qmm_t_bf16(
+        AffineMatmul {
+            packed: &packed,
+            scales: &scales,
+            biases: &biases,
+            x: &x,
+            m,
+            n,
+            k,
+            group_size,
+        },
         expected_kernel,
     ) else {
         return;
@@ -736,7 +831,16 @@ fn affine_qmm_t_nax_b4_bf16_matches_cpu_reference() {
 
     let (packed, scales, biases, x) =
         make_inputs_bf16(0xD4D4_u64 ^ group_size as u64, n, k, m, group_size);
-    let expected = cpu_qmm_t_bf16(&packed, &scales, &biases, &x, m, n, k, group_size);
+    let expected = cpu_qmm_t_bf16(AffineMatmul {
+        packed: &packed,
+        scales: &scales,
+        biases: &biases,
+        x: &x,
+        m,
+        n,
+        k,
+        group_size,
+    });
 
     // Force the NAX kernel on the MTL4 dispatch path.
     let Some(__dev) = scratchy_target_metal::device::detect_device() else {
@@ -774,10 +878,12 @@ fn affine_qmm_t_nax_b4_bf16_matches_cpu_reference() {
             m as u32,
             n as u32,
             k as u32,
-            group_size as u32,
-            4,
-            DequantDtype::Bf16,
-            ScaleDtype::F16,
+            AffineFormat {
+                group_size: group_size as u32,
+                bits: 4,
+                dtype: DequantDtype::Bf16,
+                scale_dtype: ScaleDtype::F16,
+            },
             AffineCodes::AsWritten,
         );
         let (tg, tpg) = qmm_t_dispatch_shape(kernel, m as u32, n as u32, 1);
@@ -892,7 +998,16 @@ fn affine_qmm_t_b4_offset8_codes_match_cpu_reference() {
         kernels.extend(NaxDequant::ALL.map(QmmTKernel::Nax));
     }
     let (packed, scales, biases, x) = make_inputs_bf16(0x0FF5E7, n, k, m, gs as usize);
-    let expected = cpu_qmm_t_bf16(&packed, &scales, &biases, &x, m, n, k, gs as usize);
+    let expected = cpu_qmm_t_bf16(AffineMatmul {
+        packed: &packed,
+        scales: &scales,
+        biases: &biases,
+        x: &x,
+        m,
+        n,
+        k,
+        group_size: gs as usize,
+    });
     let offset8: Vec<u8> = packed.iter().map(|b| b ^ 0x88).collect();
     for kernel in kernels {
         let run = |packed: &[u8], codes| {
@@ -946,7 +1061,16 @@ fn affine_qmm_t_nax_k_steps_and_tails_match_cpu_reference() {
         (200, 72, 512, 64),
     ] {
         let (packed, scales, biases, x) = make_inputs_bf16(0x7A115, n, k, m, gs);
-        let expected = cpu_qmm_t_bf16(&packed, &scales, &biases, &x, m, n, k, gs);
+        let expected = cpu_qmm_t_bf16(AffineMatmul {
+            packed: &packed,
+            scales: &scales,
+            biases: &biases,
+            x: &x,
+            m,
+            n,
+            k,
+            group_size: gs,
+        });
         let offset8: Vec<u8> = packed.iter().map(|b| b ^ 0x88).collect();
         for (dequant, (codes, packed)) in NaxDequant::ALL.into_iter().flat_map(|d| {
             [

@@ -135,7 +135,17 @@ fn run<'a>(
         let mut batch = common::Mtl4DispatchBatch::begin(device).expect("an MTL4 queue");
         for i in 0..n {
             for d in chain(i) {
-                batch.encode(d.pso, &d.buffers, &[], &[], &[], d.groups, d.threads);
+                batch.encode(
+                    d.pso,
+                    &d.buffers,
+                    &[],
+                    &[],
+                    &[],
+                    common::ThreadgroupGrid {
+                        threadgroups: d.groups,
+                        threads_per_threadgroup: d.threads,
+                    },
+                );
                 batch.barrier();
             }
         }

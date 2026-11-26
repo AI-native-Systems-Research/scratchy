@@ -5,6 +5,9 @@ version = "0.1.0"
 edition = "2024"
 license.workspace = true
 publish = false
+# The tests that share `tests/common` are modules of ONE test binary (`tests/goldens.rs`), so every
+# helper there has a user; each other test is its own binary, listed below.
+autotests = false
 
 [dependencies]
 # ONE path dependency, and NO crates.io package: `triton-frontend` is dependency-free
@@ -36,3 +39,23 @@ default = []
 
 # The MLIR text reader and writer in `src/text/` remain in-tree and remain TEST
 # INSTRUMENTS, not pipeline stages.
+
+[[test]]
+name = "goldens"
+path = "tests/goldens.rs"
+
+[[test]]
+name = "expert_slab_gather"
+path = "tests/expert_slab_gather.rs"
+
+[[test]]
+name = "handoff_boundary"
+path = "tests/handoff_boundary.rs"
+
+[[test]]
+name = "pure_rust_ktir"
+path = "tests/pure_rust_ktir.rs"
+
+[[test]]
+name = "slab_scatter"
+path = "tests/slab_scatter.rs"

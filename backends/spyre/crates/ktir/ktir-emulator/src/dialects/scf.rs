@@ -169,14 +169,16 @@ fn scf_for(
 
     let result = for_op(
         ctx,
-        lb,
-        ub,
-        step,
-        iter_var,
-        body_region,
         env,
-        &iter_arg_names,
-        iter_init_values,
+        ForLoop {
+            lower_bound: lb,
+            upper_bound: ub,
+            step,
+            iter_var,
+            body_region,
+            iter_arg_names: &iter_arg_names,
+            iter_init_values,
+        },
     )?;
 
     // for_op returns a Vec of final iter_arg values; unwrap when there is
@@ -199,19 +201,32 @@ fn scf_for(
     }
 }
 
-/// Port of `ControlOps.for_op`. Returns the list of final iter_arg values, or
-/// `None` when there are no iter_args.
-#[allow(clippy::too_many_arguments)]
-fn for_op(
-    ctx: &mut CoreContext,
+/// One `scf.for`: its bounds and step, the induction variable it binds, its body, and its
+/// iter_args with their initial values.
+struct ForLoop<'a> {
     lower_bound: i64,
     upper_bound: i64,
     step: i64,
     iter_var: Ssa,
-    body_region: &[Operation<'static>],
-    env: &ExecutionEnv,
-    iter_arg_names: &[Ssa],
+    body_region: &'a [Operation<'static>],
+    iter_arg_names: &'a [Ssa],
     iter_init_values: Vec<Value>,
+}
+
+/// Port of `ControlOps.for_op`. Returns the list of final iter_arg values, or
+/// `None` when there are no iter_args.
+fn for_op(
+    ctx: &mut CoreContext,
+    env: &ExecutionEnv,
+    ForLoop {
+        lower_bound,
+        upper_bound,
+        step,
+        iter_var,
+        body_region,
+        iter_arg_names,
+        iter_init_values,
+    }: ForLoop<'_>,
 ) -> Result<Option<Vec<Value>>, String> {
     // Bind initial iter_arg values in the *parent* scope. These persist across
     // iterations; body-local values do not.
@@ -571,17 +586,30 @@ mod tests {
         execute_ops(ops, ctx, &env)
     }
 
-    /// A `scf.for` op with a body region (and optional iter_args).
-    #[allow(clippy::too_many_arguments)]
-    fn for_op_ir(
-        ops: &mut Ops,
+    /// The SSA names of a `scf.for`: its result, bounds, step, induction variable, and its
+    /// iter_args with their initial values.
+    struct ForIr<'a> {
         result: Option<&'static str>,
         lb: &'static str,
         ub: &'static str,
         step: &'static str,
         iter_var: &'static str,
-        iter_inits: &[&'static str],
-        iter_args: &[&'static str],
+        iter_inits: &'a [&'static str],
+        iter_args: &'a [&'static str],
+    }
+
+    /// A `scf.for` op with a body region (and optional iter_args).
+    fn for_op_ir(
+        ops: &mut Ops,
+        ForIr {
+            result,
+            lb,
+            ub,
+            step,
+            iter_var,
+            iter_inits,
+            iter_args,
+        }: ForIr<'_>,
         body: Vec<Operation<'static>>,
     ) -> Operation<'static> {
         let mut operands = vec![lb, ub, step];
@@ -617,13 +645,15 @@ mod tests {
         let r = ops.ssa("%r");
         let f = for_op_ir(
             &mut ops,
-            Some("%r"),
-            "%lb",
-            "%ub",
-            "%step",
-            "%i",
-            &["%init"],
-            &["%acc"],
+            ForIr {
+                result: Some("%r"),
+                lb: "%lb",
+                ub: "%ub",
+                step: "%step",
+                iter_var: "%i",
+                iter_inits: &["%init"],
+                iter_args: &["%acc"],
+            },
             body,
         );
         run(&[f], &mut ctx).unwrap();
@@ -649,13 +679,15 @@ mod tests {
         let r = ops.ssa("%r");
         let f = for_op_ir(
             &mut ops,
-            Some("%r"),
-            "%lb",
-            "%ub",
-            "%step",
-            "%i",
-            &["%init"],
-            &["%acc"],
+            ForIr {
+                result: Some("%r"),
+                lb: "%lb",
+                ub: "%ub",
+                step: "%step",
+                iter_var: "%i",
+                iter_inits: &["%init"],
+                iter_args: &["%acc"],
+            },
             vec![one, add, yld],
         );
         run(&[f], &mut ctx).unwrap();
@@ -680,13 +712,15 @@ mod tests {
         let r = ops.ssa("%r");
         let f = for_op_ir(
             &mut ops,
-            Some("%r"),
-            "%lb",
-            "%ub",
-            "%step",
-            "%i",
-            &["%init"],
-            &["%acc"],
+            ForIr {
+                result: Some("%r"),
+                lb: "%lb",
+                ub: "%ub",
+                step: "%step",
+                iter_var: "%i",
+                iter_inits: &["%init"],
+                iter_args: &["%acc"],
+            },
             vec![add, yld],
         );
         run(&[f], &mut ctx).unwrap();
@@ -713,13 +747,15 @@ mod tests {
         let r = ops.ssa("%r");
         let f = for_op_ir(
             &mut ops,
-            Some("%r"),
-            "%lb",
-            "%ub",
-            "%step",
-            "%i",
-            &["%init"],
-            &["%acc"],
+            ForIr {
+                result: Some("%r"),
+                lb: "%lb",
+                ub: "%ub",
+                step: "%step",
+                iter_var: "%i",
+                iter_inits: &["%init"],
+                iter_args: &["%acc"],
+            },
             vec![add, yld],
         );
         run(&[f], &mut ctx).unwrap();
@@ -739,7 +775,19 @@ mod tests {
         ctx.set_value(ops.ssa("%step"), Value::Index(1));
         let body = vec![ops.op(None, OpKind::ScfYield, &[])];
         let i = ops.ssa("%i");
-        let f = for_op_ir(&mut ops, None, "%lb", "%ub", "%step", "%i", &[], &[], body);
+        let f = for_op_ir(
+            &mut ops,
+            ForIr {
+                result: None,
+                lb: "%lb",
+                ub: "%ub",
+                step: "%step",
+                iter_var: "%i",
+                iter_inits: &[],
+                iter_args: &[],
+            },
+            body,
+        );
         run(&[f], &mut ctx).unwrap();
         assert!(ctx.get_value(i).is_err()); // induction var scope is gone
     }
@@ -762,13 +810,15 @@ mod tests {
         let r = ops.ssa("%r");
         let f = for_op_ir(
             &mut ops,
-            Some("%r"),
-            "%lb",
-            "%ub",
-            "%step",
-            "%i",
-            &["%a0", "%b0"],
-            &["%a", "%b"],
+            ForIr {
+                result: Some("%r"),
+                lb: "%lb",
+                ub: "%ub",
+                step: "%step",
+                iter_var: "%i",
+                iter_inits: &["%a0", "%b0"],
+                iter_args: &["%a", "%b"],
+            },
             vec![one, na, nb, yld],
         );
         run(&[f], &mut ctx).unwrap();
@@ -805,13 +855,15 @@ mod tests {
         let yld = ops.op(None, OpKind::ScfYield, &["%s"]);
         let f = for_op_ir(
             &mut ops,
-            Some("%r"),
-            "%lb",
-            "%ub",
-            "%step",
-            "%i",
-            &["%init"],
-            &["%acc"],
+            ForIr {
+                result: Some("%r"),
+                lb: "%lb",
+                ub: "%ub",
+                step: "%step",
+                iter_var: "%i",
+                iter_inits: &["%init"],
+                iter_args: &["%acc"],
+            },
             vec![one, add, yld],
         );
         let used_before = ctx.lx.borrow().used;
@@ -945,13 +997,15 @@ mod tests {
         let fyld = ops.op(None, OpKind::ScfYield, &["%s"]);
         let inner_for = for_op_ir(
             &mut ops,
-            Some("%r"),
-            "%lb",
-            "%ub",
-            "%step",
-            "%i",
-            &["%init"],
-            &["%acc"],
+            ForIr {
+                result: Some("%r"),
+                lb: "%lb",
+                ub: "%ub",
+                step: "%step",
+                iter_var: "%i",
+                iter_inits: &["%init"],
+                iter_args: &["%acc"],
+            },
             vec![add, fyld],
         );
         let oyld = ops.op(None, OpKind::ScfYield, &["%r"]);

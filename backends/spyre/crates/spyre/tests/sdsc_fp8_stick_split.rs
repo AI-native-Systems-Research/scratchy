@@ -18,11 +18,13 @@
 //! Reverting the stick basis to a hardcoded 64 (or dropping the `::<Fp8>` residency stamp) turns
 //! (1)/(2) RED; deleting the `StickExtent<Fp8>` witness turns (3) RED.
 
+use ktir_superdsc::emit::OpDecl;
 use ktir_superdsc::emit::{assemble_convert, rb};
 use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::SharedKernelBmmForm;
 use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::matmul_opspec_off;
 use ktir_superdsc::sdsc_abstract::{MatK, MatM, MatN, MatY, QueryRowCount};
 use ktir_superdsc::superdsc_opspec::{Df, Fp8, Fp16, Role};
+use scratchy_target_spyre::lower_subtile_tape_to_superdsc::{MatmulDims, NamedOperands};
 
 /// These probes emit decode-shaped projections: one token row, projection feature widths, no batch.
 fn mm(m: u32) -> MatM {
@@ -46,31 +48,39 @@ fn pf() -> SharedKernelBmmForm {
 fn fp8_matmul_splits_on_128_stick_not_64() {
     // m=1 decode, N=256, K=256 — fits LX (no time-tile), a clean single spatial split.
     let f8 = matmul_opspec_off::<Fp8>(
-        mm(1),
-        nn(256),
-        kk(256),
+        MatmulDims {
+            m: mm(1),
+            n: nn(256),
+            k: kk(256),
+        },
         yy(),
         pf(),
-        "act",
-        "w",
-        "out",
-        0,
-        0,
-        0,
+        NamedOperands {
+            a_name: "act",
+            w_name: "w",
+            o_name: "out",
+            a_off: 0,
+            w_off: 0,
+            o_off: 0,
+        },
     )
     .expect("fp8 256×256 matmul must emit");
     let f16 = matmul_opspec_off::<Fp16>(
-        mm(1),
-        nn(256),
-        kk(256),
+        MatmulDims {
+            m: mm(1),
+            n: nn(256),
+            k: kk(256),
+        },
         yy(),
         pf(),
-        "act",
-        "w",
-        "out",
-        0,
-        0,
-        0,
+        NamedOperands {
+            a_name: "act",
+            w_name: "w",
+            o_name: "out",
+            a_off: 0,
+            w_off: 0,
+            o_off: 0,
+        },
     )
     .expect("fp16 256×256 matmul must emit");
 
@@ -102,17 +112,21 @@ fn fp8_operands_are_fp8_resident() {
     // Df::Fp8 (1-byte reads). A regression that split at 128 but read the weight 2-byte fp16 would
     // be the dequant-to-fp16 reward-hack — this catches it.
     let f8 = matmul_opspec_off::<Fp8>(
-        mm(1),
-        nn(256),
-        kk(256),
+        MatmulDims {
+            m: mm(1),
+            n: nn(256),
+            k: kk(256),
+        },
         yy(),
         pf(),
-        "act",
-        "w",
-        "out",
-        0,
-        0,
-        0,
+        NamedOperands {
+            a_name: "act",
+            w_name: "w",
+            o_name: "out",
+            a_off: 0,
+            w_off: 0,
+            o_off: 0,
+        },
     )
     .unwrap();
     let mut non_output = 0;
@@ -136,17 +150,21 @@ fn fp8_operands_are_fp8_resident() {
 
     // The dense fp16 path is byte-identical: its operands stay Fp16.
     let f16 = matmul_opspec_off::<Fp16>(
-        mm(1),
-        nn(256),
-        kk(256),
+        MatmulDims {
+            m: mm(1),
+            n: nn(256),
+            k: kk(256),
+        },
         yy(),
         pf(),
-        "act",
-        "w",
-        "out",
-        0,
-        0,
-        0,
+        NamedOperands {
+            a_name: "act",
+            w_name: "w",
+            o_name: "out",
+            a_off: 0,
+            w_off: 0,
+            o_off: 0,
+        },
     )
     .unwrap();
     for arg in f16.args() {
@@ -160,34 +178,42 @@ fn fp8_non_128_multiple_extent_is_err_not_dtexception() {
     // MUST be a Rust `Err` at emit (the sealed StickExtent<Fp8> ctor), NOT an on-card
     // L3DlOpsScheduler:1070 DtException. The SAME 192 is a valid fp16 extent (3 whole 64-sticks).
     let bad = matmul_opspec_off::<Fp8>(
-        mm(1),
-        nn(192),
-        kk(256),
+        MatmulDims {
+            m: mm(1),
+            n: nn(192),
+            k: kk(256),
+        },
         yy(),
         pf(),
-        "act",
-        "w",
-        "out",
-        0,
-        0,
-        0,
+        NamedOperands {
+            a_name: "act",
+            w_name: "w",
+            o_name: "out",
+            a_off: 0,
+            w_off: 0,
+            o_off: 0,
+        },
     );
     assert!(
         bad.is_err(),
         "non-128-multiple fp8 N=192 must be Err (sub-stick), got Ok"
     );
     let ok = matmul_opspec_off::<Fp16>(
-        mm(1),
-        nn(192),
-        kk(256),
+        MatmulDims {
+            m: mm(1),
+            n: nn(192),
+            k: kk(256),
+        },
         yy(),
         pf(),
-        "act",
-        "w",
-        "out",
-        0,
-        0,
-        0,
+        NamedOperands {
+            a_name: "act",
+            w_name: "w",
+            o_name: "out",
+            a_off: 0,
+            w_off: 0,
+            o_off: 0,
+        },
     );
     assert!(
         ok.is_ok(),
@@ -208,8 +234,24 @@ fn fp8_large_matmul_time_tile_never_substick() {
         (2048, 2048, "q/o_proj"),
         (512, 2048, "k/v_proj"),
     ] {
-        let f = matmul_opspec_off::<Fp8>(mm(1), nn(n), kk(k), yy(), pf(), "a", "w", "o", 0, 0, 0)
-            .unwrap_or_else(|e| panic!("{tag} N={n} K={k} fp8 must emit, got Err: {e}"));
+        let f = matmul_opspec_off::<Fp8>(
+            MatmulDims {
+                m: mm(1),
+                n: nn(n),
+                k: kk(k),
+            },
+            yy(),
+            pf(),
+            NamedOperands {
+                a_name: "a",
+                w_name: "w",
+                o_name: "o",
+                a_off: 0,
+                w_off: 0,
+                o_off: 0,
+            },
+        )
+        .unwrap_or_else(|e| panic!("{tag} N={n} K={k} fp8 must emit, got Err: {e}"));
         let split = f.iter.split_of("out").max(1);
         let per_core = f.iter.per_core_extent("out");
         let time = f.time_tile().map(|t| t.count()).unwrap_or(1).max(1);
@@ -232,10 +274,12 @@ fn qfp8ch_convert_splits_on_128_fp8_output() {
     let mut sym: i64 = 0;
     for &cols in &[2048u32, 8192, 512] {
         let e = assemble_convert::<ktir_superdsc::collective::TpWorld<1>>(
-            "fq_afp8",
-            "qfp8ch",
-            1,
-            cols,
+            OpDecl {
+                op_name: "fq_afp8",
+                op_func: "qfp8ch",
+                rows: 1,
+                cols,
+            },
             &rb("act", 1, cols),
             &rb("afp8", 1, cols),
             &mut sym,
@@ -244,7 +288,7 @@ fn qfp8ch_convert_splits_on_128_fp8_output() {
         .expect("assemble_convert builds");
         let split = e
             .dsc()
-            .numWkSlicesPerDim_
+            .num_wk_slices_per_dim
             .get("out")
             .copied()
             .unwrap_or(1)

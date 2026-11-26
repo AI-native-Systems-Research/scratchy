@@ -348,8 +348,6 @@ struct AttnCase {
 /// CPU reference: causal (+ optional window) softmax attention over a
 /// contiguous K/V laid out `[block, kv_head, tok_in_block, head_dim]`
 /// (the paged layout with an identity block table).
-#[allow(clippy::too_many_arguments)]
-#[allow(clippy::needless_range_loop)]
 fn attn_ref(
     q: &[f32], // [num_q, num_q_heads, head_dim] (one row per query token)
     k: &[f32], // paged layout, f16-rounded
@@ -395,8 +393,8 @@ fn attn_ref(
                     continue;
                 }
                 let mut s = 0f32;
-                for d in 0..head_dim {
-                    s += qrow[d] * kv_at(t, kvh, d);
+                for (d, &qd) in qrow.iter().enumerate() {
+                    s += qd * kv_at(t, kvh, d);
                 }
                 scores.push(s * scale);
             }
@@ -404,13 +402,13 @@ fn attn_ref(
             let exps: Vec<f32> = scores.iter().map(|&s| (s - m).exp()).collect();
             let denom: f32 = exps.iter().sum();
             let orow = &mut out[(qi * num_q_heads + h) * head_dim..][..head_dim];
-            for t in 0..kv_len {
-                if exps[t] == 0.0 {
+            for (t, &e) in exps.iter().enumerate() {
+                if e == 0.0 {
                     continue;
                 }
-                let w = exps[t] / denom;
-                for d in 0..head_dim {
-                    orow[d] += w * vv_at(t, kvh, d);
+                let w = e / denom;
+                for (d, o) in orow.iter_mut().enumerate() {
+                    *o += w * vv_at(t, kvh, d);
                 }
             }
         }

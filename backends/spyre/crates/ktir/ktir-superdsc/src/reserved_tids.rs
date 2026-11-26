@@ -665,15 +665,14 @@ pub const fn reserved_region(name: &str) -> TidRegion {
 
 /// ⭐ THE PROOF, EVALUATED AT COMPILE TIME. Adding or resizing a region re-runs it; an overlap is
 /// a build error naming both regions, not a tensor that quietly answers to two names.
-#[allow(clippy::let_unit_value)]
-const _: () = {
-    // Referencing both proofs is what makes the compiler EVALUATE them; an unused `const` item is
-    // not const-evaluated, so a lock nothing mentions is a lock that never runs.
-    let _ = SENTINELS_ARE_INSIDE_THEIR_REGION;
-    let _ = RESERVED_REGIONS_ARE_DISJOINT;
-    let _ = EVERY_NAMED_REGION_RESOLVES;
-    let _ = PAGED_WINDOW_0_IS_THE_SENTINELS;
-};
+// Referencing the proofs is what makes the compiler EVALUATE them; an unused `const` item is not
+// const-evaluated, so a lock nothing mentions is a lock that never runs.
+const _: [(); 4] = [
+    SENTINELS_ARE_INSIDE_THEIR_REGION,
+    RESERVED_REGIONS_ARE_DISJOINT,
+    EVERY_NAMED_REGION_RESOLVES,
+    PAGED_WINDOW_0_IS_THE_SENTINELS,
+];
 
 /// ⭐⭐⭐ EVERY NAME THIS MODULE ADDRESSES A REGION BY, RESOLVED AT COMPILE TIME.
 ///

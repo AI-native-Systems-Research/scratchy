@@ -7505,8 +7505,8 @@ mod kv_pool_formats {
                     e.op.as_ref()
                         .and_then(|o| o.dscs_.first())
                         .and_then(|m| m.values().next())
-                        .and_then(|d| d.computeOp_.first())
-                        .map(|c| c.opFuncName.clone());
+                        .and_then(|d| d.compute_op.first())
+                        .map(|c| c.op_func_name.clone());
                 let kind = e
                     .op_name
                     .trim_end_matches(|c: char| c.is_ascii_digit())

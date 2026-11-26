@@ -11,7 +11,7 @@ use half::{bf16, f16};
 use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions, MTLSize};
 use scratchy_target_metal::aot::baked_build;
 use scratchy_target_metal::detect_device;
-use scratchy_target_metal::mtl4_dispatch::Mtl4DispatchBatch;
+use scratchy_target_metal::mtl4_dispatch::{Mtl4DispatchBatch, ThreadgroupGrid};
 use scratchy_target_metal::specialized_pipeline_cache::{PipelineKey, SpecializedPipelineCache};
 use scratchy_target_metal::tape::ids::{
     BlockSize, BlocksPerChunk, ElementCount, HeadDim, NumKvHeads,
@@ -121,8 +121,10 @@ fn relu2_matches_reference() {
             &[],
             &[],
             &[],
-            tg(padded / 256, 1),
-            tg(256, 1),
+            ThreadgroupGrid {
+                threadgroups: tg(padded / 256, 1),
+                threads_per_threadgroup: tg(256, 1),
+            },
         );
         batch.commit(true);
         let got: Vec<u16> = read(&out, padded);
@@ -222,8 +224,10 @@ fn check(c: &Case) {
         &[],
         &[],
         &[&pool_k.data, &pool_v.data],
-        tg(n_tok, nkv),
-        tg(hd, 1),
+        ThreadgroupGrid {
+            threadgroups: tg(n_tok, nkv),
+            threads_per_threadgroup: tg(hd, 1),
+        },
     );
     batch.commit(true);
 

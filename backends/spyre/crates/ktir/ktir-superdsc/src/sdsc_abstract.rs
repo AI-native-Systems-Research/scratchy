@@ -4810,15 +4810,6 @@ impl ChunkRows {
     }
 }
 
-/// THE GQA HEAD MAP: query head `qh` attends the KV head `qh / gqa` (each contiguous group of `gqa` query
-/// heads shares one K/V head; `gqa = num_q_heads / num_kv_heads`). SINGLE SOURCE OF TRUTH shared by (a) the
-/// deleted builder's K/V GQA-replication in `lower_attn_node` (`copy(new_k, kvh*hd, krep, qh*hd)`) and (b) the Kani
-/// proof (`gqa_replicate_*`). If this map were wrong, query heads would attend the WRONG KV head — scrambled
-/// attention with a preserved-ish norm (still a real head's K/V), a norm-preserving-direction-shift class.
-pub(crate) fn gqa_kv_head(qh: usize, gqa: usize) -> usize {
-    qh / gqa
-}
-
 /// A PHYSICAL page in the resident KV pool. A request's block table maps its logical pages to these.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct PhysPage(pub u32);
@@ -4872,7 +4863,7 @@ pub struct PhysPage(pub u32);
 ///   `nqh`-sized reservation was `gqa`x dead space.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct PagedKvPool {
-    /// DISTINCT kv heads — a query head reads its group's plane via [`gqa_kv_head`]. Nonzero by
+    /// DISTINCT kv heads — query head `qh` reads the plane of kv head `qh / gqa`. Nonzero by
     /// construction: a pool with no heads is unrepresentable, which is exactly what the old
     /// `nkvh == 0` refusals at every reader were checking.
     nkvh: NonZeroU32,
@@ -5804,24 +5795,6 @@ impl PagedKvPool {
     // work — but it decides the byte offset each plane lands on, and this path is measurably
     // placement-sensitive. Having transposed-K first put all three planes at offsets the tuned
     // layout never used.
-
-    #[allow(dead_code)]
-    fn v_block_base_first(&self, qh: usize, gqa: usize, b: u32) -> u32 {
-        // The head width is the POOL's (`self.hd`), never a caller's: a V page's geometry belongs to
-        // the pool that laid it out, and taking a second `hd` here let a caller name one width while
-        // the address used another.
-        // ⭐ `b * STK * hd`, NOT `b * STK * STK`. A 64-slot block advances 64 SLOTS of one stick each,
-        // and a whole slot is `hd` elements — the two agree ONLY at head_dim 64, which is every model that
-        // had run. At head_dim 128 block 0 was exact and every later block read one plane too far, so
-        // attention was right over the first 64 cached slots and drifted from the 65th. The comment above
-        // described this bug; it is now fixed rather than described.
-        // Both hd terms arrive through the type: `hd_elems` (the host usize widening, via
-        // `as_usize`) for the page-block product, `self.hd.get()` for the u32 block term. The
-        // one `as u32` narrows the page-block product to this fn's return, not the width.
-        let hd_elems = self.hd.as_usize();
-        (gqa_kv_head(qh, gqa) * Self::POOL_PAGE_SLOTS.as_usize() * hd_elems) as u32
-            + b * STK as u32 * self.hd.get()
-    }
 
     /// Kᵀ WRITE offset of `K[slot][d]` within a page+layer — the consumer's own read model, so
     /// producer and consumer cannot diverge (the `[hd, cap]` cap-sticked kernel's `dev_off(d, slot)`

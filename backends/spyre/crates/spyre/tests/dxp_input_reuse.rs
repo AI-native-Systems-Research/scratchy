@@ -5,6 +5,7 @@
 //! render to the same bytes no matter where in their bundle they start; and a compiled group kept
 //! under that key must come back exactly, under the same compiler, and never under a different one.
 
+use scratchy_target_spyre::lower_subtile_tape_to_superdsc::MatmulCounts;
 use std::path::{Path, PathBuf};
 
 use ktir_superdsc::emit;
@@ -21,10 +22,12 @@ fn identical_matmuls(
         .map(|_| {
             superdsc::assemble_matmul(
                 "rep_mm",
-                64,
-                64,
-                64,
-                1,
+                MatmulCounts {
+                    m: 64,
+                    n: 64,
+                    k: 64,
+                    batch: 1,
+                },
                 &emit::rb("rep_a", 64, 64),
                 &Stk::<KernelTag>::kernel(64_usize, 64_usize, "rep_w"),
                 &emit::rb("rep_o", 64, 64),

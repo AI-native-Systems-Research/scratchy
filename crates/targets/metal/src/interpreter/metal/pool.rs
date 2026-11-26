@@ -36,8 +36,8 @@ use super::lowered::{LoweredMetalTape, ModelSources};
 use super::pipelines::SpecializedPipelines;
 use super::runtime::{InputWrite, InputWrites, Padding, RuntimeBindings};
 use super::worker::{
-    ArenaLayout, ArenaRanks, ArenaRole, ArenaShare, GuestArena, HostArena, Hosting, MetalWorker,
-    ResolvedSources, Slot, SparsePlan, TerminalReads, WorkerError,
+    ArenaLayout, ArenaPlacement, ArenaRanks, ArenaRole, ArenaShare, GuestArena, HostArena, Hosting,
+    MetalWorker, ResolvedSources, Slot, SparsePlan, TerminalReads, WorkerError,
 };
 use crate::MetalAllocator;
 use crate::tape::constants::TapeVariant;
@@ -288,7 +288,11 @@ impl From<WorkerError> for PoolBuildError {
 #[derive(Clone)]
 pub struct RuntimeFactory(Arc<FactoryFn>);
 
-struct FactoryFn(Box<dyn Fn(&Device, &HostArena) -> RuntimeBindings>);
+/// What a [`RuntimeFactory`] runs: a worker's runtime bindings on its device, from its host's
+/// arena.
+type BuildRuntime = dyn Fn(&Device, &HostArena) -> RuntimeBindings;
+
+struct FactoryFn(Box<BuildRuntime>);
 
 // SAFETY: the boxed closure captures only Metal object handles (objc2
 // `Retained`, thread-safe retain/release) and POD; identical grounds to
@@ -762,6 +766,53 @@ impl MetalRungs {
     }
 }
 
+/// The workers a pool runs: the factory building each one's runtime bindings, and the most it
+/// creates.
+pub struct PoolWorkers {
+    pub runtime_factory: RuntimeFactory,
+    pub max_workers: usize,
+}
+
+/// A pool's arena: the block-table row stride its tapes read, the byte size of each slot, the
+/// most rows a decode or verify step brings, how the first worker's arena is shared with another
+/// model's ([`ArenaShare`], by this model's `ranks`), and the plan placing what the host does not
+/// read by pointer sparsely ([`SparsePlan`]).
+pub struct PoolArena {
+    pub block_table_stride: MaxBlocksPerSeq,
+    pub arena_layout: ArenaLayout,
+    pub decode_rows: Option<DecodeRows>,
+    pub share: ArenaShare,
+    pub ranks: ArenaRanks,
+    pub sparse_plan: Option<SparsePlan>,
+}
+
+/// What a deployment sizes a pool by, for [`MetalWorkerPool::for_buckets`] to pick its rung.
+pub struct PoolSizing {
+    /// The bucket cap the worker derived from the memory budget ([`pick_rung`]).
+    pub max_bucket_m: Option<u32>,
+    /// Runtime per-sequence block-table capacity (`KvCachePool::max_blocks_per_seq`), a KV cap
+    /// rung itself (see [`pick_rung`]): every step's block tables are rows of this width.
+    pub block_cap: usize,
+    pub addressing: KvAddressing,
+    /// The most rows a decode or verify step brings (`GpuDevice::max_decode_rows`).
+    pub decode_rows: Option<DecodeRows>,
+    /// How its arena is shared with that of a model whose forwards never overlap its own
+    /// ([`ArenaShare`]).
+    pub share: ArenaShare,
+    /// Whether the host reads the logits by pointer, so the terminal slots stay shared. A guest's
+    /// host reads none of its slots.
+    pub terminal: TerminalReads,
+}
+
+/// The rows of one forward a bucket plays: its sequences, the rows it samples, and what the host
+/// reads back.
+#[derive(Clone, Copy)]
+struct ForwardRows {
+    num_seqs: u32,
+    sampled_rows: crate::tape::ids::SampledRowCount,
+    reads: ForwardReads,
+}
+
 impl<W: CanonicalParams> MetalWorkerPool<W> {
     /// Build the pool and eagerly create the first worker.
     ///
@@ -770,7 +821,6 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
     /// path (no creation cost on the first checkout). The first worker's arena is shared with
     /// another model's as `share` says, by this model's `ranks` ([`ArenaShare`]); any later
     /// worker's is its own.
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         device: Arc<Device>,
         weights: &W,
@@ -779,18 +829,24 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         // Each bucket's row and the tape it runs, in bucket order: a forward's output slots are
         // read off the row of the tape it ran ([`Self::bucket_spec`]).
         buckets: &[(&'static MetalBucketSpec, LoweredMetalTape)],
-        block_table_stride: MaxBlocksPerSeq,
-        arena_layout: ArenaLayout,
-        runtime_factory: RuntimeFactory,
-        max_workers: usize,
-        decode_rows: Option<DecodeRows>,
-        share: ArenaShare,
-        ranks: ArenaRanks,
-        sparse_plan: Option<SparsePlan>,
+        arena: PoolArena,
+        workers: PoolWorkers,
     ) -> Result<Self, WorkerError>
     where
         W: ModelSources,
     {
+        let PoolArena {
+            block_table_stride,
+            arena_layout,
+            decode_rows,
+            share,
+            ranks,
+            sparse_plan,
+        } = arena;
+        let PoolWorkers {
+            runtime_factory,
+            max_workers,
+        } = workers;
         assert!(max_workers >= 1, "max_workers must be >= 1");
         let bucket_tapes: Arc<[LoweredMetalTape]> = buckets.iter().map(|&(_, tape)| tape).collect();
         let bucket_specs: Arc<[&'static MetalBucketSpec]> =
@@ -865,26 +921,24 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         allocator: Arc<MetalAllocator>,
         // The model's buckets and arena ranks, one model's both.
         rungs: &MetalRungs,
-        runtime_factory: RuntimeFactory,
-        max_workers: usize,
-        max_bucket_m: Option<u32>,
-        // Runtime per-sequence block-table capacity
-        // (`KvCachePool::max_blocks_per_seq`), a KV cap rung itself (see
-        // [`pick_rung`]): every step's block tables are rows of this width.
-        block_cap: usize,
-        addressing: KvAddressing,
-        // The most rows a decode or verify step brings (`GpuDevice::max_decode_rows`).
-        decode_rows: Option<DecodeRows>,
-        // How its arena is shared with that of a model whose forwards never overlap its own
-        // ([`ArenaShare`]).
-        share: ArenaShare,
-        // Whether the host reads the logits by pointer, so the terminal slots stay shared. A
-        // guest's host reads none of its slots.
-        terminal: TerminalReads,
+        workers: PoolWorkers,
+        sizing: PoolSizing,
     ) -> Result<Self, PoolBuildError>
     where
         W: ModelSources,
     {
+        let PoolWorkers {
+            runtime_factory,
+            max_workers,
+        } = workers;
+        let PoolSizing {
+            max_bucket_m,
+            block_cap,
+            addressing,
+            decode_rows,
+            share,
+            terminal,
+        } = sizing;
         if share.role() == ArenaRole::Guest && terminal == TerminalReads::Host {
             return Err(PoolBuildError::GuestReadsLogits);
         }
@@ -921,14 +975,18 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             allocator,
             pipelines,
             &buckets,
-            variant.cap,
-            arena_layout,
-            runtime_factory,
-            max_workers,
-            decode_rows,
-            share,
-            ranks,
-            Some(sparse_plan),
+            PoolArena {
+                block_table_stride: variant.cap,
+                arena_layout,
+                decode_rows,
+                share,
+                ranks,
+                sparse_plan: Some(sparse_plan),
+            },
+            PoolWorkers {
+                runtime_factory,
+                max_workers,
+            },
         )
         .map_err(PoolBuildError::Worker)
     }
@@ -1113,9 +1171,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         &self,
         worker: &MetalWorker<W>,
         bucket: &W::Bucket,
-        num_seqs: u32,
-        sampled_rows: crate::tape::ids::SampledRowCount,
-        reads: ForwardReads,
+        rows: ForwardRows,
         tail: Option<F>,
         writes: &InputWrites,
         deferred: Option<&Deferral>,
@@ -1128,6 +1184,11 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             &W::Bucket,
         ) -> Result<(), ForwardError>,
     {
+        let ForwardRows {
+            num_seqs,
+            sampled_rows,
+            reads,
+        } = rows;
         self.ensure_mtl4();
         // gemma3-mm SigLIP vision tower: the projector tail
         // (`AvgPool2d -> soft_emb_norm -> mm_input_projection`) hits an
@@ -1503,9 +1564,11 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         self.run_bucket_mtl4_with_tail(
             &guard.worker,
             &bucket,
-            num_seqs,
-            sampled_rows,
-            inputs.reads,
+            ForwardRows {
+                num_seqs,
+                sampled_rows,
+                reads: inputs.reads,
+            },
             tail,
             &writes,
             inputs.deferred,
@@ -1665,11 +1728,13 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             &self.pipelines,
             &self.sources,
             &runtime,
-            Some(self.allocator.residency()),
-            self.decode_rows,
-            share,
-            ranks,
-            self.sparse_plan.as_ref(),
+            ArenaPlacement {
+                residency: Some(self.allocator.residency()),
+                decode_rows: self.decode_rows,
+                share,
+                ranks,
+                plan: self.sparse_plan.as_ref(),
+            },
         )?;
         Ok(PooledWorker {
             worker,
@@ -2687,14 +2752,18 @@ mod tests {
             allocator,
             pipelines,
             &test_buckets(&tapes, |_| true),
-            MaxBlocksPerSeq(128),
-            arena_layout,
-            runtime_factory,
-            max,
-            None,
-            ArenaShare::Own,
-            ArenaRanks::NONE,
-            None,
+            PoolArena {
+                block_table_stride: MaxBlocksPerSeq(128),
+                arena_layout,
+                decode_rows: None,
+                share: ArenaShare::Own,
+                ranks: ArenaRanks::NONE,
+                sparse_plan: None,
+            },
+            PoolWorkers {
+                runtime_factory,
+                max_workers: max,
+            },
         )
         .expect("pool builds");
         Some(pool)
@@ -2945,14 +3014,18 @@ mod tests {
             allocator,
             pipelines,
             &test_buckets(&tapes, plays_result),
-            MaxBlocksPerSeq(128),
-            arena_layout,
-            runtime_factory,
-            max_workers,
-            None,
-            ArenaShare::Own,
-            ArenaRanks::NONE,
-            None,
+            PoolArena {
+                block_table_stride: MaxBlocksPerSeq(128),
+                arena_layout,
+                decode_rows: None,
+                share: ArenaShare::Own,
+                ranks: ArenaRanks::NONE,
+                sparse_plan: None,
+            },
+            PoolWorkers {
+                runtime_factory,
+                max_workers,
+            },
         )
         .expect("pool builds");
         Some(pool)
@@ -3892,14 +3965,19 @@ mod tests {
             &weights,
             allocator,
             test_rungs(bucket_specs, ArenaRanks::NONE),
-            runtime_factory,
-            max_workers,
-            None,
-            128, // block_cap (test default — matches the legacy MAX_BLOCKS_PER_SEQ)
-            KvAddressing::Direct,
-            None,
-            ArenaShare::Own,
-            TerminalReads::Gpu,
+            PoolWorkers {
+                runtime_factory,
+                max_workers,
+            },
+            PoolSizing {
+                max_bucket_m: None,
+                // The test default, the legacy MAX_BLOCKS_PER_SEQ.
+                block_cap: 128,
+                addressing: KvAddressing::Direct,
+                decode_rows: None,
+                share: ArenaShare::Own,
+                terminal: TerminalReads::Gpu,
+            },
         ))
     }
 
@@ -3925,14 +4003,18 @@ mod tests {
             &weights,
             allocator,
             test_rungs(&[], ArenaRanks::NONE),
-            runtime_factory,
-            1,
-            None,
-            128, // block_cap (unused — NoBuckets fires first)
-            KvAddressing::Direct,
-            None,
-            ArenaShare::Own,
-            TerminalReads::Gpu,
+            PoolWorkers {
+                runtime_factory,
+                max_workers: 1,
+            },
+            PoolSizing {
+                max_bucket_m: None,
+                block_cap: 128, // block_cap (unused — NoBuckets fires first)
+                addressing: KvAddressing::Direct,
+                decode_rows: None,
+                share: ArenaShare::Own,
+                terminal: TerminalReads::Gpu,
+            },
         );
         match res {
             Err(PoolBuildError::NoBuckets) => {}
@@ -4199,14 +4281,18 @@ mod tests {
                 &weights,
                 allocator.clone(),
                 rungs,
-                factory,
-                1,
-                None,
-                128,
-                KvAddressing::Direct,
-                None,
-                share,
-                terminal,
+                PoolWorkers {
+                    runtime_factory: factory,
+                    max_workers: 1,
+                },
+                PoolSizing {
+                    max_bucket_m: None,
+                    block_cap: 128,
+                    addressing: KvAddressing::Direct,
+                    decode_rows: None,
+                    share,
+                    terminal,
+                },
             )
         };
         let host_pool = build(host, ArenaShare::Hosts(needs), TerminalReads::Gpu)

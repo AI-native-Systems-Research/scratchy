@@ -59,17 +59,8 @@ struct EvalRow {
 }
 
 #[derive(Debug, serde::Deserialize)]
-#[allow(dead_code)]
 struct Fragment {
     page_content: String,
-    metadata: FragmentMetadata,
-}
-
-#[derive(Debug, serde::Deserialize)]
-#[allow(dead_code)]
-struct FragmentMetadata {
-    #[serde(default)]
-    title: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -389,8 +380,6 @@ fn grade_relevancy(llm: &mut LLM, question: &str, answer: &str) -> f64 {
 // ---------------------------------------------------------------------------
 
 struct ModeResult {
-    #[allow(dead_code)]
-    text: String,
     f1: f64,
     em: f64,
     bleu: f64,
@@ -500,7 +489,6 @@ pub(crate) fn run_bench_ragcsv(args: BenchRagcsvArgs) -> Result<()> {
         };
 
         plain_results.push(ModeResult {
-            text,
             f1,
             em,
             bleu: bl,
@@ -576,7 +564,6 @@ pub(crate) fn run_bench_ragcsv(args: BenchRagcsvArgs) -> Result<()> {
         };
 
         span_results.push(ModeResult {
-            text,
             f1,
             em,
             bleu: bl,

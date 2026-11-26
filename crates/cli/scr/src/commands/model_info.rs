@@ -425,7 +425,6 @@ fn render_fields(step: &NormalizedStep, m_range: Option<(u64, u64)>) -> RowField
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn print_tree<W: Write>(
     out: &mut W,
     steps: &[NormalizedStep],
@@ -437,7 +436,12 @@ fn print_tree<W: Write>(
     let tops = top_level_indices(steps);
     for (i, &idx) in tops.iter().enumerate() {
         let is_last = i + 1 == tops.len();
-        render_node(out, steps, idx, indent, is_last, 0, style, widths, m_range)?;
+        let row = RowFormat {
+            style,
+            widths,
+            m_range,
+        };
+        render_node(out, steps, idx, indent, is_last, 0, row)?;
     }
     Ok(())
 }
@@ -470,7 +474,15 @@ fn loop_count(step: &NormalizedStep) -> u32 {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+/// How a tree's rows are formatted: the styling, the column widths and the
+/// `m` range the shapes are shown over.
+#[derive(Clone, Copy)]
+struct RowFormat<'a> {
+    style: &'a Style,
+    widths: &'a Widths,
+    m_range: Option<(u64, u64)>,
+}
+
 fn render_node<W: Write>(
     out: &mut W,
     steps: &[NormalizedStep],
@@ -478,10 +490,13 @@ fn render_node<W: Write>(
     prefix: &str,
     is_last: bool,
     depth: usize,
-    style: &Style,
-    widths: &Widths,
-    m_range: Option<(u64, u64)>,
+    row: RowFormat<'_>,
 ) -> io::Result<()> {
+    let RowFormat {
+        style,
+        widths,
+        m_range,
+    } = row;
     let s = &steps[idx];
     let connector = if is_last { "└─ " } else { "├─ " };
     let child_prefix = format!("{prefix}{}", if is_last { "   " } else { "│  " });
@@ -499,17 +514,7 @@ fn render_node<W: Write>(
         let body_tops = top_level_indices(body);
         for (j, &bidx) in body_tops.iter().enumerate() {
             let body_is_last = j + 1 == body_tops.len();
-            render_node(
-                out,
-                body,
-                bidx,
-                &child_prefix,
-                body_is_last,
-                depth + 1,
-                style,
-                widths,
-                m_range,
-            )?;
+            render_node(out, body, bidx, &child_prefix, body_is_last, depth + 1, row)?;
         }
     } else {
         // Each level of nesting adds 3 visible chars to the prefix

@@ -191,7 +191,6 @@ impl SpyreSession {
     /// fusion, resident weights, and the GPU offloads. The per-node interpreter — which
     /// `program.rs:12-14` calls "the slow parity-oracle path", where "the GPU offloads, gated on a
     /// single-core grid, never fire" — is not reachable from outside the emulator crate.
-    #[allow(clippy::type_complexity)]
     pub fn new_multi<T: ktir_superdsc::collective::Tp>(
         programs: &[(&[bundle::LaunchGroup<'static, T>], &[u64])],
         weights: Vec<(usize, crate::allocator::HostBytes, SDType, Vec<usize>)>,

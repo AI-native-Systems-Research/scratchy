@@ -4,13 +4,14 @@
 //! than folded into a bigger one.
 
 use crate::addr::{DevOff, Win};
+use crate::emit::OpDecl;
 use crate::emit::{EmittedOp, op_func_from_str, sen169_bits};
 use crate::ir::island::tile_op::{TileOp, TileOpKind};
 use crate::placement::BundleLayout;
 use crate::sdsc_abstract::{BlockCols, KindTag, RowCount, StickKind, Stk};
 use crate::superdsc_opspec::{
     Allocation, AnyTensorArg, DataFormat, Df, Fp16, Fp32, OpFunc, OpInfo, OpSpec, Role,
-    SamvCoordinateMask, Scale, SdscFoldSet, TensorArg,
+    SamvCoordinateMask, Scale, SdscFoldSet, TensorArg, TensorArgDecl,
 };
 use crate::work::distribute_cores;
 
@@ -359,32 +360,32 @@ pub fn reduce_opspec_df_divided(
 
     let data = if stickmajor {
         AnyTensorArg::R2(
-            TensorArg::<2>::new(
-                true,
-                data_name.to_string(),
-                Role::Output,
-                [Scale::Active, Scale::Active],
-                device_dims_r2,
-                ["mb", "out"],
-                "out",
-                Allocation::Hbm,
-            )
+            TensorArg::<2>::new(TensorArgDecl {
+                is_input: true,
+                name: data_name.to_string(),
+                role: Role::Output,
+                scale: [Scale::Active, Scale::Active],
+                device_dims: device_dims_r2,
+                layout: ["mb", "out"],
+                stick: "out",
+                allocation: Allocation::Hbm,
+            })
             .map_err(|e| e.0)?
             .with_df(df)
             .with_row_blocked(matches!(df, Df::Fp32)),
         )
     } else {
         AnyTensorArg::R3(
-            TensorArg::<3>::new(
-                true,
-                data_name.to_string(),
-                Role::Output,
-                [Scale::Active, Scale::Active, Scale::Active],
+            TensorArg::<3>::new(TensorArgDecl {
+                is_input: true,
+                name: data_name.to_string(),
+                role: Role::Output,
+                scale: [Scale::Active, Scale::Active, Scale::Active],
                 device_dims,
-                ["mb", "out", "y"],
-                "out",
-                Allocation::Hbm,
-            )
+                layout: ["mb", "out", "y"],
+                stick: "out",
+                allocation: Allocation::Hbm,
+            })
             .map_err(|e| e.0)?
             .with_df(df)
             .with_row_blocked(matches!(df, Df::Fp32)),
@@ -398,32 +399,32 @@ pub fn reduce_opspec_df_divided(
     // stick); the rank-3 `[mb,out,y]` form stays only for the head-major (per-head attn) reduce.
     let accum = if stickmajor {
         AnyTensorArg::R2(
-            TensorArg::<2>::new(
-                false,
-                accum_name.to_string(),
-                Role::Output,
-                [Scale::Active, Scale::RedStick],
-                device_dims_r2,
-                ["mb", "out"],
-                "out",
-                Allocation::Hbm,
-            )
+            TensorArg::<2>::new(TensorArgDecl {
+                is_input: false,
+                name: accum_name.to_string(),
+                role: Role::Output,
+                scale: [Scale::Active, Scale::RedStick],
+                device_dims: device_dims_r2,
+                layout: ["mb", "out"],
+                stick: "out",
+                allocation: Allocation::Hbm,
+            })
             .map_err(|e| e.0)?
             .with_df(df)
             .with_row_blocked(matches!(df, Df::Fp32)),
         )
     } else {
         AnyTensorArg::R3(
-            TensorArg::<3>::new(
-                false,
-                accum_name.to_string(),
-                Role::Output,
-                [Scale::Active, Scale::RedStick, Scale::Active],
+            TensorArg::<3>::new(TensorArgDecl {
+                is_input: false,
+                name: accum_name.to_string(),
+                role: Role::Output,
+                scale: [Scale::Active, Scale::RedStick, Scale::Active],
                 device_dims,
-                ["mb", "out", "y"],
-                "out",
-                Allocation::Hbm,
-            )
+                layout: ["mb", "out", "y"],
+                stick: "out",
+                allocation: Allocation::Hbm,
+            })
             .map_err(|e| e.0)?
             .with_df(df)
             .with_row_blocked(matches!(df, Df::Fp32)),
@@ -457,19 +458,21 @@ pub fn reduce_opspec_df_divided(
 
 /// fp32 REDUCE (the torch-spyre RMSNorm `mean(x²)`): native fp32 SFP reduce over `cols`, keeping all
 /// `rows` (NOT matmul — PSUM is fp16-only). `data` must be an fp32 tensor from a `dl16tofp32` convert.
-#[allow(clippy::too_many_arguments)]
 pub fn assemble_reduce_df<T: crate::collective::Tp>(
-    op_name: &str,
-    op_func: &'static str,
-    rows: u32,
-    cols: u32,
+    OpDecl {
+        op_name,
+        op_func,
+        rows,
+        cols,
+    }: OpDecl<'_, u32, u32>,
     data_name: &str,
     accum_name: &str,
     df: Df,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
 ) -> Result<EmittedOp<T>, crate::superdsc_error::SuperDscError> {
-    // head_major=TRUE ⇒ rank-3 flat, matching the flat fp32 island (see assemble_pointwise_broadcast_df).
+    // head_major=TRUE ⇒ rank-3 flat, matching the flat fp32 island: it runs flat to agree with the
+    // fp16↔fp32 converts, which MUST be rank-3 (the narrowing convert crashes dxp in rank-2).
     let op = reduce_opspec_df(
         op_func_from_str(op_func),
         rows,
@@ -502,10 +505,12 @@ pub fn assemble_reduce<T: crate::collective::Tp, D: KindTag, A: KindTag>(
 ) -> Result<EmittedOp<T>, crate::superdsc_error::SuperDscError> {
     let mut sym_id_base: i64 = 0;
     assemble_reduce_seeded(
-        op_name,
-        op_func,
-        rows,
-        cols,
+        OpDecl {
+            op_name,
+            op_func,
+            rows,
+            cols,
+        },
         data,
         accum,
         &mut sym_id_base,
@@ -514,12 +519,13 @@ pub fn assemble_reduce<T: crate::collective::Tp, D: KindTag, A: KindTag>(
 }
 
 /// [`assemble_reduce`] with an explicit running symbol-id counter (risk #1).
-#[allow(clippy::too_many_arguments)]
 pub fn assemble_reduce_seeded<T: crate::collective::Tp, D: KindTag, A: KindTag>(
-    op_name: &str,
-    op_func: &'static str,
-    rows: u32,
-    cols: u32,
+    OpDecl {
+        op_name,
+        op_func,
+        rows,
+        cols,
+    }: OpDecl<'_, u32, u32>,
     data: &Stk<D>,
     accum: &Stk<A>,
     sym_id_base: &mut i64,
@@ -801,16 +807,16 @@ pub fn reduce_opspec_off_divided<D: KindTag, A: KindTag>(
     let device_dims_r2 = plan.iter_syms(["mb", "out"]);
     let data = if stickmajor {
         AnyTensorArg::R2(
-            TensorArg::<2>::new(
-                true,
-                data_name.to_string(),
-                Role::Output,
-                [Scale::Active, Scale::Active],
-                device_dims_r2,
-                ["mb", "out"],
-                "out",
-                Allocation::Hbm,
-            )
+            TensorArg::<2>::new(TensorArgDecl {
+                is_input: true,
+                name: data_name.to_string(),
+                role: Role::Output,
+                scale: [Scale::Active, Scale::Active],
+                device_dims: device_dims_r2,
+                layout: ["mb", "out"],
+                stick: "out",
+                allocation: Allocation::Hbm,
+            })
             .map_err(|e| e.0)?
             .with_df(df)
             .with_row_blocked(matches!(df, Df::Fp32))
@@ -818,16 +824,16 @@ pub fn reduce_opspec_off_divided<D: KindTag, A: KindTag>(
         )
     } else {
         AnyTensorArg::R3(
-            TensorArg::<3>::new(
-                true,
-                data_name.to_string(),
-                Role::Output,
-                [Scale::Active, Scale::Active, Scale::Active],
+            TensorArg::<3>::new(TensorArgDecl {
+                is_input: true,
+                name: data_name.to_string(),
+                role: Role::Output,
+                scale: [Scale::Active, Scale::Active, Scale::Active],
                 device_dims,
-                ["mb", "out", "y"],
-                "out",
-                Allocation::Hbm,
-            )
+                layout: ["mb", "out", "y"],
+                stick: "out",
+                allocation: Allocation::Hbm,
+            })
             .map_err(|e| e.0)?
             .with_df(df)
             .with_row_blocked(matches!(df, Df::Fp32))
@@ -844,16 +850,16 @@ pub fn reduce_opspec_off_divided<D: KindTag, A: KindTag>(
     // trigger for a real active_cap/mq_pad width) while `reduce_opspec_df` never did.
     let accum = if stickmajor {
         AnyTensorArg::R2(
-            TensorArg::<2>::new(
-                false,
-                accum_name.to_string(),
-                Role::Output,
-                [Scale::Active, Scale::RedStick],
-                device_dims_r2,
-                ["mb", "out"],
-                "out",
-                Allocation::Hbm,
-            )
+            TensorArg::<2>::new(TensorArgDecl {
+                is_input: false,
+                name: accum_name.to_string(),
+                role: Role::Output,
+                scale: [Scale::Active, Scale::RedStick],
+                device_dims: device_dims_r2,
+                layout: ["mb", "out"],
+                stick: "out",
+                allocation: Allocation::Hbm,
+            })
             .map_err(|e| e.0)?
             .with_df(df)
             .with_row_blocked(matches!(df, Df::Fp32))
@@ -861,16 +867,16 @@ pub fn reduce_opspec_off_divided<D: KindTag, A: KindTag>(
         )
     } else {
         AnyTensorArg::R3(
-            TensorArg::<3>::new(
-                false,
-                accum_name.to_string(),
-                Role::Output,
-                [Scale::Active, Scale::RedStick, Scale::Active],
+            TensorArg::<3>::new(TensorArgDecl {
+                is_input: false,
+                name: accum_name.to_string(),
+                role: Role::Output,
+                scale: [Scale::Active, Scale::RedStick, Scale::Active],
                 device_dims,
-                ["mb", "out", "y"],
-                "out",
-                Allocation::Hbm,
-            )
+                layout: ["mb", "out", "y"],
+                stick: "out",
+                allocation: Allocation::Hbm,
+            })
             .map_err(|e| e.0)?
             .with_df(df)
             .with_row_blocked(matches!(df, Df::Fp32))
@@ -899,7 +905,6 @@ pub fn reduce_opspec_off_divided<D: KindTag, A: KindTag>(
         .with_coordinate_mask(coordinate_mask))
 }
 
-#[allow(clippy::too_many_arguments)]
 // The row/width slots are TYPED: `rows` arrives only through `RowCount`'s named doors (the
 // whole-batch `nqh*mq` shared-buffer extent or the per-request `nqh` — a head count, `mq_pad` or a
 // lane count no longer type-checks there), and `cols` names which of the numerically-coincident
@@ -907,10 +912,12 @@ pub fn reduce_opspec_off_divided<D: KindTag, A: KindTag>(
 // [`win_reduce_data`]/[`win_reduce_accum`] — checked where their offsets are BORN — in place of
 // the `(Stk, DevOff)` pairs whose name and offset could come from different laws (the #717 class).
 pub fn assemble_reduce_off<T: crate::collective::Tp, D: KindTag, A: KindTag>(
-    op_name: &str,
-    op_func: &'static str,
-    rows: crate::sdsc_abstract::RowCount,
-    cols: crate::sdsc_abstract::BlockCols,
+    OpDecl {
+        op_name,
+        op_func,
+        rows,
+        cols,
+    }: OpDecl<'_>,
     data: Win<'_, D>,
     accum: Win<'_, A>,
     df: Df,
@@ -1388,10 +1395,12 @@ pub fn assemble_reduce_split<T: crate::collective::Tp, D: KindTag, A: KindTag>(
         let op_name = format!("{}_c{}_op", s.op_name, i + 1);
         if matches!(s.df, Df::Fp16) {
             ops.push(crate::emit::assemble_pointwise_broadcast_off(
-                &op_name,
-                combine,
-                rows_t,
-                combine_cols,
+                OpDecl {
+                    op_name: &op_name,
+                    op_func: combine,
+                    rows: rows_t,
+                    cols: combine_cols,
+                },
                 &[
                     crate::emit::In::sliced(s.accum, s.accum_off).ew(),
                     crate::emit::In::full(p).ew(),
@@ -1403,16 +1412,18 @@ pub fn assemble_reduce_split<T: crate::collective::Tp, D: KindTag, A: KindTag>(
             )?);
         } else {
             let mut op = crate::emit::pointwise_broadcast_opspec_df(
-                op_func_from_str(combine),
-                rows,
-                stick,
-                &[
-                    crate::emit::In::sliced(s.accum, s.accum_off).ew(),
-                    crate::emit::In::full(p).ew(),
-                ],
-                s.accum.name(),
-                crate::addr::OutCorner::At(s.accum_off),
-                A::kind() == StickKind::Flat,
+                crate::emit::EwSpec {
+                    op: op_func_from_str(combine),
+                    rows,
+                    cols: stick,
+                    inputs: &[
+                        crate::emit::In::sliced(s.accum, s.accum_off).ew(),
+                        crate::emit::In::full(p).ew(),
+                    ],
+                    o_name: s.accum.name(),
+                    out_offset: crate::addr::OutCorner::At(s.accum_off),
+                    head_major: A::kind() == StickKind::Flat,
+                },
                 s.df,
                 layout,
                 crate::work::EwDivision::Law,
@@ -1727,7 +1738,7 @@ mod long_reduce_split {
 mod the_arity_is_checked_where_the_op_is_built {
     use crate::superdsc_opspec::{
         Allocation, AnyTensorArg, CoreBudget, ItDim, OpFunc, OpSpec, Role, Scale, SdscFoldSet,
-        TensorArg, WorkPlan,
+        TensorArg, TensorArgDecl, WorkPlan,
     };
 
     fn plan() -> WorkPlan {
@@ -1755,16 +1766,16 @@ mod the_arity_is_checked_where_the_op_is_built {
 
     fn arg(p: &WorkPlan, is_input: bool, name: &str, out: Scale) -> AnyTensorArg {
         AnyTensorArg::R2(
-            TensorArg::<2>::new(
+            TensorArg::<2>::new(TensorArgDecl {
                 is_input,
-                name.to_string(),
-                Role::Output,
-                [Scale::Active, out],
-                p.iter_syms(["mb", "out"]),
-                ["mb", "out"],
-                "out",
-                Allocation::Hbm,
-            )
+                name: name.to_string(),
+                role: Role::Output,
+                scale: [Scale::Active, out],
+                device_dims: p.iter_syms(["mb", "out"]),
+                layout: ["mb", "out"],
+                stick: "out",
+                allocation: Allocation::Hbm,
+            })
             .expect("a [mb, out] arg"),
         )
     }

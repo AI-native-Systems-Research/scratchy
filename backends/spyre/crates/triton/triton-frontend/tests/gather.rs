@@ -22,7 +22,7 @@
 //! Ours must refuse the same four AND NAME THE CONSTRAINT. A refusal that says only "not
 //! supported" is not fail-closed, because it does not tell the reader which rule was broken.
 
-mod common;
+use crate::common;
 
 use triton_frontend::codegen;
 use triton_frontend::diff;

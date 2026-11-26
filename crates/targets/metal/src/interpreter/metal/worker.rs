@@ -704,6 +704,20 @@ impl SparseActivation {
     }
 }
 
+/// Where a worker's arena lives: the `MetalResidencySet` its slots are pinned into, the most rows a
+/// decode or verify step brings (`GpuDevice::max_decode_rows`: the decode split's partials are
+/// reserved for at most these), how it is shared with another model's ([`ArenaShare`], by this
+/// model's `ranks`), and the plan placing what the host does not read by pointer sparsely
+/// ([`SparsePlan`]).
+#[derive(Clone, Copy)]
+pub struct ArenaPlacement<'a> {
+    pub residency: Option<&'a crate::residency::MetalResidencySet>,
+    pub decode_rows: Option<crate::tape::ids::DecodeRows>,
+    pub share: &'a ArenaShare,
+    pub ranks: &'a ArenaRanks,
+    pub plan: Option<&'a SparsePlan>,
+}
+
 impl<W: CanonicalParams> MetalWorker<W> {
     /// What this worker shares with its guest ([`HostArena`]): the slot each guest rank takes, and
     /// its scratch. A worker hosting no guest shares no slot.
@@ -727,7 +741,6 @@ impl<W: CanonicalParams> MetalWorker<W> {
     /// `bucket_tapes` is the per-bucket lowered tape set, in the
     /// caller's bucket order. The worker bakes one dispatch + execution
     /// plan per tape.
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         device: Arc<Device>,
         arena_layout: &ArenaLayout,
@@ -743,11 +756,13 @@ impl<W: CanonicalParams> MetalWorker<W> {
             pipelines,
             sources,
             runtime,
-            None,
-            None,
-            &ArenaShare::Own,
-            &ArenaRanks::NONE,
-            None,
+            ArenaPlacement {
+                residency: None,
+                decode_rows: None,
+                share: &ArenaShare::Own,
+                ranks: &ArenaRanks::NONE,
+                plan: None,
+            },
         )
     }
 
@@ -760,7 +775,6 @@ impl<W: CanonicalParams> MetalWorker<W> {
     /// ([`ArenaShare`]); with a residency set and a `plan`, what the host does
     /// not read by pointer is placement-sparse, mapped as far as the buckets
     /// that run reach ([`SparsePlan`]).
-    #[allow(clippy::too_many_arguments)]
     pub fn new_with_residency(
         device: Arc<Device>,
         arena_layout: &ArenaLayout,
@@ -768,14 +782,15 @@ impl<W: CanonicalParams> MetalWorker<W> {
         pipelines: &SpecializedPipelines,
         sources: &ResolvedSources,
         runtime: &RuntimeBindings,
-        residency: Option<&crate::residency::MetalResidencySet>,
-        // The most rows a decode or verify step brings (`GpuDevice::max_decode_rows`): the decode
-        // split's partials are reserved for at most these.
-        decode_rows: Option<crate::tape::ids::DecodeRows>,
-        share: &ArenaShare,
-        ranks: &ArenaRanks,
-        plan: Option<&SparsePlan>,
+        placement: ArenaPlacement<'_>,
     ) -> Result<Self, WorkerError> {
+        let ArenaPlacement {
+            residency,
+            decode_rows,
+            share,
+            ranks,
+            plan,
+        } = placement;
         // Arena slot count comes from the lowered tape (post-FUF
         // coloring). The shared arena is sized to the MAX colored slot
         // count across buckets (see `for_buckets`); per-bucket counts can
@@ -1129,17 +1144,19 @@ impl<W: CanonicalParams> MetalWorker<W> {
             let baking = bake_bucket::<W>(
                 bucket_idx,
                 tape,
-                &arena,
-                scratch[ScratchKind::SplitK]
-                    .as_ref()
-                    .map(Activation::buffer),
-                scratch[ScratchKind::Moe].as_ref().map(Activation::buffer),
-                scratch[ScratchKind::RopedK]
-                    .as_ref()
-                    .map(Activation::buffer),
+                BindingBuffers {
+                    arena: &arena,
+                    splitk_scratch: scratch[ScratchKind::SplitK]
+                        .as_ref()
+                        .map(Activation::buffer),
+                    moe_scratch: scratch[ScratchKind::Moe].as_ref().map(Activation::buffer),
+                    roped_k_scratch: scratch[ScratchKind::RopedK]
+                        .as_ref()
+                        .map(Activation::buffer),
+                    sources,
+                    runtime,
+                },
                 pipelines,
-                sources,
-                runtime,
                 device.clone(),
             )?;
             bucket_bakings.push(baking);
@@ -1593,20 +1610,27 @@ fn kernel_kind(id: StepKernel) -> KernelKind {
     }
 }
 
+/// The buffers a command's bindings resolve to: the worker's arena, its shared scratch (split-K
+/// partials, the MoE's, roped K), the model's sources and the worker's runtime bindings.
+#[derive(Clone, Copy)]
+struct BindingBuffers<'a> {
+    arena: &'a [Buffer],
+    splitk_scratch: Option<&'a Buffer>,
+    moe_scratch: Option<&'a Buffer>,
+    roped_k_scratch: Option<&'a Buffer>,
+    sources: &'a ResolvedSources,
+    runtime: &'a RuntimeBindings,
+}
+
 /// Bake one bucket's execution plan.
-#[allow(clippy::too_many_arguments)]
 fn bake_bucket<W: CanonicalParams>(
     bucket_index: usize,
     tape: &LoweredMetalTape,
-    arena: &[Buffer],
-    splitk_scratch: Option<&Buffer>,
-    moe_scratch: Option<&Buffer>,
-    roped_k_scratch: Option<&Buffer>,
+    buffers: BindingBuffers<'_>,
     pipelines: &SpecializedPipelines,
-    sources: &ResolvedSources,
-    runtime: &RuntimeBindings,
     device: Arc<Device>,
 ) -> Result<BucketBaking, WorkerError> {
+    let arena = buffers.arena;
     // The shared arena is sized to the max colored slot count across
     // buckets; this bucket's tape may reference fewer slots (different
     // buckets pick different fusions). Only a tape demanding MORE slots
@@ -1639,12 +1663,11 @@ fn bake_bucket<W: CanonicalParams>(
                     bucket_index,
                     cmd_idx,
                     gemm.bindings(),
-                    arena,
-                    /*splitk_scratch=*/ None,
-                    moe_scratch,
-                    /*roped_k_scratch=*/ None,
-                    sources,
-                    runtime,
+                    BindingBuffers {
+                        splitk_scratch: None,
+                        roped_k_scratch: None,
+                        ..buffers
+                    },
                 )?;
                 // One row: MLX's GEMV; otherwise an MMA GEMM (`pipeline_for_gemm`). All are
                 // custom kernels on the same per-step dispatch plumbing as every other compute
@@ -1681,17 +1704,8 @@ fn bake_bucket<W: CanonicalParams>(
                 let pipeline = pipelines
                     .pipeline_for_command::<W>(&cmd)
                     .map_err(WorkerError::PipelineLookup)?;
-                let bindings_for_cmd = resolve_bindings(
-                    bucket_index,
-                    cmd_idx,
-                    cmd.bindings.iter().copied(),
-                    arena,
-                    splitk_scratch,
-                    moe_scratch,
-                    roped_k_scratch,
-                    sources,
-                    runtime,
-                )?;
+                let bindings_for_cmd =
+                    resolve_bindings(bucket_index, cmd_idx, cmd.bindings.iter().copied(), buffers)?;
                 let dispatch_for_cmd = mtl_size_pair(&cmd);
                 (
                     pipeline,
@@ -1847,18 +1861,20 @@ impl ResolvedSources {
 /// Returns owned `Buffer` clones (cheap ObjC refcount) so callers
 /// don't have to thread the [`MetalAllocator`]'s arenas-`Mutex` lock
 /// guard through to the encoder.
-#[allow(clippy::too_many_arguments)]
 fn resolve_bindings(
     bucket_index: usize,
     command_index: usize,
     bindings: impl IntoIterator<Item = Binding>,
-    arena: &[Buffer],
-    splitk_scratch: Option<&Buffer>,
-    moe_scratch: Option<&Buffer>,
-    roped_k_scratch: Option<&Buffer>,
-    sources: &ResolvedSources,
-    runtime: &RuntimeBindings,
+    buffers: BindingBuffers<'_>,
 ) -> Result<Vec<(Buffer, u64, u64)>, WorkerError> {
+    let BindingBuffers {
+        arena,
+        splitk_scratch,
+        moe_scratch,
+        roped_k_scratch,
+        sources,
+        runtime,
+    } = buffers;
     let mut out: Vec<(Buffer, u64, u64)> = Vec::new();
     for binding in bindings {
         let (buf, off, idx) = match &binding {
@@ -2292,7 +2308,9 @@ mod tests {
         let gathered = (0..num_sampled).map(|i| (i, at(i))).collect();
         let scattered = (0..num_sampled).map(|i| (at(i), i)).collect();
         let restored = (0..num_tokens).map(|r| (r, r)).collect();
-        let cases: [(&str, Vec<&LoweredCommand>, Vec<(usize, usize)>); 3] = [
+        // `(name, commands, (row, the row it holds) wanted)`.
+        type Case<'a> = (&'a str, Vec<&'a LoweredCommand>, Vec<(usize, usize)>);
+        let cases: [Case<'_>; 3] = [
             ("gather", vec![&gather], gathered),
             ("scatter", vec![&scatter], scattered),
             ("gather then scatter", vec![&gather, &scatter], restored),
@@ -2800,11 +2818,13 @@ mod tests {
                 &pipelines,
                 &sources(&weights, &allocator, tapes),
                 &runtime,
-                None,
-                None,
-                share,
-                ranks,
-                None,
+                ArenaPlacement {
+                    residency: None,
+                    decode_rows: None,
+                    share,
+                    ranks,
+                    plan: None,
+                },
             )
         };
         const K: u64 = 1024;

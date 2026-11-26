@@ -73,15 +73,9 @@ fn run(rows: usize, cols: usize, seed: u64, dtype: GateScaleDType) {
 
     // Round inputs through the storage dtype so the CPU reference sees
     // exactly what the kernel reads.
-    #[allow(clippy::type_complexity)]
-    let (routed_b, shared_b, gate_b, routed_r, shared_r, gate_r): (
-        Vec<u8>,
-        Vec<u8>,
-        Vec<u8>,
-        Vec<f32>,
-        Vec<f32>,
-        Vec<f32>,
-    ) = match dtype {
+    // The routed, shared and gate inputs as the kernel stores them, then as f32.
+    type Rounded = (Vec<u8>, Vec<u8>, Vec<u8>, Vec<f32>, Vec<f32>, Vec<f32>);
+    let (routed_b, shared_b, gate_b, routed_r, shared_r, gate_r): Rounded = match dtype {
         GateScaleDType::F16 => {
             let r: Vec<f16> = routed_f32.iter().map(|&v| f16::from_f32(v)).collect();
             let s: Vec<f16> = shared_f32.iter().map(|&v| f16::from_f32(v)).collect();

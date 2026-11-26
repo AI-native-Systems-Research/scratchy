@@ -219,14 +219,14 @@ fn dsc(
 /// three DISTINCT placements.
 /// placements — so which address appears is which buffer the op reads.
 fn operand_addresses(d: &ktir_superdsc::wire::Dsc) -> Vec<u64> {
-    d.labeledDs_
+    d.labeled_ds
         .iter()
         .filter_map(|l| {
-            d.scheduleTree_
+            d.schedule_tree
                 .iter()
-                .find(|n| n.nodeType_ == "allocate" && n.ldsIdx_ == l.ldsIdx_)
+                .find(|n| n.node_type == "allocate" && n.lds_idx == l.lds_idx)
                 .and_then(|n| {
-                    n.startAddressCoreCorelet_
+                    n.start_address_core_corelet
                         .data_
                         .get("[0, 0, 0]")
                         .and_then(|v| v.parse().ok())
@@ -327,7 +327,7 @@ fn the_bound_scale_operand_is_the_parameters_own_placement() {
     let d = dsc(op);
     // The op is a `multiply`.
     assert!(
-        d.computeOp_.iter().any(|c| c.opFuncName == "mul"),
+        d.compute_op.iter().any(|c| c.op_func_name == "mul"),
         "a scalarmul is a `mul` opFunc (`multiply` is the OpFunc KEY, `mul` its dxp spelling): {}",
         op.op_name
     );

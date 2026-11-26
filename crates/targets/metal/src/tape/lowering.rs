@@ -89,6 +89,63 @@ pub struct BakePoint<'a> {
     pub class: crate::tape::lowered::GenClass,
 }
 
+/// One lowered half of a tape: the tape, what its sampled rows' steps write of the logits (`None`:
+/// it has none), and each command's step rows.
+type LoweredRows = (LoweredMetalTape, Option<LogitsRows>, Vec<Vec<u32>>);
+
+/// The chip a tape serves (its profile and generation class) and the as-stored codes whose vote
+/// every reader of a weight consumes ([`codes_for`]).
+#[derive(Clone, Copy)]
+struct ChipCodes<'a> {
+    profile: Option<&'a crate::targets::MetalTargetProfile>,
+    class: crate::tape::lowered::GenClass,
+    as_stored: &'a AsStoredCodes<'a>,
+}
+
+/// The tape a step lowers into: its attention addressing (chunked for spec-decode), its bucket,
+/// its KV cap rung (the runtime per-sequence block-table capacity,
+/// `KvCachePool::max_blocks_per_seq`: the `MaxBlocksPerSeq` function constants and the rope-once
+/// `roped_k_scratch` pages take it, so long context isn't truncated), and the chip it serves.
+#[derive(Clone, Copy)]
+struct TapeCx<'a> {
+    chunked: bool,
+    bucket_m: u32,
+    block_cap: u32,
+    chip: ChipCodes<'a>,
+}
+
+/// The bucket's shared scratch extents a step's lowering grows: the split-K partials, the MoE's
+/// (and the recurrent layers'), and the rope-once roped K.
+struct ScratchBytes<'s> {
+    splitk: &'s mut u32,
+    moe: &'s mut u32,
+    roped_k: &'s mut u32,
+}
+
+/// The weight site an affine matvec reads: its layer, its source, and the weights of the ends
+/// folded into it.
+struct QmvSite {
+    layer: LayerId,
+    ix: SourceIx,
+    end_weights: Vec<Binding>,
+}
+
+/// A fused gate/up step's operands: its input and output slots and its weight layer.
+#[derive(Clone, Copy)]
+struct GateUpOperands {
+    in_slot: u32,
+    out_slot: u32,
+    layer: u32,
+}
+
+/// What a recurrent conv reads: its input rows, its conv weight, and (Mamba-2) the column slice of
+/// the in-projection rows it convolves with its conv bias.
+struct ConvReads {
+    input: Binding,
+    conv_w: Binding,
+    sliced: Option<(ColumnSlice, Binding)>,
+}
+
 /// The weights a row can bind: its site's sources and the model's class rotary tables.
 #[derive(Clone, Copy)]
 struct RowSources<'a> {
@@ -338,9 +395,7 @@ fn sample_rows(
     plain: Vec<GatedCommand>,
     bucket_m: u32,
     w: RowSources<'_>,
-    profile: Option<&crate::targets::MetalTargetProfile>,
-    class: crate::tape::lowered::GenClass,
-    as_stored: &AsStoredCodes<'_>,
+    chip: ChipCodes<'_>,
 ) -> Result<(Vec<GatedCommand>, Option<LogitsRows>), LoweringError> {
     use crate::tape::lowered::RuntimeGate::{OnlyIfEveryRowSampled, UnlessEveryRowSampled};
     use SampleRowsStep as R;
@@ -367,26 +422,19 @@ fn sample_rows(
         (Some(a), R::Matmul) => {
             let x = Some(SetAxis::SampledRows(crate::tape::lowered::MScaleAxis::X));
             let ix = w.of(WeightKind::Linear, 0)?;
-            let codes = codes_for(
-                p,
-                profile,
-                class,
-                as_stored,
-                ix,
-                a.bits.get(),
-                a.k.get(),
-                a.group_size,
-            );
+            let codes = codes_for(p, chip, ix, a.bits.get(), a.k.get(), a.group_size);
             let qmv = affine_qmv_command(
                 p,
                 &a,
                 1,
                 x,
-                a.layer,
-                ix,
+                QmvSite {
+                    layer: a.layer,
+                    ix,
+                    end_weights: Vec::new(),
+                },
                 codes,
                 pick_qmv_kernel(a.n.get(), a.k.get(), a.bits.get()),
-                Vec::new(),
             );
             let one = LogitsRows::Sampled { tile: RowTile::Row };
             (sliced(qmv), Some(one))
@@ -471,14 +519,17 @@ fn writes_logits(tape: Option<LogitsRows>, step: Option<LogitsRows>) -> Option<L
 ///   reads the codes as written: it stays offset-8.
 fn codes_for(
     p: &ModelFacts,
-    profile: Option<&crate::targets::MetalTargetProfile>,
-    class: crate::tape::lowered::GenClass,
-    as_stored: &AsStoredCodes<'_>,
+    chip: ChipCodes<'_>,
     ix: SourceIx,
     bits: u32,
     k: u32,
     group: AffineGroupSize,
 ) -> super::kernel_constants::AffineCodes {
+    let ChipCodes {
+        profile,
+        class,
+        as_stored,
+    } = chip;
     let codes = super::kernel_constants::AffineCodes::of(profile, bits);
     let planes = !as_stored.reads(ix)
         && class == crate::tape::lowered::GenClass::M5Wide
@@ -530,12 +581,15 @@ fn affine_qmv_command(
     g: &AffineMatmul,
     rows: u32,
     set_axis: Option<SetAxis>,
-    layer: LayerId,
-    ix: SourceIx,
+    site: QmvSite,
     codes: super::kernel_constants::AffineCodes,
     kernel: QmvKernel,
-    end_weights: Vec<Binding>,
 ) -> LoweredCommand {
+    let QmvSite {
+        layer,
+        ix,
+        end_weights,
+    } = site;
     let (n, k) = (g.n.get(), g.k.get());
     let (tg, tpg) = qmv_dispatch_shape(kernel, rows, n, /*B=*/ 1);
     let (kernel_id, constants) = match kernel {
@@ -963,11 +1017,10 @@ fn route_small_m(
     cmds: Vec<GatedCommand>,
     bucket_m: u32,
     w: RowSources<'_>,
-    profile: Option<&crate::targets::MetalTargetProfile>,
-    class: crate::tape::lowered::GenClass,
-    as_stored: &AsStoredCodes<'_>,
+    chip: ChipCodes<'_>,
     splitk_scratch_bytes: &mut u32,
 ) -> Result<Vec<GatedCommand>, LoweringError> {
+    let class = chip.class;
     use crate::tape::lowered::RuntimeGate::{OnlyIfSmallMTokens, UnlessSmallMTokens};
     // A sample-rows step lowered its matmul, twin included.
     let (MetalStep::AffineQmm(g) | MetalStep::SampleRows(SampledMatmul::Affine(g), _)) = *step
@@ -999,7 +1052,7 @@ fn route_small_m(
     let ix = w.of(WeightKind::Linear, 0)?;
     // The small-M kernels read the codes as stored, signed (offset-8). The bf16 twin
     // (`AffineQmmSmallM`) reads them row-major only: planes codes take the W4A8 tile below.
-    let codes = codes_for(p, profile, class, as_stored, ix, 4, k, group);
+    let codes = codes_for(p, chip, ix, 4, k, group);
     let tile = match SmallMTile::for_bucket(bucket_m) {
         Some(tile) if codes.signed() && n.is_multiple_of(SMALL_M_TILE_COLS) => tile,
         _ => return Ok(cmds),
@@ -1803,7 +1856,7 @@ fn lower(
     live_rows: &[PlayLive],
     at: &BakePoint<'_>,
     as_stored: &AsStoredCodes<'_>,
-) -> Result<(LoweredMetalTape, Option<LogitsRows>, Vec<Vec<u32>>), LoweringError> {
+) -> Result<LoweredRows, LoweringError> {
     let BakePoint {
         chunked,
         bucket_m,
@@ -1813,6 +1866,11 @@ fn lower(
         class,
         ..
     } = *at;
+    let chip = ChipCodes {
+        profile,
+        class,
+        as_stored,
+    };
     let mut commands: Vec<GatedCommand> = Vec::with_capacity(rows.len());
     let mut barrier_before: Vec<Fence> = Vec::with_capacity(rows.len());
     // Per command, the plays short of the whole forward that run it: its row's (a row past the
@@ -1924,37 +1982,29 @@ fn lower(
                 let w = RowSources::of_row(sources, i, at);
                 let own = lower_one(
                     p,
-                    chunked,
+                    TapeCx {
+                        chunked,
+                        bucket_m,
+                        block_cap,
+                        chip,
+                    },
                     step,
                     w,
-                    bucket_m,
                     0,
-                    &mut splitk_scratch_bytes,
-                    &mut moe_scratch_bytes,
-                    &mut roped_k_scratch_bytes,
-                    block_cap,
-                    profile,
-                    class,
-                    as_stored,
+                    ScratchBytes {
+                        splitk: &mut splitk_scratch_bytes,
+                        moe: &mut moe_scratch_bytes,
+                        roped_k: &mut roped_k_scratch_bytes,
+                    },
                     m_divisor,
                 )?;
                 let own = own.into_iter().map(GatedCommand::ungated).collect();
-                let cmds = route_small_m(
-                    p,
-                    step,
-                    own,
-                    bucket_m,
-                    w,
-                    profile,
-                    class,
-                    as_stored,
-                    &mut splitk_scratch_bytes,
-                )?;
+                let cmds =
+                    route_small_m(p, step, own, bucket_m, w, chip, &mut splitk_scratch_bytes)?;
                 let cmds = route_gdn(p, step, cmds, bucket_m)?;
                 let cmds = route_draft_commit(step, cmds);
                 record_decode_partials(p, step, &cmds, at, *gate, &mut decode_partials)?;
-                let (cmds, rows) =
-                    sample_rows(p, step, cmds, bucket_m, w, profile, class, as_stored)?;
+                let (cmds, rows) = sample_rows(p, step, cmds, bucket_m, w, chip)?;
                 logits_rows = writes_logits(logits_rows, rows);
                 // Past the sampled rows, a command over their logits other than the logit tail's
                 // (a fold the tail joined) runs over the step's every row: the buffer holds them.
@@ -2293,7 +2343,6 @@ fn update_shape_state(step: &MetalStep, m_divisor: &mut u32) {
 /// use `GLOBAL_ROT_DIM` + proportional pairing; SLIDING arms use the
 /// base `ROT_DIM` with full-NeoX `rot_dim/2` pairing. MUST match how
 /// `rope_append` rotated that layer (lowering.rs ~2339).
-#[allow(clippy::type_complexity)]
 fn rope_on_read_params(
     p: &ModelFacts,
     is_global: bool,
@@ -2579,29 +2628,28 @@ fn dispatched(
 
 fn lower_one(
     p: &ModelFacts,
-    chunked: bool,
+    cx: TapeCx<'_>,
     inst: &MetalStep,
     w: RowSources<'_>,
-    bucket_m: u32,
     layer_offset: u32,
-    splitk_scratch_bytes: &mut u32,
-    moe_scratch_bytes: &mut u32,
-    roped_k_scratch_bytes: &mut u32,
-    // Runtime per-sequence block-table capacity (`KvCachePool::max_blocks_per_seq`).
-    // Replaces `p.max_blocks_per_seq` at the `MaxBlocksPerSeq` function-constant
-    // sites (block-table row stride + scratch bound) and the rope-once
-    // `roped_k_scratch` `num_pages` so long context isn't truncated.
-    block_cap: u32,
-    profile: Option<&crate::targets::MetalTargetProfile>,
-    // The chip class the tape serves: the W4A8 GEMM splits K on the wide class.
-    gen_class: crate::tape::lowered::GenClass,
-    // The as-stored weights, whose vote every reader consumes (`codes_for`).
-    as_stored: &AsStoredCodes<'_>,
+    scratch: ScratchBytes<'_>,
     // The row-count divisor in force, threaded by `lower()` (1 normally;
     // `vision_merge_factor` after the merger reshape) so post-merge ops
     // dispatch over `bucket_m / m_divisor` rows.
     m_divisor: u32,
 ) -> Result<Vec<TapeCommand>, LoweringError> {
+    let TapeCx {
+        chunked,
+        bucket_m,
+        block_cap,
+        chip,
+    } = cx;
+    let (profile, gen_class) = (chip.profile, chip.class);
+    let ScratchBytes {
+        splitk: splitk_scratch_bytes,
+        moe: moe_scratch_bytes,
+        roped_k: roped_k_scratch_bytes,
+    } = scratch;
     // `eff_m` = the live row count this op operates on at the bucket
     // level. For everything before the merger reshape this is `bucket_m`;
     // for the merger's `[num_tokens / vision_merge_factor, ...]` ops it
@@ -2632,18 +2680,15 @@ fn lower_one(
         if let Some(decode) = decode {
             return lower_one(
                 p,
-                chunked,
+                cx,
                 &decode,
                 w,
-                bucket_m,
                 layer_offset,
-                splitk_scratch_bytes,
-                moe_scratch_bytes,
-                roped_k_scratch_bytes,
-                block_cap,
-                profile,
-                gen_class,
-                as_stored,
+                ScratchBytes {
+                    splitk: &mut *splitk_scratch_bytes,
+                    moe: &mut *moe_scratch_bytes,
+                    roped_k: &mut *roped_k_scratch_bytes,
+                },
                 m_divisor,
             );
         }
@@ -2659,18 +2704,15 @@ fn lower_one(
             let mut part = |step: &MetalStep, site| {
                 lower_one(
                     p,
-                    chunked,
+                    cx,
                     step,
                     RowSources { site, ..w },
-                    bucket_m,
                     layer_offset,
-                    splitk_scratch_bytes,
-                    moe_scratch_bytes,
-                    roped_k_scratch_bytes,
-                    block_cap,
-                    profile,
-                    gen_class,
-                    as_stored,
+                    ScratchBytes {
+                        splitk: &mut *splitk_scratch_bytes,
+                        moe: &mut *moe_scratch_bytes,
+                        roped_k: &mut *roped_k_scratch_bytes,
+                    },
                     m_divisor,
                 )
             };
@@ -3284,17 +3326,19 @@ fn lower_one(
             let is_nax = profile.is_some_and(|p| crate::targets::is_nax_capable(p.generation));
             if is_nax && narrow_matvec(n_v, k_v, bits_v, bucket_m) {
                 let layer = super::ids::LayerId(*layer + layer_offset);
-                let codes = codes_for(p, profile, gen_class, as_stored, ix, bits_v, k_v, group);
+                let codes = codes_for(p, chip, ix, bits_v, k_v, group);
                 affine_qmv_command(
                     p,
                     g,
                     bucket_m,
                     None,
-                    layer,
-                    w.of(WeightKind::Linear, 0)?,
+                    QmvSite {
+                        layer,
+                        ix: w.of(WeightKind::Linear, 0)?,
+                        end_weights: qmv_end_weights(g, w, layer_offset)?,
+                    },
                     codes,
                     QmvKernel::Fast,
-                    qmv_end_weights(g, w, layer_offset)?,
                 )
             } else if bucket_m < vl {
                 // Matvec branch (decode-shape). The MLX-mirrored shape
@@ -3304,16 +3348,7 @@ fn lower_one(
                 // single-stream M1 Max (the sweep's per-CB overhead
                 // biased it toward generic).
                 let layer = super::ids::LayerId(*layer + layer_offset);
-                let codes = codes_for(
-                    p,
-                    profile,
-                    gen_class,
-                    as_stored,
-                    ix,
-                    g.bits.get(),
-                    g.k.get(),
-                    g.group_size,
-                );
+                let codes = codes_for(p, chip, ix, g.bits.get(), g.k.get(), g.group_size);
                 // MLX gates affine qmv_wide on arch gen >= 15 (quantized.cpp:537-539) —
                 // M3 and later (M4 is gen 16, M5 is gen 17). `affine_qmv_wide_ok` mirrors
                 // that boundary; M1/M2 keep the fold twin.
@@ -3331,11 +3366,13 @@ fn lower_one(
                     g,
                     bucket_m,
                     None,
-                    layer,
-                    w.of(WeightKind::Linear, 0)?,
+                    QmvSite {
+                        layer,
+                        ix: w.of(WeightKind::Linear, 0)?,
+                        end_weights: qmv_end_weights(g, w, layer_offset)?,
+                    },
                     codes,
                     pick_qmv_kernel_wide(n_v, k_v, bits_v, bucket_m, wide_ok),
-                    qmv_end_weights(g, w, layer_offset)?,
                 )
             // The matmul band takes no ends: the qmm_t kernels have no norm / bias /
             // residual fold, so the shared fold pass only folds a matmul's ends while its
@@ -3405,7 +3442,7 @@ fn lower_one(
                 // W4A8 on the matrix unit's int8 lane: a pre-pass quantizes
                 // the activations per (row, 64-chunk) into the shared scratch,
                 // then the GEMM multiplies them against the offset-8 codes.
-                let codes = codes_for(p, profile, gen_class, as_stored, ix, bits_v, k_v, group);
+                let codes = codes_for(p, chip, ix, bits_v, k_v, group);
                 let w4a8_tile = W4a8Tile::for_n(n_v).filter(|_| {
                     matches!(kernel, QmmTKernel::Nax(_))
                         && codes.signed()
@@ -3515,9 +3552,7 @@ fn lower_one(
                                 k: super::ids::KDimI32(k_v as i32),
                                 n: super::ids::NDimI32(n_v as i32),
                                 m: super::ids::MDimI32(bucket_m as i32),
-                                codes: codes_for(
-                                    p, profile, gen_class, as_stored, ix, bits_v, k_v, group,
-                                ),
+                                codes: codes_for(p, chip, ix, bits_v, k_v, group),
                             }
                             .into_baked(),
                             dispatch: DispatchShape {
@@ -3556,9 +3591,7 @@ fn lower_one(
                                 k: super::ids::KDimI32(k_v as i32),
                                 n: super::ids::NDimI32(n_v as i32),
                                 m: super::ids::MDimI32(bucket_m as i32),
-                                codes: codes_for(
-                                    p, profile, gen_class, as_stored, ix, bits_v, k_v, group,
-                                ),
+                                codes: codes_for(p, chip, ix, bits_v, k_v, group),
                             }
                             .into_baked(),
                             dispatch: DispatchShape {
@@ -3625,9 +3658,7 @@ fn lower_one(
                                 k_partition_size: super::ids::KPartitionSizeI32(
                                     k_partition_size as i32,
                                 ),
-                                codes: codes_for(
-                                    p, profile, gen_class, as_stored, ix, bits_v, k_v, group,
-                                ),
+                                codes: codes_for(p, chip, ix, bits_v, k_v, group),
                             }
                             .into_baked(),
                             dispatch: DispatchShape {
@@ -4476,9 +4507,11 @@ fn lower_one(
         I::FusedGateUpSiluMul(Slot(in_slot), Slot(out_slot), LayerId(layer)) => {
             fused_gate_up_mul_cmd(
                 p,
-                *in_slot,
-                *out_slot,
-                *layer,
+                GateUpOperands {
+                    in_slot: *in_slot,
+                    out_slot: *out_slot,
+                    layer: *layer,
+                },
                 false,
                 bucket_m,
                 w.of(WeightKind::Linear, 0)?,
@@ -4490,16 +4523,7 @@ fn lower_one(
                 return Err(LoweringError::OneRowFold { bucket_m });
             }
             let (n, k, gs, bits) = (g.n.get(), g.k.get(), g.group_size.get(), g.bits.get());
-            let codes = codes_for(
-                p,
-                profile,
-                gen_class,
-                as_stored,
-                w.of(WeightKind::Linear, 0)?,
-                bits,
-                k,
-                g.group_size,
-            );
+            let codes = codes_for(p, chip, w.of(WeightKind::Linear, 0)?, bits, k, g.group_size);
             let constants = super::kernel_constants::AffineGatedQmvConstants {
                 qmv: super::kernel_constants::AffineQmvConstants {
                     k: super::ids::KDimI32(k as i32),
@@ -4563,9 +4587,11 @@ fn lower_one(
         I::FusedGateUpGeluMul(Slot(in_slot), Slot(out_slot), LayerId(layer)) => {
             fused_gate_up_mul_cmd(
                 p,
-                *in_slot,
-                *out_slot,
-                *layer,
+                GateUpOperands {
+                    in_slot: *in_slot,
+                    out_slot: *out_slot,
+                    layer: *layer,
+                },
                 true,
                 bucket_m,
                 w.of(WeightKind::Linear, 0)?,
@@ -6141,11 +6167,13 @@ fn lower_one(
             cmds.push(recurrent_conv(
                 p,
                 g,
-                arena(qkv_slot, 1),
-                weight(WeightTensor::GdnConv1d, 2),
+                ConvReads {
+                    input: arena(qkv_slot, 1),
+                    conv_w: weight(WeightTensor::GdnConv1d, 2),
+                    sliced: None,
+                },
                 layer_id,
                 layout.conv_out,
-                None,
                 bucket_m,
             )?);
 
@@ -6210,17 +6238,19 @@ fn lower_one(
             let mut cmds = vec![recurrent_conv(
                 p,
                 g,
-                zx(1),
-                weight(WeightTensor::GdnConv1d, 2),
+                ConvReads {
+                    input: zx(1),
+                    conv_w: weight(WeightTensor::GdnConv1d, 2),
+                    sliced: Some((
+                        ColumnSlice {
+                            stride: row,
+                            offset: d_inner,
+                        },
+                        weight(WeightTensor::GdnConvBias, 7),
+                    )),
+                },
                 layer_id,
                 layout.conv_out,
-                Some((
-                    ColumnSlice {
-                        stride: row,
-                        offset: d_inner,
-                    },
-                    weight(WeightTensor::GdnConvBias, 7),
-                )),
                 bucket_m,
             )?];
             cmds.extend(recurrent_scan(
@@ -7383,17 +7413,19 @@ fn gelu_constants(n: u32) -> &'static [ConstantValue] {
 /// Gemma3 text, `is_gelu = true`); the `IS_GELU` fn-const (slot 9
 /// decode / 10 prefill) flips the kernel epilogue. Dispatch / bindings
 /// are identical across activations.
-#[allow(clippy::too_many_arguments)]
 fn fused_gate_up_mul_cmd(
     p: &ModelFacts,
-    in_slot: u32,
-    out_slot: u32,
-    layer: u32,
+    ops: GateUpOperands,
     is_gelu: bool,
     bucket_m: u32,
     ix: SourceIx,
     layer_offset: u32,
 ) -> Result<LoweredCommand, LoweringError> {
+    let GateUpOperands {
+        in_slot,
+        out_slot,
+        layer,
+    } = ops;
     let inter = intermediate(p)?.get() as u32;
     let (threadgroups, threads_per_threadgroup) = if bucket_m == 1 {
         // Decode (MLX gemv port): blockM = BM*SM*TM = 4 outputs per
@@ -7825,13 +7857,16 @@ impl ColumnSlice {
 fn recurrent_conv(
     p: &ModelFacts,
     g: scratchy_state_decoder_gdn::geometry::Gdn,
-    input: Binding,
-    conv_w: Binding,
+    reads: ConvReads,
     layer: super::ids::LayerId,
     conv_out: u32,
-    sliced: Option<(ColumnSlice, Binding)>,
     bucket_m: u32,
 ) -> Result<LoweredCommand, LoweringError> {
+    let ConvReads {
+        input,
+        conv_w,
+        sliced,
+    } = reads;
     use crate::tape::ids::BucketM;
     use crate::tape::lowered::{MScaleAxis, MScaling};
     let runtime = |kind, binding_index| Binding::Runtime {
@@ -13300,18 +13335,24 @@ mod tests {
         let mut roped_k = 0u32;
         let cmds = lower_one(
             &tp(),
-            /*chunked=*/ false,
+            TapeCx {
+                chunked: false,
+                bucket_m: BUCKET_M,
+                block_cap: 128,
+                chip: ChipCodes {
+                    profile: None,
+                    class: crate::tape::lowered::GenClass::M1,
+                    as_stored: &AsStoredCodes::default(),
+                },
+            },
             &scalar_mul,
             row(),
-            BUCKET_M,
             0,
-            &mut scratch,
-            &mut moe_scratch,
-            &mut roped_k,
-            128,
-            None,
-            crate::tape::lowered::GenClass::M1,
-            &AsStoredCodes::default(),
+            ScratchBytes {
+                splitk: &mut scratch,
+                moe: &mut moe_scratch,
+                roped_k: &mut roped_k,
+            },
             1,
         )
         .expect("lower scalar_mul");
@@ -13344,18 +13385,24 @@ mod tests {
         let (mut scratch, mut moe, mut roped_k) = (0u32, 0u32, 0u32);
         lower_one(
             p,
-            false,
+            TapeCx {
+                chunked: false,
+                bucket_m,
+                block_cap: 128,
+                chip: ChipCodes {
+                    profile: None,
+                    class: crate::tape::lowered::GenClass::M1,
+                    as_stored: &AsStoredCodes::default(),
+                },
+            },
             step,
             row(),
-            bucket_m,
             0,
-            &mut scratch,
-            &mut moe,
-            &mut roped_k,
-            128,
-            None,
-            crate::tape::lowered::GenClass::M1,
-            &AsStoredCodes::default(),
+            ScratchBytes {
+                splitk: &mut scratch,
+                moe: &mut moe,
+                roped_k: &mut roped_k,
+            },
             1,
         )
         .expect("lower")
@@ -13389,18 +13436,24 @@ mod tests {
         let mut roped_k = 0u32;
         let cmds = lower_one(
             &tp(),
-            /*chunked=*/ false,
+            TapeCx {
+                chunked: false,
+                bucket_m: 1,
+                block_cap: 128,
+                chip: ChipCodes {
+                    profile: None,
+                    class: crate::tape::lowered::GenClass::M1,
+                    as_stored: &AsStoredCodes::default(),
+                },
+            },
             &inst,
             row(),
-            /*bucket_m=*/ 1,
             /*layer_offset=*/ 5,
-            &mut scratch,
-            &mut moe_scratch,
-            &mut roped_k,
-            /*block_cap=*/ 128,
-            /*profile=*/ None,
-            crate::tape::lowered::GenClass::M1,
-            &AsStoredCodes::default(),
+            ScratchBytes {
+                splitk: &mut scratch,
+                moe: &mut moe_scratch,
+                roped_k: &mut roped_k,
+            },
             /*m_divisor=*/ 1,
         )
         .expect("lower");
@@ -13483,18 +13536,24 @@ mod tests {
         let mut roped_k = 0u32;
         let cmds = lower_one(
             &tp(),
-            /*chunked=*/ false,
+            TapeCx {
+                chunked: false,
+                bucket_m: 512,
+                block_cap: 128,
+                chip: ChipCodes {
+                    profile: None,
+                    class: crate::tape::lowered::GenClass::M1,
+                    as_stored: &AsStoredCodes::default(),
+                },
+            },
             &inst,
             row(),
-            /*bucket_m=*/ 512,
             /*layer_offset=*/ 0,
-            &mut scratch,
-            &mut moe_scratch,
-            &mut roped_k,
-            /*block_cap=*/ 128,
-            /*profile=*/ None,
-            crate::tape::lowered::GenClass::M1,
-            &AsStoredCodes::default(),
+            ScratchBytes {
+                splitk: &mut scratch,
+                moe: &mut moe_scratch,
+                roped_k: &mut roped_k,
+            },
             /*m_divisor=*/ 1,
         )
         .expect("lower");
@@ -13539,18 +13598,24 @@ mod tests {
         let mut roped_k = 0u32;
         let cmds = lower_one(
             &tp(),
-            /*chunked=*/ false,
+            TapeCx {
+                chunked: false,
+                bucket_m: 64,
+                block_cap: 128,
+                chip: ChipCodes {
+                    profile: None,
+                    class: crate::tape::lowered::GenClass::M1,
+                    as_stored: &AsStoredCodes::default(),
+                },
+            },
             &inst,
             row(),
-            /*bucket_m=*/ 64,
             /*layer_offset=*/ 0,
-            &mut scratch,
-            &mut moe_scratch,
-            &mut roped_k,
-            /*block_cap=*/ 128,
-            /*profile=*/ None,
-            crate::tape::lowered::GenClass::M1,
-            &AsStoredCodes::default(),
+            ScratchBytes {
+                splitk: &mut scratch,
+                moe: &mut moe_scratch,
+                roped_k: &mut roped_k,
+            },
             /*m_divisor=*/ 1,
         )
         .expect("lower");
@@ -13625,18 +13690,24 @@ mod tests {
         let mut roped_k = 0u32;
         let cmds = lower_one(
             &tp(),
-            /*chunked=*/ false,
+            TapeCx {
+                chunked: false,
+                bucket_m: 64,
+                block_cap: 128,
+                chip: ChipCodes {
+                    profile: None,
+                    class: crate::tape::lowered::GenClass::M1,
+                    as_stored: &AsStoredCodes::default(),
+                },
+            },
             &inst,
             row(),
-            /*bucket_m=*/ 64,
             /*layer_offset=*/ 0,
-            &mut scratch,
-            &mut moe_scratch,
-            &mut roped_k,
-            /*block_cap=*/ 128,
-            /*profile=*/ None,
-            crate::tape::lowered::GenClass::M1,
-            &AsStoredCodes::default(),
+            ScratchBytes {
+                splitk: &mut scratch,
+                moe: &mut moe_scratch,
+                roped_k: &mut roped_k,
+            },
             /*m_divisor=*/ 1,
         )
         .expect("lower");
@@ -13703,18 +13774,24 @@ mod tests {
         let mut roped_k = 0u32;
         let cmds = lower_one(
             &tp(),
-            /*chunked=*/ false,
+            TapeCx {
+                chunked: false,
+                bucket_m: 512,
+                block_cap: 128,
+                chip: ChipCodes {
+                    profile: None,
+                    class: crate::tape::lowered::GenClass::M1,
+                    as_stored: &AsStoredCodes::default(),
+                },
+            },
             &inst,
             row(),
-            /*bucket_m=*/ 512,
             /*layer_offset=*/ 0,
-            &mut scratch,
-            &mut moe_scratch,
-            &mut roped_k,
-            /*block_cap=*/ 128,
-            /*profile=*/ None,
-            crate::tape::lowered::GenClass::M1,
-            &AsStoredCodes::default(),
+            ScratchBytes {
+                splitk: &mut scratch,
+                moe: &mut moe_scratch,
+                roped_k: &mut roped_k,
+            },
             /*m_divisor=*/ 1,
         )
         .expect("lower");
@@ -13746,18 +13823,24 @@ mod tests {
         let mut roped_k = 0u32;
         let cmds = lower_one(
             &tp(),
-            /*chunked=*/ false,
+            TapeCx {
+                chunked: false,
+                bucket_m,
+                block_cap: 128,
+                chip: ChipCodes {
+                    profile: None,
+                    class: crate::tape::lowered::GenClass::M1,
+                    as_stored: &AsStoredCodes::default(),
+                },
+            },
             &inst,
             row(),
-            bucket_m,
             /*layer_offset=*/ 5,
-            &mut scratch,
-            &mut moe_scratch,
-            &mut roped_k,
-            /*block_cap=*/ 128,
-            /*profile=*/ None,
-            crate::tape::lowered::GenClass::M1,
-            &AsStoredCodes::default(),
+            ScratchBytes {
+                splitk: &mut scratch,
+                moe: &mut moe_scratch,
+                roped_k: &mut roped_k,
+            },
             /*m_divisor=*/ 1,
         )
         .expect("lower");

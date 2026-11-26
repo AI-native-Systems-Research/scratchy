@@ -1175,7 +1175,6 @@ mod tests {
     }
 
     /// Pure-Rust replica of `sample_top_k_top_p_core`.
-    #[allow(clippy::too_many_arguments)]
     fn golden_sample(
         logits: &[f32],
         temp: f32,

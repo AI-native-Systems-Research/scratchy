@@ -5,6 +5,9 @@ version = "0.1.0"
 edition = "2024"
 license.workspace = true
 publish = false
+# The tests that share `tests/common` are modules of ONE test binary (`tests/fixtures.rs`), so every
+# helper there has a user; each other test is its own binary, listed below.
+autotests = false
 
 # Re-hosted from triton-spyre's third_party/spyre/rust/triton-frontend (see
 # backends/spyre/crates/triton/PROVENANCE.md). No [workspace] table: this is a member of scratchy's
@@ -33,3 +36,19 @@ scratchy-triton-splice = { path = "../splice" }
 ktir-superdsc = { path = "../../ktir/ktir-superdsc" }
 
 [dependencies]
+
+[[test]]
+name = "fixtures"
+path = "tests/fixtures.rs"
+
+[[test]]
+name = "const_fold"
+path = "tests/const_fold.rs"
+
+[[test]]
+name = "divergence"
+path = "tests/divergence.rs"
+
+[[test]]
+name = "no_parser"
+path = "tests/no_parser.rs"

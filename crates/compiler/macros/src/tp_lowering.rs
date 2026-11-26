@@ -108,10 +108,7 @@ pub(crate) fn shard_kind_for_last_segment(last: &str) -> ShardKind {
 /// Returns `Replicate` on the empty string.
 ///
 /// Consumed by `codegen::emit_unindexed_let` /
-/// `codegen::emit_layered_load_body` once task #5 wires shard-kind
-/// dispatch into the load helpers. Pinned by tests now; the
-/// `dead_code` allow is removed on its first non-test caller.
-#[allow(dead_code)]
+/// `codegen::emit_layered_load_body`.
 pub(crate) fn shard_kind_for_dotted_prefix(prefix: &str) -> ShardKind {
     let last = prefix.rsplit('.').next().unwrap_or("");
     shard_kind_for_last_segment(last)

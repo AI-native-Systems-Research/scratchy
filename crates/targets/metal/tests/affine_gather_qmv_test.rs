@@ -11,6 +11,7 @@ use std::ptr::NonNull;
 use half::{bf16, f16};
 use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions, MTLSize};
 use scratchy_target_metal::aot::baked_pipeline;
+use scratchy_target_metal::cpu_reference::AffineMatmul;
 use scratchy_target_metal::cpu_reference::{
     affine_qmm_t_b8_bf16_s_bf16, affine_qmv_b2_bf16_s_bf16, affine_qmv_b3_bf16_s_bf16,
     affine_qmv_b4_bf16, affine_qmv_b4_bf16_s_bf16,
@@ -66,6 +67,28 @@ fn read_bf16(
     unsafe { std::slice::from_raw_parts(ptr, n) }.to_vec()
 }
 
+/// The buffers a gather-qmv dispatch binds: the input, the packed weight with its scales and
+/// biases, the routed expert indices, and the output.
+struct GatherBuffers<'a> {
+    x_buf: &'a common::Buffer,
+    w_buf: &'a common::Buffer,
+    s_buf: &'a common::Buffer,
+    b_buf: &'a common::Buffer,
+    idx_buf: &'a common::Buffer,
+    y_buf: &'a common::Buffer,
+}
+
+/// A gather-qmv's shape: its tokens, the experts each routes to, each expert's `[n_out, k]`, and
+/// the affine group width.
+#[derive(Clone, Copy)]
+struct GatherShape {
+    num_tokens: u32,
+    top_k: u32,
+    n_out: u32,
+    k: u32,
+    group_size: u32,
+}
+
 /// Build the gather-qmv pipeline for the given shape and dispatch it on
 /// the production MTL4 path. Replicates the bindings of
 /// `MetalAffineGatherQmv::execute` (buffer 0=packed_w, 1=scales,
@@ -74,23 +97,28 @@ fn read_bf16(
 /// heuristic + `(1, n_out/8, num_tokens*top_k)` grid. `bits` is fixed at
 /// 4 (only width the kernel wires). Returns `false` if the host has no
 /// MTL4 queue (caller should skip).
-#[allow(clippy::too_many_arguments)]
 fn dispatch_gather_qmv(
     device: &common::Device,
-    x_buf: &common::Buffer,
-    w_buf: &common::Buffer,
-    s_buf: &common::Buffer,
-    b_buf: &common::Buffer,
-    idx_buf: &common::Buffer,
-    y_buf: &common::Buffer,
-    num_tokens: u32,
-    top_k: u32,
-    n_out: u32,
-    k: u32,
-    group_size: u32,
+    bufs: GatherBuffers<'_>,
+    shape: GatherShape,
     dtype: DequantDtype,
     scale_dtype: ScaleDtype,
 ) -> bool {
+    let GatherBuffers {
+        x_buf,
+        w_buf,
+        s_buf,
+        b_buf,
+        idx_buf,
+        y_buf,
+    } = bufs;
+    let GatherShape {
+        num_tokens,
+        top_k,
+        n_out,
+        k,
+        group_size,
+    } = shape;
     let bits: u32 = 4;
     // The lowering's Fast-vs-Generic rule.
     let kernel = if scratchy_target_metal::tape::quantized::qmv_fast_covers(n_out, k) {
@@ -198,17 +226,21 @@ fn affine_gather_qmv_bf16_mixtral_decode_fast() {
 
     if !dispatch_gather_qmv(
         &mdev.device,
-        &x_buf,
-        &w_buf,
-        &s_buf,
-        &b_buf,
-        &idx_buf,
-        &y_buf,
-        num_tokens as u32,
-        top_k as u32,
-        n_out as u32,
-        k as u32,
-        group_size as u32,
+        GatherBuffers {
+            x_buf: &x_buf,
+            w_buf: &w_buf,
+            s_buf: &s_buf,
+            b_buf: &b_buf,
+            idx_buf: &idx_buf,
+            y_buf: &y_buf,
+        },
+        GatherShape {
+            num_tokens: num_tokens as u32,
+            top_k: top_k as u32,
+            n_out: n_out as u32,
+            k: k as u32,
+            group_size: group_size as u32,
+        },
         DequantDtype::Bf16,
         ScaleDtype::F16,
     ) {
@@ -223,16 +255,16 @@ fn affine_gather_qmv_bf16_mixtral_decode_fast() {
     for n in 0..num_tokens {
         for slot in 0..top_k {
             let expert = indices[n * top_k + slot] as usize;
-            let want = affine_qmv_b4_bf16(
-                &packed[expert * packed_per_expert..(expert + 1) * packed_per_expert],
-                &scales_f16[expert * sb_per_expert..(expert + 1) * sb_per_expert],
-                &biases_f16[expert * sb_per_expert..(expert + 1) * sb_per_expert],
-                &x_bf16[n * k..(n + 1) * k],
-                1,
-                n_out,
+            let want = affine_qmv_b4_bf16(AffineMatmul {
+                packed: &packed[expert * packed_per_expert..(expert + 1) * packed_per_expert],
+                scales: &scales_f16[expert * sb_per_expert..(expert + 1) * sb_per_expert],
+                biases: &biases_f16[expert * sb_per_expert..(expert + 1) * sb_per_expert],
+                x: &x_bf16[n * k..(n + 1) * k],
+                m: 1,
+                n: n_out,
                 k,
                 group_size,
-            );
+            });
             let base = (n * top_k + slot) * n_out;
             for c in 0..n_out {
                 let g = got[base + c].to_f32();
@@ -307,17 +339,21 @@ fn affine_gather_qmv_bf16_generic() {
 
     if !dispatch_gather_qmv(
         &mdev.device,
-        &x_buf,
-        &w_buf,
-        &s_buf,
-        &b_buf,
-        &idx_buf,
-        &y_buf,
-        num_tokens as u32,
-        top_k as u32,
-        n_out as u32,
-        k as u32,
-        group_size as u32,
+        GatherBuffers {
+            x_buf: &x_buf,
+            w_buf: &w_buf,
+            s_buf: &s_buf,
+            b_buf: &b_buf,
+            idx_buf: &idx_buf,
+            y_buf: &y_buf,
+        },
+        GatherShape {
+            num_tokens: num_tokens as u32,
+            top_k: top_k as u32,
+            n_out: n_out as u32,
+            k: k as u32,
+            group_size: group_size as u32,
+        },
         DequantDtype::Bf16,
         ScaleDtype::F16,
     ) {
@@ -331,16 +367,16 @@ fn affine_gather_qmv_bf16_generic() {
     for n in 0..num_tokens {
         for slot in 0..top_k {
             let expert = indices[n * top_k + slot] as usize;
-            let want = affine_qmv_b4_bf16(
-                &packed[expert * packed_per_expert..(expert + 1) * packed_per_expert],
-                &scales_f16[expert * sb_per_expert..(expert + 1) * sb_per_expert],
-                &biases_f16[expert * sb_per_expert..(expert + 1) * sb_per_expert],
-                &x_bf16[n * k..(n + 1) * k],
-                1,
-                n_out,
+            let want = affine_qmv_b4_bf16(AffineMatmul {
+                packed: &packed[expert * packed_per_expert..(expert + 1) * packed_per_expert],
+                scales: &scales_f16[expert * sb_per_expert..(expert + 1) * sb_per_expert],
+                biases: &biases_f16[expert * sb_per_expert..(expert + 1) * sb_per_expert],
+                x: &x_bf16[n * k..(n + 1) * k],
+                m: 1,
+                n: n_out,
                 k,
                 group_size,
-            );
+            });
             let base = (n * top_k + slot) * n_out;
             for c in 0..n_out {
                 let g = got[base + c].to_f32();
@@ -417,17 +453,21 @@ fn affine_gather_qmv_bf16_s_bf16_qwen3_moe_decode_fast() {
 
     if !dispatch_gather_qmv(
         &mdev.device,
-        &x_buf,
-        &w_buf,
-        &s_buf,
-        &b_buf,
-        &idx_buf,
-        &y_buf,
-        num_tokens as u32,
-        top_k as u32,
-        n_out as u32,
-        k as u32,
-        group_size as u32,
+        GatherBuffers {
+            x_buf: &x_buf,
+            w_buf: &w_buf,
+            s_buf: &s_buf,
+            b_buf: &b_buf,
+            idx_buf: &idx_buf,
+            y_buf: &y_buf,
+        },
+        GatherShape {
+            num_tokens: num_tokens as u32,
+            top_k: top_k as u32,
+            n_out: n_out as u32,
+            k: k as u32,
+            group_size: group_size as u32,
+        },
         DequantDtype::Bf16,
         ScaleDtype::Bf16,
     ) {
@@ -441,16 +481,16 @@ fn affine_gather_qmv_bf16_s_bf16_qwen3_moe_decode_fast() {
     for n in 0..num_tokens {
         for slot in 0..top_k {
             let expert = indices[n * top_k + slot] as usize;
-            let want = affine_qmv_b4_bf16_s_bf16(
-                &packed[expert * packed_per_expert..(expert + 1) * packed_per_expert],
-                &scales_bf16[expert * sb_per_expert..(expert + 1) * sb_per_expert],
-                &biases_bf16[expert * sb_per_expert..(expert + 1) * sb_per_expert],
-                &x_bf16[n * k..(n + 1) * k],
-                1,
-                n_out,
+            let want = affine_qmv_b4_bf16_s_bf16(AffineMatmul {
+                packed: &packed[expert * packed_per_expert..(expert + 1) * packed_per_expert],
+                scales: &scales_bf16[expert * sb_per_expert..(expert + 1) * sb_per_expert],
+                biases: &biases_bf16[expert * sb_per_expert..(expert + 1) * sb_per_expert],
+                x: &x_bf16[n * k..(n + 1) * k],
+                m: 1,
+                n: n_out,
                 k,
                 group_size,
-            );
+            });
             let base = (n * top_k + slot) * n_out;
             // K=2048 inflates bf16 accumulation noise: stdev grows as
             // sqrt(K) * bf16_eps * per-elem-magnitude. With bf16_eps ≈
@@ -533,17 +573,21 @@ fn affine_gather_qmv_bf16_s_bf16_qwen3_moe_down_proj_shape() {
 
     if !dispatch_gather_qmv(
         &mdev.device,
-        &x_buf,
-        &w_buf,
-        &s_buf,
-        &b_buf,
-        &idx_buf,
-        &y_buf,
-        num_tokens as u32,
-        top_k as u32,
-        n_out as u32,
-        k as u32,
-        group_size as u32,
+        GatherBuffers {
+            x_buf: &x_buf,
+            w_buf: &w_buf,
+            s_buf: &s_buf,
+            b_buf: &b_buf,
+            idx_buf: &idx_buf,
+            y_buf: &y_buf,
+        },
+        GatherShape {
+            num_tokens: num_tokens as u32,
+            top_k: top_k as u32,
+            n_out: n_out as u32,
+            k: k as u32,
+            group_size: group_size as u32,
+        },
         DequantDtype::Bf16,
         ScaleDtype::Bf16,
     ) {
@@ -557,16 +601,16 @@ fn affine_gather_qmv_bf16_s_bf16_qwen3_moe_down_proj_shape() {
     for n in 0..num_tokens {
         for slot in 0..top_k {
             let expert = indices[n * top_k + slot] as usize;
-            let want = affine_qmv_b4_bf16_s_bf16(
-                &packed[expert * packed_per_expert..(expert + 1) * packed_per_expert],
-                &scales_bf16[expert * sb_per_expert..(expert + 1) * sb_per_expert],
-                &biases_bf16[expert * sb_per_expert..(expert + 1) * sb_per_expert],
-                &x_bf16[n * k..(n + 1) * k],
-                1,
-                n_out,
+            let want = affine_qmv_b4_bf16_s_bf16(AffineMatmul {
+                packed: &packed[expert * packed_per_expert..(expert + 1) * packed_per_expert],
+                scales: &scales_bf16[expert * sb_per_expert..(expert + 1) * sb_per_expert],
+                biases: &biases_bf16[expert * sb_per_expert..(expert + 1) * sb_per_expert],
+                x: &x_bf16[n * k..(n + 1) * k],
+                m: 1,
+                n: n_out,
                 k,
                 group_size,
-            );
+            });
             let base = (n * top_k + slot) * n_out;
             let allowed_abs = 0.3_f32; // K=768 with bf16 accumulation tolerance
             let allowed_rel = 0.25_f32;
@@ -652,17 +696,21 @@ fn affine_gather_qmv_bf16_s_bf16_qwen3_moe_down_proj_top_k_1_workaround() {
     // set to m_rows = T*top_k so total dispatched rows = m_rows.
     if !dispatch_gather_qmv(
         &mdev.device,
-        &x_buf,
-        &w_buf,
-        &s_buf,
-        &b_buf,
-        &idx_buf,
-        &y_buf,
-        m_rows as u32, // num_tokens, but in workaround we pass T*top_k
-        1u32,          // top_k_in_kernel = 1 (workaround)
-        n_out as u32,
-        k as u32,
-        group_size as u32,
+        GatherBuffers {
+            x_buf: &x_buf,
+            w_buf: &w_buf,
+            s_buf: &s_buf,
+            b_buf: &b_buf,
+            idx_buf: &idx_buf,
+            y_buf: &y_buf,
+        },
+        GatherShape {
+            num_tokens: m_rows as u32, // num_tokens, but in workaround we pass T*top_k
+            top_k: 1u32,               // top_k_in_kernel = 1 (workaround)
+            n_out: n_out as u32,
+            k: k as u32,
+            group_size: group_size as u32,
+        },
         DequantDtype::Bf16,
         ScaleDtype::Bf16,
     ) {
@@ -675,16 +723,16 @@ fn affine_gather_qmv_bf16_s_bf16_qwen3_moe_down_proj_top_k_1_workaround() {
     let mut max_err = 0.0_f32;
     for nk in 0..m_rows {
         let expert = indices[nk] as usize;
-        let want = affine_qmv_b4_bf16_s_bf16(
-            &packed[expert * packed_per_expert..(expert + 1) * packed_per_expert],
-            &scales_bf16[expert * sb_per_expert..(expert + 1) * sb_per_expert],
-            &biases_bf16[expert * sb_per_expert..(expert + 1) * sb_per_expert],
-            &x_bf16[nk * k..(nk + 1) * k],
-            1,
-            n_out,
+        let want = affine_qmv_b4_bf16_s_bf16(AffineMatmul {
+            packed: &packed[expert * packed_per_expert..(expert + 1) * packed_per_expert],
+            scales: &scales_bf16[expert * sb_per_expert..(expert + 1) * sb_per_expert],
+            biases: &biases_bf16[expert * sb_per_expert..(expert + 1) * sb_per_expert],
+            x: &x_bf16[nk * k..(nk + 1) * k],
+            m: 1,
+            n: n_out,
             k,
             group_size,
-        );
+        });
         let base = nk * n_out;
         let allowed_abs = 0.3_f32;
         let allowed_rel = 0.25_f32;
@@ -776,17 +824,21 @@ fn affine_gather_qmv_bf16_s_bf16_qwen3_moe_down_proj_production_dispatch() {
 
     if !dispatch_gather_qmv(
         &mdev.device,
-        &x_buf,
-        &w_buf,
-        &s_buf,
-        &b_buf,
-        &idx_buf,
-        &y_buf,
-        m_rows as u32, // num_tokens param == m_rows (workaround)
-        1u32,          // top_k_in_kernel = 1 (workaround)
-        n_out as u32,
-        k as u32,
-        group_size as u32,
+        GatherBuffers {
+            x_buf: &x_buf,
+            w_buf: &w_buf,
+            s_buf: &s_buf,
+            b_buf: &b_buf,
+            idx_buf: &idx_buf,
+            y_buf: &y_buf,
+        },
+        GatherShape {
+            num_tokens: m_rows as u32, // num_tokens param == m_rows (workaround)
+            top_k: 1u32,               // top_k_in_kernel = 1 (workaround)
+            n_out: n_out as u32,
+            k: k as u32,
+            group_size: group_size as u32,
+        },
         DequantDtype::Bf16,
         ScaleDtype::Bf16,
     ) {
@@ -801,16 +853,16 @@ fn affine_gather_qmv_bf16_s_bf16_qwen3_moe_down_proj_production_dispatch() {
     let mut fail_count = 0usize;
     for nk in 0..m_rows {
         let expert = indices[nk] as usize;
-        let want = affine_qmv_b4_bf16_s_bf16(
-            &packed[expert * packed_per_expert..(expert + 1) * packed_per_expert],
-            &scales_bf16[expert * sb_per_expert..(expert + 1) * sb_per_expert],
-            &biases_bf16[expert * sb_per_expert..(expert + 1) * sb_per_expert],
-            &x_bf16[nk * k..(nk + 1) * k],
-            1,
-            n_out,
+        let want = affine_qmv_b4_bf16_s_bf16(AffineMatmul {
+            packed: &packed[expert * packed_per_expert..(expert + 1) * packed_per_expert],
+            scales: &scales_bf16[expert * sb_per_expert..(expert + 1) * sb_per_expert],
+            biases: &biases_bf16[expert * sb_per_expert..(expert + 1) * sb_per_expert],
+            x: &x_bf16[nk * k..(nk + 1) * k],
+            m: 1,
+            n: n_out,
             k,
             group_size,
-        );
+        });
         let base = nk * n_out;
         let allowed_abs = 0.3_f32;
         let allowed_rel = 0.25_f32;
@@ -901,17 +953,21 @@ fn affine_gather_qmv_bf16_s_bf16_qwen3_5_moe_down_proj_fast_k512() {
 
     if !dispatch_gather_qmv(
         &mdev.device,
-        &x_buf,
-        &w_buf,
-        &s_buf,
-        &b_buf,
-        &idx_buf,
-        &y_buf,
-        num_tokens as u32,
-        top_k as u32,
-        n_out as u32,
-        k as u32,
-        group_size as u32,
+        GatherBuffers {
+            x_buf: &x_buf,
+            w_buf: &w_buf,
+            s_buf: &s_buf,
+            b_buf: &b_buf,
+            idx_buf: &idx_buf,
+            y_buf: &y_buf,
+        },
+        GatherShape {
+            num_tokens: num_tokens as u32,
+            top_k: top_k as u32,
+            n_out: n_out as u32,
+            k: k as u32,
+            group_size: group_size as u32,
+        },
         DequantDtype::Bf16,
         ScaleDtype::Bf16,
     ) {
@@ -925,16 +981,16 @@ fn affine_gather_qmv_bf16_s_bf16_qwen3_5_moe_down_proj_fast_k512() {
     for n in 0..num_tokens {
         for slot in 0..top_k {
             let expert = indices[n * top_k + slot] as usize;
-            let want = affine_qmv_b4_bf16_s_bf16(
-                &packed[expert * packed_per_expert..(expert + 1) * packed_per_expert],
-                &scales_bf16[expert * sb_per_expert..(expert + 1) * sb_per_expert],
-                &biases_bf16[expert * sb_per_expert..(expert + 1) * sb_per_expert],
-                &x_bf16[n * k..(n + 1) * k],
-                1,
-                n_out,
+            let want = affine_qmv_b4_bf16_s_bf16(AffineMatmul {
+                packed: &packed[expert * packed_per_expert..(expert + 1) * packed_per_expert],
+                scales: &scales_bf16[expert * sb_per_expert..(expert + 1) * sb_per_expert],
+                biases: &biases_bf16[expert * sb_per_expert..(expert + 1) * sb_per_expert],
+                x: &x_bf16[n * k..(n + 1) * k],
+                m: 1,
+                n: n_out,
                 k,
                 group_size,
-            );
+            });
             let base = (n * top_k + slot) * n_out;
             let allowed_abs = 0.2_f32;
             let allowed_rel = 0.20_f32;
@@ -1010,17 +1066,21 @@ fn affine_gather_qmv_bf16_s_bf16_qwen3_5_moe_gate_proj_e256() {
 
     if !dispatch_gather_qmv(
         &mdev.device,
-        &x_buf,
-        &w_buf,
-        &s_buf,
-        &b_buf,
-        &idx_buf,
-        &y_buf,
-        num_tokens as u32,
-        top_k as u32,
-        n_out as u32,
-        k as u32,
-        group_size as u32,
+        GatherBuffers {
+            x_buf: &x_buf,
+            w_buf: &w_buf,
+            s_buf: &s_buf,
+            b_buf: &b_buf,
+            idx_buf: &idx_buf,
+            y_buf: &y_buf,
+        },
+        GatherShape {
+            num_tokens: num_tokens as u32,
+            top_k: top_k as u32,
+            n_out: n_out as u32,
+            k: k as u32,
+            group_size: group_size as u32,
+        },
         DequantDtype::Bf16,
         ScaleDtype::Bf16,
     ) {
@@ -1034,16 +1094,16 @@ fn affine_gather_qmv_bf16_s_bf16_qwen3_5_moe_gate_proj_e256() {
     for n in 0..num_tokens {
         for slot in 0..top_k {
             let expert = indices[n * top_k + slot] as usize;
-            let want = affine_qmv_b4_bf16_s_bf16(
-                &packed[expert * packed_per_expert..(expert + 1) * packed_per_expert],
-                &scales_bf16[expert * sb_per_expert..(expert + 1) * sb_per_expert],
-                &biases_bf16[expert * sb_per_expert..(expert + 1) * sb_per_expert],
-                &x_bf16[n * k..(n + 1) * k],
-                1,
-                n_out,
+            let want = affine_qmv_b4_bf16_s_bf16(AffineMatmul {
+                packed: &packed[expert * packed_per_expert..(expert + 1) * packed_per_expert],
+                scales: &scales_bf16[expert * sb_per_expert..(expert + 1) * sb_per_expert],
+                biases: &biases_bf16[expert * sb_per_expert..(expert + 1) * sb_per_expert],
+                x: &x_bf16[n * k..(n + 1) * k],
+                m: 1,
+                n: n_out,
                 k,
                 group_size,
-            );
+            });
             let base = (n * top_k + slot) * n_out;
             let allowed_abs = 0.3_f32;
             let allowed_rel = 0.20_f32;
@@ -1162,16 +1222,16 @@ fn affine_gather_qmv_b3_bf16_glm_4_5_air_decode() {
         for n in 0..num_tokens {
             for slot in 0..top_k {
                 let e = indices[n * top_k + slot] as usize;
-                let want = affine_qmv_b3_bf16_s_bf16(
-                    &packed[e * w_pe..(e + 1) * w_pe],
-                    &scales[e * sb_pe..(e + 1) * sb_pe],
-                    &biases[e * sb_pe..(e + 1) * sb_pe],
-                    &x[n * k..(n + 1) * k],
-                    1,
-                    n_out,
+                let want = affine_qmv_b3_bf16_s_bf16(AffineMatmul {
+                    packed: &packed[e * w_pe..(e + 1) * w_pe],
+                    scales: &scales[e * sb_pe..(e + 1) * sb_pe],
+                    biases: &biases[e * sb_pe..(e + 1) * sb_pe],
+                    x: &x[n * k..(n + 1) * k],
+                    m: 1,
+                    n: n_out,
                     k,
                     group_size,
-                );
+                });
                 let base = (n * top_k + slot) * n_out;
                 for c in 0..n_out {
                     let g = got[base + c].to_f32();
@@ -1284,16 +1344,16 @@ fn affine_gather_qmv_b2_bf16_gpt_oss_decode() {
         for n in 0..num_tokens {
             for slot in 0..top_k {
                 let e = indices[n * top_k + slot] as usize;
-                let want = affine_qmv_b2_bf16_s_bf16(
-                    &packed[e * w_pe..(e + 1) * w_pe],
-                    &scales[e * sb_pe..(e + 1) * sb_pe],
-                    &biases[e * sb_pe..(e + 1) * sb_pe],
-                    &x[n * k..(n + 1) * k],
-                    1,
-                    n_out,
+                let want = affine_qmv_b2_bf16_s_bf16(AffineMatmul {
+                    packed: &packed[e * w_pe..(e + 1) * w_pe],
+                    scales: &scales[e * sb_pe..(e + 1) * sb_pe],
+                    biases: &biases[e * sb_pe..(e + 1) * sb_pe],
+                    x: &x[n * k..(n + 1) * k],
+                    m: 1,
+                    n: n_out,
                     k,
                     group_size,
-                );
+                });
                 let base = (n * top_k + slot) * n_out;
                 for c in 0..n_out {
                     let g = got[base + c].to_f32();
@@ -1407,16 +1467,16 @@ fn affine_gather_qmv_b8_bf16_qwen3_5_optiq_fast() {
         for n in 0..num_tokens {
             for slot in 0..top_k {
                 let e = indices[n * top_k + slot] as usize;
-                let want = affine_qmm_t_b8_bf16_s_bf16(
-                    &packed[e * w_pe..(e + 1) * w_pe],
-                    &scales[e * sb_pe..(e + 1) * sb_pe],
-                    &biases[e * sb_pe..(e + 1) * sb_pe],
-                    &x[n * k..(n + 1) * k],
-                    1,
-                    n_out,
+                let want = affine_qmm_t_b8_bf16_s_bf16(AffineMatmul {
+                    packed: &packed[e * w_pe..(e + 1) * w_pe],
+                    scales: &scales[e * sb_pe..(e + 1) * sb_pe],
+                    biases: &biases[e * sb_pe..(e + 1) * sb_pe],
+                    x: &x[n * k..(n + 1) * k],
+                    m: 1,
+                    n: n_out,
                     k,
                     group_size,
-                );
+                });
                 let base = (n * top_k + slot) * n_out;
                 for c in 0..n_out {
                     let g = got[base + c].to_f32();
@@ -1636,26 +1696,26 @@ fn routed_gated_b3_case(num_experts: usize, k: usize, n_out: usize, top_k: usize
     let mut worst = (0usize, 0usize);
     for nk in 0..pairs {
         let e = picks_all[nk];
-        let g = affine_qmv_b3_bf16_s_bf16(
-            &g_packed[e * w_pe..(e + 1) * w_pe],
-            &g_scales[e * sb_pe..(e + 1) * sb_pe],
-            &g_biases[e * sb_pe..(e + 1) * sb_pe],
-            &x[..k],
-            1,
-            n_out,
+        let g = affine_qmv_b3_bf16_s_bf16(AffineMatmul {
+            packed: &g_packed[e * w_pe..(e + 1) * w_pe],
+            scales: &g_scales[e * sb_pe..(e + 1) * sb_pe],
+            biases: &g_biases[e * sb_pe..(e + 1) * sb_pe],
+            x: &x[..k],
+            m: 1,
+            n: n_out,
             k,
             group_size,
-        );
-        let u = affine_qmv_b3_bf16_s_bf16(
-            &u_packed[e * w_pe..(e + 1) * w_pe],
-            &u_scales[e * sb_pe..(e + 1) * sb_pe],
-            &u_biases[e * sb_pe..(e + 1) * sb_pe],
-            &x[..k],
-            1,
-            n_out,
+        });
+        let u = affine_qmv_b3_bf16_s_bf16(AffineMatmul {
+            packed: &u_packed[e * w_pe..(e + 1) * w_pe],
+            scales: &u_scales[e * sb_pe..(e + 1) * sb_pe],
+            biases: &u_biases[e * sb_pe..(e + 1) * sb_pe],
+            x: &x[..k],
+            m: 1,
+            n: n_out,
             k,
             group_size,
-        );
+        });
         for c in 0..n_out {
             let gv = g[c].to_f32();
             let uv = u[c].to_f32();

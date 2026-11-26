@@ -14,6 +14,7 @@ use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions, MTLSize};
 use scratchy_layers::kv_int8::{decode_row, encode_row};
 use scratchy_target_metal::aot::baked_build;
 use scratchy_target_metal::detect_device;
+use scratchy_target_metal::mtl4_dispatch::ThreadgroupGrid;
 use scratchy_target_metal::specialized_pipeline_cache::{
     ConstantValue, PipelineKey, SpecializedPipelineCache,
 };
@@ -306,8 +307,10 @@ fn decode_run(
             &[],
             &[],
             &[],
-            size(1, num_q / heads, splits),
-            size(d, 1, 1),
+            ThreadgroupGrid {
+                threadgroups: size(1, num_q / heads, splits),
+                threads_per_threadgroup: size(d, 1, 1),
+            },
         );
         batch.barrier();
     }
@@ -383,8 +386,10 @@ fn dense_decode_time(
             &[],
             &[],
             &resident,
-            size(1, num_q / heads, 1),
-            size(1024, 1, 1),
+            ThreadgroupGrid {
+                threadgroups: size(1, num_q / heads, 1),
+                threads_per_threadgroup: size(1024, 1, 1),
+            },
         );
         batch.barrier();
     }

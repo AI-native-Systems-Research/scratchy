@@ -1038,14 +1038,11 @@ pub fn run_matmul_loop_gpu(
             // K-long dependent FMA chain, which loses to this kernel's staged operand
             // reuse even though it carries 127 phantom rows.
             engine.matmul_unified(
-                m,
-                k,
-                n,
+                GemmDims { m, k, n },
                 &ua,
                 &ub,
                 &mut uc,
-                None,
-                Epilogue::NONE,
+                FusedEpilogue::NONE,
                 info.transpose_b,
             )?;
             uc.as_slice().to_vec()
@@ -1344,7 +1341,6 @@ fn resolve_gemm_operand_unified(
 /// elements). `row_off=0` is the default full-tensor read. Used by the
 /// last-token-only rewrite to reconstruct a single activation row (`m_row_off`).
 #[cfg(metal)]
-#[allow(clippy::too_many_arguments)]
 fn resolve_gemm_operand_unified_off(
     root: Ssa,
     rows: usize,
@@ -1408,7 +1404,7 @@ fn resolve_gemm_operand_unified_off(
             }
             let fingerprint = {
                 let hbm = ctx.hbm.borrow();
-                weight_fingerprint(hbm, addr, n, b_dtype)
+                weight_fingerprint(&hbm, addr, n, b_dtype)
             };
             let key = WeightKey {
                 addr,
@@ -1512,7 +1508,7 @@ fn resolve_gemm_weight_slice(
     // Fingerprint the FULL weight (root identity); col_off keys the slice apart.
     let fingerprint = {
         let hbm = ctx.hbm.borrow();
-        weight_fingerprint(hbm, base, k * b_stride as usize, b_dtype)
+        weight_fingerprint(&hbm, base, k * b_stride as usize, b_dtype)
     };
     let key = WeightKey {
         addr: base,
@@ -1545,7 +1541,6 @@ fn resolve_gemm_weight_slice(
 /// CONTIGUOUS block (`n*k` elements at `n_off*k`) — so this is a plain contiguous
 /// read either way. Cached once per process (keyed by `col_off = n_off`).
 #[cfg(metal)]
-#[allow(clippy::too_many_arguments)]
 fn resolve_gemm_bt_operand(
     root: Ssa,
     n: usize,
@@ -1616,7 +1611,7 @@ fn resolve_gemm_bt_operand(
     }
     let fingerprint = {
         let hbm = ctx.hbm.borrow();
-        weight_fingerprint(hbm, addr, count, b_dtype)
+        weight_fingerprint(&hbm, addr, count, b_dtype)
     };
     let key = WeightKey {
         // The TENSOR's base, not this tile's `addr` — `col_off` is what separates the tiles, and
@@ -1755,7 +1750,14 @@ pub fn run_plain_matmul_gpu(
         let ua = engine.unified_from(&a.as_f32())?;
         let ub = engine.unified_from(&b.as_f32())?;
         let mut uc = engine.unified(m * n)?;
-        engine.matmul_unified(m, k, n, &ua, &ub, &mut uc, None, Epilogue::NONE, false)?;
+        engine.matmul_unified(
+            GemmDims { m, k, n },
+            &ua,
+            &ub,
+            &mut uc,
+            FusedEpilogue::NONE,
+            false,
+        )?;
         Ok(uc.as_slice().to_vec())
     })?;
     if let Some(acc) = acc {
@@ -3813,21 +3815,17 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+/// A device, its queue, and a pipeline compiled on it: what one dispatch encodes against.
+#[cfg(metal)]
+type DispatchHandles = (
+    objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLDevice>>,
+    objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLCommandQueue>>,
+    objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>>,
+);
+
 /// Device + queue + the cached pipeline for `kernel` (compiled on first sight).
 #[cfg(metal)]
-#[allow(clippy::type_complexity)]
-fn cached_dispatch(
-    kernel: &MslKernel,
-) -> Result<
-    (
-        objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLDevice>>,
-        objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLCommandQueue>>,
-        objc2::rc::Retained<
-            objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputePipelineState>,
-        >,
-    ),
-    String,
-> {
+fn cached_dispatch(kernel: &MslKernel) -> Result<DispatchHandles, String> {
     use objc2_foundation::NSString;
     use objc2_metal::{MTLCreateSystemDefaultDevice, MTLDevice, MTLLibrary};
     use std::hash::{Hash, Hasher};
@@ -4165,6 +4163,41 @@ pub struct ChainStep<'a> {
     pub b: &'a [f32],
     pub epi: Epilogue,
     pub e: Option<&'a [f32]>,
+}
+
+/// A GEMM's extents: `A` is m×k, `B` k×n (n×k when transposed), the result m×n.
+#[cfg(metal)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GemmDims {
+    pub m: usize,
+    pub k: usize,
+    pub n: usize,
+}
+
+/// A GEMV's extents: `x` is length k, `B` k×n (n×k when transposed), `y` length n.
+#[cfg(metal)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GemvDims {
+    pub k: usize,
+    pub n: usize,
+}
+
+/// A zero-copy GEMM's fused epilogue and its resident elementwise operand `E` (`None` when the
+/// epilogue reads none).
+#[cfg(metal)]
+#[derive(Clone, Copy)]
+pub struct FusedEpilogue<'a> {
+    pub epi: Epilogue,
+    pub e: Option<&'a UnifiedBuffer>,
+}
+
+#[cfg(metal)]
+impl FusedEpilogue<'_> {
+    /// No epilogue and no operand — a plain matmul.
+    pub const NONE: FusedEpilogue<'static> = FusedEpilogue {
+        epi: Epilogue::NONE,
+        e: None,
+    };
 }
 
 /// A fused matmul epilogue: `out = act(c BINOP e)`, where `e` is a per-element
@@ -5260,34 +5293,28 @@ impl NaxGemm {
         a: &[f32],
         b: &[f32],
     ) -> Result<Vec<f32>, String> {
-        self.run_epi(m, k, n, a, b, None, Epilogue::NONE)
+        self.run_epi(GemmDims { m, k, n }, a, b, None, Epilogue::NONE)
     }
 
     /// Fused matmul + elementwise epilogue in one kernel: `D = act(A·B BINOP E)`
     /// where `E` is the row-major m×n elementwise operand. No host readback of
     /// the matmul result and no second kernel launch — the activation/bias runs
     /// in the GEMM store. See [`Epilogue`].
-    #[allow(clippy::too_many_arguments)]
     pub fn run_fused(
         &self,
-        m: usize,
-        k: usize,
-        n: usize,
+        dims: GemmDims,
         a: &[f32],
         b: &[f32],
         e: &[f32],
         epi: Epilogue,
     ) -> Result<Vec<f32>, String> {
-        assert_eq!(e.len(), m * n, "epilogue operand E must be m×n");
-        self.run_epi(m, k, n, a, b, Some(e), epi)
+        assert_eq!(e.len(), dims.m * dims.n, "epilogue operand E must be m×n");
+        self.run_epi(dims, a, b, Some(e), epi)
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn run_epi(
         &self,
-        m: usize,
-        k: usize,
-        n: usize,
+        GemmDims { m, k, n }: GemmDims,
         a: &[f32],
         b: &[f32],
         e: Option<&[f32]>,
@@ -5383,17 +5410,13 @@ impl NaxGemm {
     /// contracts the last axis (`A·Bᵀ`) via the `KTIR_TRANSPOSE_B` pipeline — the
     /// kernel's B-staging reads `[n,k]` verbatim (no host copy/transpose/gather).
     /// `b.len` is `n·k` either way, so the size check is unchanged.
-    #[allow(clippy::too_many_arguments)]
     pub fn matmul_unified(
         &self,
-        m: usize,
-        k: usize,
-        n: usize,
+        GemmDims { m, k, n }: GemmDims,
         a: &UnifiedBuffer,
         b: &UnifiedBuffer,
         c: &mut UnifiedBuffer,
-        e: Option<&UnifiedBuffer>,
-        epi: Epilogue,
+        FusedEpilogue { epi, e }: FusedEpilogue<'_>,
         transpose_b: bool,
     ) -> Result<(), String> {
         use objc2_metal::MTLSize;
@@ -5534,16 +5557,13 @@ impl NaxGemm {
     /// is length `k`, `y` is length `n`. With `transpose_b`, `B` is the on-disk
     /// `[n,k]` weight contracted over its last axis (`x·Bᵀ`), read verbatim.
     /// `b.len` is `k·n` either way. Dispatches one thread per output column.
-    #[allow(clippy::too_many_arguments)]
     pub fn gemv_unified(
         &self,
-        k: usize,
-        n: usize,
+        GemvDims { k, n }: GemvDims,
         x: &UnifiedBuffer,
         b: &UnifiedBuffer,
         y: &mut UnifiedBuffer,
-        e: Option<&UnifiedBuffer>,
-        epi: Epilogue,
+        FusedEpilogue { epi, e }: FusedEpilogue<'_>,
         transpose_b: bool,
     ) -> Result<(), String> {
         use objc2_metal::{MTLComputePipelineState, MTLSize};
@@ -5626,7 +5646,14 @@ impl NaxGemm {
         let ux = self.unified_from(x)?;
         let ub = self.unified_from(b)?;
         let mut uy = self.unified(n)?;
-        self.gemv_unified(k, n, &ux, &ub, &mut uy, None, Epilogue::NONE, transpose_b)?;
+        self.gemv_unified(
+            GemvDims { k, n },
+            &ux,
+            &ub,
+            &mut uy,
+            FusedEpilogue::NONE,
+            transpose_b,
+        )?;
         Ok(uy.as_slice().to_vec())
     }
 
@@ -6122,7 +6149,7 @@ pub fn metal_gemm_fused(
     GEMM_NAX.with(|c| {
         c.get_or_init(|| NaxGemm::new().ok())
             .as_ref()
-            .and_then(|g| g.run_fused(m, k, n, a, b, e, epi).ok())
+            .and_then(|g| g.run_fused(GemmDims { m, k, n }, a, b, e, epi).ok())
     })
 }
 
@@ -6371,14 +6398,11 @@ kernel void mpp_probe(
             let ub = ctx.unified_from(&b).unwrap();
             let mut uc = ctx.unified(m * n).unwrap();
             ctx.matmul_unified(
-                m,
-                k,
-                n,
+                GemmDims { m, k, n },
                 &ua,
                 &ub,
                 &mut uc,
-                None,
-                Epilogue::NONE,
+                FusedEpilogue::NONE,
                 /*transpose_b=*/ true,
             )
             .unwrap();
@@ -6413,14 +6437,11 @@ kernel void mpp_probe(
             let ub = ctx.unified_from(&b).unwrap();
             let mut uc = ctx.unified(m * n).unwrap();
             ctx.matmul_unified(
-                m,
-                k,
-                n,
+                GemmDims { m, k, n },
                 &ua,
                 &ub,
                 &mut uc,
-                None,
-                Epilogue::NONE,
+                FusedEpilogue::NONE,
                 /*transpose_b=*/ true,
             )
             .unwrap();
@@ -6478,7 +6499,7 @@ kernel void mpp_probe(
             let mut uc_f32 = ctx.unified(m * n)?;
             let mut uc_fp8 = ctx.unified(m * n)?;
             for (ub, uc) in [(&ub_f32, &mut uc_f32), (&ub_fp8, &mut uc_fp8)] {
-                ctx.matmul_unified(m, k, n, &ua, ub, uc, None, Epilogue::NONE, true)?;
+                ctx.matmul_unified(GemmDims { m, k, n }, &ua, ub, uc, FusedEpilogue::NONE, true)?;
             }
             let (want, got) = (uc_f32.as_slice(), uc_fp8.as_slice());
             for (i, (w, g)) in want.iter().zip(got).enumerate() {
@@ -6533,24 +6554,35 @@ kernel void mpp_probe(
         let mut c_owned = ctx.unified(m * n)?;
         let mut c_view = ctx.unified(m * n)?;
         ctx.matmul_unified(
-            m,
-            k,
-            n,
+            GemmDims { m, k, n },
             &ua,
             &owned,
             &mut c_owned,
-            None,
-            Epilogue::NONE,
+            FusedEpilogue::NONE,
             true,
         )?;
-        ctx.matmul_unified(m, k, n, &ua, &view, &mut c_view, None, Epilogue::NONE, true)?;
+        ctx.matmul_unified(
+            GemmDims { m, k, n },
+            &ua,
+            &view,
+            &mut c_view,
+            FusedEpilogue::NONE,
+            true,
+        )?;
         for (i, (w, g)) in c_owned.as_slice().iter().zip(c_view.as_slice()).enumerate() {
             assert_eq!(w.to_bits(), g.to_bits(), "borrowed vs owned at element {i}");
         }
         RESIDENT_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         assert!(
-            ctx.matmul_unified(m, k, n, &ua, &view, &mut c_view, None, Epilogue::NONE, true)
-                .is_err(),
+            ctx.matmul_unified(
+                GemmDims { m, k, n },
+                &ua,
+                &view,
+                &mut c_view,
+                FusedEpilogue::NONE,
+                true
+            )
+            .is_err(),
             "a view from a retired generation must never be dispatched"
         );
         drop(view);
@@ -6588,14 +6620,11 @@ kernel void mpp_probe(
                 let ub_f32 = ctx.unified_from(&b).unwrap();
                 let mut uc_f32 = ctx.unified(m * n).unwrap();
                 ctx.matmul_unified(
-                    m,
-                    k,
-                    n,
+                    GemmDims { m, k, n },
                     &ua,
                     &ub_f32,
                     &mut uc_f32,
-                    None,
-                    Epilogue::NONE,
+                    FusedEpilogue::NONE,
                     transpose_b,
                 )
                 .unwrap();
@@ -6604,14 +6633,11 @@ kernel void mpp_probe(
                 assert!(ub_f16.is_f16(), "B buffer must be f16");
                 let mut uc_f16 = ctx.unified(m * n).unwrap();
                 ctx.matmul_unified(
-                    m,
-                    k,
-                    n,
+                    GemmDims { m, k, n },
                     &ua,
                     &ub_f16,
                     &mut uc_f16,
-                    None,
-                    Epilogue::NONE,
+                    FusedEpilogue::NONE,
                     transpose_b,
                 )
                 .unwrap();
@@ -6701,8 +6727,18 @@ kernel void mpp_probe(
             let ub = ctx.unified_from(&b).unwrap();
             let ue = ctx.unified_from(&e).unwrap();
             let mut uy = ctx.unified(n).unwrap();
-            ctx.gemv_unified(k, n, &ux, &ub, &mut uy, Some(&ue), Epilogue::ADD, false)
-                .unwrap();
+            ctx.gemv_unified(
+                GemvDims { k, n },
+                &ux,
+                &ub,
+                &mut uy,
+                FusedEpilogue {
+                    epi: Epilogue::ADD,
+                    e: Some(&ue),
+                },
+                false,
+            )
+            .unwrap();
             let base = crate::blas::naive_sgemv(k, n, &x, &b);
             let want: Vec<f32> = base.iter().zip(&e).map(|(v, ev)| v + ev).collect();
             assert_eq!(
@@ -6795,7 +6831,13 @@ kernel void mpp_probe(
             let a = ctx.run(m, k0, k1, &x, &w1).unwrap();
             let b = ctx.run(m, k1, k2, &a, &w2).unwrap();
             let _ = ctx
-                .run_fused(m, k2, k3, &b, &w3, &bias, Epilogue { binop: 1, act: 1 })
+                .run_fused(
+                    GemmDims { m, k: k2, n: k3 },
+                    &b,
+                    &w3,
+                    &bias,
+                    Epilogue { binop: 1, act: 1 },
+                )
                 .unwrap();
         }
         let separate = t1.elapsed().as_secs_f64() / iters as f64;
@@ -6885,8 +6927,15 @@ kernel void mpp_probe(
         let ua = ctx.unified_from(&a).unwrap();
         let ub = ctx.unified_from(&b).unwrap();
         let mut uc = ctx.unified(m * n).unwrap();
-        ctx.matmul_unified(m, k, n, &ua, &ub, &mut uc, None, Epilogue::NONE, false)
-            .unwrap();
+        ctx.matmul_unified(
+            GemmDims { m, k, n },
+            &ua,
+            &ub,
+            &mut uc,
+            FusedEpilogue::NONE,
+            false,
+        )
+        .unwrap();
 
         // Correctness vs the copy-based path (same kernel, identical result).
         let want = ctx.run(m, k, n, &a, &b).unwrap();
@@ -6901,8 +6950,15 @@ kernel void mpp_probe(
         let it = 50;
         let t0 = std::time::Instant::now();
         for _ in 0..it {
-            ctx.matmul_unified(m, k, n, &ua, &ub, &mut uc, None, Epilogue::NONE, false)
-                .unwrap();
+            ctx.matmul_unified(
+                GemmDims { m, k, n },
+                &ua,
+                &ub,
+                &mut uc,
+                FusedEpilogue::NONE,
+                false,
+            )
+            .unwrap();
         }
         let zc = t0.elapsed().as_secs_f64() / it as f64;
         let t1 = std::time::Instant::now();
@@ -6986,7 +7042,13 @@ kernel void mpp_probe(
         let b: Vec<f32> = (0..k * n).map(|i| ((i % 7) as f32 - 3.0) * 0.25).collect();
         let e: Vec<f32> = (0..m * n).map(|i| (i % 11) as f32 * 0.1 - 0.5).collect();
         let got = ctx
-            .run_fused(m, k, n, &a, &b, &e, Epilogue { binop: 1, act: 1 })
+            .run_fused(
+                GemmDims { m, k, n },
+                &a,
+                &b,
+                &e,
+                Epilogue { binop: 1, act: 1 },
+            )
             .unwrap();
         let mm = crate::blas::naive_sgemm(m, k, n, &a, &b);
         for i in 0..m * n {
@@ -7027,7 +7089,9 @@ kernel void mpp_probe(
             (Epilogue { binop: 1, act: 2 }, |c, ev| (c + ev).tanh()),   // add + tanh
         ];
         for &(epi, f) in cases {
-            let got = ctx.run_fused(m, k, n, &a, &b, &e, epi).unwrap();
+            let got = ctx
+                .run_fused(GemmDims { m, k, n }, &a, &b, &e, epi)
+                .unwrap();
             let mut max_rel = 0.0f32;
             for i in 0..m * n {
                 let want = f(mm[i], e[i]);

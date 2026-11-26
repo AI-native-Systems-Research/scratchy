@@ -11,7 +11,7 @@ use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions, MTLSize};
 use scratchy_target_metal::aot::baked_build;
 use scratchy_target_metal::detect_device;
 use scratchy_target_metal::logprobs::{SLOTS, THREADS, TOP, encode_raw_copies};
-use scratchy_target_metal::mtl4_dispatch::Mtl4DispatchBatch;
+use scratchy_target_metal::mtl4_dispatch::{Mtl4DispatchBatch, ThreadgroupGrid};
 use scratchy_target_metal::specialized_pipeline_cache::{PipelineKey, SpecializedPipelineCache};
 use scratchy_target_metal::tape::ids::LogitsWidth;
 use scratchy_target_metal::tape::kernel_constants::LogprobsConstants;
@@ -109,15 +109,17 @@ fn score(
         &[(entries.len() as u32, 3)],
         &[],
         &[],
-        MTLSize {
-            width: entries.len(),
-            height: 1,
-            depth: 1,
-        },
-        MTLSize {
-            width: THREADS,
-            height: 1,
-            depth: 1,
+        ThreadgroupGrid {
+            threadgroups: MTLSize {
+                width: entries.len(),
+                height: 1,
+                depth: 1,
+            },
+            threads_per_threadgroup: MTLSize {
+                width: THREADS,
+                height: 1,
+                depth: 1,
+            },
         },
     );
     batch.commit(true);

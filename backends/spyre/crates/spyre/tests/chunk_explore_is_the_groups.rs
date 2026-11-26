@@ -25,16 +25,21 @@ use ktir_superdsc::superdsc_opspec::{
 };
 use scratchy_target_spyre::dxp_cache::GroupDigest;
 use scratchy_target_spyre::lower_subtile_tape_to_superdsc as superdsc;
+use scratchy_target_spyre::lower_subtile_tape_to_superdsc::{
+    MatmulCounts, MatmulDims, NamedOperands,
+};
 use scratchy_target_spyre::superdsc_bake::{ChunkExplore, EmitNs, GroupId, SealedGroup};
 
 /// A dense projection as every granite layer emits it: an unbatched fp16 matmul, no gather.
 fn dense_matmul() -> emit::EmittedOp<ktir_superdsc::collective::TpWorld<1>> {
     superdsc::assemble_matmul(
         "matmul_o7",
-        256,
-        2048,
-        2048,
-        1,
+        MatmulCounts {
+            m: 256,
+            n: 2048,
+            k: 2048,
+            batch: 1,
+        },
         &emit::rb("a", 256, 2048),
         &Stk::<KernelTag>::kernel(2048_usize, 2048_usize, "w"),
         &emit::rb("o", 256, 2048),
@@ -47,17 +52,21 @@ fn dense_matmul() -> emit::EmittedOp<ktir_superdsc::collective::TpWorld<1>> {
 /// operand but the output and the index painted fp8, gathered through `of_expert_planes`.
 fn gathered_expert_matmul() -> emit::EmittedOp<ktir_superdsc::collective::TpWorld<1>> {
     let mut spec = matmul_opspec_off_operands_phys_gathered::<Fp16>(
-        MatM::of_token_rows(96),
-        MatN::of_out_features(64),
-        MatK::of_in_features(2816),
+        MatmulDims {
+            m: MatM::of_token_rows(96),
+            n: MatN::of_out_features(64),
+            k: MatK::of_in_features(2816),
+        },
         MatY::unbatched(),
         SharedKernelBmmForm::of_attn_rows(false, QueryRowCount::of_mq(1)),
-        "Tensor0",
-        "Tensor1",
-        "Tensor3",
-        0,
-        0,
-        0,
+        NamedOperands {
+            a_name: "Tensor0",
+            w_name: "Tensor1",
+            o_name: "Tensor3",
+            a_off: 0,
+            w_off: 0,
+            o_off: 0,
+        },
         <Fp8 as DataFormat>::DF,
         None,
         Some(GatherIndex::of_expert_planes(

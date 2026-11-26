@@ -455,7 +455,17 @@ fn affine_dequant_b4_bytes(
     );
 
     let out_bytes = scratchy_quantizations::affine_dequant_b4_to_dtype(
-        &w_bytes, &s_bytes, &b_bytes, n, k, group_size, bits, s_dtype, dtype_out,
+        scratchy_quantizations::AffineWeight {
+            weight_bytes: &w_bytes,
+            scales_bytes: &s_bytes,
+            biases_bytes: &b_bytes,
+            n,
+            k,
+            group_size,
+            bits,
+            scale_dtype: s_dtype,
+        },
+        dtype_out,
     )?;
     Ok((out_bytes, n, k))
 }

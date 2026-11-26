@@ -352,12 +352,12 @@ fn alloc_address(
 ) -> Option<u64> {
     let dsc = op.dsc();
     let dsc = dsc.dscs_.first()?.values().next()?;
-    let idx = dsc.labeledDs_.iter().find(|ds| ds.dsType_ == tag)?.ldsIdx_;
+    let idx = dsc.labeled_ds.iter().find(|ds| ds.ds_type == tag)?.lds_idx;
     let node = dsc
-        .scheduleTree_
+        .schedule_tree
         .iter()
-        .find(|n| n.ldsIdx_ == idx && n.nodeType_ == "allocate")?;
-    node.startAddressCoreCorelet_
+        .find(|n| n.lds_idx == idx && n.node_type == "allocate")?;
+    node.start_address_core_corelet
         .data_
         .get("[0, 0, 0]")?
         .parse()
@@ -371,10 +371,10 @@ fn value_tensor_address(
     let dsc = op.dsc();
     let dsc = dsc.dscs_.first()?.values().next()?;
     let node = dsc
-        .scheduleTree_
+        .schedule_tree
         .iter()
-        .find(|n| n.nodeType_ == "allocate" && n.indirectAllocType_ == "value_tensor")?;
-    node.startAddressCoreCorelet_
+        .find(|n| n.node_type == "allocate" && n.indirect_alloc_type == "value_tensor")?;
+    node.start_address_core_corelet
         .data_
         .get("[0, 0, 0]")?
         .parse()
@@ -416,22 +416,21 @@ fn the_gathered_matmul_emits_the_copy_then_the_matmul() {
             .expect("each copy leg has a descriptor");
         // The copy is the vendor's own gathered fixture shape: an `identity` opFunc with the
         // indirect-access index attached, and the value/index alloc pair.
-        let identity = dsc
-            .computeOp_
-            .iter()
-            .any(|c| c.opFuncName == "identity" && !c.indirectAccessIndexLabeledDs.is_empty());
+        let identity = dsc.compute_op.iter().any(|c| {
+            c.op_func_name == "identity" && !c.indirect_access_index_labeled_ds.is_empty()
+        });
         assert!(
             identity,
             "each copy leg is an `identity` carrying the indirect-access index (the wrong-rows \
              trap's whole point): {:?}",
             copy.op_name
         );
-        let has_pair = dsc.scheduleTree_.iter().any(|n| {
-            n.indirectAllocType_ == "value_tensor" && n.relatedIndirectAccessAlloc_.is_some()
+        let has_pair = dsc.schedule_tree.iter().any(|n| {
+            n.indirect_alloc_type == "value_tensor" && n.related_indirect_access_alloc.is_some()
         }) && dsc
-            .scheduleTree_
+            .schedule_tree
             .iter()
-            .any(|n| n.indirectAllocType_ == "index_tensor");
+            .any(|n| n.indirect_alloc_type == "index_tensor");
         assert!(
             has_pair,
             "each copy leg's value/index alloc pair is the gather itself: {:?}",
@@ -454,9 +453,9 @@ fn the_gathered_matmul_emits_the_copy_then_the_matmul() {
         .expect("the matmul has a descriptor");
     assert!(
         mm_dsc
-            .computeOp_
+            .compute_op
             .iter()
-            .any(|c| c.opFuncName == "batchmatmul"),
+            .any(|c| c.op_func_name == "batchmatmul"),
         "the last op is the contraction: {:?}",
         mm.op_name
     );

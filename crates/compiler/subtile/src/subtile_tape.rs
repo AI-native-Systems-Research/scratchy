@@ -55,8 +55,6 @@
 //! target-agnostic SubtileTape, mechanically grep-checkable, is the
 //! kill criterion this module enforces.
 
-#![allow(dead_code)]
-
 use std::collections::BTreeMap;
 use std::marker::PhantomData;
 
@@ -367,7 +365,6 @@ impl ComputeInputs {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[allow(clippy::large_enum_variant)]
 pub enum Instr {
     /// Mint a fresh slot id for a producer's output. Pairs (eventually)
     /// with one [`Instr::Compute`] writing this slot, and one
@@ -381,7 +378,7 @@ pub enum Instr {
     Compute {
         node: SubtileId,
         writes: SlotId,
-        inputs: ComputeInputs,
+        inputs: Box<ComputeInputs>,
         /// Per-iteration node ids for a re-rolled layer-loop body — the
         /// store-side mirror of [`ComputeInput::External::per_layer`].
         /// `node` stays copy-0's id (the structural anchor); this holds
@@ -719,7 +716,7 @@ fn push_compute_inputs(
     instrs.push(Instr::Compute {
         node,
         writes: writes_id,
-        inputs,
+        inputs: Box::new(inputs),
         per_layer_out,
     });
     SlotWritten {
@@ -2650,13 +2647,12 @@ fn slot_id(idx: u32) -> SlotId {
 /// One step of the trivial host-tape player. The production player
 /// runs at the per-target lowering output, not at this layer.
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[allow(clippy::large_enum_variant)]
 pub enum PlayStep {
     Allocated(SlotId),
     Computed {
         node: SubtileId,
         writes: SlotId,
-        inputs: ComputeInputs,
+        inputs: Box<ComputeInputs>,
     },
     Freed(SlotId),
     LoopOpened(u32),
@@ -2801,12 +2797,6 @@ pub(crate) mod tests {
             _seal: sealed::Seal(()),
         }
     }
-    fn mk_loop_var(id: u32) -> LoopVarId {
-        LoopVarId {
-            id,
-            _seal: sealed::Seal(()),
-        }
-    }
 
     // ── Builder shape ─────────────────────────────────────────────
 
@@ -2876,7 +2866,7 @@ pub(crate) mod tests {
                 Instr::Compute {
                     node: SubtileId(99),
                     writes: mk_slot(0),
-                    inputs: ComputeInputs::Variadic(vec![]),
+                    inputs: Box::new(ComputeInputs::Variadic(vec![])),
                     per_layer_out: vec![],
                 },
                 Instr::FreeSlot { slot: mk_slot(0) },
@@ -2917,13 +2907,13 @@ pub(crate) mod tests {
                 Instr::Compute {
                     node: SubtileId(0),
                     writes: mk_slot(0),
-                    inputs: ComputeInputs::Variadic(vec![]),
+                    inputs: Box::new(ComputeInputs::Variadic(vec![])),
                     per_layer_out: vec![],
                 },
                 Instr::Compute {
                     node: SubtileId(0),
                     writes: mk_slot(0),
-                    inputs: ComputeInputs::Variadic(vec![]),
+                    inputs: Box::new(ComputeInputs::Variadic(vec![])),
                     per_layer_out: vec![],
                 },
                 Instr::FreeSlot { slot: mk_slot(0) },
@@ -2949,13 +2939,13 @@ pub(crate) mod tests {
                 Instr::Compute {
                     node: SubtileId(1),
                     writes: mk_slot(1),
-                    inputs: ComputeInputs::Variadic(vec![]),
+                    inputs: Box::new(ComputeInputs::Variadic(vec![])),
                     per_layer_out: vec![],
                 },
                 Instr::Compute {
                     node: SubtileId(0),
                     writes: mk_slot(0),
-                    inputs: ComputeInputs::Variadic(vec![]),
+                    inputs: Box::new(ComputeInputs::Variadic(vec![])),
                     per_layer_out: vec![],
                 },
                 Instr::FreeSlot { slot: mk_slot(0) },
@@ -2992,7 +2982,9 @@ pub(crate) mod tests {
                 Instr::Compute {
                     node: SubtileId(0),
                     writes: mk_slot(0),
-                    inputs: ComputeInputs::A1([ComputeInput::Computed(vec![mk_slot(0)])]), // self-read names node 0 as a pred — bogus
+                    inputs: Box::new(ComputeInputs::A1([ComputeInput::Computed(vec![mk_slot(
+                        0,
+                    )])])), // self-read names node 0 as a pred — bogus
                     per_layer_out: vec![],
                 },
                 Instr::FreeSlot { slot: mk_slot(0) },
@@ -3466,14 +3458,6 @@ pub(crate) mod tests {
              [W_0, W_1, W_2] = [1, 2, 3]; a revert-to-layer-0 reroll would \
              carry [1] / [1,1,1]",
         );
-    }
-
-    /// Companion to the gather proof: build the test's distinct-weight
-    /// chain so the interp-side oracle (`interp::numeric`) can replay the
-    /// re-rolled tape and prove iteration v reads W_v. Exposed `pub(crate)`
-    /// so the numeric module shares ONE source of truth for the fixture.
-    pub(crate) fn per_layer_weight_chain_graph() -> SubtileIR<NeoX> {
-        per_layer_weight_chain()
     }
 
     /// Two MoE blocks whose experts differ only in width: the steps after the projection (the

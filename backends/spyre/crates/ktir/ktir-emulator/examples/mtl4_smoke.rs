@@ -2,7 +2,7 @@
 // classic `queue.commandBuffer()` (clippy.toml's `disallowed-methods`) onto
 // the local `mtl4` MTL4 dispatch helper, checking each against a naive CPU
 // reference. Run: cargo run --features metal --example mtl4_smoke
-use ktir_emulator::metal::{Epilogue, NaxGemm, run_nax_matmul_tile};
+use ktir_emulator::metal::{Epilogue, FusedEpilogue, GemmDims, NaxGemm, run_nax_matmul_tile};
 
 fn cpu_matmul(m: usize, k: usize, n: usize, a: &[f32], b: &[f32]) -> Vec<f32> {
     let mut c = vec![0.0f32; m * n];
@@ -57,8 +57,15 @@ fn main() {
     let ua = gemm.unified_from(&a).unwrap();
     let ub = gemm.unified_from(&b).unwrap();
     let mut uc = gemm.unified(m * n).unwrap();
-    gemm.matmul_unified(m, k, n, &ua, &ub, &mut uc, None, Epilogue::NONE, false)
-        .expect("matmul_unified");
+    gemm.matmul_unified(
+        GemmDims { m, k, n },
+        &ua,
+        &ub,
+        &mut uc,
+        FusedEpilogue::NONE,
+        false,
+    )
+    .expect("matmul_unified");
     assert_close("matmul_unified", uc.as_slice(), &want, 5e-1);
 
     // gemv_unified / gemv: m=1 GEMV path.

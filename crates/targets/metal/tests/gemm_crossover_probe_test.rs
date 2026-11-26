@@ -20,7 +20,7 @@ use scratchy_target_metal::device::detect_device;
 use scratchy_target_metal::interpreter::metal::pipelines::{GemmBody, gemm_pipeline};
 use scratchy_target_metal::interpreter::metal::{GemmDims, MetalDtype};
 use scratchy_target_metal::mtl4_dispatch::{
-    Mtl4DispatchBatch, Pipeline, shared_slice, shared_zeroed,
+    Mtl4DispatchBatch, Pipeline, ThreadgroupGrid, shared_slice, shared_zeroed,
 };
 use scratchy_target_metal::specialized_pipeline_cache::{PipelineKey, SpecializedPipelineCache};
 use scratchy_target_metal::targets::is_nax_capable;
@@ -44,8 +44,10 @@ fn time_body(
             &[],
             &[],
             &[],
-            grid,
-            threads,
+            ThreadgroupGrid {
+                threadgroups: grid,
+                threads_per_threadgroup: threads,
+            },
         );
     }
     let t0 = std::time::Instant::now();

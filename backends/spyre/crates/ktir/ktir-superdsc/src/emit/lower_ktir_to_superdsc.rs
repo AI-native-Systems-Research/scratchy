@@ -39,12 +39,14 @@ use super::{
     emit_sdsc_tiled, fl, op_func_from_str, pointwise_broadcast_opspec_df,
     pointwise_chunk_out_offset, pw1, pw2, rb, rb_df, rbo,
 };
+use super::{EwSpec, OpDecl};
 use crate::ir::bridge::tiled_op_sdsc_op::reduce::{
     ReduceAccumLeg, ReduceDataLeg, ReduceDivision, ReduceGeometry, ReduceSplit,
     assemble_reduce_split, partial_accum_handle, reduce_data_handle,
 };
 use crate::ir::bridge::tiled_op_sdsc_op::{
-    assemble_matmul_off, assemble_matmul_seeded, assemble_matmul_windowed,
+    MatmulCounts, MatmulDims, MatmulOperands, RowIsland, assemble_matmul_off,
+    assemble_matmul_seeded, assemble_matmul_windowed,
 };
 use crate::ir::bridge::tiled_op_sdsc_op::{
     assemble_pointwise_broadcast_off_from_tile, assemble_pointwise_seeded_from_tile,
@@ -2561,14 +2563,15 @@ pub fn elementwise_df<T: crate::collective::Tp>(
         let ew: Vec<_> = in_handles.iter().map(|h| In::full(h).ew()).collect();
         let tile_op = pointwise_tile_op_df(rows, cols, 1, arity as u32 + 1, df);
         return Ok(vec![assemble_pointwise_broadcast_off_from_tile(
-            &op_name,
+            OpDecl {
+                op_name: &op_name,
+                op_func,
+                rows,
+                cols,
+            },
             &tile_op,
-            op_func,
-            rows,
-            cols,
             &ew,
-            &out_h,
-            // WHOLE-TENSOR by the corner refusal above, not by default.
+            &out_h, // WHOLE-TENSOR by the corner refusal above, not by default.
             crate::addr::DevOff::ZERO,
             sym_id_base,
             layout,
@@ -2727,11 +2730,13 @@ pub fn elementwise_df<T: crate::collective::Tp>(
         .collect::<Result<Vec<_>, Error>>()?;
     let tile_op = pointwise_tile_op(rows, cols, 1, arity as u32 + 1);
     Ok(vec![assemble_pointwise_broadcast_off_from_tile(
-        &op_name,
+        OpDecl {
+            op_name: &op_name,
+            op_func,
+            rows,
+            cols,
+        },
         &tile_op,
-        op_func,
-        rows,
-        cols,
         &ew,
         &out_h,
         out_off,
@@ -3149,14 +3154,15 @@ pub fn int_binary<T: crate::collective::Tp>(
     let ew: Vec<_> = in_handles.iter().map(|h| In::full(h).ew()).collect();
     let tile_op = pointwise_tile_op_df(rows, cols, 1, 3, Df::SenUint32);
     Ok(vec![assemble_pointwise_broadcast_off_from_tile(
-        &op_name,
+        OpDecl {
+            op_name: &op_name,
+            op_func,
+            rows,
+            cols,
+        },
         &tile_op,
-        op_func,
-        rows,
-        cols,
         &ew,
-        &out_h,
-        // WHOLE-TENSOR by the corner refusal above, not by default.
+        &out_h, // WHOLE-TENSOR by the corner refusal above, not by default.
         crate::addr::DevOff::ZERO,
         sym_id_base,
         layout,
@@ -3472,14 +3478,15 @@ fn elementwise_broadcast<T: crate::collective::Tp>(
         df,
     );
     Ok(vec![assemble_pointwise_broadcast_off_from_tile(
-        &op_name,
+        OpDecl {
+            op_name: &op_name,
+            op_func,
+            rows,
+            cols,
+        },
         &tile_op,
-        op_func,
-        rows,
-        cols,
         &ew,
-        &out_h,
-        // WHOLE-TENSOR: [`elementwise`] refuses a column corner on any operand before routing
+        &out_h, // WHOLE-TENSOR: [`elementwise`] refuses a column corner on any operand before routing
         // here (a broadcast/per-row operand is addressed at its own extent or the buffer base,
         // neither of which can place a column window), so the offset is 0 by proof, not by
         // default.
@@ -3570,11 +3577,13 @@ fn elementwise_y_by_column<T: crate::collective::Tp>(
             })
             .collect();
         ops.push(assemble_pointwise_broadcast_off_from_tile(
-            &format!("{op_func}{j}_o{}", out.tid),
+            OpDecl {
+                op_name: &format!("{op_func}{j}_o{}", out.tid),
+                op_func,
+                rows,
+                cols: stick,
+            },
             &tile_op,
-            op_func,
-            rows,
-            stick,
             &ew,
             &out_h,
             at(out, j),
@@ -3689,14 +3698,16 @@ fn elementwise_by_inner_spray<T: crate::collective::Tp>(
                 })
                 .collect();
             Ok(assemble_pointwise_broadcast_off_from_tile(
-                &match planes {
-                    1 => format!("{op_func}_o{}", out.tid),
-                    _ => format!("{op_func}{c}_o{}", out.tid),
+                OpDecl {
+                    op_name: &match planes {
+                        1 => format!("{op_func}_o{}", out.tid),
+                        _ => format!("{op_func}{c}_o{}", out.tid),
+                    },
+                    op_func,
+                    rows: y,
+                    cols,
                 },
                 &tile_op,
-                op_func,
-                y,
-                cols,
                 &ew,
                 &out_h,
                 at(out, c),
@@ -3832,11 +3843,13 @@ fn elementwise_by_outer_spray<T: crate::collective::Tp>(
                 })
                 .collect();
             ops.push(assemble_pointwise_broadcast_off_from_tile(
-                &op_name(0, c),
+                OpDecl {
+                    op_name: &op_name(0, c),
+                    op_func,
+                    rows,
+                    cols: stick,
+                },
                 &tile_op,
-                op_func,
-                rows,
-                stick,
                 &ew,
                 &out_h,
                 at(out, c, 0),
@@ -3865,11 +3878,13 @@ fn elementwise_by_outer_spray<T: crate::collective::Tp>(
                 })
                 .collect();
             ops.push(assemble_pointwise_broadcast_off_from_tile(
-                &op_name(j, c),
+                OpDecl {
+                    op_name: &op_name(j, c),
+                    op_func,
+                    rows: mb,
+                    cols: stick,
+                },
                 &tile_op,
-                op_func,
-                mb,
-                stick,
                 &ew,
                 &out_h,
                 at(out, c, j * mb),
@@ -4102,10 +4117,12 @@ pub fn convert<T: crate::collective::Tp>(
     let in_h = rb_df(&ins[0].name(), rows, cols, in_df);
     let out_h = rb_df(&out.name(), rows, cols, out_df);
     Ok(vec![assemble_convert(
-        &op_name,
-        op_func,
-        rows,
-        cols,
+        OpDecl {
+            op_name: &op_name,
+            op_func,
+            rows,
+            cols,
+        },
         &in_h,
         &out_h,
         sym_id_base,
@@ -4188,13 +4205,14 @@ pub fn silumul<T: crate::collective::Tp>(
     let out = rb(&out, rows, o.v_cols);
     Ok(vec![
         assemble_pointwise_broadcast_off(
-            &silu_name,
-            "silu",
-            crate::sdsc_abstract::RowCount::of_token_rows(rows),
-            crate::sdsc_abstract::BlockCols::of_feature_cols(cols),
+            OpDecl {
+                op_name: &silu_name,
+                op_func: "silu",
+                rows: crate::sdsc_abstract::RowCount::of_token_rows(rows),
+                cols: crate::sdsc_abstract::BlockCols::of_feature_cols(cols),
+            },
             &[In::col_window(&gate, gate_w).ew()],
-            &tmp,
-            // The WRITE needs the same nest the READS above go through. A raw `cols_start` is the
+            &tmp, // The WRITE needs the same nest the READS above go through. A raw `cols_start` is the
             // flat element index; in the stick-blocked output, column `c` of a `[rows, cols]` tensor
             // starts at `(c/64)*(rows*64)`. Equal only at rows == 1, so decode was right and prefill
             // wrote every later column block on top of the first one.
@@ -4203,10 +4221,12 @@ pub fn silumul<T: crate::collective::Tp>(
             layout,
         )?,
         assemble_pointwise_broadcast_off(
-            &mul_name,
-            "multiply",
-            crate::sdsc_abstract::RowCount::of_token_rows(rows),
-            crate::sdsc_abstract::BlockCols::of_feature_cols(cols),
+            OpDecl {
+                op_name: &mul_name,
+                op_func: "multiply",
+                rows: crate::sdsc_abstract::RowCount::of_token_rows(rows),
+                cols: crate::sdsc_abstract::BlockCols::of_feature_cols(cols),
+            },
             &[
                 In::col_window(&tmp, out_w).ew(),
                 In::col_window(&up, up_w).ew(),
@@ -4305,12 +4325,14 @@ pub fn rmsnorm<T: crate::collective::Tp>(
     let gamma = tensors[1].name();
     let t = out.tid;
     assemble_rmsnorm(
-        &format!("o{t}"),
-        rows,
-        cols,
-        &x,
+        RowIsland {
+            prefix: &format!("o{t}"),
+            rows,
+            cols,
+            x: &x,
+            out_id: crate::place::SynthId::Act(t),
+        },
         &gamma,
-        crate::place::SynthId::Act(t),
         &eps_const,
         ones_const.as_deref(),
         sym_id_base,
@@ -5265,16 +5287,18 @@ pub fn rope_at<T: crate::collective::Tp, const HD: u32>(
         // handle's dims as the BOUND (#731's door), so the annotation lie is now a refusal; the builder
         // reads name + kind only, so the emission is byte-identical.
         let op = pointwise_broadcast_opspec_df(
-            op_func_from_str(f),
-            1,
-            hd,
-            &[
-                In::sliced(&rb(a, mq, total), aoff).ew(),
-                In::sliced(&rb(b, mq, total), boff).ew(),
-            ],
-            o,
-            ooff.into(),
-            false, // RoPE per-(row,head) [1,hd] block (rows==1): rank-3 flat
+            EwSpec {
+                op: op_func_from_str(f),
+                rows: 1,
+                cols: hd,
+                inputs: &[
+                    In::sliced(&rb(a, mq, total), aoff).ew(),
+                    In::sliced(&rb(b, mq, total), boff).ew(),
+                ],
+                o_name: o,
+                out_offset: ooff.into(),
+                head_major: false,
+            }, // RoPE per-(row,head) [1,hd] block (rows==1): rank-3 flat
             Df::Fp16,
             layout,
             EwDivision::Law,
@@ -5330,19 +5354,23 @@ pub fn rope_at<T: crate::collective::Tp, const HD: u32>(
         // rot = x[rows,hd] @ P[hd,hd] — the same P kernel for every row (m=rows GEMM, k=n=hd).
         ops.push(assemble_matmul_off(
             &format!("rope_rot_o{t}"),
-            crate::sdsc_abstract::MatM::of_head_major_rows(rows),
-            crate::sdsc_abstract::MatN::of_head_dim(hdw),
-            crate::sdsc_abstract::MatK::of_head_dim(hdw),
+            MatmulDims {
+                m: crate::sdsc_abstract::MatM::of_head_major_rows(rows),
+                n: crate::sdsc_abstract::MatN::of_head_dim(hdw),
+                k: crate::sdsc_abstract::MatK::of_head_dim(hdw),
+            },
             crate::sdsc_abstract::MatY::unbatched(),
             crate::ir::bridge::tiled_op_sdsc_op::SharedKernelBmmForm::batch_inner_proven(
                 bmm_site::TapeLoweringSite::witness(),
             ),
-            &rb(&x, rows, hd),
-            crate::addr::DevOff::ZERO,
-            &Stk::<KernelTag>::kernel(hd as usize, hd as usize, &p),
-            crate::addr::DevOff::ZERO,
-            &rb(&rot, rows, hd),
-            crate::addr::DevOff::ZERO,
+            MatmulOperands {
+                a: &rb(&x, rows, hd),
+                a_at: crate::addr::DevOff::ZERO,
+                w: &Stk::<KernelTag>::kernel(hd as usize, hd as usize, &p),
+                w_off: crate::addr::DevOff::ZERO,
+                o: &rb(&rot, rows, hd),
+                o_at: crate::addr::DevOff::ZERO,
+            },
             sym_id_base,
             layout,
         )?);
@@ -5364,10 +5392,12 @@ pub fn rope_at<T: crate::collective::Tp, const HD: u32>(
         let hm_rows = crate::sdsc_abstract::RowCount::of_head_major_rows(rows);
         let hd_cols = crate::sdsc_abstract::BlockCols::of_head_dim(hdw);
         ops.push(pw2(
-            &format!("rope_xc_o{t}"),
-            "multiply",
-            hm_rows,
-            hd_cols,
+            OpDecl {
+                op_name: &format!("rope_xc_o{t}"),
+                op_func: "multiply",
+                rows: hm_rows,
+                cols: hd_cols,
+            },
             In::full(&hh(&x)),
             cos_in,
             &hh(&xc),
@@ -5375,10 +5405,12 @@ pub fn rope_at<T: crate::collective::Tp, const HD: u32>(
             layout,
         )?);
         ops.push(pw2(
-            &format!("rope_rs_o{t}"),
-            "multiply",
-            hm_rows,
-            hd_cols,
+            OpDecl {
+                op_name: &format!("rope_rs_o{t}"),
+                op_func: "multiply",
+                rows: hm_rows,
+                cols: hd_cols,
+            },
             In::full(&hh(&rot)),
             sin_in,
             &hh(&rs),
@@ -5386,10 +5418,12 @@ pub fn rope_at<T: crate::collective::Tp, const HD: u32>(
             layout,
         )?);
         ops.push(pw2(
-            &format!("rope_add_o{t}"),
-            "add",
-            hm_rows,
-            hd_cols,
+            OpDecl {
+                op_name: &format!("rope_add_o{t}"),
+                op_func: "add",
+                rows: hm_rows,
+                cols: hd_cols,
+            },
             In::full(&hh(&xc)),
             In::full(&hh(&rs)),
             &hh(&out),
@@ -5439,18 +5473,12 @@ pub fn rope_at<T: crate::collective::Tp, const HD: u32>(
             // corners of the same `[mq, total]` plane `ew_ph` reads (see its note); the mint reads the
             // dims as the bound and the builder reads name + kind only.
             let op = pointwise_broadcast_opspec_df(
-                op_func_from_str(f),
-                mq,
-                stk,
-                &[
+                EwSpec { op: op_func_from_str(f), rows: mq, cols: stk, inputs: &[
                     In::sliced(&rb(a, mq, total), aoff).ew(),
                     In::sliced(&rb(b, mq, total), boff).ew(),
-                ],
-                o,
-                ooff.into(),
-                // cols == stk, and `stickmajor` needs cols > 64, so it cannot fire either way — this
+                ], o_name: o, out_offset: ooff.into(), head_major: // cols == stk, and `stickmajor` needs cols > 64, so it cannot fire either way — this
                 // is the same rank-3 flat form regardless of the row count.
-                true,
+                true },
                 Df::Fp16,
                 layout,
                 EwDivision::Law,
@@ -5551,21 +5579,25 @@ pub fn rope_at<T: crate::collective::Tp, const HD: u32>(
                 } else {
                     format!("rope_rot_s{s}_o{t}")
                 },
-                crate::sdsc_abstract::MatM::of_query_rows(
-                    crate::sdsc_abstract::QueryRowCount::of_mq(mq),
-                ),
-                crate::sdsc_abstract::MatN::one_stick(crate::sdsc_abstract::Lanes::FP16),
-                crate::sdsc_abstract::MatK::one_stick(crate::sdsc_abstract::Lanes::FP16),
+                MatmulDims {
+                    m: crate::sdsc_abstract::MatM::of_query_rows(
+                        crate::sdsc_abstract::QueryRowCount::of_mq(mq),
+                    ),
+                    n: crate::sdsc_abstract::MatN::one_stick(crate::sdsc_abstract::Lanes::FP16),
+                    k: crate::sdsc_abstract::MatK::one_stick(crate::sdsc_abstract::Lanes::FP16),
+                },
                 crate::sdsc_abstract::MatY::of_gqa_group(heads, a_place, o_place),
                 crate::ir::bridge::tiled_op_sdsc_op::SharedKernelBmmForm::of_head_batched(
                     bmm_site::TapeLoweringSite::witness(),
                 ),
-                &rb(&x, mq, total),
-                a_place,
-                &Stk::<KernelTag>::kernel(hd as usize, hd as usize, &p),
-                p_off,
-                &rb(&rot, mq, total),
-                o_place,
+                MatmulOperands {
+                    a: &rb(&x, mq, total),
+                    a_at: a_place,
+                    w: &Stk::<KernelTag>::kernel(hd as usize, hd as usize, &p),
+                    w_off: p_off,
+                    o: &rb(&rot, mq, total),
+                    o_at: o_place,
+                },
                 sym_id_base,
                 layout,
             )?);
@@ -5577,21 +5609,25 @@ pub fn rope_at<T: crate::collective::Tp, const HD: u32>(
             let off_h = doff(0, h * hd_u);
             ops.push(assemble_matmul_off(
                 &format!("rope_rot_h{h}_o{t}"),
-                crate::sdsc_abstract::MatM::of_query_rows(
-                    crate::sdsc_abstract::QueryRowCount::of_mq(mq),
-                ),
-                crate::sdsc_abstract::MatN::of_head_dim(hdw),
-                crate::sdsc_abstract::MatK::of_head_dim(hdw),
+                MatmulDims {
+                    m: crate::sdsc_abstract::MatM::of_query_rows(
+                        crate::sdsc_abstract::QueryRowCount::of_mq(mq),
+                    ),
+                    n: crate::sdsc_abstract::MatN::of_head_dim(hdw),
+                    k: crate::sdsc_abstract::MatK::of_head_dim(hdw),
+                },
                 crate::sdsc_abstract::MatY::unbatched(),
                 crate::ir::bridge::tiled_op_sdsc_op::SharedKernelBmmForm::batch_inner_proven(
                     bmm_site::TapeLoweringSite::witness(),
                 ),
-                &rb(&x, mq, total),
-                off_h,
-                &Stk::<KernelTag>::kernel(hd as usize, hd as usize, &p),
-                crate::addr::DevOff::ZERO,
-                &rb(&rot, mq, total),
-                off_h,
+                MatmulOperands {
+                    a: &rb(&x, mq, total),
+                    a_at: off_h,
+                    w: &Stk::<KernelTag>::kernel(hd as usize, hd as usize, &p),
+                    w_off: crate::addr::DevOff::ZERO,
+                    o: &rb(&rot, mq, total),
+                    o_at: off_h,
+                },
                 sym_id_base,
                 layout,
             )?);
@@ -5605,10 +5641,12 @@ pub fn rope_at<T: crate::collective::Tp, const HD: u32>(
         );
         let cols_all = crate::sdsc_abstract::BlockCols::of_feature_cols(total);
         ops.push(pw2(
-            &format!("rope_xc_o{t}"),
-            "multiply",
-            rows_all,
-            cols_all,
+            OpDecl {
+                op_name: &format!("rope_xc_o{t}"),
+                op_func: "multiply",
+                rows: rows_all,
+                cols: cols_all,
+            },
             In::full(&rb(&x, mq, total)),
             In::full(&rb(&cos, mq, total)),
             &rb(&xc, mq, total),
@@ -5616,10 +5654,12 @@ pub fn rope_at<T: crate::collective::Tp, const HD: u32>(
             layout,
         )?);
         ops.push(pw2(
-            &format!("rope_rs_o{t}"),
-            "multiply",
-            rows_all,
-            cols_all,
+            OpDecl {
+                op_name: &format!("rope_rs_o{t}"),
+                op_func: "multiply",
+                rows: rows_all,
+                cols: cols_all,
+            },
             In::full(&rb(&rot, mq, total)),
             In::full(&rb(&sin, mq, total)),
             &rb(&rs, mq, total),
@@ -5630,10 +5670,12 @@ pub fn rope_at<T: crate::collective::Tp, const HD: u32>(
         // second-half split left to make this op two ops (which the stick planes' interleaving would
         // have forced — first-half slabs are every OTHER plane, not a contiguous run).
         ops.push(pw2(
-            &format!("rope_out_o{t}"),
-            "add",
-            rows_all,
-            cols_all,
+            OpDecl {
+                op_name: &format!("rope_out_o{t}"),
+                op_func: "add",
+                rows: rows_all,
+                cols: cols_all,
+            },
             In::full(&rb(&xc, mq, total)),
             In::full(&rb(&rs, mq, total)),
             &rb(&out, mq, total),
@@ -5697,18 +5739,12 @@ pub fn rope_at<T: crate::collective::Tp, const HD: u32>(
             // callers pass `all = heads*mq`) — so the handle states the swept window's own extent. The
             // mint reads the dims as the bound; the builder reads name + kind only.
             let op = pointwise_broadcast_opspec_df(
-                op_func_from_str(f),
-                rows,
-                hd,
-                &[
+                EwSpec { op: op_func_from_str(f), rows, cols: hd, inputs: &[
                     In::sliced(&rb(a, rows, hd), aoff).ew(),
                     In::sliced(&rb(b, rows, hd), boff).ew(),
-                ],
-                o,
-                ooff.into(),
-                // cols == hd == stick, so `stickmajor` cannot fire (it needs cols>64) and this stays
+                ], o_name: o, out_offset: ooff.into(), head_major: // cols == hd == stick, so `stickmajor` cannot fire (it needs cols>64) and this stays
                 // the SAME rank-3 flat form the per-row path used — only the row count differs.
-                false,
+                false },
                 Df::Fp16,
                 layout,
                 EwDivision::Law,
@@ -5745,19 +5781,23 @@ pub fn rope_at<T: crate::collective::Tp, const HD: u32>(
         // over all rows does, because the row axis already enumerates (head, row) contiguously.
         ops.push(assemble_matmul_off(
             &format!("rope_rot_o{t}"),
-            crate::sdsc_abstract::MatM::of_token_rows(heads * mq),
-            crate::sdsc_abstract::MatN::of_head_dim(hdw),
-            crate::sdsc_abstract::MatK::of_head_dim(hdw),
+            MatmulDims {
+                m: crate::sdsc_abstract::MatM::of_token_rows(heads * mq),
+                n: crate::sdsc_abstract::MatN::of_head_dim(hdw),
+                k: crate::sdsc_abstract::MatK::of_head_dim(hdw),
+            },
             crate::sdsc_abstract::MatY::unbatched(),
             crate::ir::bridge::tiled_op_sdsc_op::SharedKernelBmmForm::batch_inner_proven(
                 bmm_site::TapeLoweringSite::witness(),
             ),
-            &rb(&x, heads * mq, hd),
-            crate::addr::DevOff::ZERO,
-            &Stk::<KernelTag>::kernel(hd as usize, hd as usize, &p),
-            crate::addr::DevOff::ZERO,
-            &rb(&rot, heads * mq, hd),
-            crate::addr::DevOff::ZERO,
+            MatmulOperands {
+                a: &rb(&x, heads * mq, hd),
+                a_at: crate::addr::DevOff::ZERO,
+                w: &Stk::<KernelTag>::kernel(hd as usize, hd as usize, &p),
+                w_off: crate::addr::DevOff::ZERO,
+                o: &rb(&rot, heads * mq, hd),
+                o_at: crate::addr::DevOff::ZERO,
+            },
             sym_id_base,
             layout,
         )?);
@@ -5835,19 +5875,23 @@ pub fn rope_at<T: crate::collective::Tp, const HD: u32>(
             // rot[r,h] = x[r,h]·P  (per-head [1,hd] @ [hd,hd] kernel; same P kernel, mb=1)
             ops.push(assemble_matmul_off(
                 &format!("rope_rot_r{r}_h{h}_o{t}"),
-                crate::sdsc_abstract::MatM::single_row(),
-                crate::sdsc_abstract::MatN::of_head_dim(hdw),
-                crate::sdsc_abstract::MatK::of_head_dim(hdw),
+                MatmulDims {
+                    m: crate::sdsc_abstract::MatM::single_row(),
+                    n: crate::sdsc_abstract::MatN::of_head_dim(hdw),
+                    k: crate::sdsc_abstract::MatK::of_head_dim(hdw),
+                },
                 crate::sdsc_abstract::MatY::unbatched(),
                 crate::ir::bridge::tiled_op_sdsc_op::SharedKernelBmmForm::batch_inner_proven(
                     bmm_site::TapeLoweringSite::witness(),
                 ),
-                &rb(&x, 1, hd),
-                off,
-                &Stk::<KernelTag>::kernel(hd as usize, hd as usize, &p),
-                crate::addr::DevOff::ZERO,
-                &rb(&rot, 1, hd),
-                off,
+                MatmulOperands {
+                    a: &rb(&x, 1, hd),
+                    a_at: off,
+                    w: &Stk::<KernelTag>::kernel(hd as usize, hd as usize, &p),
+                    w_off: crate::addr::DevOff::ZERO,
+                    o: &rb(&rot, 1, hd),
+                    o_at: off,
+                },
                 sym_id_base,
                 layout,
             )?);
@@ -6041,17 +6085,12 @@ pub fn lmlast<T: crate::collective::Tp>(
         .rows()
         .flat_map(|(req, row)| (0..hidden / stk).map(move |j| (req, row, j)))
         .map(|(req, row, j)| {
-            assemble_pointwise_broadcast_off(
-                // ⛔ NAMED AFTER THE STICK-PLANE ROW THE COPY WRITES — `j·S + r` of the destination's
+            assemble_pointwise_broadcast_off(OpDecl { op_name: // ⛔ NAMED AFTER THE STICK-PLANE ROW THE COPY WRITES — `j·S + r` of the destination's
                 // `[.., stk]` staging, the same row the corner below addresses. At `S = 1` that is
                 // `j` alone, so every name is byte-identical to the single-row law's
                 // `lmlast{j}_o{owner}`; at `S > 1` the plane row is a bijection over `(j, r)`, so
                 // every copy keeps its own name.
-                &format!("lmlast{}_o{owner}", (j * s) as usize + req.get()),
-                "identity",
-                crate::sdsc_abstract::RowCount::of_token_rows(1),
-                crate::sdsc_abstract::BlockCols::of_one_stick(crate::sdsc_abstract::Lanes::FP16),
-                &[In::sliced(
+                &format!("lmlast{}_o{owner}", (j * s) as usize + req.get()), op_func: "identity", rows: crate::sdsc_abstract::RowCount::of_token_rows(1), cols: crate::sdsc_abstract::BlockCols::of_one_stick(crate::sdsc_abstract::Lanes::FP16) }, &[In::sliced(
                     &src_name,
                     // row `j*mq + row` of a `[.., stk]` staging — a corner, not a product.
                     crate::addr::rc_of(
@@ -6062,16 +6101,11 @@ pub fn lmlast<T: crate::collective::Tp>(
                         Df::Fp16,
                     ),
                 )
-                .ew()],
-                &dst,
-                // Row `r`, column `j*stk` of the `[S, hidden]` last-hidden staging — a corner on
+                .ew()], &dst, // Row `r`, column `j*stk` of the `[S, hidden]` last-hidden staging — a corner on
                 // that tensor, not a product. At one request the row term is 0, so this is the
                 // same address the single-row law stated; saying it as a coordinate keeps the last
                 // hand-built offset in this file from being the one nobody notices.
-                crate::addr::rc_of(s, hidden, req.get() as u32, j * stk, Df::Fp16),
-                sym_id_base,
-                layout,
-            )
+                crate::addr::rc_of(s, hidden, req.get() as u32, j * stk, Df::Fp16), sym_id_base, layout)
         })
         .collect::<Result<Vec<_>, _>>()?)
 }
@@ -6154,10 +6188,12 @@ pub fn block_copy<T: crate::collective::Tp>(
     let src_name = rb(&src.name(), rows, c_src);
     let dst = rb(&out.name(), rows, c_dst);
     Ok(vec![assemble_pointwise_broadcast_off(
-        name,
-        "identity",
-        crate::sdsc_abstract::RowCount::of_stick_column_rows(sticks, rows),
-        crate::sdsc_abstract::BlockCols::of_one_stick(crate::sdsc_abstract::Lanes::FP16),
+        OpDecl {
+            op_name: name,
+            op_func: "identity",
+            rows: crate::sdsc_abstract::RowCount::of_stick_column_rows(sticks, rows),
+            cols: crate::sdsc_abstract::BlockCols::of_one_stick(crate::sdsc_abstract::Lanes::FP16),
+        },
         &[In::sliced(&src_name, crate::addr::rc_of(rows, c_src, 0, 0, Df::Fp16)).ew()],
         &dst,
         crate::addr::rc_of(rows, c_dst, 0, off, Df::Fp16),
@@ -6536,10 +6572,12 @@ pub fn matmul_oriented<T: crate::collective::Tp>(
     let op = if whole(&a) && whole(&w) && whole(&out) {
         assemble_matmul_seeded(
             &op_name,
-            m,
-            n_dev,
-            k,
-            1,
+            MatmulCounts {
+                m,
+                n: n_dev,
+                k,
+                batch: 1,
+            },
             &rb(&a.name(), m, k),
             &Stk::<KernelTag>::kernel(k as usize, n_dev as usize, &w_name),
             &rb(&out.name(), m, n_dev),
@@ -6573,16 +6611,20 @@ pub fn matmul_oriented<T: crate::collective::Tp>(
         }
         assemble_matmul_windowed(
             &op_name,
-            MatM::of_token_rows(m),
-            MatN::of_out_features(n_dev),
-            MatK::of_in_features(k),
-            &rb(&a.name(), m, k),
-            a_off,
-            &Stk::<KernelTag>::kernel(k as usize, n_dev as usize, &w_name),
-            w_off,
+            MatmulDims {
+                m: MatM::of_token_rows(m),
+                n: MatN::of_out_features(n_dev),
+                k: MatK::of_in_features(k),
+            },
+            MatmulOperands {
+                a: &rb(&a.name(), m, k),
+                a_at: a_off,
+                w: &Stk::<KernelTag>::kernel(k as usize, n_dev as usize, &w_name),
+                w_off,
+                o: &rb(&out.name(), m, n_dev),
+                o_at: o_off,
+            },
             k_full,
-            &rb(&out.name(), m, n_dev),
-            o_off,
             sym_id_base,
             layout,
         )?
@@ -6698,11 +6740,13 @@ pub fn scalar_binary<T: crate::collective::Tp>(
     let mut tile_op = pointwise_tile_op(rows, cols, 1, 2);
     tile_op.kind = TileOpKind::PointwiseOrReduce { n_operands: 2 };
     Ok(vec![assemble_pointwise_broadcast_off_from_tile(
-        &format!("{op_func}_o{}", out.tid),
+        OpDecl {
+            op_name: &format!("{op_func}_o{}", out.tid),
+            op_func,
+            rows,
+            cols,
+        },
         &tile_op,
-        op_func,
-        rows,
-        cols,
         &inputs,
         &out_h,
         crate::addr::OutCorner::ZERO,
@@ -6735,11 +6779,13 @@ pub fn fill<T: crate::collective::Tp>(
     let mut tile_op = pointwise_tile_op(rows, cols, 1, 1);
     tile_op.kind = TileOpKind::PointwiseOrReduce { n_operands: 1 };
     Ok(vec![assemble_pointwise_broadcast_off_from_tile(
-        &format!("fill_o{}", out.tid),
+        OpDecl {
+            op_name: &format!("fill_o{}", out.tid),
+            op_func: "identity",
+            rows,
+            cols,
+        },
         &tile_op,
-        "identity",
-        rows,
-        cols,
         &inputs,
         &out_h,
         crate::addr::OutCorner::ZERO,
@@ -7777,10 +7823,12 @@ pub fn embed_row_gather<T: crate::collective::Tp>(
         None
     } else {
         Some(super::pw1(
-            &format!("{name}_rowflat"),
-            "identity",
-            crate::sdsc_abstract::RowCount::of_token_rows(width),
-            crate::sdsc_abstract::BlockCols::of_feature_cols(hidden),
+            OpDecl {
+                op_name: &format!("{name}_rowflat"),
+                op_func: "identity",
+                rows: crate::sdsc_abstract::RowCount::of_token_rows(width),
+                cols: crate::sdsc_abstract::BlockCols::of_feature_cols(hidden),
+            },
             super::In::full(&rb(&rowg_dest_name, width, hidden)),
             &rb(&out.name(), width, hidden),
             sym_id_base,
@@ -8539,7 +8587,7 @@ mod elementwise_tests {
         let sdsc = ops[1].op.as_ref().expect("an emitted descriptor");
         let dsc = sdsc.dscs_[0].values().next().expect("one descriptor");
         assert_eq!(
-            serde_json::to_value(&dsc.scheduleTree_[0].maxDimSizes_).expect("the walk serializes"),
+            serde_json::to_value(&dsc.schedule_tree[0].max_dim_sizes).expect("the walk serializes"),
             serde_json::json!([-1, -1]),
             "a standalone block: dxp rebuilds its own [84, 128]"
         );
@@ -8625,13 +8673,15 @@ mod elementwise_tests {
         let merged = In::y_broadcast(&merged_h, Spray::outer(4)).ew();
         let op = crate::ir::bridge::tiled_op_sdsc_op::pointwise_broadcast_opspec_from_tile(
             &pointwise_tile_op(64, 64, 4, 3),
-            256,
-            64,
-            op_func_from_str("sub"),
-            &[dense, merged],
-            "t7",
-            crate::addr::OutCorner::ZERO,
-            false,
+            EwSpec {
+                op: op_func_from_str("sub"),
+                rows: 256,
+                cols: 64,
+                inputs: &[dense, merged],
+                o_name: "t7",
+                out_offset: crate::addr::OutCorner::ZERO,
+                head_major: false,
+            },
             None,
             crate::work::CoreDivision::Ew(EwDivision::Law),
         )
@@ -8675,16 +8725,18 @@ mod elementwise_tests {
         let mask_h = rb("t6", 21, 64);
         let op = crate::ir::bridge::tiled_op_sdsc_op::pointwise_broadcast_opspec_from_tile(
             &pointwise_tile_op(21, 64, 32, 3),
-            672,
-            64,
-            op_func_from_str("add"),
-            &[
-                In::full(&scores_h).ew(),
-                In::y_broadcast(&mask_h, Spray::outer(32)).ew(),
-            ],
-            "t7",
-            crate::addr::OutCorner::ZERO,
-            false,
+            EwSpec {
+                op: op_func_from_str("add"),
+                rows: 672,
+                cols: 64,
+                inputs: &[
+                    In::full(&scores_h).ew(),
+                    In::y_broadcast(&mask_h, Spray::outer(32)).ew(),
+                ],
+                o_name: "t7",
+                out_offset: crate::addr::OutCorner::ZERO,
+                head_major: false,
+            },
             None,
             crate::work::CoreDivision::Ew(EwDivision::Law),
         )
@@ -8700,17 +8752,17 @@ mod elementwise_tests {
         let folds = crate::superdsc_opspec::SdscFoldSet::new(op.iter.cores_used());
         let sdsc = crate::emit::emit_sdsc("add_o7", &op, &folds, None).expect("it emits");
         let dsc = &sdsc.dscs_[0]["add_o7"];
-        for n in &dsc.scheduleTree_ {
-            assert_eq!(n.layoutDimOrder_, vec!["mb", "y", "out"], "{}", n.name_);
+        for n in &dsc.schedule_tree {
+            assert_eq!(n.layout_dim_order, vec!["mb", "y", "out"], "{}", n.name_);
             assert_eq!(
-                serde_json::to_value(&n.maxDimSizes_).expect("the walk serializes"),
+                serde_json::to_value(&n.max_dim_sizes).expect("the walk serializes"),
                 serde_json::json!([21, 32, 64]),
                 "{}",
                 n.name_
             );
         }
         assert_eq!(
-            dsc.labeledDs_[1].scale_,
+            dsc.labeled_ds[1].scale_,
             vec![1, -1, 1],
             "the mask's broadcast `y`, in dxp's order"
         );
@@ -8730,13 +8782,15 @@ mod elementwise_tests {
         let mask = In::y_broadcast(&mask_h, Spray::inner(4)).ew();
         let op = crate::ir::bridge::tiled_op_sdsc_op::pointwise_broadcast_opspec_from_tile(
             &pointwise_tile_op(64, 64, 4, 3),
-            256,
-            64,
-            op_func_from_str("add"),
-            &[dense, mask],
-            "t7",
-            crate::addr::OutCorner::ZERO,
-            false,
+            EwSpec {
+                op: op_func_from_str("add"),
+                rows: 256,
+                cols: 64,
+                inputs: &[dense, mask],
+                o_name: "t7",
+                out_offset: crate::addr::OutCorner::ZERO,
+                head_major: false,
+            },
             None,
             crate::work::CoreDivision::Ew(EwDivision::Law),
         )
@@ -8772,16 +8826,18 @@ mod elementwise_tests {
         let b_h = rb("t6", 64, 64);
         let err = crate::ir::bridge::tiled_op_sdsc_op::pointwise_broadcast_opspec_from_tile(
             &pointwise_tile_op(64, 64, 4, 3),
-            256,
-            64,
-            op_func_from_str("add"),
-            &[
-                In::y_broadcast(&a_h, Spray::outer(4)).ew(),
-                In::y_broadcast(&b_h, Spray::inner(4)).ew(),
-            ],
-            "t7",
-            crate::addr::OutCorner::ZERO,
-            false,
+            EwSpec {
+                op: op_func_from_str("add"),
+                rows: 256,
+                cols: 64,
+                inputs: &[
+                    In::y_broadcast(&a_h, Spray::outer(4)).ew(),
+                    In::y_broadcast(&b_h, Spray::inner(4)).ew(),
+                ],
+                o_name: "t7",
+                out_offset: crate::addr::OutCorner::ZERO,
+                head_major: false,
+            },
             None,
             crate::work::CoreDivision::Ew(EwDivision::Law),
         )
@@ -8801,13 +8857,15 @@ mod elementwise_tests {
         let merged = In::y_broadcast(&merged_h, Spray::outer(4)).ew();
         let Err(m) = crate::ir::bridge::tiled_op_sdsc_op::pointwise_broadcast_opspec_from_tile(
             &pointwise_tile_op(64, 64, 2, 3),
-            256,
-            64,
-            op_func_from_str("sub"),
-            &[dense, merged],
-            "t7",
-            crate::addr::OutCorner::ZERO,
-            false,
+            EwSpec {
+                op: op_func_from_str("sub"),
+                rows: 256,
+                cols: 64,
+                inputs: &[dense, merged],
+                o_name: "t7",
+                out_offset: crate::addr::OutCorner::ZERO,
+                head_major: false,
+            },
             None,
             crate::work::CoreDivision::Ew(EwDivision::Law),
         ) else {
@@ -8830,13 +8888,15 @@ mod elementwise_tests {
         let merged = In::y_broadcast(&merged_h, Spray::outer(4)).ew();
         let Err(m) = crate::ir::bridge::tiled_op_sdsc_op::pointwise_broadcast_opspec_from_tile(
             &pointwise_tile_op(64, 128, 4, 3),
-            256,
-            128,
-            op_func_from_str("sub"),
-            &[dense, merged],
-            "t7",
-            crate::addr::OutCorner::ZERO,
-            false,
+            EwSpec {
+                op: op_func_from_str("sub"),
+                rows: 256,
+                cols: 128,
+                inputs: &[dense, merged],
+                o_name: "t7",
+                out_offset: crate::addr::OutCorner::ZERO,
+                head_major: false,
+            },
             None,
             crate::work::CoreDivision::Ew(EwDivision::Law),
         ) else {
@@ -9531,11 +9591,11 @@ mod elementwise_tests {
             .next()
             .expect("one dsc");
         serde_json::to_value(
-            &dsc.scheduleTree_
+            &dsc.schedule_tree
                 .iter()
-                .find(|n| n.nodeType_ == "allocate" && n.ldsIdx_ == lds)
+                .find(|n| n.node_type == "allocate" && n.lds_idx == lds)
                 .expect("an allocate node per operand")
-                .maxDimSizes_,
+                .max_dim_sizes,
         )
         .expect("the walk serializes")
     }
@@ -9853,12 +9913,12 @@ mod elementwise_tests {
             .expect("one dsc");
         // The output operand is the LAST allocate node (inputs first, output last).
         let out_node = dsc
-            .scheduleTree_
+            .schedule_tree
             .iter()
-            .rfind(|n| n.nodeType_ == "allocate")
+            .rfind(|n| n.node_type == "allocate")
             .expect("an allocate node per operand, the output last");
         let start: u64 = out_node
-            .startAddressCoreCorelet_
+            .start_address_core_corelet
             .data_
             .values()
             .next()
@@ -9885,12 +9945,12 @@ mod elementwise_tests {
             .next()
             .expect("one dsc");
         let out0 = dsc0
-            .scheduleTree_
+            .schedule_tree
             .iter()
-            .rfind(|n| n.nodeType_ == "allocate")
+            .rfind(|n| n.node_type == "allocate")
             .expect("output allocate");
         let start0: u64 = out0
-            .startAddressCoreCorelet_
+            .start_address_core_corelet
             .data_
             .values()
             .next()
@@ -9940,11 +10000,11 @@ mod elementwise_tests {
                 .values()
                 .next()
                 .expect("one dsc");
-            dsc.scheduleTree_
+            dsc.schedule_tree
                 .iter()
-                .filter(|n| n.nodeType_ == "allocate")
+                .filter(|n| n.node_type == "allocate")
                 .map(|n| {
-                    n.startAddressCoreCorelet_
+                    n.start_address_core_corelet
                         .data_
                         .values()
                         .next()
@@ -10067,11 +10127,11 @@ mod elementwise_tests {
             .values()
             .next()
             .expect("one dsc");
-        dsc.scheduleTree_
+        dsc.schedule_tree
             .iter()
-            .filter(|n| n.nodeType_ == "allocate")
+            .filter(|n| n.node_type == "allocate")
             .map(|n| {
-                n.startAddressCoreCorelet_
+                n.start_address_core_corelet
                     .data_
                     .values()
                     .map(|a| a.parse::<u64>().expect("decimal"))
@@ -10440,10 +10500,10 @@ mod elementwise_tests {
                     .values()
                     .next()
                     .expect("one dsc");
-                dsc.scheduleTree_
+                dsc.schedule_tree
                     .iter()
-                    .filter(|n| n.nodeType_ == "allocate")
-                    .map(|n| n.layoutDimOrder_.clone())
+                    .filter(|n| n.node_type == "allocate")
+                    .map(|n| n.layout_dim_order.clone())
                     .collect()
             };
         let (r0, ..) = mlp_chunks_at_zero();
@@ -10669,12 +10729,14 @@ pub fn rmsnorm_at<T: crate::collective::Tp>(
     let gamma = tensors[1].name();
     let t = out.tid;
     assemble_rmsnorm(
-        &format!("o{t}"),
-        rows,
-        cols,
-        &x,
+        RowIsland {
+            prefix: &format!("o{t}"),
+            rows,
+            cols,
+            x: &x,
+            out_id: crate::place::SynthId::Act(t),
+        },
         &gamma,
-        crate::place::SynthId::Act(t),
         &eps_const,
         ones_const.as_deref(),
         sym_id_base,
@@ -10738,11 +10800,13 @@ pub fn rmsnorm_unit_at<T: crate::collective::Tp>(
     let x = tensors[0].name();
     let t = out.tid;
     assemble_rmsnorm_unit(
-        &format!("o{t}"),
-        rows,
-        cols,
-        &x,
-        crate::place::SynthId::Act(t),
+        RowIsland {
+            prefix: &format!("o{t}"),
+            rows,
+            cols,
+            x: &x,
+            out_id: crate::place::SynthId::Act(t),
+        },
         &eps_const,
         sym_id_base,
         layout,
@@ -10922,10 +10986,12 @@ pub fn windowed_rmsnorm<T: crate::collective::Tp>(
     let mut ops: Vec<EmittedOp<T>> = Vec::new();
     if let (Some(g), Some(ones), Some(gw)) = (&gamma_h, &ones_h, &gw_h) {
         ops.push(pw2(
-            &format!("rmga_o{t}"),
-            "add",
-            crate::sdsc_abstract::RowCount::of_token_rows(1),
-            f_cols,
+            OpDecl {
+                op_name: &format!("rmga_o{t}"),
+                op_func: "add",
+                rows: crate::sdsc_abstract::RowCount::of_token_rows(1),
+                cols: f_cols,
+            },
             In::mb(g),
             In::scalar(ones),
             gw,
@@ -10945,10 +11011,12 @@ pub fn windowed_rmsnorm<T: crate::collective::Tp>(
         // 1. sq16 = x² over the head window (out at the window — `pw2`'s ZERO would
         //    make every head overwrite head 0's block).
         ops.push(assemble_pointwise_broadcast_off(
-            &format!("rmsq_{prefix}"),
-            "mul",
-            t_rows,
-            f_cols,
+            OpDecl {
+                op_name: &format!("rmsq_{prefix}"),
+                op_func: "mul",
+                rows: t_rows,
+                cols: f_cols,
+            },
             &[In::sliced(&x_h, win).ew(), In::sliced(&x_h, win).ew()],
             &sq16_h,
             win,
@@ -10985,11 +11053,12 @@ pub fn windowed_rmsnorm<T: crate::collective::Tp>(
             ops.extend(split);
         } else {
             ops.push(assemble_reduce_off(
-                &rmmean_op,
-                "mean",
-                t_rows,
-                f_cols,
-                // The data window is head `h`'s `[m, d]` slab of the `[m, full]` square — `col_of`'s
+                OpDecl {
+                    op_name: &rmmean_op,
+                    op_func: "mean",
+                    rows: t_rows,
+                    cols: f_cols,
+                }, // The data window is head `h`'s `[m, d]` slab of the `[m, full]` square — `col_of`'s
                 // whole-block shift, minted against the buffer's own handle.
                 win_reduce_data(
                     layout,
@@ -11017,10 +11086,12 @@ pub fn windowed_rmsnorm<T: crate::collective::Tp>(
         }
         // 3. mean + eps.
         ops.push(pw2(
-            &format!("rmeps_{prefix}"),
-            "add",
-            t_rows,
-            s_cols,
+            OpDecl {
+                op_name: &format!("rmeps_{prefix}"),
+                op_func: "add",
+                rows: t_rows,
+                cols: s_cols,
+            },
             In::full(&mean_h),
             In::scalar(&eps_h),
             &meps_h,
@@ -11029,10 +11100,12 @@ pub fn windowed_rmsnorm<T: crate::collective::Tp>(
         )?);
         // 4. rinv = rsqrt(mean+eps).
         ops.push(pw1(
-            &format!("rmrsqrt_{prefix}"),
-            "rsqrt",
-            t_rows,
-            s_cols,
+            OpDecl {
+                op_name: &format!("rmrsqrt_{prefix}"),
+                op_func: "rsqrt",
+                rows: t_rows,
+                cols: s_cols,
+            },
             In::full(&meps_h),
             &rinv_h,
             sym_id_base,
@@ -11044,10 +11117,12 @@ pub fn windowed_rmsnorm<T: crate::collective::Tp>(
         //    when the convention states an offset, the stored row when it does not.
         if let Some(g) = &gamma_h {
             ops.push(assemble_pointwise_broadcast_off(
-                &format!("rmxn_{prefix}"),
-                "multiply",
-                t_rows,
-                f_cols,
+                OpDecl {
+                    op_name: &format!("rmxn_{prefix}"),
+                    op_func: "multiply",
+                    rows: t_rows,
+                    cols: f_cols,
+                },
                 &[In::sliced(&x_h, win).ew(), In::col(&rinv_h).ew()],
                 &xn_h,
                 win,
@@ -11056,10 +11131,12 @@ pub fn windowed_rmsnorm<T: crate::collective::Tp>(
             )?);
             let gain = gw_h.as_ref().unwrap_or(g);
             ops.push(assemble_pointwise_broadcast_off(
-                &format!("rmg_{prefix}"),
-                "multiply",
-                t_rows,
-                f_cols,
+                OpDecl {
+                    op_name: &format!("rmg_{prefix}"),
+                    op_func: "multiply",
+                    rows: t_rows,
+                    cols: f_cols,
+                },
                 &[In::sliced(&xn_h, win).ew(), In::mb(gain).ew()],
                 &out_h,
                 win,
@@ -11068,10 +11145,12 @@ pub fn windowed_rmsnorm<T: crate::collective::Tp>(
             )?);
         } else {
             ops.push(assemble_pointwise_broadcast_off(
-                &format!("rmxn_{prefix}"),
-                "multiply",
-                t_rows,
-                f_cols,
+                OpDecl {
+                    op_name: &format!("rmxn_{prefix}"),
+                    op_func: "multiply",
+                    rows: t_rows,
+                    cols: f_cols,
+                },
                 &[In::sliced(&x_h, win).ew(), In::col(&rinv_h).ew()],
                 &out_h,
                 win,
@@ -11123,11 +11202,13 @@ pub fn tanhsoftcap<T: crate::collective::Tp>(
     let x = tensors[0].name();
     let t = out.tid;
     Ok(assemble_tanhsoftcap(
-        &format!("o{t}"),
-        rows,
-        cols,
-        &x,
-        crate::place::SynthId::Act(t),
+        RowIsland {
+            prefix: &format!("o{t}"),
+            rows,
+            cols,
+            x: &x,
+            out_id: crate::place::SynthId::Act(t),
+        },
         &cap_const,
         sym_id_base,
         layout,
@@ -11171,10 +11252,12 @@ pub fn scalarweightmul<T: crate::collective::Tp>(
     let out_h = rb(&out.name(), rows, cols);
     let op_name = format!("scalarmul_o{t}");
     Ok(vec![pw2(
-        &op_name,
-        "multiply",
-        crate::sdsc_abstract::RowCount::of_token_rows(rows),
-        crate::sdsc_abstract::BlockCols::of_feature_cols(cols),
+        OpDecl {
+            op_name: &op_name,
+            op_func: "multiply",
+            rows: crate::sdsc_abstract::RowCount::of_token_rows(rows),
+            cols: crate::sdsc_abstract::BlockCols::of_feature_cols(cols),
+        },
         In::full(&x_h),
         In::scalar(&w_h),
         &out_h,
@@ -11297,10 +11380,14 @@ pub fn reshape<T: crate::collective::Tp>(
     for q in 0..n_sticks {
         let base = q * u64::from(stk);
         ops.push(assemble_pointwise_broadcast_off(
-            &format!("reshape{q}_o{}", out.tid),
-            "identity",
-            crate::sdsc_abstract::RowCount::of_token_rows(1),
-            crate::sdsc_abstract::BlockCols::of_one_stick(crate::sdsc_abstract::Lanes::FP16),
+            OpDecl {
+                op_name: &format!("reshape{q}_o{}", out.tid),
+                op_func: "identity",
+                rows: crate::sdsc_abstract::RowCount::of_token_rows(1),
+                cols: crate::sdsc_abstract::BlockCols::of_one_stick(
+                    crate::sdsc_abstract::Lanes::FP16,
+                ),
+            },
             &[In::sliced(
                 &src_name,
                 crate::addr::rc_of(
@@ -11683,11 +11770,13 @@ fn scalarmul_scaled<T: crate::collective::Tp>(
         .map_err(Error::from);
     }
     Ok(vec![assemble_pointwise_broadcast_off_from_tile(
-        &op_name,
+        OpDecl {
+            op_name: &op_name,
+            op_func: "multiply",
+            rows,
+            cols,
+        },
         &tile_op,
-        "multiply",
-        rows,
-        cols,
         &inputs,
         &out_h,
         corner,
@@ -11851,10 +11940,12 @@ pub fn reduce<T: crate::collective::Tp>(
             }
             Ok(vec![
                 crate::ir::bridge::tiled_op_sdsc_op::reduce::assemble_reduce_seeded(
-                    &op_name,
-                    kind.op_func(),
-                    rows,
-                    cols,
+                    OpDecl {
+                        op_name: &op_name,
+                        op_func: kind.op_func(),
+                        rows,
+                        cols,
+                    },
                     &rb(&data.name(), rows, cols),
                     &rb(&out.name(), rows, 1),
                     sym_id_base,
@@ -12031,10 +12122,12 @@ pub fn reduce_df<T: crate::collective::Tp>(
     }
     Ok(vec![
         crate::ir::bridge::tiled_op_sdsc_op::reduce::assemble_reduce_df(
-            &op_name,
-            kind.op_func(),
-            rows,
-            cols,
+            OpDecl {
+                op_name: &op_name,
+                op_func: kind.op_func(),
+                rows,
+                cols,
+            },
             &data.name(),
             &out.name(),
             df,

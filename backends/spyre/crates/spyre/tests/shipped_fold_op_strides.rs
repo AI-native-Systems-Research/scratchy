@@ -19,6 +19,7 @@ use ktir_superdsc::sdsc_abstract::{
     BlockCols, KernelTag, MaskRows, MatK, MatM, MatN, MatY, OperandPlacement, QueryRowCount,
     RowBlockedTag, RungWidth, SlotWindow, StickLayout, Stk,
 };
+use scratchy_target_spyre::lower_subtile_tape_to_superdsc::{MatmulDims, MatmulOperands};
 
 const HD: u32 = 64;
 const STICK: u32 = 64; // the fold sweeps one 64-slot block at a time
@@ -147,10 +148,11 @@ fn print_what_the_shipped_fold_score_op_addresses() {
     // calibration stands; the declared-walk fields are pinned in `batched_decode_walk_order.rs`.
     let e = assemble_matmul_off(
         "sc_shipped",
-        MatM::of_query_rows(QueryRowCount::of_mq(MQ)),
-        MatN::of_kv_window(BlockCols::of_slot_window(SlotWindow::SLOTS)),
-        MatK::of_head_dim(ktir_superdsc::sdsc_abstract::HeadWidth::of_whole_sticks(HD)),
-        // The batch axis carries both operands' head strides, so the head-outermost walk it derives
+        MatmulDims {
+            m: MatM::of_query_rows(QueryRowCount::of_mq(MQ)),
+            n: MatN::of_kv_window(BlockCols::of_slot_window(SlotWindow::SLOTS)),
+            k: MatK::of_head_dim(ktir_superdsc::sdsc_abstract::HeadWidth::of_whole_sticks(HD)),
+        }, // The batch axis carries both operands' head strides, so the head-outermost walk it derives
         // (`mb_dev * in` for the read, `mb_dev * out` for the write) is checked against where the heads
         // really are: `qs` is the token stream (`mq*hd` apart) and `sc` is head-major (`mq*stick`).
         MatY::of_gqa_group(
@@ -177,12 +179,14 @@ fn print_what_the_shipped_fold_score_op_addresses() {
             ),
         ),
         SharedKernelBmmForm::of_attn_rows(true, QueryRowCount::of_mq(MQ)),
-        &act("t_qs", MQ, HD),
-        DevOff::ZERO,
-        &ker("t_kct", HD, POOL_PAGE_SLOTS),
-        DevOff::ZERO,
-        &act("t_sc", NQH * MQ, STICK),
-        DevOff::ZERO,
+        MatmulOperands {
+            a: &act("t_qs", MQ, HD),
+            a_at: DevOff::ZERO,
+            w: &ker("t_kct", HD, POOL_PAGE_SLOTS),
+            w_off: DevOff::ZERO,
+            o: &act("t_sc", NQH * MQ, STICK),
+            o_at: DevOff::ZERO,
+        },
         &mut s,
         None,
     )

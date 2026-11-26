@@ -34,15 +34,38 @@ impl<T> UnsafeShared<T> {
     pub fn new(v: T) -> Self {
         Self(std::cell::UnsafeCell::new(v))
     }
-    // `borrow`/`borrow_mut` intentionally mirror `RefCell`'s names (drop-in surface).
-    #[allow(clippy::should_implement_trait, clippy::mut_from_ref)]
-    pub fn borrow(&self) -> &T {
-        // SAFETY: see type doc — disjoint/read-only concurrent access by contract.
+    /// A shared view of the value, as `RefCell::borrow` hands out — with no borrow flag.
+    pub fn borrow(&self) -> SharedRef<'_, T> {
+        SharedRef(&self.0)
+    }
+    /// A mutable view of the value, as `RefCell::borrow_mut` hands out — with no borrow flag.
+    pub fn borrow_mut(&self) -> SharedMut<'_, T> {
+        SharedMut(&self.0)
+    }
+}
+
+/// [`UnsafeShared::borrow`]'s view: `RefCell`'s `Ref` without the flag.
+pub struct SharedRef<'a, T>(&'a std::cell::UnsafeCell<T>);
+impl<T> std::ops::Deref for SharedRef<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        // SAFETY: see `UnsafeShared`'s doc — disjoint/read-only concurrent access by contract.
         unsafe { &*self.0.get() }
     }
-    #[allow(clippy::mut_from_ref)]
-    pub fn borrow_mut(&self) -> &mut T {
-        // SAFETY: see type doc.
+}
+
+/// [`UnsafeShared::borrow_mut`]'s view: `RefCell`'s `RefMut` without the flag.
+pub struct SharedMut<'a, T>(&'a std::cell::UnsafeCell<T>);
+impl<T> std::ops::Deref for SharedMut<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        // SAFETY: see `UnsafeShared`'s doc.
+        unsafe { &*self.0.get() }
+    }
+}
+impl<T> std::ops::DerefMut for SharedMut<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        // SAFETY: see `UnsafeShared`'s doc — no other view of these bytes is live, by contract.
         unsafe { &mut *self.0.get() }
     }
 }

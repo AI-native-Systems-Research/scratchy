@@ -23,11 +23,22 @@ pub type Device = Retained<ProtocolObject<dyn MTLDevice>>;
 /// retaining/reading it from another thread is sound. Used to keep the
 /// sidecar-writer's source allocation mapped until the write finishes
 /// even if the owning `MmapRegion` is torn down first. (regression: c54955a3)
-struct BufKeepAlive(#[allow(dead_code)] Buffer);
+struct BufKeepAlive {
+    _buffer: Buffer,
+}
 // SAFETY: see doc comment — immutable shared-storage buffer, read-only access.
 unsafe impl Send for BufKeepAlive {}
 
 const DEFAULT_CHUNK_BYTES: usize = 256 * 1024 * 1024;
+
+/// A safetensors file mapped for registration: its path, the mapping, and the mapped bytes'
+/// base and length.
+struct MappedSource<'a> {
+    path: &'a Path,
+    mmap: Arc<memmap2::Mmap>,
+    base: *const u8,
+    len: usize,
+}
 
 struct MetalArena {
     buffer: Pinned,
@@ -1177,10 +1188,12 @@ impl MetalAllocator {
                     }
                     let _ = std::fs::remove_file(cf);
                     return self.register_mmap_copy_path(
-                        path,
-                        mmap_back,
-                        base,
-                        len,
+                        MappedSource {
+                            path,
+                            mmap: mmap_back,
+                            base,
+                            len,
+                        },
                         packed,
                         aligned_capacity,
                         meta,
@@ -1190,10 +1203,12 @@ impl MetalAllocator {
             }
         }
         self.register_mmap_copy_path(
-            path,
-            mmap,
-            base,
-            len,
+            MappedSource {
+                path,
+                mmap,
+                base,
+                len,
+            },
             packed,
             aligned_capacity,
             meta,
@@ -1232,7 +1247,6 @@ impl MetalAllocator {
     /// bytesNoCopy MTLBuffer — no copy; the file pages are the
     /// buffer. On failure returns the source mmap back so the caller
     /// can fall through to the copy path.
-    #[allow(clippy::result_large_err)]
     fn register_from_aligned_cache(
         &self,
         meta: AlignedCacheMeta,
@@ -1539,18 +1553,20 @@ impl MetalAllocator {
     /// The pre-sidecar `register_mmap` tail: allocate the aligned
     /// buffer, copy every tensor into it (page-fault bound; WILLNEED
     /// hinted), then optionally build the sidecar in the background.
-    #[allow(clippy::too_many_arguments)]
     fn register_mmap_copy_path(
         &self,
-        path: &Path,
-        mmap: Arc<memmap2::Mmap>,
-        base: *const u8,
-        len: usize,
+        source: MappedSource<'_>,
         packed: Vec<(usize, usize, usize)>,
         aligned_capacity: usize,
         meta: Option<AlignedCacheMeta>,
         cache_enabled: bool,
     ) -> Result<()> {
+        let MappedSource {
+            path,
+            mmap,
+            base,
+            len,
+        } = source;
         let dst_buffer = self
             .device
             .newBufferWithLength_options(aligned_capacity, MTLResourceOptions::StorageModeShared)
@@ -1740,7 +1756,9 @@ impl MetalAllocator {
         // Clone before the buffer is moved into the MmapRegion: the
         // writer thread holds this to keep the allocation alive past a
         // short-run teardown (see spawn_aligned_cache_writer).
-        let writer_keepalive = BufKeepAlive(dst_buffer.clone());
+        let writer_keepalive = BufKeepAlive {
+            _buffer: dst_buffer.clone(),
+        };
         let offset8: Offset8Ranges = Arc::default();
         let settled: RegionSettled = Arc::default();
         self.mmaps

@@ -11,9 +11,7 @@
 //!
 //! See `src/consumer.rs` for where each gap's premise is read out of their tree.
 
-mod common;
-
-use common::*;
+use crate::common::*;
 use triton_ktir::consumer;
 use triton_ktir::text::parse;
 

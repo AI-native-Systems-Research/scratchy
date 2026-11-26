@@ -216,9 +216,8 @@ pub struct ResidentExecutor {
     /// weight buffer keyed on such a tid can go stale, so it is dropped on every
     /// `set_sources` — only tids written by NEITHER the forward NOR the current
     /// `set_sources` (the immutable model weights) stay resident. Read only on the
-    /// Metal weight-cache path (`retain_resident_weights`); the off-Metal build has
-    /// no GPU weight cache, so the field is unused there.
-    #[cfg_attr(not(metal), allow(dead_code))]
+    /// Metal weight-cache path (`retain_resident_weights`), so the field exists only there.
+    #[cfg(metal)]
     forward_written: std::collections::HashSet<u64>,
     /// The model dtype the per-node oracle threads (F16). All sticks are sized and
     /// read back at this dtype.
@@ -393,6 +392,7 @@ impl ResidentExecutor {
         // across passes — notably the KV-cache prefixes the decode forward grows each
         // step. A GPU weight buffer cached against such a tid can go stale, so it is
         // never kept resident across a `set_sources` (see `set_sources`).
+        #[cfg(metal)]
         let mut forward_written: std::collections::HashSet<u64> = std::collections::HashSet::new();
         let mut ids: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
         let mut planned: Vec<PlannedProgram> = Vec::with_capacity(programs.len());
@@ -487,6 +487,7 @@ impl ResidentExecutor {
             for node in &spec.nodes {
                 for b in &node.bindings {
                     ids.insert(b.tensor);
+                    #[cfg(metal)]
                     if b.is_output {
                         forward_written.insert(b.tensor);
                     }
@@ -517,7 +518,7 @@ impl ResidentExecutor {
         let mut stick: HashMap<u64, i64> = HashMap::new();
         let mut numel: HashMap<u64, usize> = HashMap::new();
         {
-            let hbm = mem.hbm.borrow_mut();
+            let mut hbm = mem.hbm.borrow_mut();
             for &tid in &ids {
                 let shape = shapes
                     .get(&tid)
@@ -576,6 +577,7 @@ impl ResidentExecutor {
             numel,
             view_dtype: view_dtypes,
             sources,
+            #[cfg(metal)]
             forward_written,
             dtype,
             seg_keys: std::cell::RefCell::new(HashMap::new()),
@@ -1941,7 +1943,7 @@ impl ResidentExecutor {
     /// starts clean. Sources (weights / mask / input) keep their resident bytes.
     /// Cheap: these are activations (kB) not weights (GB).
     fn zero_non_sources(&mut self) {
-        let hbm = self.mem.hbm.borrow_mut();
+        let mut hbm = self.mem.hbm.borrow_mut();
         for (&tid, &s) in &self.stick {
             if self.sources.contains(&tid) {
                 continue;

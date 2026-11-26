@@ -329,10 +329,10 @@ fn index_run_base(
     let dsc = op.dsc();
     let dsc = dsc.dscs_.first()?.values().next()?;
     let node = dsc
-        .scheduleTree_
+        .schedule_tree
         .iter()
-        .find(|n| n.nodeType_ == "allocate" && n.indirectAllocType_ == "index_tensor")?;
-    node.startAddressCoreCorelet_
+        .find(|n| n.node_type == "allocate" && n.indirect_alloc_type == "index_tensor")?;
+    node.start_address_core_corelet
         .data_
         .get("[0, 0, 0]")?
         .parse()
