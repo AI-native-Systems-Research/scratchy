@@ -38,7 +38,7 @@ use std::collections::{BTreeMap, HashMap};
 use scratchy_ir::model_facts::ModelFacts;
 use scratchy_subtile::handoff::{BundleTensor, Expansion, ExpansionId};
 use scratchy_subtile::lower::{
-    AffineInt4, ArchOp, ExpertQuant, GemmWeight, InputRef, LoweringInput, OpDesc,
+    AffineInt4, ArchOp, ExpertQuant, ExpertWeight, GemmWeight, InputRef, LoweringInput, OpDesc,
 };
 use scratchy_subtile::subtile_ir::{
     AttnMask, DraftConvStage, EwKind, ExpertBody, ExpertBundle, ExpertProj, GainConvention,
@@ -96,23 +96,8 @@ pub enum BridgeError {
     /// emit (fp8 needs the weight_scale wired as a 3rd Gemm input + 1-byte staging; int4/ggml unwired).
     /// A build-time refusal — NOT a silent mis-lower of a packed weight as dense fp16.
     UnsupportedWeight { tile: TileId, detail: &'static str },
-    /// NO KERNEL takes this shape at all — not a gap in the bridge, a gap
-    /// in the kernels. Distinct from
-    /// [`Self::UnsupportedWeight`] because the two are handled
-    /// differently: this one is TOLERATED the way the runtime-lowering
-    /// path tolerated it (the preset bakes an empty variant list and
-    /// the pool refuses at load), while a bridge gap must stay fatal
-    /// or the front-end swap silently drops a tile.
-    NoKernel { tile: TileId, detail: &'static str },
     /// A MoE's config declares an expert activation no expert body realizes.
     UnrealizedExpertActivation { tile: TileId, act: String },
-}
-
-impl BridgeError {
-    /// See [`Self::NoKernel`].
-    pub fn is_no_kernel(&self) -> bool {
-        matches!(self, Self::NoKernel { .. })
-    }
 }
 
 impl std::fmt::Display for BridgeError {
@@ -160,9 +145,6 @@ impl std::fmt::Display for BridgeError {
                  and no kernel implements a third",
                 tile.0
             ),
-            Self::NoKernel { tile, detail } => {
-                write!(f, "tile {}: {detail}", tile.0)
-            }
             Self::UnrealizedExpertActivation { tile, act } => write!(
                 f,
                 "tile {} moe_block: the config declares expert activation `{act}`, which no \
@@ -277,7 +259,7 @@ struct Experts {
     k: TopK,
     inter: u32,
     hidden: u32,
-    quant: ExpertQuant,
+    weight: ExpertWeight,
     bundle: ExpertBundle,
     body: ExpertBody,
     shared: SharedExpertBound,
@@ -317,22 +299,23 @@ impl<'a> Builder<'a> {
     /// `bank` and activated as the expert body says, projected back, restored to token order,
     /// summed by `scores`. Closes the expansion; returns the sum.
     ///
-    /// `bank` resolves one projection's WEIGHT and SCALE sources — the two are separate
-    /// launch tensors (a bundle holds both), so the matmul binds them as operands 2 and 3.
+    /// `bank` resolves one projection's WEIGHT source and, for a bank that has one
+    /// ([`ExpertWeight::has_scale`]), its SCALE source — separate launch tensors (a bundle holds
+    /// both), bound after the rows and pairs in that order.
     fn experts(
         &mut self,
         x: InputRef,
         indices: usize,
         scores: usize,
-        bank: &dyn Fn(ExpertProj) -> (InputRef, InputRef),
+        bank: &dyn Fn(ExpertProj) -> (InputRef, Option<InputRef>),
         e: Experts,
     ) -> usize {
-        let (k, quant, bundle) = (e.k, e.quant, e.bundle);
+        let (k, weight, bundle) = (e.k, e.weight, e.bundle);
         let matmul = |proj, n| SubOp::ExpertMatmul {
             proj,
             n,
             k,
-            quant,
+            weight,
             bundle,
         };
         let sort = SubOp::ExpertSort {
@@ -341,8 +324,12 @@ impl<'a> Builder<'a> {
             bundle,
         };
         let pairs = self.push_op(sort, vec![x, InputRef::Op(indices)]);
-        let rows =
-            |r: usize, w: InputRef, s: InputRef| vec![InputRef::Op(r), InputRef::Op(pairs), w, s];
+        let rows = |r: usize, w: InputRef, s: Option<InputRef>| {
+            [InputRef::Op(r), InputRef::Op(pairs), w]
+                .into_iter()
+                .chain(s)
+                .collect()
+        };
         let act = match e.body {
             ExpertBody::Gated(act) => {
                 let (gw, gs) = bank(ExpertProj::Gate);
@@ -604,6 +591,31 @@ fn kv_cache_index(node: &FufNode) -> Option<u64> {
         } => index.map(|i| i.0),
         _ => None,
     })
+}
+
+/// An expert bank's format, from the checkpoint's storage of it: the bank lowers as it is stored,
+/// and each target decides in its own lowering whether it has a kernel for that format. A packed
+/// format [`ExpertWeight`] has no variant for is refused, never read as another format's bytes.
+fn expert_weight(
+    tile: TileId,
+    storage: Option<&crate::quantization::StorageFormat>,
+) -> Result<ExpertWeight, BridgeError> {
+    use crate::quantization::StorageFormat as S;
+    match storage {
+        Some(S::Affine { group_size, bits }) => Ok(ExpertWeight::Affine(ExpertQuant::declared(
+            *group_size,
+            *bits,
+        ))),
+        Some(S::Fp8 { .. }) => Ok(ExpertWeight::Fp8Dynamic),
+        None | Some(S::Dense) => Ok(ExpertWeight::Dense),
+        Some(S::Awq { .. } | S::Gptq { .. } | S::Bnb4 { .. } | S::Ggml | S::Nvfp4 { .. }) => {
+            Err(BridgeError::UnsupportedWeight {
+                tile,
+                detail: "MoE expert bank: an AWQ/GPTQ/bnb/GGML/NVFP4 bank has no ExpertWeight \
+                         format to lower as",
+            })
+        }
+    }
 }
 
 /// A MoE block's expert and top-k counts; a block routing to none is a malformed config.
@@ -1563,18 +1575,7 @@ pub fn lower_decode_to_wavefront(
                     .get("routed_scaling_factor")
                     .map(|&f| f as f32)
                     .filter(|&f| f != 1.0);
-                let (group_size, bits) = match crate::weight_vocab::weight_storage_of(node) {
-                    Some(crate::quantization::StorageFormat::Affine { group_size, bits }) => {
-                        (*group_size, *bits)
-                    }
-                    _ => {
-                        return Err(BridgeError::NoKernel {
-                            tile,
-                            detail: "MoE without affine expert storage has no kernel \
-                                     (no expert kernel takes dense expert storage)",
-                        });
-                    }
-                };
+                let weight = expert_weight(tile, crate::weight_vocab::weight_storage_of(node))?;
                 let (experts, k) = moe_counts(tile, num_experts, top_k)?;
                 // Qwen order: softmax over every expert, then top-k (renormalised when the
                 // config says so); Mixtral: top-k, then softmax over the chosen; GLM-4 /
@@ -1621,15 +1622,15 @@ pub fn lower_decode_to_wavefront(
                     k,
                     inter: moe_inter,
                     hidden,
-                    quant: ExpertQuant::declared(group_size, bits),
+                    weight,
                     bundle,
                     body,
                     shared: SharedExpertBound(shared),
                 };
-                // The fused MoE bundle is ONE source (its affine scales resolve by tensor
-                // role at the target, not as separate operands), so both of a projection's
-                // weight operands bind it.
-                let bank = &|_proj: ExpertProj| (w, w);
+                // The fused MoE bundle is ONE source (its affine or fp8 scales resolve by
+                // tensor role at the target, not as separate operands), so a bank's weight and
+                // its scale, when it has one, both bind it.
+                let bank = &|_proj: ExpertProj| (w, weight.has_scale().then_some(w));
                 let idx = bx.experts(expert_x, indices, scores, bank, experts);
                 bx.produced.insert((tile.0, 0), Producer::Op(idx));
                 result = Some(idx);
@@ -1857,14 +1858,8 @@ pub fn lower_decode_to_wavefront(
                     })? as u32;
                 // The EXPERT bundle's storage — the SECOND weight edge in
                 // DSL order (router first, switch_glu second); mixed-bit
-                // presets quantize the router differently. Falls back to
-                // (64, 4).
-                let (group_size, bits) = match ew.2 {
-                    crate::quantization::StorageFormat::Affine { group_size, bits } => {
-                        (group_size, bits)
-                    }
-                    _ => (64, 4),
-                };
+                // presets quantize the router differently.
+                let weight = expert_weight(tile, Some(&ew.2))?;
                 // Routes off its own pre-norm of `router_in`: logits → top-k → scores at a
                 // `hidden^-0.5` temperature → softmax → × per-expert scale. GeGLU experts over
                 // `expert_in`.
@@ -1883,8 +1878,9 @@ pub fn lower_decode_to_wavefront(
                 let w_src = |bx: &mut Builder, t: BundleTensor, out: u32, inp: u32| {
                     expert_src(bx, t, e_rows * out, inp)
                 };
+                // A bank without a scale binds no scale source.
                 let s_src = |bx: &mut Builder, t: BundleTensor, out: u32| {
-                    expert_src(bx, t, e_rows * out, 1)
+                    (weight.has_scale()).then(|| expert_src(bx, t, e_rows * out, 1))
                 };
                 let gate_w = w_src(&mut bx, BundleTensor::ExpertGateW, moe_inter, hidden);
                 let gate_s = s_src(&mut bx, BundleTensor::ExpertGateS, moe_inter);
@@ -1913,7 +1909,7 @@ pub fn lower_decode_to_wavefront(
                     k,
                     inter: moe_inter,
                     hidden,
-                    quant: ExpertQuant::declared(group_size, bits),
+                    weight,
                     bundle: ExpertBundle::SwitchGlu,
                     body: ExpertBody::Gated(GatedAct::Gelu),
                     shared: SharedExpertBound(None),
@@ -1924,7 +1920,7 @@ pub fn lower_decode_to_wavefront(
                         ExpertProj::Up => (up_w, up_s),
                         ExpertProj::Down => (down_w, down_s),
                     };
-                    (InputRef::Ext(w), InputRef::Ext(s))
+                    (InputRef::Ext(w), s.map(InputRef::Ext))
                 };
                 let idx = bx.experts(expert_in, indices, scores, bank, experts);
                 bx.produced.insert((tile.0, 0), Producer::Op(idx));
@@ -1970,18 +1966,7 @@ pub fn lower_decode_to_wavefront(
                     .ok_or(BridgeError::MissingBound {
                         key: "moe_intermediate_size",
                     })? as u32;
-                let (group_size, bits) = match crate::weight_vocab::weight_storage_of(node) {
-                    Some(crate::quantization::StorageFormat::Affine { group_size, bits }) => {
-                        (*group_size, *bits)
-                    }
-                    _ => {
-                        return Err(BridgeError::NoKernel {
-                            tile,
-                            detail: "gptoss_moe without affine expert storage has no kernel \
-                                     (no expert kernel takes dense expert storage)",
-                        });
-                    }
-                };
+                let weight = expert_weight(tile, crate::weight_vocab::weight_storage_of(node))?;
                 // The SwiGLU-OAI limit is BAKED as 7.0 into the kernels
                 // (`swiglu_oai_mul_f`, the GATED_ACT==2 epilogue); gpt-oss is
                 // the only consumer, so a config carrying any other limit is
@@ -2021,7 +2006,7 @@ pub fn lower_decode_to_wavefront(
                     k,
                     inter: moe_inter,
                     hidden,
-                    quant: ExpertQuant::declared(group_size, bits),
+                    weight,
                     bundle: ExpertBundle::GptOss,
                     body: ExpertBody::Gated(GatedAct::SwigluOai),
                     shared: SharedExpertBound(None),
@@ -2029,7 +2014,7 @@ pub fn lower_decode_to_wavefront(
                 // The fused MoE bundle is ONE source (its affine scales resolve by tensor
                 // role at the target, not as separate operands), so both of a projection's
                 // weight operands bind it — the `moe_block` arm's own law.
-                let bank = &|_proj: ExpertProj| (w, w);
+                let bank = &|_proj: ExpertProj| (w, weight.has_scale().then_some(w));
                 let idx = bx.experts(x, indices, scores, bank, experts);
                 bx.produced.insert((tile.0, 0), Producer::Op(idx));
                 result = Some(idx);
@@ -2355,5 +2340,34 @@ pub fn stats<E: scratchy_subtile::handoff::EmbedState>(
         op_histogram,
         weight_sources,
         prefix_sources,
+    }
+}
+
+#[cfg(test)]
+mod expert_weight_tests {
+    use super::*;
+    use crate::quantization::StorageFormat;
+
+    /// A bank in a packed format `ExpertWeight` has no variant for is a build-time refusal, never
+    /// lowered as another format's bytes.
+    #[test]
+    fn a_packed_expert_bank_is_refused_at_build() {
+        for storage in [StorageFormat::Ggml, StorageFormat::Nvfp4 { group_size: 16 }] {
+            let got = expert_weight(TileId(7), Some(&storage));
+            assert!(
+                matches!(
+                    got,
+                    Err(BridgeError::UnsupportedWeight {
+                        tile: TileId(7),
+                        ..
+                    })
+                ),
+                "{storage:?}: {got:?}"
+            );
+        }
+        assert_eq!(
+            expert_weight(TileId(7), None).ok(),
+            Some(ExpertWeight::Dense)
+        );
     }
 }

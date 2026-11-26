@@ -19,7 +19,7 @@ use scratchy_subtile::handoff::{
     ExpansionId, LoweredDecode, SlotMap, SourceBinding, TileId, WeightKind, WeightSlot,
 };
 use scratchy_subtile::kv_codec::CodecGuard;
-use scratchy_subtile::lower::{GemmWeight, InputRef};
+use scratchy_subtile::lower::{ExpertWeight, GemmWeight, InputRef};
 use scratchy_subtile::subtile_ir::{
     AttnMask, DraftConvStage, EwKind, ExpertBody, ExpertBundle, ExpertProj, GainConvention,
     RopeFormTag, RowScale, SubOp, SubtileIR, SubtileId,
@@ -118,6 +118,10 @@ pub enum Refused {
     UndeclaredSharedExpert {
         base: String,
     },
+    /// An expert bank that is not MLX-affine (dense bf16 or fp8): metal's expert kernels are
+    /// affine-only. Metal has no kernel for the model, so the canonical is skipped
+    /// ([`StepRefusal::is_no_kernel`]).
+    NonAffineExperts,
     /// Every step of the construct may drop its commands or not run, so its fence can land on
     /// none: no step of it runs always, and no two run under complementary guards.
     GroupNeverRuns(ExpansionId),
@@ -147,6 +151,14 @@ pub enum Refused {
         cols: u32,
         heads: u32,
     },
+}
+
+impl StepRefusal {
+    /// Whether metal has no kernel for the model ([`Refused::NonAffineExperts`]): the canonical
+    /// gets no steps and bakes no variants, rather than failing the build.
+    pub fn is_no_kernel(&self) -> bool {
+        matches!(self.why, Refused::NonAffineExperts)
+    }
 }
 
 impl std::fmt::Display for StepRefusal {
@@ -823,19 +835,15 @@ impl Recording<'_> {
                 }
                 SubOp::RouteTopK { k: t } => k = Some(st::TopK(t.get())),
                 SubOp::ExpertMatmul {
-                    proj,
-                    n,
-                    quant: q,
-                    bundle: b,
-                    ..
+                    proj, n, bundle: b, ..
                 } => {
-                    let width = Some(self.expert_matmul(j)?.step.width.bits());
+                    let step = self.expert_matmul(j)?.step;
+                    let width = Some(step.width.bits());
                     match proj {
                         ExpertProj::Gate => gate = width,
                         ExpertProj::Up => {
                             (inter, bundle) = (Some(Inter(n)), Some(b));
-                            let (group, _) = self.affine(j, q.group().get(), q.bits().get())?;
-                            (group_size, up) = (Some(group), width);
+                            (group_size, up) = (Some(step.group_size), width);
                         }
                         ExpertProj::Down => down = width,
                     }
@@ -1006,12 +1014,15 @@ impl Recording<'_> {
     fn expert_matmul(&self, j: usize) -> Result<ExpertRecord, StepRefusal> {
         let SubOp::ExpertMatmul {
             proj,
-            quant,
+            weight,
             bundle,
             ..
         } = *self.op(j)
         else {
             return Err(self.no(j, Refused::FusionShape));
+        };
+        let ExpertWeight::Affine(quant) = weight else {
+            return Err(self.no(j, Refused::NonAffineExperts));
         };
         let ((rows, reads, norm), e) = (self.moe_rows(j, 0)?, self.source_arg(j, 2)?);
         let (group_size, op_bits) = self.affine(j, quant.group().get(), quant.bits().get())?;

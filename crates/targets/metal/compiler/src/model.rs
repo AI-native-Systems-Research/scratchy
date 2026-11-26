@@ -726,28 +726,20 @@ pub(crate) fn emit(cx: &ModelCx<'_>) -> ModelEmission {
                 std::num::NonZeroU32::new(8192).unwrap(),
             ),
         );
-        let l = match scratchy_forward_compiler_macro::to_wavefront::lower_decode_to_wavefront(
+        let l = scratchy_forward_compiler_macro::to_wavefront::lower_decode_to_wavefront(
             fuf,
             inferred,
             &bounds,
             &bridge_model,
             prefix,
             m as u32,
-        ) {
-            Ok(l) => l,
-            // METAL HAS NO KERNEL (dense MoE) is not a front-end gap: the canonical gets no steps,
-            // so the bake bakes NO variants and the pool refuses at load. Anything else has no
-            // fallback.
-            Err(e) => {
-                assert!(
-                    e.is_no_kernel(),
-                    "[m2-flip] {stem} m={m}: the shared tape refused a DECLARED pilot ({e:?}) — \
-                     with the solve off there is no fallback",
-                );
-                eprintln!("[m2-eq] {stem} m={m} wavefront REFUSED: {e}");
-                continue;
-            }
-        };
+        )
+        .unwrap_or_else(|e| {
+            panic!(
+                "[m2-flip] {stem} m={m}: the shared tape refused a DECLARED pilot ({e:?}) — with \
+                 the solve off there is no fallback"
+            )
+        });
         // A preset's widths and groups are the kernels' (`quantization`'s preset check refuses
         // any other), so each mints.
         let affine_group = |g: u32| {
@@ -842,8 +834,17 @@ pub(crate) fn emit(cx: &ModelCx<'_>) -> ModelEmission {
                 BackboneLayout::Encoder => scratchy_subtile::sample_rows::ResultRows::Every,
             },
         };
-        let lowered = mc3::lower_canonical_classed(&l, &facts, mc, at, &mut metal_sources)
-            .unwrap_or_else(|e| panic!("[m2-flip] {stem} m={m}: {e}"));
+        // METAL HAS NO KERNEL for a bank its expert kernels do not take (`NonAffineExperts`): the
+        // canonical gets no steps, so the bake bakes NO variants and the pool refuses at load. The
+        // step records refuse before any source is interned. Anything else has no fallback.
+        let lowered = match mc3::lower_canonical_classed(&l, &facts, mc, at, &mut metal_sources) {
+            Ok(lowered) => lowered,
+            Err(e) if e.is_no_kernel() => {
+                eprintln!("[m2-eq] {stem} m={m} steps REFUSED: {e}");
+                continue;
+            }
+            Err(e) => panic!("[m2-flip] {stem} m={m}: {e}"),
+        };
         // The narrow band's shared bucket facts — the classed lowering proved the wide band
         // keeps every one of them (only the step tapes may differ).
         *ns_field = lowered.narrow.colours.get();
