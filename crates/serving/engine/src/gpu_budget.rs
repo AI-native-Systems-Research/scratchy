@@ -54,7 +54,14 @@ pub struct MaxNumSeqsFacts {
     pub peak_activation_bytes: usize,
     /// The GDN state pool's cost of ONE slot (`reserve_bytes(_, 1, ..)` —
     /// the reservation is linear in `num_slots`). `None` = non-hybrid arch.
+    /// The LIVE slot only: the snapshot pool beside it is priced by
+    /// [`Self::snapshot_pool`], never folded into this field.
     pub recurrent_per_slot_bytes: Option<usize>,
+    /// The recurrent-state snapshot pool a run holds beside the KV of a
+    /// longest prompt — priced by the ONE law ([`snapshot_pool_slots`]) at
+    /// whatever width is being tested. `None` = no snapshot pool (a
+    /// non-hybrid arch, or a backend that snapshots elsewhere).
+    pub snapshot_pool: Option<SnapshotPoolFacts>,
     /// The sampler arena's cost per row — the resolver sizes the arena it
     /// itself triggers (`n·(vocab + 2·max_hist)·4` plus the sliced buffers'
     /// terms). 0 when the backend keeps no per-row sampler arena.
@@ -68,9 +75,9 @@ impl MaxNumSeqsFacts {
     const REDUNDANCY_BYTES: usize = 150 * 1024 * 1024;
 
     /// The largest width whose per-sequence + fixed costs still leave the KV
-    /// floor: `budget − allocated − activations − 150 MiB pad −
-    /// n·(gdn_per_slot + sampler_row) ≥ KV_FLOOR_BYTES`. Floored at 1 — a
-    /// slot count of 0 cannot be built (`GdnStatePool::new` requires
+    /// floor AFTER the snapshot pool the ONE law carves from those leftovers:
+    /// `budget − fixed − n·per_row − pool(n) ≥ KV_FLOOR_BYTES`. Floored at
+    /// 1 — a slot count of 0 cannot be built (`GdnStatePool::new` requires
     /// `num_slots >= 1`) and a model always serves at least one sequence.
     fn affordable_width(&self) -> usize {
         // No budget = nothing to clamp against — clamping a tier on absent
@@ -86,9 +93,74 @@ impl MaxNumSeqsFacts {
             .allocated_bytes
             .saturating_add(self.peak_activation_bytes)
             .saturating_add(Self::REDUNDANCY_BYTES);
-        let slot_budget = budget.saturating_sub(fixed).saturating_sub(KV_FLOOR_BYTES);
-        (slot_budget / per_row.max(1)).max(1)
+        // What a width leaves after its own per-row and the fixed terms…
+        let left = |n: usize| {
+            budget
+                .saturating_sub(fixed)
+                .saturating_sub(n.saturating_mul(per_row))
+        };
+        // …minus the snapshot pool the ONE law buys from those leftovers.
+        let pool_bytes = |n: usize| match self.snapshot_pool.as_ref() {
+            None => 0,
+            Some(p) => snapshot_pool_slots(p, left(n)).saturating_mul(p.slot_bytes),
+        };
+        let start =
+            (budget.saturating_sub(fixed).saturating_sub(KV_FLOOR_BYTES) / per_row.max(1)).max(1);
+        if per_row == 0 {
+            // No per-row cost: every width leaves the same bytes, so the
+            // pool cannot prefer one width over another — the unclamped
+            // bound stands and the OOM guard owns refusing a run the pool
+            // prices out entirely.
+            return start;
+        }
+        // The predicate is NOT monotone in the width (a wider run leaves
+        // less, which also buys fewer snapshot slots), so scan down from the
+        // width that would fit without the pool for the largest that fits
+        // with it.
+        let mut n = start;
+        while n > 1 && left(n).saturating_sub(pool_bytes(n)) < KV_FLOOR_BYTES {
+            n -= 1;
+        }
+        n
     }
+}
+
+/// The snapshot pool law's inputs — see [`snapshot_pool_slots`]. Derived once
+/// by the backend that holds the pool, consumed by both the width resolver
+/// and that backend's memory split, so the two can never disagree on what a
+/// snapshot costs or how many the run holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SnapshotPoolFacts {
+    /// One snapshot slot's bytes: a live state slot's, WITHOUT draft lanes,
+    /// plus a DFlash2 drafter's context window (a snapshot is a slot like
+    /// any other; its drafter's window sits beside the state).
+    pub slot_bytes: usize,
+    /// The KV bytes one longest prompt holds (`max_model_len` rounded up to
+    /// blocks) — a snapshot serves nothing whose KV a request could not
+    /// hold too, so the pool is sized beside exactly that.
+    pub kv_len_bytes: usize,
+    /// Whether the run saves prefix snapshots at all: without prefix
+    /// caching there is no pool, however many slots would fit.
+    pub prefix_caching: bool,
+}
+
+/// ⭐ THE SNAPSHOT POOL LAW — ONE statement of how many recurrent-state
+/// snapshot slots a run holds beside the KV of a longest prompt:
+/// `available / (slot + one longest prompt's KV)` of them, at least one when
+/// even that fits, none when prefix caching is off or not even one slot
+/// fits — past the pool, the backend's disk tier holds every snapshot.
+///
+/// `available` is the calling site's own number (the width resolver passes
+/// what a candidate width leaves; the memory split passes what the live
+/// pool, weights and activations leave) — one law, each site's own number,
+/// the two drifting on the number but never on its meaning. Never
+/// re-derived: both callers consume this function.
+pub fn snapshot_pool_slots(facts: &SnapshotPoolFacts, available: usize) -> usize {
+    if !facts.prefix_caching {
+        return 0;
+    }
+    (available / (facts.slot_bytes + facts.kv_len_bytes))
+        .max(usize::from(available >= facts.slot_bytes))
 }
 
 /// Resolve an UNSET `--max-num-seqs` from device memory + per-sequence state
@@ -267,7 +339,10 @@ pub fn recurrent_slot_key(req_id: &str) -> u64 {
 
 #[cfg(test)]
 mod max_num_seqs_default_tests {
-    use super::{BASE_MAX_NUM_SEQS, KV_FLOOR_BYTES, MaxNumSeqsFacts, resolve_default_max_num_seqs};
+    use super::{
+        BASE_MAX_NUM_SEQS, KV_FLOOR_BYTES, MaxNumSeqsFacts, SnapshotPoolFacts,
+        resolve_default_max_num_seqs, snapshot_pool_slots,
+    };
 
     const GIB_U64: u64 = 1024 * 1024 * 1024;
     const GIB: usize = 1024 * 1024 * 1024;
@@ -284,6 +359,7 @@ mod max_num_seqs_default_tests {
             allocated_bytes: 4 * GIB,
             peak_activation_bytes: 512 * MIB,
             recurrent_per_slot_bytes: Some(19 * MIB),
+            snapshot_pool: None,
             sampler_bytes_per_row: 8 * MIB,
         };
         over(&mut f);
@@ -292,13 +368,19 @@ mod max_num_seqs_default_tests {
 
     /// The criterion the resolver must satisfy at a clamped width, checked
     /// against the RESOLVED number rather than a recomputation of the
-    /// division: every fixed + per-row cost the facts name, PLUS the KV
-    /// floor, fits inside the budget — i.e. a default never trips the OOM
-    /// guard it is sized against.
+    /// division: every fixed + per-row cost the facts name, PLUS the
+    /// snapshot pool the law buys at that width, PLUS the KV floor, fits
+    /// inside the budget — i.e. a default never trips the OOM guard it is
+    /// sized against.
     fn kv_left(f: &MaxNumSeqsFacts, width: usize) -> i64 {
         let per_row = f.recurrent_per_slot_bytes.unwrap_or(0) + f.sampler_bytes_per_row;
         let fixed = f.allocated_bytes + f.peak_activation_bytes + MaxNumSeqsFacts::REDUNDANCY_BYTES;
-        f.device_budget_bytes.unwrap_or(0) as i64 - fixed as i64 - (per_row * width) as i64
+        let left = f.device_budget_bytes.unwrap_or(0) - fixed - per_row * width;
+        let pool = match f.snapshot_pool.as_ref() {
+            None => 0,
+            Some(p) => snapshot_pool_slots(p, left) * p.slot_bytes,
+        };
+        left as i64 - pool as i64
     }
 
     /// A starved box (budget below every fixed term) still serves one
@@ -411,6 +493,96 @@ mod max_num_seqs_default_tests {
             false,
         );
         assert_eq!(w, BASE_MAX_NUM_SEQS);
+    }
+
+    /// The law's every branch, on one shape: the count beside a longest
+    /// prompt's KV, the floor at one slot, none when not even one fits,
+    /// and none when caching is off however many would fit.
+    #[test]
+    fn the_snapshot_pool_law_counts_floors_and_refuses() {
+        let p = |slot: usize, kv_len: usize, caching: bool| SnapshotPoolFacts {
+            slot_bytes: slot,
+            kv_len_bytes: kv_len,
+            prefix_caching: caching,
+        };
+        // 10 GiB beside 48 MiB slots and 1 GiB of longest-prompt KV:
+        // 10·2^30 / (48·2^20 + 2^30) = 9 slots.
+        assert_eq!(snapshot_pool_slots(&p(48 * MIB, GIB, true), 10 * GIB), 9);
+        // Not even one slot fits: none — the disk tier holds everything.
+        assert_eq!(snapshot_pool_slots(&p(48 * MIB, GIB, true), 47 * MIB), 0);
+        // Exactly one slot fits with nothing beside it for KV: one — the
+        // pool is floored at a single slot whenever the slot itself fits.
+        assert_eq!(snapshot_pool_slots(&p(48 * MIB, GIB, true), 48 * MIB), 1);
+        // Caching off: no pool, however much would fit.
+        assert_eq!(snapshot_pool_slots(&p(48 * MIB, GIB, false), 10 * GIB), 0);
+    }
+
+    /// The audit's point 2: a recurrent model served WITHOUT prefix caching
+    /// holds no snapshot pool, so its default width is priced by the live
+    /// slot alone — never halved for snapshots that are never allocated.
+    #[test]
+    fn caching_off_prices_no_snapshot_pool_against_the_width() {
+        let no_pool = roomy(|f| {
+            f.device_budget_bytes = Some(5 * GIB);
+            f.allocated_bytes = 2 * GIB;
+            f.peak_activation_bytes = 300 * MIB;
+            f.recurrent_per_slot_bytes = Some(61 * MIB);
+            f.sampler_bytes_per_row = 0;
+        });
+        let caching_off = roomy(|f| {
+            f.device_budget_bytes = Some(5 * GIB);
+            f.allocated_bytes = 2 * GIB;
+            f.peak_activation_bytes = 300 * MIB;
+            f.recurrent_per_slot_bytes = Some(61 * MIB);
+            f.sampler_bytes_per_row = 0;
+            f.snapshot_pool = Some(SnapshotPoolFacts {
+                slot_bytes: 61 * MIB,
+                kv_len_bytes: GIB,
+                prefix_caching: false,
+            });
+        });
+        assert_eq!(
+            resolve_default_max_num_seqs(&caching_off, false),
+            resolve_default_max_num_seqs(&no_pool, false),
+            "caching off buys no pool, so it must not shrink the width"
+        );
+    }
+
+    /// The pool the law buys at a width is counted against it: a tight box
+    /// whose leftovers would fund nine live slots with no pool resolves
+    /// narrower when the law fills those leftovers with snapshots — and the
+    /// resolved width still satisfies the criterion (KV floor above the
+    /// pool). The predicate is not monotone in the width (seven rows fails
+    /// while six passes: more rows leave less, which buys fewer snapshot
+    /// slots), which is why the resolver scans down rather than dividing.
+    #[test]
+    fn the_snapshot_pool_counts_against_the_width() {
+        let box_ = |pool: Option<SnapshotPoolFacts>| {
+            roomy(|f| {
+                f.device_budget_bytes = Some(3 * GIB);
+                f.allocated_bytes = GIB;
+                f.peak_activation_bytes = 300 * MIB;
+                f.recurrent_per_slot_bytes = Some(61 * MIB);
+                f.sampler_bytes_per_row = 0;
+                f.snapshot_pool = pool;
+            })
+        };
+        let without = box_(None);
+        let with_pool = box_(Some(SnapshotPoolFacts {
+            slot_bytes: 61 * MIB,
+            kv_len_bytes: 256 * MIB,
+            prefix_caching: true,
+        }));
+        let w = resolve_default_max_num_seqs(&with_pool, false);
+        assert!(
+            w < resolve_default_max_num_seqs(&without, false),
+            "the pool must shrink the width: {w}"
+        );
+        assert!(kv_left(&with_pool, w) >= KV_FLOOR_BYTES as i64);
+        assert!(
+            kv_left(&with_pool, w + 1) < KV_FLOOR_BYTES as i64,
+            "one more row than resolved would breach the floor"
+        );
     }
 }
 

@@ -1436,8 +1436,7 @@ impl MetalAllocator {
                 // Around the page cache: don't dirty ~19 GiB of it for a
                 // write-once blob — keeps the source/weight pages (and
                 // everything else) resident.
-                let file =
-                    crate::uncached_file::UncachedFile::new(std::fs::File::create(&tmp)?)?;
+                let file = crate::uncached_file::UncachedFile::new(std::fs::File::create(&tmp)?)?;
                 let mut f = std::io::BufWriter::with_capacity(8 << 20, file.file());
                 const CHUNK: usize = 64 << 20;
                 let mut off = 0usize;

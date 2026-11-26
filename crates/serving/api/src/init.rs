@@ -1316,6 +1316,7 @@ fn resolve_max_num_seqs(
                     allocated_bytes: 0,
                     peak_activation_bytes: 0,
                     recurrent_per_slot_bytes: None,
+                    snapshot_pool: None,
                     sampler_bytes_per_row: 0,
                 },
                 is_offline,

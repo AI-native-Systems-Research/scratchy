@@ -396,7 +396,9 @@ mod tests {
         if snaps.contains(key) {
             return None;
         }
-        let slot = snaps.empty_slot().or_else(|| snaps.victim(writer).map(|(s, _)| s))?;
+        let slot = snaps
+            .empty_slot()
+            .or_else(|| snaps.victim(writer).map(|(s, _)| s))?;
         snaps.place(slot, key, position, writer);
         Some(slot)
     }

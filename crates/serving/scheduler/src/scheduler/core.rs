@@ -8087,7 +8087,7 @@ mod tests {
     }
 
     /// The worker maps the whole pool at startup: every block is free from the start, and no step
-    /// moves memory (the step output carries no memory ops — the type is gone).
+    /// moves memory (a step's output carries no memory ops).
     #[test]
     fn every_block_is_free_from_the_start_and_no_step_moves_memory() {
         let mut t = shared();
@@ -8108,12 +8108,11 @@ mod tests {
     /// A save past the pool takes the victim's slot and spills it to the disk tier.
     #[test]
     fn a_save_past_the_pool_spills_the_victim_to_disk() {
-        let mut t = SimpleBlockTracker::with_caching(8, kbt(16)).with_state_snapshots(
-            SnapshotBudget {
+        let mut t =
+            SimpleBlockTracker::with_caching(8, kbt(16)).with_state_snapshots(SnapshotBudget {
                 disk_slots: 2,
                 ..apart(1)
-            },
-        );
+            });
         assert_eq!(t.reserve_snapshot(1, 16, "a"), Some(0));
         t.commit_state_saves(&[StateSnapshotOp {
             req_id: "a".into(),
@@ -8184,7 +8183,11 @@ mod tests {
             Some(vec![7, 6, 5, 4]),
             "a's blocks, tail first"
         );
-        assert_eq!(KVCacheManagerOps::num_cached_blocks(&t), 4, "the half c left");
+        assert_eq!(
+            KVCacheManagerOps::num_cached_blocks(&t),
+            4,
+            "the half c left"
+        );
         assert!(holds_snapshot(&t, 9), "the older snapshot stays");
 
         // The snapshot is newer: c evicts a's cached blocks and the snapshot stays.

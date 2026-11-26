@@ -758,6 +758,20 @@ fn int8_kv(model: &dyn scratchy_target_metal::MetalWeights) -> bool {
     model.kv_codec().is_int8()
 }
 
+/// A DFlash2 checkpoint's context window — the ONE read of its config's
+/// `dflash_config.swa_window_size` (and the `hidden_size` its bytes need), consumed by the
+/// drafter's own load and by every site that prices a snapshot's window before that load
+/// runs (the width resolver).
+fn dflash2_window(config: &HfModelConfig) -> Option<scratchy_target_metal::dflash2::WindowLayout> {
+    let window = config
+        .extra
+        .get("dflash_config")
+        .and_then(|d| d.get("swa_window_size"))
+        .and_then(|v| v.as_u64())? as u32;
+    let hidden = config.hidden_size()?;
+    Some(scratchy_target_metal::dflash2::WindowLayout { window, hidden })
+}
+
 /// Bytes one block of the TARGET pool costs: built with int8 KV, every layer's codes and
 /// scales at its class's geometry and the scratch of the widest; otherwise a hybrid model's
 /// page in each of its group-shared tensors, every other model's dense rows.
@@ -889,7 +903,9 @@ struct MetalBudget {
 // `recurrent_slot_key` and the shared unset-`--max-num-seqs` resolver are
 // backend-neutral; they live in `scratchy-serving-engine` (cycle-free for
 // every worker) and are re-exported here.
-use scratchy_serving_engine::gpu_budget::MaxNumSeqsFacts;
+use scratchy_serving_engine::gpu_budget::{
+    MaxNumSeqsFacts, SnapshotPoolFacts, snapshot_pool_slots,
+};
 pub use scratchy_serving_engine::gpu_budget::{recurrent_slot_key, resolve_default_max_num_seqs};
 
 impl MetalWorker {
@@ -1104,6 +1120,7 @@ impl MetalWorker {
         model: &dyn scratchy_target_metal::MetalWeights,
         arch: &str,
         gpu_device: &scratchy_target_metal::GpuDevice,
+        draft_hf_config: Option<&HfModelConfig>,
     ) -> ExecutorResult<()> {
         if self.resolved_max_num_seqs.is_some() {
             return Ok(());
@@ -1142,11 +1159,11 @@ impl MetalWorker {
                     ),
                 };
                 // The width resolver does not see `gdn_reserve` (that fold happens later, in
-                // `determine_available_memory`, from the width this picks) — so tell it here what
-                // a sequence costs whole: its live slot, and the snapshot slot its prompt leaves
-                // behind. The live slot itself is metered ONCE, by `gdn_reserve`; this doubling
-                // is only the resolver's price of a width, never a second subtraction.
-                let gdn_per_slot = gdn_per_slot.map(|b| 2 * b);
+                // `determine_available_memory`, from the width this picks) — so it prices a
+                // sequence's LIVE slot here (its documented meaning in
+                // `MaxNumSeqsFacts::recurrent_per_slot_bytes`, metered once by `gdn_reserve`),
+                // and the snapshot pool beside it through the ONE law's facts below, at
+                // whatever width the resolver tests.
                 let (budget, allocated) = self
                     .metal_device
                     .as_ref()
@@ -1178,15 +1195,7 @@ impl MetalWorker {
                 // sized by the width itself: n·(vocab + 2·max_hist)·4 plus
                 // the sliced buffers' terms — count its per-row cost so the
                 // default accounts for what it triggers.
-                let max_model_len = self
-                    .config
-                    .max_model_len
-                    .or_else(|| {
-                        self.hf_config
-                            .as_ref()
-                            .and_then(|c| c.max_position_embeddings())
-                    })
-                    .unwrap_or(4096);
+                let max_model_len = self.max_model_len();
                 let sampler_row = scratchy_target_metal::sampling::SamplerArena::bytes_per_row(
                     u32::try_from(model.vocab_size()).unwrap_or(u32::MAX),
                     u32::try_from(max_model_len.max(1)).unwrap_or(u32::MAX),
@@ -1207,6 +1216,7 @@ impl MetalWorker {
                     allocated_bytes: allocated + draft_rows * sampler_row + gdn_lanes,
                     peak_activation_bytes: peak,
                     recurrent_per_slot_bytes: gdn_per_slot,
+                    snapshot_pool: self.snapshot_pool_facts(Some(model), draft_hf_config),
                     sampler_bytes_per_row: sampler_row,
                 };
                 resolve_default_max_num_seqs(&facts, false)
@@ -1525,9 +1535,12 @@ impl MetalWorker {
                 .map_err(|e| init(&format!("acceptance compile: {e:?}")))?
                 .ok_or_else(|| init("its bake has no acceptance kernel"))?;
         let dflash = config.extra.get("dflash_config");
-        let window = (dflash.and_then(|d| d.get("swa_window_size")))
-            .and_then(|v| v.as_u64())
-            .ok_or_else(|| init("its config names no dflash_config.swa_window_size"))?;
+        // The ONE read of the window (see `dflash2_window`): its tokens size the rings'
+        // slots, its bytes the window a snapshot keeps beside the state.
+        let window = dflash2_window(config).ok_or_else(|| {
+            init("its config names no dflash_config.swa_window_size or hidden_size")
+        })?;
+        let window_bytes = window.bytes();
         let taps = (dflash.and_then(|d| d.get("target_layer_ids")))
             .and_then(|v| v.as_array())
             .map(|ids| ids.len())
@@ -1541,14 +1554,10 @@ impl MetalWorker {
         let elem_bytes = size_of::<u16>();
         let slot_bytes = scratchy_target_metal::dflash2::DraftRingPool::slot_bytes(
             kv_heads,
-            window as usize,
+            window.window as usize,
             head_dim,
             elem_bytes,
         );
-        let hidden =
-            (config.hidden_size()).ok_or_else(|| init("its config names no hidden_size"))?;
-        let window_bytes =
-            scratchy_target_metal::dflash2::DraftRingPool::window_bytes(window as usize, hidden);
         let (device, residency) = (&gpu_device.device, gpu_device.allocator.residency());
         let rings = scratchy_target_metal::dflash2::DraftRingPool::new(
             layers,
@@ -1560,8 +1569,9 @@ impl MetalWorker {
         .map_err(|e| init(&format!("rings: {e}")))?;
         residency.commit();
         info!(
-            "ScratchyWorker(metal): DFlash2 drafter — {layers} layers' rings of {window} positions \
+            "ScratchyWorker(metal): DFlash2 drafter — {layers} layers' rings of {} positions \
              for {slots} sequences, and their context windows ({} MiB)",
+            window.window,
             (2 * layers * slots * slot_bytes + slots * window_bytes) >> 20
         );
         let target_kernels =
@@ -1577,7 +1587,7 @@ impl MetalWorker {
             drafter: ::scratchy_serving_engine::spec_decode::BlockDrafter {
                 budget,
                 max_model_len: self.max_model_len(),
-                window: window as usize,
+                window: window.window as usize,
             },
             accept,
             sampling,
@@ -1587,10 +1597,7 @@ impl MetalWorker {
             captured_row_bytes: taps * target.hidden_size() as usize * elem_bytes,
             cycle_buffer: None,
             cost,
-            window: scratchy_target_metal::dflash2::WindowLayout {
-                window: window as u32,
-                hidden,
-            },
+            window,
             contexts: HashMap::new(),
             snapshot_windows: None,
         })
@@ -3015,9 +3022,17 @@ impl MetalWorker {
         Ok(())
     }
 
-    /// One live state slot's bytes across every GDN state buffer. `None` without recurrent state.
-    fn recurrent_slot_bytes(&self) -> Option<usize> {
-        let cfg = (self.model.as_ref()).and_then(|m| m.recurrent_state())?;
+    /// One live state slot's bytes across every GDN state buffer. `None` without recurrent
+    /// state. `load_model` runs the width resolver before `self.model` takes the
+    /// loaded target, so the caller hands the just-loaded model in; every later site passes
+    /// `None` and the field serves.
+    fn recurrent_slot_bytes(
+        &self,
+        model: Option<&dyn scratchy_target_metal::MetalWeights>,
+    ) -> Option<usize> {
+        let cfg = model
+            .or(self.model.as_deref())
+            .and_then(|m| m.recurrent_state())?;
         let dims = cfg.state_dims();
         let bytes = GdnStatePool::<scratchy_target_metal::PoolMem>::reserve_bytes(
             cfg.num_linear_layers(),
@@ -3029,9 +3044,39 @@ impl MetalWorker {
         (bytes > 0).then_some(bytes)
     }
 
-    /// A snapshot's DFlash2 context window, in bytes: 0 without a DFlash2 drafter.
-    fn snapshot_window_bytes(&self) -> usize {
-        self.dflash2.as_ref().map_or(0, |d| d.window.bytes())
+    /// The snapshot pool law's ONE input derivation (the law itself is
+    /// `gpu_budget::snapshot_pool_slots`): a snapshot slot's typed bytes, the KV a longest
+    /// prompt holds, and the caching mode. `None` without recurrent state.
+    ///
+    /// `load_model` runs the width resolver before `self.model` takes the target and before a
+    /// DFlash2 drafter loads, so the caller hands both in; every later site passes `None`s and
+    /// the fields serve.
+    fn snapshot_pool_facts(
+        &self,
+        model: Option<&dyn scratchy_target_metal::MetalWeights>,
+        draft_hf_config: Option<&HfModelConfig>,
+    ) -> Option<SnapshotPoolFacts> {
+        let model = model.or(self.model.as_deref())?;
+        let slot = self.recurrent_slot_bytes(Some(model))?;
+        let bs = self.config.block_size;
+        Some(SnapshotPoolFacts {
+            // A snapshot is a slot like any other, without draft lanes; a DFlash2 drafter's
+            // context window sits beside the state.
+            slot_bytes: slot + self.snapshot_window_bytes(draft_hf_config),
+            kv_len_bytes: self.max_model_len().div_ceil(bs.get()) * target_block_bytes(model, bs),
+            prefix_caching: self.config.enable_prefix_caching,
+        })
+    }
+
+    /// A snapshot's DFlash2 context window, in bytes: 0 without a DFlash2 drafter. The drafter
+    /// loads after the width resolver, which prices the same window from the same checkpoint
+    /// config — hence the parameter.
+    fn snapshot_window_bytes(&self, draft_hf_config: Option<&HfModelConfig>) -> usize {
+        match (self.dflash2.as_ref(), draft_hf_config) {
+            (Some(d), _) => d.window.bytes(),
+            (None, Some(c)) => dflash2_window(c).map_or(0, |w| w.bytes()),
+            (None, None) => 0,
+        }
     }
 
     /// The MTP head reads its target's KV and has none of its own (Gemma 4's assistant).
@@ -3115,16 +3160,15 @@ impl MetalWorker {
         })?;
         let layout = vec![(block_bytes_draft, false); num_tensors_draft * 2];
         let seeded = (draft_chunks * blocks_per_chunk).min(draft_blocks);
-        let draft_stores =
-            scratchy_target_metal::sparse_kv::SparseStores::new(
-                &mtl_device,
-                &residency,
-                draft_blocks,
-                blocks_per_chunk,
-                &layout,
-            )
-            .and_then(|mut s| s.grow_to(seeded, &kv_mapper).map(|_| s))
-            .map_err(|e| ExecutorError::WorkerInit(format!("draft KV stores: {e}")))?;
+        let draft_stores = scratchy_target_metal::sparse_kv::SparseStores::new(
+            &mtl_device,
+            &residency,
+            draft_blocks,
+            blocks_per_chunk,
+            &layout,
+        )
+        .and_then(|mut s| s.grow_to(seeded, &kv_mapper).map(|_| s))
+        .map_err(|e| ExecutorError::WorkerInit(format!("draft KV stores: {e}")))?;
         info!(
             "ScratchyWorker(metal): draft KV layer buffers — {} buffers",
             layout.len()
@@ -6559,7 +6603,12 @@ impl Worker for MetalWorker {
         // `initialize_cache`, spec-decode chain bounds). The target and the
         // `gpu_device` it needs for rung picking are still locals here
         // (fields assigned at the end of load_model) — pass them in.
-        self.resolve_max_num_seqs(model.as_ref(), &arch, &gpu_device)?;
+        self.resolve_max_num_seqs(
+            model.as_ref(),
+            &arch,
+            &gpu_device,
+            draft.as_ref().map(|(_, _, c)| c),
+        )?;
         gpu_device.max_decode_rows = Some(decode_rows(
             self.config.verify_seqs,
             self.max_num_seqs_resolved(),
@@ -6874,32 +6923,34 @@ impl Worker for MetalWorker {
             .collect();
         let capacity = (max_chunks * blocks_per_chunk).min(num_gpu_blocks);
         // A recurrent model's KV pool is mapped whole at startup and never remapped while
-        // serving; every other model's keeps its one-chunk seed and grows — doubling, never
-        // unmapping — as the pool reaches its blocks. An int8 model's canonical cache is its
-        // stores, built at its first forward (a warmup): the registry's watermark set here is
-        // how far they map whole when they register.
-        let shares = self.gdn_snapshot_cap > 0;
+        // serving — whether or not prefix caching gave it a snapshot pool; every other model's
+        // keeps its one-chunk seed and grows — doubling, never unmapping — as the pool reaches
+        // its blocks. An int8 model's canonical cache is its stores, built at its first forward
+        // (a warmup): the registry's watermark set here is how far they map whole when they
+        // register.
+        let shares = self.recurrent_slot_bytes(None).is_some();
         if shares && kv_codec.is_int8() {
             let registry = device.allocator.sparse_kv.lock();
-            (registry.expect("sparse KV registry").reach(num_gpu_blocks, &kv_mapper))
-                .map_err(|e| ExecutorError::WorkerInit(format!("int8 KV: {e}")))?;
+            (registry
+                .expect("sparse KV registry")
+                .reach(num_gpu_blocks, &kv_mapper))
+            .map_err(|e| ExecutorError::WorkerInit(format!("int8 KV: {e}")))?;
         }
-        let kv_stores =
-            scratchy_target_metal::sparse_kv::SparseStores::new(
-                &mtl_device,
-                &residency,
-                capacity,
-                blocks_per_chunk,
-                &layout,
-            )
-            .and_then(|mut s| {
-                let through = match shares {
-                    true => capacity,
-                    false => blocks_per_chunk.min(capacity),
-                };
-                s.grow_to(through, &kv_mapper).map(|_| s)
-            })
-            .map_err(|e| ExecutorError::WorkerInit(format!("KV stores: {e}")))?;
+        let kv_stores = scratchy_target_metal::sparse_kv::SparseStores::new(
+            &mtl_device,
+            &residency,
+            capacity,
+            blocks_per_chunk,
+            &layout,
+        )
+        .and_then(|mut s| {
+            let through = match shares {
+                true => capacity,
+                false => blocks_per_chunk.min(capacity),
+            };
+            s.grow_to(through, &kv_mapper).map(|_| s)
+        })
+        .map_err(|e| ExecutorError::WorkerInit(format!("KV stores: {e}")))?;
         info!(
             "ScratchyWorker(metal): KV layers — {} tensors × K/V, up to {} chunks of {} bytes \
              each, {}",
@@ -7039,7 +7090,7 @@ impl Worker for MetalWorker {
             // state's, a window a slot. Nothing reads a snapshot's before a save writes it.
             let window_bytes = match self.gdn_snapshot_cap {
                 0 => 0,
-                _ => self.snapshot_window_bytes(),
+                _ => self.snapshot_window_bytes(None),
             };
             let layout: Vec<(usize, bool)> = (0..gdn_cfg.num_linear_layers())
                 .flat_map(|_| [(conv_slot, false), (ssm_slot, false)])
@@ -7052,16 +7103,15 @@ impl Worker for MetalWorker {
             // never remapped while serving.
             let snapshots_from = live;
             let num_slots = snapshots_from + self.gdn_snapshot_cap;
-            let stores =
-                scratchy_target_metal::sparse_kv::SparseStores::new(
-                    &mtl_device,
-                    &residency,
-                    num_slots,
-                    1,
-                    &layout,
-                )
-                .and_then(|mut s| s.grow_to(num_slots, &mapper).map(|_| s))
-                .map_err(|e| ExecutorError::WorkerInit(format!("GDN state stores: {e}")))?;
+            let stores = scratchy_target_metal::sparse_kv::SparseStores::new(
+                &mtl_device,
+                &residency,
+                num_slots,
+                1,
+                &layout,
+            )
+            .and_then(|mut s| s.grow_to(num_slots, &mapper).map(|_| s))
+            .map_err(|e| ExecutorError::WorkerInit(format!("GDN state stores: {e}")))?;
             let next = std::cell::Cell::new(0usize);
             let gdn_pool = unsafe {
                 GdnStatePool::new(
@@ -7370,51 +7420,29 @@ impl Worker for MetalWorker {
         // ⭐ THE STATE BUDGET'S ONE SPLIT, made here, once: live state is metered by `gdn_reserve`
         // above (one slot per sequence the width resolved, folded into `weights_and_overhead`
         // because the pool is built after this runs), and the snapshot pool is carved out of what
-        // is left, mapped whole at startup, never remapped while serving; everything else is KV.
-        // The pool holds the snapshots that fit beside the KV of a longest prompt (a snapshot
-        // serves nothing whose KV a request could not hold too), at least one slot, none when not
-        // even one fits — past it the disk tier holds every snapshot. A snapshot is a slot like
-        // any other, without draft lanes; a DFlash2 drafter's keeps its context window beside the
-        // state.
-        let max_model_len = self
-            .config
-            .max_model_len
-            .or_else(|| {
-                self.hf_config
-                    .as_ref()
-                    .and_then(|c| c.max_position_embeddings())
-            })
-            .unwrap_or(4096);
-        let available = match self.recurrent_slot_bytes() {
+        // is left by the ONE law (`gpu_budget::snapshot_pool_slots`, the same statement the width
+        // resolver priced the default against), mapped whole at startup, never remapped while
+        // serving; everything else is KV.
+        let available = match self.snapshot_pool_facts(None, None) {
             None => {
                 self.gdn_snapshot_cap = 0;
                 available
             }
-            Some(slot) => {
+            Some(p) => {
                 // The live slots are metered exactly once, by `gdn_reserve` above: the pool's
-                // bytes are already out of `available`. What is left buys the SNAPSHOT pool —
-                // a slot beside the KV of a longest prompt, at least one, none when not even
-                // one fits — and the KV pool takes the rest.
-                let snap = slot + self.snapshot_window_bytes();
-                let pool = match self.config.enable_prefix_caching {
-                    false => 0,
-                    true => {
-                        let target = self.model.as_deref().expect("model loaded");
-                        let kv_len = max_model_len.div_ceil(bs.get())
-                            * target_block_bytes(target, bs);
-                        (available / (snap + kv_len)).max(usize::from(available >= snap))
-                    }
-                };
+                // bytes are already out of `available`. What is left buys the SNAPSHOT pool
+                // through the ONE law, and the KV pool takes the rest.
+                let pool = snapshot_pool_slots(&p, available);
                 self.gdn_snapshot_cap = pool;
                 info!(
                     "ScratchyWorker(metal): state budget — {} live + {} snapshot slots × \
                      {:.1} MiB mapped at startup, {:.2} GiB left for KV",
                     self.max_num_seqs_resolved(),
                     pool,
-                    snap as f64 / 1_048_576.0,
-                    (available - pool * snap) as f64 / 1_073_741_824.0,
+                    p.slot_bytes as f64 / 1_048_576.0,
+                    (available - pool * p.slot_bytes) as f64 / 1_073_741_824.0,
                 );
-                available - pool * snap
+                available - pool * p.slot_bytes
             }
         };
         // Per-pair split: when a draft model is loaded, every target KV
@@ -9599,10 +9627,13 @@ impl Worker for MetalWorker {
     /// block a step names, so the scheduler must hand out blocks already mapped before never-used
     /// ones, or distinct prompts one at a time map the pool far past what they hold.
     fn kv_backing(&self) -> scratchy_core_common::KvBacking {
-        if self.gdn_snapshot_cap == 0 {
-            scratchy_core_common::KvBacking::OnFirstUse
-        } else {
+        // The recurrent-state fact, not the snapshot count: a recurrent model's KV is
+        // allocated whole at startup even when prefix caching is off (pool empty) — mapping
+        // while serving is what this backend never does for them.
+        if self.recurrent_slot_bytes(None).is_some() {
             scratchy_core_common::KvBacking::Allocated
+        } else {
+            scratchy_core_common::KvBacking::OnFirstUse
         }
     }
 
