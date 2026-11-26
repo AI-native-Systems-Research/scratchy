@@ -11,7 +11,10 @@
 /backends/spyre-hw/target/
 **/*.rs.bk
 /bench_results/
-.claude/worktrees/
+# Session debris under .claude/ never enters the repo (#916 committed 149 files of it);
+# the project skills are the tracked exception.
+.claude/*
+!.claude/skills/
 
 DRAFT_SPEC_DECODE_PLAN.md
 SPEC_DECODE_REFACTOR_PLAN.md
