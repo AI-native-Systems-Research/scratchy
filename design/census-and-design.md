@@ -262,10 +262,12 @@ artifact. The design must state this law once and keep it.
 PR #1403 was closed with a direction, not just a verdict: *"the step logic moves into senlib-rs
 and scratchy uses it. Nothing from this branch is reused."* The design below therefore places
 the ordering and submit/land primitives on the senlib-rs (flex-rs) side of the seam — flex-rs
-already owns `Stream`/`StreamId` (`flex-rs/src/stream.rs:52`), `synchronize` (`:1497`), and
-the event surface (`flex-rs/src/event.rs`) — and scratchy consumes them through its existing
-doors. Nothing below re-introduces #1403's code; the laws are restated because they are the
-mechanism's own, and their home changes.
+already owns `Stream`/`StreamId` (`flex-rs/src/stream.rs:52`), the launch doors with their
+per-op completion latch, and `synchronize` (`:1497`) — and scratchy consumes them through its
+existing doors. Nothing below re-introduces #1403's code; the laws are restated because they
+are the mechanism's own, and their home changes. **§3.8 reads the seam at senlib-rs main
+`7382758` and pins the exact doors; where it contradicts an earlier phrasing (the event
+surface), §3.8 is the law.**
 
 ### 3.1 One launch stream per card (kills S1's wait and S3)
 
@@ -365,6 +367,157 @@ beside decode steps), same rows (bind/submit/defer/total/depth/busy), same laws 
 may print; it must not cost; gated by `--bench`, no env toggles). Without it the §4 bar is
 unmeasurable. This is the first thing the front types, and it lands alone against base to
 establish the BEFORE numbers.
+
+### 3.8 The flex-rs doors the step logic lands behind (amendment — the seam read at senlib-rs main `7382758`)
+
+The open design call was which exact flex-rs doors the step logic lands behind. This section
+closes it by reading the local senlib-rs checkout (read-only; main at `7382758`, clean). Line
+numbers below are into that tree unless a filename says otherwise; scratchy-side lines name
+the spyre-hw card crate. Three pins, two findings.
+
+#### 3.8.1 Where the card-owned launch stream lives, and the minimal ownership move
+
+**What flex-rs owns today.** `RuntimeContext` is PER-DEVICE (`flex-rs/src/runtime.rs:228-249`:
+`device_id`, a `Mutex<HashMap<StreamId, Arc<RuntimeStream>>>`, and a DEFAULT stream minted at
+`RuntimeContext::create` — `:265-280`, `StrictOrdering`/`Normal`/untracked, undestroyable
+(`destroy_stream` refuses it, `:415`), reachable only as an id (`default_stream_id()`,
+`:456`) plus the non-owning `get_stream` (`:400`). Created streams live in the same map;
+`create_stream(priority, mode, track_hazards)` is `:379`. So flex-rs's answer to "which type
+holds a Stream" is: the per-device `RuntimeContext`, and it already mints one stream per card
+at create — the default — that nothing destroys.
+
+**What scratchy does today.** Every `Executor` (one per rung×rank session —
+`sdsc_runner.rs:176-188`, rank `r` borrowing card `r`'s runtime) mints its OWN dedicated
+stream in `Executor::prepare` (`superdsc_exec.rs:3083-3086`, the doc at `:3074` saying
+"DEDICATED ... (not the default)" for fence-deque reasons that `retire_fence` has since
+removed) through `Stream::create` (card `runtime.rs:989` → `RuntimeContext::create_stream`)
+under the serialized `STREAM_CREATE` mutex (`runtime.rs:968-981`). The scratchy `Stream`
+handle is already a shared-state token — `Arc<RuntimeContext> + StreamId`
+(card `runtime.rs:963-966`), `Send` by construction, destroyed through `destroy_stream` on
+`Drop` (`:1544-1553`).
+
+**The minimal ownership move (not a rewrite).** Hoist ONE `Stream::create` from
+`Executor::prepare` to the card's owner — the per-rank construction that builds executors —
+so each rank mints one dedicated stream at bring-up and hands every `Executor` a borrow of it.
+Nothing in flex-rs moves: creation, lookup, and destruction stay exactly where they are. On
+the scratchy side the change is who calls `Stream::create` and how many times (per card once,
+not per rung): `Executor`'s field becomes a borrow of the card's stream in the lifetime shape
+it already has (the executor already borrows the card runtime for `'c`,
+`sdsc_runner.rs:185-187`), and the executor stops destroying the stream — the card's teardown
+does, once, after every session is gone. Two flex-rs facts make one-per-card safe and cheap,
+both already stated in the tree: fence deques retire at completion, so a whole-life shared
+stream does not accumulate (`superdsc_exec.rs:3074-3082`); and fewer streams means fewer
+entries into the serialized create section (`runtime.rs:968-981`), never more. The DEFAULT
+stream is rejected for this: it is exposed only as an id, cannot be destroyed, and would hide
+the card's teardown drain inside the context's; a dedicated card-owned stream states the
+ownership once, explicitly.
+
+Two laws ride the move. **One error domain per card:** a stream that takes a device error
+goes sticky-shutdown with its deferred error (`stream.rs:774`, `synchronize` rethrows it once,
+`:1497`); with one stream per card, a card failure poisons the card's queue — which is the
+truth, the card is dead — where today the same failure poisons one rung's stream while its
+sibling rungs look alive. **No hazard tracking:** sessions are untracked today and stay so
+(card `runtime.rs:983-988`); with one stream per card there is no second stream to edge
+against, ordering is the one stream's FIFO, and the #546 tracked-stream door (`create_with`,
+card `runtime.rs:1008`) stays unconsumed by this front.
+
+#### 3.8.2 The submit-without-run door: what it composes, what is reused, what is new
+
+`submit_bound` today (`sdsc_runner.rs:918-936`): `bind_all` (the H2D preamble into shadows)
+→ `each_parallel(predict_submit)`, waiting nothing. `predict_submit`
+(`superdsc_exec.rs:4957`) is `forward_half` (`:4797` — the refill H2Ds, then the doorbell)
+plus the logits D2H when the caller reads back. The flex-rs primitives under those:
+
+- **The doorbell:** `RuntimeStream::launch_compute_batch` (`flex-rs/src/stream.rs:1097`) /
+  `launch_compute_wires` (`:1159`) — one submitted operation, one doorbell for the whole
+  step, `pipeline_barrier` the OR of the step's host fences, and — the fact this amendment
+  exists to pin — a `user_cb: Option<UserCallback>` parameter on BOTH (`:1101`, `:1163`).
+  Scratchy's wrappers hard-pass `None` today (card `runtime.rs:1435`, `:1539`).
+- **The preamble and the read:** `launch_h2d` (`:1000`) / `launch_d2h` (`:1017`),
+  compute-pipeline shaped; scratchy's signaled twins arm the completion latch
+  (`h2d_on_compute_signaled` card `runtime.rs:1137`, `d2h_on_compute_signaled` `:1298`).
+- **The landing / quiet point, today:** the per-op completion latch —
+  `UserCallback::Latch(Arc<(Mutex<bool>, Condvar)>)` (`flex-rs/src/stream.rs:428`), fired by
+  the completion bracket on the scheduler's completion thread inside a catch-unwind
+  (`StreamBracket::call`, `:496-524`; a FAILED op never fires it — the stream records a
+  deferred error and goes sticky-shutdown, which is exactly why scratchy's
+  `ReadSignal::wait_or` carries its dead-stream timeout tick, card `runtime.rs:930`).
+  Scratchy parks on it (`ReadSignal`) and peeks it (`ReadPeek`, `fired()` only,
+  card `runtime.rs:874-887` — the busy row's own probe). `settle_peer_step`'s landing is the
+  same latch on the last H2D (`superdsc_exec.rs:5077` → `quiet_shadow` `:5200`).
+- **The drain being deleted:** `predict_finish`'s whole-stream `synchronize`
+  (`superdsc_exec.rs:5098-5100` → `flex-rs/src/stream.rs:1497`, `wait_until_drained`
+  `:1464`) — the per-chunk S1 wait.
+
+**Reused verbatim by the new door:** the doorbells, the DMA doors, the latch, the park, the
+peek, the quiet point. **Genuinely new: exactly one thing** — arming the landing latch on the
+DOORBELL op of a READLESS submit. A middle chunk (`StepLogits::Discarded`) submits compute and
+reads nothing, so today it has no landing at all; its only wait was the whole-stream
+synchronize being deleted. flex-rs already exposes the capability: the `Option<UserCallback>`
+parameter on both compute doors. The scratchy-side change is a `*_signaled` twin of
+`compute_batch` / `compute_wires` in the card runtime — the exact shape the DMA doors already
+have (`h2d_on_compute_signaled` / `d2h_on_compute_signaled`): same door, `Some(&ReadSignal)`
+instead of `None`. A read-bearing submit (decode, prompt-final) needs nothing new at all: its
+D2H already carries the latch, and `finish_deferred_read_with` (`sdsc_runner.rs:966-982`)
+already parks on it without a stream drain.
+
+#### 3.8.3 The senlib-rs surface scratchy consumes, named as it should be
+
+- `RuntimeContext::create_stream(priority, mode, track_hazards)` (`flex-rs/src/runtime.rs:379`)
+  — once per card at bring-up; `Normal` / `StrictOrdering` / untracked, the values every
+  scratchy session has ever run (card `runtime.rs:984-988`).
+- `RuntimeStream::launch_compute_batch` / `launch_compute_wires` (`flex-rs/src/stream.rs:1097`
+  / `:1159`) — the doorbell; `pipeline_barrier` the OR of the step's host fences; `user_cb`
+  the step's landing latch (the only widening: scratchy passes `Some` where it passes `None`
+  today).
+- `RuntimeStream::launch_h2d` / `launch_d2h` (`:1000` / `:1017`) — the preamble and the read,
+  compute-pipeline shaped, latch-armed where a quiet point or a landing is needed.
+- `UserCallback::Latch` (`:428`) — the ONE completion form the cadence uses.
+- `RuntimeStream::query` (`:1527`) — the non-blocking stream-scoped busy answer
+  (`in_flight == 0`), if a probe ever needs the stream's own count; the read-scoped probe
+  stays `ReadPeek`.
+- `RuntimeStream::synchronize` (`:1497`) and `drain_for_teardown` (`:1566`) — error
+  surfacing and teardown ONLY, never the step cadence.
+- **NOT consumed by this front:** `Event` / `launch_event_signal` / `launch_event_wait`
+  (finding F-A below); `create_with(track_hazards = true)` (no second stream to edge
+  against); `launch_operation_host_callback`; the stream-level P2P doors (the collectives
+  ride the baked program's own sends and waits, not stream ops).
+
+**The senlib-rs-side step logic, per the nuke ruling, is the CADENCE over these doors** —
+submit, arm the landing, hand back what the step owes, drain landings in submission order —
+stated over ops and streams. The forward's own composition (which CBs make a step, what a
+suffix is) stays scratchy's: it is the baked program's fact, and putting it in senlib-rs
+would put a model fact below the seam. This is the boundary that keeps "the step logic moves
+into senlib-rs" true without dragging the ladder across it.
+
+#### 3.8.4 Findings
+
+**F-A — the event surface is NOT the landing, and §3.0's earlier phrasing is retired by this
+section.** In senlib-rs, `launch_event_signal` and `launch_event_wait` are not queue
+operations: they execute inline on the CALLER's thread (the vendor's scheduler routes them
+around `schedule()`; the port runs them at the launch site — `flex-rs/src/stream.rs:24-31`
+module doc), `launch_event_signal` FIRST blocks until the entire stream drains
+(`wait_until_drained` at `:1377` — `headOpReady`'s gate realized as a caller block,
+`:1464`), and `launch_event_wait` parks the caller in `Event::wait` (`:1422`,
+`flex-rs/src/event.rs:135`). An `Event` used as a step's landing would reintroduce S1's drain
+under another name. The landing is the per-op completion latch, and it is exposed on every
+launch door. The Event surface remains what it is — host-side inter-stream coordination —
+and this front consumes none of it.
+
+**F-B — flex-rs lacks nothing this design needs.** The one capability the design names that
+flex-rs does not today spell — a step-shaped door — is fully composed of exposed primitives
+(the `Option<UserCallback>` on the compute doors is the last piece, and it is public). No
+flex-rs primitive changes, no new flex-rs API is required, and nothing here is hacked around
+on the scratchy side. The scratchy-side seam widenings are exactly two, both in scratchy's
+card runtime, both consuming doors that already exist: (i) the `*_signaled` twins of the
+compute doors, (ii) the one-stream-per-card ownership hoist of §3.8.1. The senlib-rs-side
+addition the nuke ruling asks for is new CODE in senlib-rs over the public surface above
+(the cadence of §3.8.3), not a change to flex-rs itself.
+
+**No second statement of a law:** the busy probe stays `ReadPeek` (one latch, one peek type);
+the quiet point stays the last-H2D latch (one `quiet_shadow`); the landing stays
+`UserCallback::Latch` (one completion form); ordering stays the one stream's FIFO (no hazard
+tracker, no Event, no second ordering mechanism beside the queue).
 
 ---
 
