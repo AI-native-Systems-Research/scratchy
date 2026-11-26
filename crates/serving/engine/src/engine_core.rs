@@ -2917,7 +2917,7 @@ mod tests {
             let StepOutcome::Progressed { outputs, .. } = engine.step().unwrap() else {
                 panic!("a step that does nothing");
             };
-            for o in outputs.into_values().flat_map(|o| o.outputs) {
+            for o in outputs.into_iter().flat_map(|o| o.outputs) {
                 let r = received.entry(o.request_id).or_default();
                 r.0 += o.new_token_ids.len();
                 r.1 = r.1.or(o.finish_reason);
