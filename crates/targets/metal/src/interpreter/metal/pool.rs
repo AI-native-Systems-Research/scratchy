@@ -414,7 +414,7 @@ pub struct MetalWorkerPool<W: CanonicalParams> {
     /// Phase A.3 MTL4 surface. Lazily initialized on the first forward.
     /// Panics on init if MTL4 is unavailable — MTL4 is a hard assertion
     /// on the host (macOS 15+ / Apple Family 7+), not an opt-in gate
-    /// (the metal backend is MTL4-only; MTL3 was removed).
+    /// (the metal backend is MTL4-only; there is no MTL3 path).
     mtl4: Mutex<Option<Mtl4Pool>>,
     inner: Mutex<PoolInner<W>>,
     cv: Condvar,
@@ -1486,10 +1486,10 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         let runtime = &guard.runtime;
         let tail = tail.map(|f| move |enc: &_, worker: &_, b: &_| f(enc, worker, runtime, b));
 
-        // All execution goes through the MTL4 path. (The opt-in MTL3
-        // dispatch path was removed — it only ever ran the all-dispatch
-        // buckets that MTL4 already handles, and its M4-era latency edge
-        // no longer applies.) A bucket has no MTL4 plan
+        // All execution goes through the MTL4 path. (There is no MTL3
+        // dispatch path: it could only run the all-dispatch buckets
+        // that MTL4 already handles, and its M4-era latency edge does
+        // not hold on current hardware.) A bucket has no MTL4 plan
         // (`mtl4_steps == None`) only if a kernel exceeds the 31-entry
         // argument-table bind cap.
         assert!(

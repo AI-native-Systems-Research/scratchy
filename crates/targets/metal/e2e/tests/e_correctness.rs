@@ -41,8 +41,7 @@ fn completion_request(prompt: &str, max_tokens: u32, logprobs: u32) -> Completio
 ///      without Metal instead of silently falling back via `--device auto`,
 ///   2. compares **output text** rather than top-N logprobs — the
 ///      metal `MetalWorker` path doesn't yet populate per-token
-///      logprobs (the historical `vllm-mlx` worker had the same gap
-///      before it was removed).
+///      logprobs.
 ///      `extract_engine_output` would panic on the missing `logprobs`
 ///      field. Token-stream parity through ≥ N tokens at temp=0 (P10
 ///      deliverable bar) is enforced by requiring an exact text-prefix

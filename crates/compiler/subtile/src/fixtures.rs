@@ -827,7 +827,6 @@ pub fn buf_byte_sizes(input: &LoweringInput) -> Vec<usize> {
     out
 }
 
-// `orchestrator_kernel_args` was removed alongside the OLD
-// substrate; the new tape-build path constructs kernel args directly
-// via `tk_tape::KernelArg` / `KernelArgRef` / `KernelArgTy` /
-// `U32Source`. The walker rewrite owns this surface now.
+// No kernel-arg fixture here: the tape-build path constructs kernel
+// args directly via `tk_tape::KernelArg` / `KernelArgRef` /
+// `KernelArgTy` / `U32Source`, and the walker owns that surface.

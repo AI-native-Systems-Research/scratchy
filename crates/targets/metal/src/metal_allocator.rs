@@ -1616,9 +1616,9 @@ impl MetalAllocator {
         // first touch. A single thread faults sequentially at queue
         // depth ~1 and measured 1.33 GiB/s (13.9 s for the 18.6 GiB
         // Qwen3.5-35B). Scoped worker threads fault disjoint 16 MiB
-        // chunks concurrently, restoring NVMe queue depth. The old
-        // `rayon::spawn` version was removed over a 'static-capture
-        // lifetime puzzle; `std::thread::scope` borrows instead, so
+        // chunks concurrently, restoring NVMe queue depth. Not
+        // `rayon::spawn`, which poses a 'static-capture lifetime
+        // puzzle; `std::thread::scope` borrows instead, so
         // the buffer pointer never needs 'static.
         //
         // SAFETY: every chunk's dst is a disjoint range inside the

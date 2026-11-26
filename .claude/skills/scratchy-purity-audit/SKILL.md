@@ -144,6 +144,7 @@ Anything else, including a second checkpoint check outside that one door, is a v
 - Report counts plus the worst examples, not a list of all of them.
 
 ### P5. Newtypes for every quantity; no raw scalars; no strings
+Enforced, for a float stored as bits in a field (a `*_bits: u32` or `u64` field its crate converts with `from_bits` or `to_bits`), by the `p5_*` lints in `lints/scratchy-purity` (`scripts/purity.sh`); a finding there is the verdict.
 - No naked `u32`/`u64`/`usize`/`f32`/`bool`/`&str` quantity crosses an API: `m`, `n`, `k`, `rows`, `cols`, `head_dim`, `kv_heads`, `top_k`, `bucket_m`, eps and scale are each their own type.
 - A newtype with a `pub` inner field (`struct X(pub u64)`) is not a newtype. The one checking constructor is the only way in, and `get()` is the only exit.
 - Floats stored as bits (`eps_bits: u32`, `theta_bits: u64`) are a raw scalar. Use a newtype that implements `Eq` over its bits internally.
@@ -208,6 +209,7 @@ Anything else, including a second checkpoint check outside that one door, is a v
 
 ### P11. Lock and comment hygiene
 Report these as one grouped line after the rules above.
+Enforced by the `p11_*` lints in `lints/scratchy-purity` (`scripts/purity.sh`); a finding there is the verdict.
 - No `#[allow]` anywhere: not at a site, and not in a `[lints]` table. Find the design the lint doesn't flag. (Main's `[lints]` tables only declare check-cfg.)
 - No escape-hatch constructors (`from_untyped`, `conflated_with_*`, a `pub` raw constructor on a checked type).
 - No weakened tests or ratchets ("did the number get smaller?").

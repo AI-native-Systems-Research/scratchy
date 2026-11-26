@@ -179,12 +179,12 @@ fn superdsc_rotary_kind(
     theta: f64,
     local: bool,
 ) -> scratchy_target_spyre::wiring::RotaryKind {
-    let theta_bits = (theta as f32).to_bits();
+    let theta = scratchy_target_spyre::wiring::RopeTheta::new(theta as f32);
     if local {
         let local_theta = model.text.rope_local_for(&model.source_stem).get();
         scratchy_target_spyre::wiring::RotaryKind::Default {
             head_dim: hd as u32,
-            theta_bits: (local_theta as f32).to_bits(),
+            theta: scratchy_target_spyre::wiring::RopeTheta::new(local_theta as f32),
         }
     } else {
         let g_hd = model
@@ -196,7 +196,7 @@ fn superdsc_rotary_kind(
             Some(f) if g_hd != hd as u32 && (f - 1.0).abs() > 1e-9 => {
                 scratchy_target_spyre::wiring::RotaryKind::Proportional {
                     head_dim: g_hd,
-                    theta_bits,
+                    theta,
                     rotated: (f * g_hd as f64).round() as u32,
                 }
             }
@@ -204,7 +204,7 @@ fn superdsc_rotary_kind(
                 // Uniform: the class is the base head dim and θ (g_hd == hd
                 // here whenever the factor is absent).
                 head_dim: g_hd,
-                theta_bits,
+                theta,
             },
         }
     }
@@ -429,7 +429,13 @@ fn emit_superdsc_wiring(
     // θ is the config's, typed at load (stated, or its arch's own default), the same value the
     // numeric gate's prefill probe stages its rows by.
     let theta = model.text.rope_theta.get() as f32;
-    let theta_bits = u32l(theta.to_bits());
+    // A θ spelled as the float it is: `f32`'s shortest round-trip literal, so the baked value is
+    // the bake's own, bit for bit.
+    let theta_toks = |theta: scratchy_target_spyre::wiring::RopeTheta| {
+        let lit = proc_macro2::Literal::f32_suffixed(theta.get());
+        quote! { ::scratchy_target_spyre::wiring::RopeTheta::new(#lit) }
+    };
+    let rope_theta = theta_toks(scratchy_target_spyre::wiring::RopeTheta::new(theta));
 
     // cos/sin carry their FULL column width: GQA gives more than one (Q vs K),
     // each filled by tiling the per-position rotary row across heads.
@@ -448,29 +454,26 @@ fn emit_superdsc_wiring(
     // the gate's staged rows cannot disagree.
     let rot_kind = |local: bool| -> proc_macro2::TokenStream {
         match superdsc_rotary_kind(model, hd, f64::from(theta), local) {
-            scratchy_target_spyre::wiring::RotaryKind::Default {
-                head_dim,
-                theta_bits,
-            } => {
+            scratchy_target_spyre::wiring::RotaryKind::Default { head_dim, theta } => {
                 let hd_lit = u32l(head_dim);
-                let tb = u32l(theta_bits);
+                let th = theta_toks(theta);
                 quote! {
                     ::scratchy_target_spyre::wiring::RotaryKind::Default {
-                        head_dim: #hd_lit, theta_bits: #tb,
+                        head_dim: #hd_lit, theta: #th,
                     }
                 }
             }
             scratchy_target_spyre::wiring::RotaryKind::Proportional {
                 head_dim,
-                theta_bits,
+                theta,
                 rotated,
             } => {
                 let hd_lit = u32l(head_dim);
-                let tb = u32l(theta_bits);
+                let th = theta_toks(theta);
                 let r = u32l(rotated);
                 quote! {
                     ::scratchy_target_spyre::wiring::RotaryKind::Proportional {
-                        head_dim: #hd_lit, theta_bits: #tb, rotated: #r,
+                        head_dim: #hd_lit, theta: #th, rotated: #r,
                     }
                 }
             }
@@ -1156,7 +1159,7 @@ fn emit_superdsc_wiring(
                 layers: #n_layers,
                 head_dim: #head_dim,
                 nqh: #nqh,
-                rope_theta_bits: #theta_bits,
+                rope_theta: #rope_theta,
             },
             rope_class_hds: &[#(#rope_class_hds),*],
             attn_class_hds: &[#(#attn_class_hds),*],
@@ -1415,8 +1418,8 @@ fn cow_u8s(v: &[u8]) -> proc_macro2::TokenStream {
 /// cannot drift from the type it is a value of.
 /// One [`bundle::SynthRole`] as tokens.
 ///
-/// ⛔ AN EXHAUSTIVE MATCH, NOT A STRING. A synthetic's role used to be a name SUFFIX
-/// (`format!("{out}_rot")`) built at the emit site and matched at the consume site. Here the
+/// ⛔ AN EXHAUSTIVE MATCH, NOT A STRING. A synthetic's role is not a name SUFFIX
+/// (`format!("{out}_rot")`) built at the emit site and matched at the consume site: the
 /// bake holds the value and the macro emits the value; adding a role breaks THIS match at build
 /// time, which is the whole reason it is an enum.
 fn synth_role_tokens(

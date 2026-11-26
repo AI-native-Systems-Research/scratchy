@@ -37,11 +37,9 @@ use scratchy_tensors::GpuTensor;
 // reach through the same prefix every other wiring type uses.
 pub use ktir_superdsc::sdsc_abstract::{QueryExtent, RungCap, RungWidth};
 
-// ⭐ `act_name` MOVED TO `ktir_superdsc::place`, BESIDE THE `PlaceId` WHOSE `Display` IT CALLS. Its
-// whole body was `bundle::PlaceId::Act(tid).to_string()`, and that module's header already claimed
-// to hold "the ONE site that spells an operand" — so this was simply left behind when `PlaceId` and
-// the `SynthRole` vocabulary went. Its 22 call sites are all in the lowering, which is now in that
-// crate too.
+// ⭐ `act_name` LIVES IN `ktir_superdsc::place`, BESIDE THE `PlaceId` WHOSE `Display` IT CALLS:
+// that module is the one site that spells an operand, and every caller is in the lowering, in
+// that crate.
 
 /// The staged tensor of a linear layer, whatever its quant variant.
 ///
@@ -354,8 +352,8 @@ impl Wiring {
 
     /// THE FORWARD TAPE FOR THIS BUNDLE.
     ///
-    /// ⭐ EVERY FIELD IS GENERATED DATA. The shape used to be assembled in the worker out of a
-    /// `BundleMeta` the worker had itself built by scanning the artifact; here it is a projection
+    /// ⭐ EVERY FIELD IS GENERATED DATA. The shape is not assembled in the worker out of a
+    /// `BundleMeta` the worker builds by scanning the artifact; it is a projection
     /// of the emitted wiring, so there is nothing for a second opinion to disagree with.
     pub fn forward_shape(
         &self,
@@ -541,6 +539,36 @@ pub struct LayerWiring {
     pub prefix_v: u32,
 }
 
+/// ⭐ A ROPE BASE θ — the `f32` every rotary frequency is a power of, held as its bits so the
+/// `const`-able structs that carry it still derive `Eq` and `Hash`: `f32` is not structurally-eq,
+/// so equality here is bit equality, inside. Minted from the float and read back as the float;
+/// the bits never leave it.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RopeTheta(u32);
+
+impl RopeTheta {
+    /// θ, refused unless finite and positive: a zero, negative or non-finite base has no
+    /// frequencies. A `const fn`, so a baked θ that fails it fails the build.
+    pub const fn new(theta: f32) -> Self {
+        assert!(
+            theta.is_finite() && theta > 0.0,
+            "a rope base θ is finite and positive"
+        );
+        Self(theta.to_bits())
+    }
+
+    #[inline]
+    pub const fn get(self) -> f32 {
+        f32::from_bits(self.0)
+    }
+}
+
+impl std::fmt::Debug for RopeTheta {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "RopeTheta({:?})", self.get())
+    }
+}
+
 /// Model geometry, baked.
 ///
 /// ⛔ THE WORKER USED TO RE-READ THIS FROM `config.json` AT RUNTIME
@@ -573,15 +601,14 @@ pub struct Geometry {
     /// The fix is the count itself, baked here from the bounds, so the staged row
     /// count and the baked placement cannot disagree.
     pub nqh: u32,
-    /// Rotary base, as bits — `f32` is not structurally-eq, so a `const`-able
-    /// struct cannot hold one and still derive `Eq`. Read via [`Self::rope_theta`].
-    pub rope_theta_bits: u32,
+    /// Rotary base θ. Read via [`Self::rope_theta`].
+    pub rope_theta: RopeTheta,
 }
 
 impl Geometry {
     #[inline]
     pub const fn rope_theta(&self) -> f32 {
-        f32::from_bits(self.rope_theta_bits)
+        self.rope_theta.get()
     }
 }
 
@@ -611,13 +638,13 @@ pub enum RotaryKind {
         /// consumers (sliding: `head_dim`; a uniform model: `head_dim`).
         head_dim: u32,
         /// The class's rope base θ.
-        theta_bits: u32,
+        theta: RopeTheta,
     },
     /// mlx `ProportionalRoPE` — partial rotary whose exponent denominator is
     /// the FULL head dim (gemma-4 global layers: hd 512, rotated 128, θ 1e6).
     Proportional {
         head_dim: u32,
-        theta_bits: u32,
+        theta: RopeTheta,
         /// How many leading dims of the head actually rotate; the rest are
         /// pass-through (freq = ∞ ⇒ cos 1, sin 0).
         rotated: u32,
@@ -632,12 +659,10 @@ impl RotaryKind {
         }
     }
 
-    /// The class's rope base θ, as bits (see [`Geometry::rope_theta_bits`]).
+    /// The class's rope base θ (see [`RopeTheta`]).
     pub const fn theta(self) -> f32 {
         match self {
-            Self::Default { theta_bits, .. } | Self::Proportional { theta_bits, .. } => {
-                f32::from_bits(theta_bits)
-            }
+            Self::Default { theta, .. } | Self::Proportional { theta, .. } => theta.get(),
         }
     }
 }
@@ -999,11 +1024,11 @@ pub struct Wiring {
     pub tensor_shapes: &'static [(u32, u32)],
     /// The host-gathered hidden row's source id.
     ///
-    /// ⛔ THE ANSWER, NOT THE DATA TO COMPUTE IT FROM. This used to be a
-    /// `&[Source]` role array that the worker SCANNED at every model load
+    /// ⛔ THE ANSWER, NOT THE DATA TO COMPUTE IT FROM. Not a
+    /// `&[Source]` role array for the worker to SCAN at every model load
     /// (`.position(|s| matches!(s, EmbeddedHidden))`) — a compile-time fact
-    /// re-derived at runtime, which is the same tell as the JSON `role`
-    /// strings this replaced, just with a nicer type. The roles are still an
+    /// re-derived at runtime, which is the same tell as JSON `role`
+    /// strings, just with a nicer type. The roles are still an
     /// exhaustive enum where they belong: in the macro, over `SourceBinding`.
     pub embed_src: u32,
     /// Rotary `cos` / `sin` sources as `(id, full column width, rotary class)`.
@@ -3051,7 +3076,7 @@ mod constant_tape_tests {
                 layers: 1,
                 head_dim: 64,
                 nqh: 2,
-                rope_theta_bits: 0,
+                rope_theta: RopeTheta::new(10_000.0),
             },
             rope_class_hds: &[],
             attn_class_hds: &[],

@@ -94,8 +94,8 @@ pub async fn run_serve(args: ServeArgs) -> Result<()> {
                 "Speculative decoding (draft model): {} (k={})",
                 spec_model, args.num_speculative_tokens,
             );
-            // Phase 5.5 superseded the global-disable env hack with a
-            // runtime gate (`RuntimeGate::OnlyIfSingleSeqNoSpec`) that
+            // No global-disable env hack: a runtime gate
+            // (`RuntimeGate::OnlyIfSingleSeqNoSpec`)
             // skips the lm_head slice on the spec verify batch only;
             // prefill/decode keep the ~10 ms TTFT win the slice gives.
             // See the target's tape lowering.

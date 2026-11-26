@@ -261,8 +261,8 @@ fn extract_slice(
 
 /// Resolve a `slice_offsets`/`slice_sizes`/`slice_strides` list to i64s. A static
 /// list is an [`Attr::IntList`]; a dynamic one NAMES the values carrying it
-/// ([`Attr::Ssas`]), read here from the value table. It used to be one list of
-/// STRING tokens, each sniffed for a leading `%` to decide which it was.
+/// ([`Attr::Ssas`]), read here from the value table. Not one list of STRING
+/// tokens, each sniffed for a leading `%` to decide which it is.
 fn resolve_slice_list(
     op: &Operation,
     ctx: &mut CoreContext,

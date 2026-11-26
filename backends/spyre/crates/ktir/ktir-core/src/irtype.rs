@@ -4,9 +4,9 @@
 //
 //! A VALUE'S TYPE, AS A TYPE.
 //!
-//! An operation's result type used to be a string like `"tensor<32x64xf16>"`, so every pass that
-//! needed a dim took the string apart and printed it back — a parse and a render in the middle of a
-//! compiler that already knew the shape. [`IrType`] states it directly: the dims are a slice you
+//! An operation's result type is not a string like `"tensor<32x64xf16>"`, which every pass that
+//! needs a dim would take apart and print back — a parse and a render in the middle of a
+//! compiler that already knows the shape. [`IrType`] states it directly: the dims are a slice you
 //! read, and reshaping is editing a field.
 
 use crate::dtypes::DType;

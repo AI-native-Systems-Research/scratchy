@@ -263,6 +263,42 @@ jobs:
   # drops the implicit `success()` that would otherwise skip them whenever
   # this job fails.
   # ---------------------------------------------------------------------------
+  purity:
+    name: linux-amd64 (purity lints)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # Resolution only, as in linux-workspace: the card workspace names a sibling senlib-rs.
+      - name: Senlib-rs stub (resolution sibling for the card workspace)
+        run: scripts/ci-senlib-stub.sh
+
+      # The lint library builds on its own pinned nightly (lints/scratchy-purity/rust-toolchain.toml),
+      # which rustup installs on first use; cargo-dylint itself builds on stable.
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: purity
+          workspaces: |
+            lints/scratchy-purity -> target
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Install cargo-dylint
+        run: cargo install cargo-dylint dylint-link --version 6.4.0 --locked
+
+      # The lints' own ui and unit tests, then main's code under them. Every lint is Deny.
+      # The ui harness builds its driver and its tests under the temp dir, and rewrites that path
+      # in the output it compares. /tmp would rewrite the P11 temp-path cases, and a dir inside
+      # a workspace breaks the driver's build, so the runner's own temp dir it is.
+      - name: Lint tests
+        working-directory: lints/scratchy-purity
+        env:
+          TMPDIR: ${{ runner.temp }}
+        run: cargo test
+      - name: Purity lints (root workspace)
+        run: scripts/purity.sh --scope root
+      - name: Purity lints (spyre workspace)
+        run: scripts/purity.sh --scope spyre
+
   macos-scope:
     name: macOS scope
     runs-on: ubuntu-latest
@@ -330,6 +366,12 @@ jobs:
       - name: Clippy
         run: cargo clippy -p scratchy-target-metal-models
           --features scratchy-models/all,scratchy-models/mtp,vision -- -D warnings
+
+      # The purity lints over the five metal crates, at the same scope as the clippy above.
+      - name: Install cargo-dylint
+        run: cargo install cargo-dylint dylint-link --version 6.4.0 --locked
+      - name: Purity lints (metal crates)
+        run: scripts/purity.sh --scope metal-all
 
       # The other half of macos-scope's skip: fails if this job compiled a crate
       # whose PRs skip it. lock() reads the card workspace's metadata too, against

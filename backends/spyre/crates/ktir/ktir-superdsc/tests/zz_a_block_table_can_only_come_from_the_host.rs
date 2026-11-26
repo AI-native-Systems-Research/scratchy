@@ -2,11 +2,11 @@
 
 //! ⭐ THE PAGES A REQUEST HOLDS COME FROM THE HOST, AND THE CACHEABLE PREFIX STOPS AT THE FIRST HOLE.
 //!
-//! Two properties, both of which used to be false and each of which cost a session:
+//! Two properties, each of which costs a session when it is false:
 //!
-//! * A request's page map was filled by a free-list search inside the worker — a SECOND allocator over
-//!   the pool the scheduler already owns and refcounts. That is what made a prefix-cache HIT meaningless
-//!   (the scheduler said "these blocks hold that prefix"; the worker held it nowhere) and it is now
+//! * A request's page map is never filled by a free-list search inside the worker — a SECOND allocator over
+//!   the pool the scheduler already owns and refcounts. That makes a prefix-cache HIT meaningless
+//!   (the scheduler says "these blocks hold that prefix"; the worker holds it nowhere) and it is
 //!   unwritable, because [`BlockTable`] has no constructor that does not take host ids.
 //! * A batched step appends every row at ONE slot, so a request shorter than its batch-mates carries a
 //!   masked hole and its keys stop being token-addressed there. Only the leading run may be hashed by a
@@ -194,7 +194,7 @@ fn a_prefill_records_one_run_so_a_whole_prompt_stays_cacheable() {
     );
 }
 
-/// ⛔⛔⛔ A HOST LIST THAT STOPS SHORT IS **REFUSED** NOW — IT USED TO BE SERVED FROM A PRIVATE RESERVE.
+/// ⛔⛔⛔ A HOST LIST THAT STOPS SHORT IS **REFUSED** — NOT SERVED FROM A PRIVATE RESERVE.
 ///
 /// 🛑 THIS TEST WAS THE POSITIVE CONTROL FOR `BlockTable::hole_pages_used`, and both the counter and the arm it
 /// measured are deleted. Keeping the test's SHAPE and inverting its expectation is deliberate: the same input

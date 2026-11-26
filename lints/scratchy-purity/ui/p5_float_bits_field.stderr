@@ -1,0 +1,27 @@
+error: P5: `eps_bits` stores a float as bits, a raw scalar; use a newtype that compares its bits inside
+  --> $DIR/p5_float_bits_field.rs:3:5
+   |
+LL |     pub eps_bits: u32,
+   |     ^^^^^^^^^^^^^^^^^
+   |
+   = help: wrap it in a newtype that implements Eq over its bits internally
+   = note: `#[forbid(p5_float_bits_field)]` on by default
+
+error: P5: `theta_bits` stores a float as bits, a raw scalar; use a newtype that compares its bits inside
+  --> $DIR/p5_float_bits_field.rs:4:5
+   |
+LL |     pub theta_bits: u64,
+   |     ^^^^^^^^^^^^^^^^^^^
+   |
+   = help: wrap it in a newtype that implements Eq over its bits internally
+
+error: P5: `factor_bits` stores a float as bits, a raw scalar; use a newtype that compares its bits inside
+  --> $DIR/p5_float_bits_field.rs:17:14
+   |
+LL |     Scaled { factor_bits: u32 },
+   |              ^^^^^^^^^^^^^^^^
+   |
+   = help: wrap it in a newtype that implements Eq over its bits internally
+
+error: aborting due to 3 previous errors
+

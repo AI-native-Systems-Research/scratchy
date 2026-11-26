@@ -1,0 +1,37 @@
+error[E0453]: allow(p11_tombstone_comment) incompatible with previous forbid
+  --> $DIR/p11_no_opt_out.rs:2:10
+   |
+LL | #![allow(p11_tombstone_comment, p11_escape_hatch_constructor)]
+   |          ^^^^^^^^^^^^^^^^^^^^^ overruled by previous forbid
+   |
+   = note: `forbid` lint level is the default for p11_tombstone_comment
+
+error[E0453]: allow(p11_escape_hatch_constructor) incompatible with previous forbid
+  --> $DIR/p11_no_opt_out.rs:2:33
+   |
+LL | #![allow(p11_tombstone_comment, p11_escape_hatch_constructor)]
+   |                                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ overruled by previous forbid
+   |
+   = note: `forbid` lint level is the default for p11_escape_hatch_constructor
+
+error: P11: this comment narrates history (`moved from`); comments describe the code as it is, in the present tense
+  --> $DIR/p11_no_opt_out.rs:4:1
+   |
+LL | // This helper moved from `old::module`.
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: say what the code does now, or delete the comment
+   = note: `#[forbid(p11_tombstone_comment)]` on by default
+
+error: P11: `from_untyped` is an escape-hatch constructor; a checked type has one checking constructor, the only way in
+  --> $DIR/p11_no_opt_out.rs:8:12
+   |
+LL |     pub fn from_untyped(n: u32) -> Self {
+   |            ^^^^^^^^^^^^
+   |
+   = help: delete it, and mint the value through the type's checking constructor
+   = note: `#[forbid(p11_escape_hatch_constructor)]` on by default
+
+error: aborting due to 4 previous errors
+
+For more information about this error, try `rustc --explain E0453`.

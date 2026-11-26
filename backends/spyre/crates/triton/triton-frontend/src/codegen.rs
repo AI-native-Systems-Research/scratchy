@@ -1053,7 +1053,7 @@ impl<'a> CodeGen<'a> {
                 }
                 Ok(Val::Seq(out))
             }
-            // A slice. ONLY THE UNBOUNDED `:` EXISTS, and this used to be a silent hole.
+            // A slice. ONLY THE UNBOUNDED `:` EXISTS, and a bounded one must not be a silent hole.
             //
             // Triton's `tensor.__getitem__` (`python/triton/language/core.py`) accepts exactly
             // two subscript items: `None`, which is an `expand_dims`, and a FULL `:`, which is
@@ -1064,10 +1064,10 @@ impl<'a> CodeGen<'a> {
             // MEASURED, on `x[:, :HALF]` -- the obvious transcription of Hugging Face's
             // `rotate_half`, which is why `rope.py` exists in the form it does.
             //
-            // This arm returned `Val::Slice` for ANY slice, and `subscript` treats `Val::Slice`
-            // as a no-op, so `x[:, :64]` COMPILED HERE and yielded the whole 128-wide tile:
+            // Returning `Val::Slice` for ANY slice is wrong: `subscript` treats `Val::Slice`
+            // as a no-op, so `x[:, :64]` would COMPILE HERE and yield the whole 128-wide tile:
             // a wrong answer with no diagnostic, from a kernel the oracle refuses outright.
-            // Now the bounds are checked and the refusal names the construct.
+            // So the bounds are checked and the refusal names the construct.
             // `tests/slicing.rs` is the control.
             Expr::Slice {
                 lower,
