@@ -320,11 +320,9 @@ all-arches = [
 "qwen3.6-35b-a3b-dflash2" = ["arch-dflash2"]
 "qwen3.8-27b-dflash2" = ["arch-dflash2"]
 
-# p-eagle (4 configs)
+# p-eagle (2 configs)
 "gpt-oss-120b-p-eagle" = ["arch-p-eagle"]
-"gpt-oss-120b-p-eagle-mixed" = ["arch-p-eagle"]
 "gpt-oss-20b-p-eagle" = ["arch-p-eagle"]
-"gpt-oss-20b-p-eagle-mixed" = ["arch-p-eagle"]
 
 # qwen3-5-vl (2 configs)
 "qwen3.5-9b" = ["arch-qwen3-5-vl"]
@@ -534,9 +532,7 @@ all-arches = [
 ]
 "p-eagle" = [
     "gpt-oss-120b-p-eagle",
-    "gpt-oss-120b-p-eagle-mixed",
     "gpt-oss-20b-p-eagle",
-    "gpt-oss-20b-p-eagle-mixed",
 ]
 "qwen3-5-vl" = [
     "qwen3.5-9b",
@@ -689,9 +685,7 @@ all = [
     "qwen3.6-35b-a3b-dflash2",
     "qwen3.8-27b-dflash2",
     "gpt-oss-120b-p-eagle",
-    "gpt-oss-120b-p-eagle-mixed",
     "gpt-oss-20b-p-eagle",
-    "gpt-oss-20b-p-eagle-mixed",
     "qwen3.5-9b",
     "qwen3.5-9b-parity-tiny",
     "qwen3.6-27b",
