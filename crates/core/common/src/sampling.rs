@@ -224,6 +224,13 @@ pub struct SamplingParams {
     #[serde(default)]
     pub think_first: Option<ThinkFirst>,
 
+    /// The token a reply's hidden header ends with — what its reasoning parser reads before any
+    /// text its reader sees (harmony's `<|message|>`). A speculative request drafts only past the
+    /// token after it: up to there its steps are its target's alone, so the first text its reader
+    /// sees comes when it does without drafts. `None`: it drafts from its first token on.
+    #[serde(default)]
+    pub drafts_after: Option<u32>,
+
     /// When set, only these token IDs may be sampled. All other logits
     /// are masked to `-inf`. Similar to grammar masking but static.
     pub allowed_token_ids: Option<Vec<u32>>,
@@ -272,6 +279,7 @@ impl Default for SamplingParams {
             logit_bias: None,
             guided_grammar: None,
             think_first: None,
+            drafts_after: None,
             allowed_token_ids: None,
             bad_words_token_ids: None,
             seal: false,

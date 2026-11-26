@@ -3379,6 +3379,11 @@ impl AsyncEngine {
                 }),
                 _ => None,
             };
+        // A reply's hidden header is its target's alone (`SamplingParams::drafts_after`).
+        sampling_params.drafts_after = (self.request_reasoning_parser(&token_ids))
+            .and_then(|parser| parser.header_end())
+            .zip(self.tokenizer.as_ref())
+            .and_then(|(end, tokenizer)| tokenizer.token_to_id(end));
 
         Ok(EngineCoreRequest {
             request_id: request_id.to_string(),

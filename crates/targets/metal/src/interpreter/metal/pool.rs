@@ -424,10 +424,37 @@ pub struct MetalWorkerPool<W: CanonicalParams> {
     role: ArenaRole,
 }
 
-/// Pool-owned MTL4 surface. The command buffer is re-created per forward
-/// (cheap — Metal pools internally). The shared event is monotonically
-/// signaled after each commit.
+/// Pool-owned MTL4 surface: the forwards' queue, and the queue of the work after them
+/// ([`ForwardAfter`]), which the forwards after them do not wait for.
+///
+/// [`ForwardAfter`]: super::forward::ForwardAfter
 struct Mtl4Pool {
+    forwards: Mtl4Lane,
+    after: Mtl4Lane,
+}
+
+/// Which of [`Mtl4Pool`]'s queues a command buffer is committed on.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Lane {
+    /// After every command buffer committed on it before.
+    Forwards,
+    /// After every command buffer committed on it before, and the newest forward.
+    After,
+}
+
+impl Lane {
+    /// The queue a forward's work after it is committed on.
+    fn after(after: &dyn super::forward::AfterForward) -> Self {
+        match after.lane() {
+            super::forward::AfterLane::Behind => Self::Forwards,
+            super::forward::AfterLane::Beside => Self::After,
+        }
+    }
+}
+
+/// One MTL4 queue. The command buffer is re-created per forward (cheap — Metal pools internally).
+/// The shared event is monotonically signaled after each commit.
+struct Mtl4Lane {
     queue: crate::interpreter::metal::__re::Mtl4Queue,
     /// Command allocators, each with the staging a deferred forward's input writes ride in, taken
     /// in turn: one is reset only once its last command buffer is done, so a forward is encoded
@@ -439,7 +466,7 @@ struct Mtl4Pool {
     signal_counter: u64,
 }
 
-/// One of [`Mtl4Pool::ring`]'s command allocators.
+/// One of [`Mtl4Lane::ring`]'s command allocators.
 struct RingSlot {
     allocator: crate::interpreter::metal::__re::Mtl4Allocator,
     /// What a deferred forward's recorded input writes are copied from.
@@ -1075,28 +1102,34 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         if slot.is_some() {
             return;
         }
-        let queue = self.device.newMTL4CommandQueue().expect(
-            "device.newMTL4CommandQueue() returned nil \
-             — host does not support MTL4 (requires macOS 15+ on Apple Family 7+)",
-        );
-        let ring = std::array::from_fn(|_| RingSlot {
-            allocator: self
+        let lane = || {
+            let queue = self.device.newMTL4CommandQueue().expect(
+                "device.newMTL4CommandQueue() returned nil \
+                 — host does not support MTL4 (requires macOS 15+ on Apple Family 7+)",
+            );
+            let ring = std::array::from_fn(|_| RingSlot {
+                allocator: self
+                    .device
+                    .newCommandAllocator()
+                    .expect("device.newCommandAllocator() returned nil"),
+                staging: None,
+                signal: 0,
+            });
+            let shared_event = self
                 .device
-                .newCommandAllocator()
-                .expect("device.newCommandAllocator() returned nil"),
-            staging: None,
-            signal: 0,
-        });
-        let shared_event = self
-            .device
-            .newSharedEvent()
-            .expect("device.newSharedEvent() returned nil");
+                .newSharedEvent()
+                .expect("device.newSharedEvent() returned nil");
+            Mtl4Lane {
+                queue,
+                ring,
+                next: 0,
+                shared_event,
+                signal_counter: 0,
+            }
+        };
         *slot = Some(Mtl4Pool {
-            queue,
-            ring,
-            next: 0,
-            shared_event,
-            signal_counter: 0,
+            forwards: lane(),
+            after: lane(),
         });
     }
 
@@ -1190,22 +1223,22 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         };
         // A deferred forward, and the work after it behind it: the host waits for neither.
         if let Some(deferral) = deferred {
-            let ((), committed) = self.commit(Some(writes), encode)?;
+            let ((), committed) = self.commit(Lane::Forwards, Some(writes), encode)?;
             deferral.committed(committed.in_flight);
             if let Some(after) = after {
-                let ((), committed) = self.commit(None, |enc| {
+                let ((), committed) = self.commit(Lane::after(after), None, |enc| {
                     after.encode(enc).map_err(ForwardError::Followup)
                 })?;
                 after.committed(committed.in_flight);
             }
             return Ok(());
         }
-        // Work after the forward, in a command buffer of its own committed behind it — so it
-        // starts once the forward is done — that the host does not wait for: the forward's
-        // outputs are read as soon as its own is done.
+        // Work after the forward, in a command buffer of its own — so it starts once the forward is
+        // done — that the host does not wait for: the forward's outputs are read as soon as its own
+        // is done.
         if let Some(after) = after {
-            let ((), forward) = self.commit(Some(writes), encode)?;
-            let committed = self.commit(None, |enc| {
+            let ((), forward) = self.commit(Lane::Forwards, Some(writes), encode)?;
+            let committed = self.commit(Lane::after(after), None, |enc| {
                 after.encode(enc).map_err(ForwardError::Followup)
             });
             let waited = forward.in_flight.wait();
@@ -1238,7 +1271,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         ) -> Result<R, ForwardError>,
     ) -> Result<(R, Submitted), ForwardError> {
         let t_pre = std::time::Instant::now();
-        let (encoded, committed) = self.commit(writes, encode)?;
+        let (encoded, committed) = self.commit(Lane::Forwards, writes, encode)?;
         committed.in_flight.wait()?;
         Ok((
             encoded,
@@ -1250,12 +1283,14 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         ))
     }
 
-    /// ONE command buffer on the pool's MTL4 queue, committed without waiting for it. `encode`
-    /// records onto its compute encoder, the pool's residency sets declared on it, after the
-    /// forward's input `writes`; if it fails, its error returns with the command buffer ended and
-    /// nothing committed. It starts once every command buffer committed before it is done.
+    /// ONE command buffer on the pool's MTL4 queue `lane`, committed without waiting for it.
+    /// `encode` records onto its compute encoder, the pool's residency sets declared on it, after
+    /// the forward's input `writes`; if it fails, its error returns with the command buffer ended
+    /// and nothing committed. It starts once every command buffer committed on its queue before it
+    /// is done — and on [`Lane::After`], the newest forward too.
     fn commit<R>(
         &self,
+        lane: Lane,
         writes: Option<&InputWrites>,
         encode: impl FnOnce(
             &::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTL4ComputeCommandEncoder>,
@@ -1271,7 +1306,15 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             .expect("newCommandBuffer returned nil");
         let (encoded, t_encoded, in_flight) = {
             let mut slot = self.mtl4.lock().expect("mtl4 mutex");
-            let mtl4 = slot.as_mut().expect("ensure_mtl4 succeeded");
+            let pool = slot.as_mut().expect("ensure_mtl4 succeeded");
+            let forward = (
+                pool.forwards.shared_event.clone(),
+                pool.forwards.signal_counter,
+            );
+            let mtl4 = match lane {
+                Lane::Forwards => &mut pool.forwards,
+                Lane::After => &mut pool.after,
+            };
             let taken = mtl4.next;
             mtl4.next = (taken + 1) % mtl4.ring.len();
             let ring = &mut mtl4.ring[taken];
@@ -1326,6 +1369,9 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             let before = mtl4.signal_counter - 1;
             if event.signaledValue() < before {
                 queue.waitForEvent_value(ProtocolObject::from_ref(&**event), before);
+            }
+            if lane == Lane::After && forward.0.signaledValue() < forward.1 {
+                queue.waitForEvent_value(ProtocolObject::from_ref(&*forward.0), forward.1);
             }
             let error = std::sync::Arc::new(CommitFeedback::default());
             let feedback = commit_options(&error);

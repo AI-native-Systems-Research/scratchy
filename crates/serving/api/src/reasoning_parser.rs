@@ -117,6 +117,14 @@ pub trait ReasoningParser: Send + Sync {
     /// (`<think>` and `</think>`): a request's guided grammar waits for the close (#793). `None`
     /// for a parser that reads its markers as text, so the grammar applies from the first token.
     fn think_tokens(&self) -> Option<ThinkTokens>;
+
+    /// The marker the header a reply opens with ends on, when the parser reads none of that header
+    /// as text its reader sees (harmony's `<|channel|>analysis<|message|>`): a speculative request
+    /// drafts only past it (`SamplingParams::drafts_after`). `None`: a reply's first token can be
+    /// text.
+    fn header_end(&self) -> Option<&'static str> {
+        None
+    }
 }
 
 /// Per-request state for streaming reasoning extraction.
@@ -658,6 +666,11 @@ impl ReasoningParser for GptOssReasoningParser {
     /// Harmony's channel markers are read as text: they aren't single tokens on every port.
     fn think_tokens(&self) -> Option<ThinkTokens> {
         None
+    }
+
+    /// A harmony reply opens on its channel's header, `<|channel|>…<|message|>`, none of it text.
+    fn header_end(&self) -> Option<&'static str> {
+        Some("<|message|>")
     }
 
     fn extract_reasoning(&self, model_output: &str) -> ExtractedReasoning {

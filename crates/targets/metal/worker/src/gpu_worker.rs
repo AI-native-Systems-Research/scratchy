@@ -273,12 +273,11 @@ pub struct MetalWorker {
     /// The MTP head's target hidden rows are the layers its target captures for it
     /// (`HeadRegistration::reads_captures`), not the target's final hidden states.
     head_reads_captures: bool,
-    /// The command buffer an MTP head's passes run in after a step that gave a request its first
-    /// token ([`ForwardAfter`]), still on the device: the next step waits for it before it writes
-    /// anything those passes read.
-    ///
-    /// [`ForwardAfter`]: scratchy_target_metal::interpreter::metal::ForwardAfter
-    head_in_flight: Option<HeadAfter>,
+    /// The command buffers an MTP head's passes run in on the queue after the forwards
+    /// ([`HeadPlace::After`]), still on the device, oldest first. A step whose passes ride its own
+    /// command buffer waits for them; one whose passes queue behind them waits for all but the
+    /// newest: the head's worker stages a forward's inputs in one of two slots, in turn.
+    head_in_flight: Vec<HeadAfter>,
     /// An MTP head's passes have run: its pool is built. Its first forward builds it, waiting for
     /// its buffers to be made resident on the GPU — behind the target's forward, that wait would
     /// be the target's too — so the passes run after a step's own command buffer only from then.
@@ -315,6 +314,14 @@ pub struct MetalWorker {
     /// holds — no step in flight, no output the engine has not resolved — and
     /// grows it only when the step has more rows.
     argmax_slots: Vec<Arc<ArgmaxSlot>>,
+    /// The target hidden rows an MTP head beside its target reads, kept at their KV slots
+    /// (`spec_decode::Kept`): every target forward copies its captured rows in. A store of the
+    /// sparse KV registry, mapped as far as the KV pool is, its bytes a block priced in the KV
+    /// budget beside the head's KV (`head_kept_block_bytes`). `None` for any other head.
+    head_kept: Option<scratchy_target_metal::argmax::Buffer>,
+    /// Each request's first position its MTP head beside the target has not run
+    /// (`spec_decode::Kept::ran`): none for a request not yet in it.
+    head_kept_ran: HashMap<String, usize>,
     /// This step's [`Deferral`], set by `execute_model` for
     /// `forward_argmax_blocking` to commit the target forward under, with the
     /// input tokens still on the device; `None` for a step the host waits for.
@@ -1021,7 +1028,7 @@ impl MetalWorker {
             mtp_drafter: None,
             mask_hidden: None,
             head_reads_captures: false,
-            head_in_flight: None,
+            head_in_flight: Vec::new(),
             head_ran: false,
             dflash2: None,
             sampler_kernels: None,
@@ -1029,6 +1036,8 @@ impl MetalWorker {
             sampler_logits: None,
             pending_sampler: None,
             argmax_slots: Vec::new(),
+            head_kept: None,
+            head_kept_ran: HashMap::new(),
             deferral: None,
             pending_chain: None,
             last_forward_end: None,
@@ -1418,6 +1427,7 @@ impl MetalWorker {
         };
         let rows = dev.max_decode_rows;
         let draft = self.draft_model.as_deref();
+        let beside = self.head_beside();
         let draft_buckets = match draft {
             Some(d) if !d.reads_target_hidden() => buckets(d)?,
             _ => Vec::new(),
@@ -1426,6 +1436,8 @@ impl MetalWorker {
             .map(|bucket_m| {
                 let own = layout(target, bucket_m, rows)?;
                 let draft = match draft {
+                    // A head beside its target: its own arena, at the target's rows.
+                    Some(head) if beside => layout(head, bucket_m, rows)?.iter().sum(),
                     Some(head) if head.reads_target_hidden() => {
                         let pick = |m: Model<'_>| Self::metal_pick(m, dev, Some(bucket_m), 1);
                         let guest = pick(head)?.guest(rows);
@@ -1462,6 +1474,10 @@ impl MetalWorker {
         let rows = dev.max_decode_rows;
         let draft = self.draft_model.as_deref();
         let draft_bytes = match draft {
+            Some(head) if self.head_beside() => {
+                Self::metal_pick(head, dev, max_m, self.head_block_cap(block_cap))?
+                    .scratch_bytes(rows)
+            }
             Some(head) if head.reads_target_hidden() => {
                 let guest = Self::metal_pick(head, dev, max_m, self.head_block_cap(block_cap))?;
                 target_rung.hosting_scratch_bytes(rows, &guest.guest(rows))
@@ -1478,7 +1494,7 @@ impl MetalWorker {
     /// model (`MetalWeights::metal_host`) before its pool is built, at its first forward.
     fn metal_head_guest(&self) -> ExecutorResult<Option<GuestArena>> {
         let (Some(head), Some(dev)) = (
-            self.draft_model.as_deref().filter(|_| self.draft_is_head()),
+            (self.draft_model.as_deref()).filter(|_| self.draft_is_head() && !self.head_beside()),
             self.gpu_device.as_ref(),
         ) else {
             return Ok(None);
@@ -1675,6 +1691,27 @@ impl MetalWorker {
         (self.draft_model.as_ref()).is_some_and(|m| m.reads_target_hidden())
     }
 
+    /// An MTP head whose passes after a step run beside the target's forwards after it
+    /// ([`AfterLane::Beside`]): one keeping a KV pool of its own, whose prompt pass a first token's
+    /// step leaves to run beside the steps after it. Its arena is its own, priced beside the
+    /// target's: the target's forwards run while it does. A head reading its target's KV has no
+    /// prompt pass, and runs in its target's arena, behind its forwards.
+    ///
+    /// [`AfterLane::Beside`]: scratchy_target_metal::interpreter::metal::AfterLane::Beside
+    fn head_beside(&self) -> bool {
+        self.mtp_drafter.is_some() && self.draft_is_head() && self.draft_keeps_kv()
+    }
+
+    /// A KV block's bytes of the target hidden rows a head beside its target keeps
+    /// (`head_kept`): `block_size` rows of its target's width, in the head's dtype; 0 for any
+    /// other head.
+    fn head_kept_block_bytes(&self, block_size: usize) -> usize {
+        match (self.head_beside(), self.draft_model.as_deref()) {
+            (true, Some(head)) => block_size * head.target_hidden_width() as usize * 2,
+            _ => 0,
+        }
+    }
+
     /// Where the draft's int8 KV stages ([`DraftScratch`]): a head whose KV geometry is its
     /// int8 target's stages through the target's scratch, as `build_int8_provision` places it.
     fn draft_scratch(&self) -> DraftScratch {
@@ -1704,9 +1741,11 @@ impl MetalWorker {
         use ::scratchy_serving_engine::spec_decode::BackendError;
         let main = (self.gpu_device.as_ref())
             .ok_or_else(|| BackendError::Backend("gpu_device not initialized".into()))?;
-        // A draft model's arena is its own.
+        // A draft model's arena is its own, and so is a head's beside its target.
         let host = match self.model.as_deref() {
-            Some(target) if self.draft_is_head() => Some(Box::new(hosted_by(target)?)),
+            Some(target) if self.draft_is_head() && !self.head_beside() => {
+                Some(Box::new(hosted_by(target)?))
+            }
             _ => None,
         };
         Ok(GpuDevice {
@@ -2154,10 +2193,11 @@ impl MetalWorker {
     }
 
     /// Whether a step's MTP head passes run after it, in a command buffer of their own
-    /// ([`ForwardAfter`]): when every request the head drafts for gets its first token from it.
-    /// That token is the target's alone, so its time to first token is the target's; the step
-    /// reads back no drafts — the next one decodes without — so it defers like any other. Its
-    /// head's pool must be built (`head_ran`): its first forward waits for its buffers' residency.
+    /// ([`ForwardAfter`]): when every request the head drafts for gets its first token from it, or
+    /// the head only primes KV (`primes_only`). The step's tokens are the target's alone, so its
+    /// time to first token is the target's; the step reads back no drafts — the next one decodes
+    /// without — so it defers like any other. Its head's pool must be built (`head_ran`): its first
+    /// forward waits for its buffers' residency.
     ///
     /// [`ForwardAfter`]: scratchy_target_metal::interpreter::metal::ForwardAfter
     fn head_after(&self, sched: &SchedulerOutput) -> bool {
@@ -2165,7 +2205,8 @@ impl MetalWorker {
             && self.head_ran
             && !sched.spec_pipeline.behind
             && !sched.draft_req_ids.is_empty()
-            && (sched.draft_req_ids.iter()).all(|r| self.input_batch.num_generated(r) == 0)
+            && (sched.primes_only
+                || (sched.draft_req_ids.iter()).all(|r| self.input_batch.num_generated(r) == 0))
     }
 
     /// Whether this step can be committed without waiting for it: its rows
@@ -2347,7 +2388,7 @@ impl MetalWorker {
                 &req,
                 &[],
                 Some(then),
-                false,
+                HeadPlace::Onto,
             )
             .map_err(|e| ExecutorError::WorkerExecution(format!("prompt logprobs: {e}")))?;
             self.read_prompt_logprobs(req_ids, &step)?;
@@ -3238,7 +3279,9 @@ impl MetalWorker {
                     true => vec![draft_store_block_bytes(d, bs.get())],
                     false => int8_stores(d),
                 });
+                store_bytes.extend(Some(self.head_kept_block_bytes(bs.get())).filter(|&b| b > 0));
                 draft_block_bytes(d, bs.get(), self.draft_scratch())
+                    + self.head_kept_block_bytes(bs.get())
             }
             None => 0,
         };
@@ -3405,6 +3448,23 @@ impl MetalWorker {
         }
         .map_err(|e| ExecutorError::WorkerInit(format!("draft KvCachePool: {e}")))?;
         self.draft_kv_stores = Some(draft_stores);
+        // The target rows a head beside its target keeps: a store of the KV registry, a block's
+        // rows at each of the pool's blocks.
+        let kept_bytes = self.head_kept_block_bytes(self.config.block_size.get());
+        if kept_bytes > 0 {
+            let stores = scratchy_target_metal::sparse_kv::SparseStores::new(
+                &mtl_device,
+                &residency,
+                draft_blocks,
+                blocks_per_chunk,
+                &[(kept_bytes, false)],
+            )
+            .map_err(|e| ExecutorError::WorkerInit(format!("MTP head's kept rows: {e}")))?;
+            self.head_kept = Some(stores.buffer(0));
+            let registry = draft_dev.allocator.sparse_kv.lock();
+            (registry.expect("sparse KV registry").register(stores))
+                .map_err(|e| ExecutorError::WorkerInit(format!("MTP head's kept rows: {e}")))?;
+        }
         pool.fill_chunk_tables(|m| m.gpu_address());
         info!(
             "ScratchyWorker(metal): draft KV pool ready in {:?} ({} layers × {} blocks × {} tokens, \
@@ -3803,7 +3863,8 @@ impl ::scratchy_serving_engine::spec_decode::SpecDecodeBackend for MetalWorker {
         req: &::scratchy_serving_engine::spec_decode::ForwardArgmaxRequest<'_>,
         hidden_rows: &[u32],
     ) -> Result<(Vec<u32>, Vec<u8>), ::scratchy_serving_engine::spec_decode::BackendError> {
-        let out = self.forward_argmax_then(model, kv_pool, req, hidden_rows, None, false)?;
+        let out =
+            self.forward_argmax_then(model, kv_pool, req, hidden_rows, None, HeadPlace::Onto)?;
         Ok((out.tokens, out.hidden))
     }
 
@@ -3994,8 +4055,10 @@ impl MetalWorker {
         req: &::scratchy_serving_engine::spec_decode::ForwardArgmaxRequest<'_>,
         hidden_rows: &[u32],
         then: Option<Then<'_>>,
-        head_after: bool,
+        place: HeadPlace,
     ) -> Result<Forwarded, ::scratchy_serving_engine::spec_decode::BackendError> {
+        let head_after = place != HeadPlace::Onto;
+        let head_beside = self.head_beside();
         use ::scratchy_serving_engine::spec_decode::{BackendError, KvPoolHandle, ModelHandle};
 
         // Resolve handles. 0 → target, 1 → draft; everything else is
@@ -4438,6 +4501,8 @@ impl MetalWorker {
                     device,
                     behind,
                     reads_captures: self.head_reads_captures,
+                    beside: head_beside,
+                    kept: self.head_kept.clone(),
                 })))
             }
             _ => None,
@@ -4551,9 +4616,31 @@ impl MetalWorker {
             .as_ref()
             .map(|k| k as *const scratchy_target_metal::sampling::SamplerKernels as usize);
         let (head_cell, head_onto_cell) = (&head, &head_onto);
-        // What the target left the head's passes after its command buffer (`head_after`).
+        // What the target left the head's passes after its command buffer ([`HeadPlace::After`]).
         let hidden_after = std::cell::RefCell::new(None);
         let hidden_after_cell = &hidden_after;
+        let beside = head_after && head_beside;
+        // The target's captured rows a head beside it keeps, each at its KV slot: runs of rows
+        // whose slots run on.
+        let kept = (self.head_kept.clone()).filter(|_| model == ModelHandle::TARGET);
+        let kept_row = match (&kept, self.draft_model.as_deref()) {
+            (Some(_), Some(head)) => head.target_hidden_width() as usize * 2,
+            _ => 0,
+        };
+        let mut kept_runs: Vec<(usize, usize, usize)> = Vec::new();
+        for (row, &slot) in req
+            .slot_mapping
+            .iter()
+            .enumerate()
+            .filter(|_| kept.is_some())
+        {
+            let slot = slot as usize;
+            match kept_runs.last_mut() {
+                _ if slot == u32::MAX as usize => {}
+                Some((at, from, n)) if *at + *n == row && *from + *n == slot => *n += 1,
+                _ => kept_runs.push((row, slot, 1)),
+            }
+        }
         // A grammar mask overwrites the logits in place: the step's logprobs score the raw rows,
         // set aside before it.
         #[cfg(feature = "guided-decoding")]
@@ -4656,6 +4743,21 @@ impl MetalWorker {
                 if let Some(pass) = &logprobs {
                     pass.encode(&logprobs_device, enc, logits_addr, out_addr)?;
                 }
+                // The rows the target captured, kept at their slots for its head beside it.
+                if let (Some(kept), Some(captured)) = (&kept, outputs.captured) {
+                    let copies: Vec<_> = (kept_runs.iter())
+                        .map(
+                            |&(row, slot, n)| scratchy_target_metal::dflash2::WindowCopy {
+                                from: captured,
+                                from_at: row * kept_row,
+                                to: kept,
+                                to_at: slot * kept_row,
+                                len: n * kept_row,
+                            },
+                        )
+                        .collect();
+                    scratchy_target_metal::dflash2::encode_window_copies(enc, &copies);
+                }
                 // The head's passes, reading the tokens just picked and what the target left: on
                 // this command buffer, or — `head_after` — the one after it, reading what this
                 // one leaves.
@@ -4678,8 +4780,8 @@ impl MetalWorker {
             },
         );
         let argmax_out_after = argmax_out.clone();
-        let mut after =
-            scratchy_target_metal::interpreter::metal::ForwardAfter::new(Box::new(move |enc| {
+        let mut after = scratchy_target_metal::interpreter::metal::ForwardAfter::new(
+            Box::new(move |enc| {
                 let hidden = (hidden_after_cell.borrow_mut().take())
                     .ok_or("the head's passes after a forward that left no hidden rows")?;
                 if let Some(HeadEncoder::Mtp(h)) = head_cell.borrow_mut().as_mut() {
@@ -4687,7 +4789,12 @@ impl MetalWorker {
                     *head_onto_cell.borrow_mut() = Some(onto);
                 }
                 Ok(())
-            }));
+            }),
+            match beside {
+                true => scratchy_target_metal::interpreter::metal::AfterLane::Beside,
+                false => scratchy_target_metal::interpreter::metal::AfterLane::Behind,
+            },
+        );
         if head_after {
             ctx.after = Some(&after);
         }
@@ -4712,10 +4819,18 @@ impl MetalWorker {
                 Some(HeadEncoder::Mtp(h)) => h.buffer.clone(),
                 _ => None,
             };
-            self.head_in_flight = Some(HeadAfter {
+            let after = HeadAfter {
                 in_flight,
                 _chain: chain,
-            });
+                _tokens: argmax.clone(),
+            };
+            match place {
+                // The step reads its drafts back: once the passes are done.
+                HeadPlace::After { drafts: true } => after.in_flight.wait().map_err(|e| {
+                    BackendError::Backend(format!("MTP head passes after a step: {e}"))
+                })?,
+                _ => self.head_in_flight.push(after),
+            }
         }
         drop(after);
         // A blocking forward's time (its encoding and the GPU's run), and the host's since the last
@@ -4807,13 +4922,13 @@ impl MetalWorker {
         }
         self.sampler_logits = logits_capture.borrow_mut().take();
         // What the passes left, once the command buffer is done; then the head's worker goes back —
-        // after passes still on the device too (`head_after`), which leave nothing for this step:
-        // its staging slot outlives this step (`Onto`), and the next step waits for them before it
-        // writes what they read.
+        // after passes still on the device too (`HeadPlace::After` with no drafts), which leave
+        // nothing for this step: its staging slot outlives this step (`Onto`), and the next step
+        // waits for them before it writes what they read.
         let onto = head_onto.into_inner();
-        let head = match head_after {
-            true => None,
-            false => (head.into_inner()).map(|h| h.outcome(onto.as_deref())),
+        let head = match place {
+            HeadPlace::After { drafts: false } => None,
+            _ => (head.into_inner()).map(|h| h.outcome(onto.as_deref())),
         };
         drop(onto);
         Ok(Forwarded {
@@ -5183,6 +5298,11 @@ struct HeadPassesEncoder<'a> {
     /// Its target hidden rows are the layers the target captured for it, not its final hidden
     /// states (`HeadRegistration::reads_captures`).
     reads_captures: bool,
+    /// Its passes may run beside its target's forwards, in an arena of its own
+    /// (`MetalWorker::head_beside`).
+    beside: bool,
+    /// The target rows it keeps at their KV slots (`MetalWorker::head_kept`).
+    kept: Option<scratchy_target_metal::argmax::Buffer>,
 }
 
 impl<'a> HeadPassesEncoder<'a> {
@@ -5438,7 +5558,17 @@ impl<'a> HeadPassesEncoder<'a> {
                     let (row, step_row, rows) = (row as usize, step_row as usize, rows as usize);
                     DeviceInput::hidden_rows(hidden.clone(), step_row, row, rows, row_bytes)
                 });
-                token_inputs.chain(hidden_inputs).collect()
+                // Rows the worker kept at their slots: read there.
+                let kept = (pass.kept_rows.iter()).map(|&(row, slot, rows)| {
+                    let kept = self
+                        .kept
+                        .clone()
+                        .ok_or("kept rows of a head that keeps none")?;
+                    let (row, slot, rows) = (row as usize, slot as usize, rows as usize);
+                    Ok(DeviceInput::hidden_rows(kept, slot, row, rows, row_bytes))
+                });
+                let kept = kept.collect::<Result<Vec<_>, String>>()?;
+                token_inputs.chain(hidden_inputs).chain(kept).collect()
             }
         };
         let behind = self.behind && reads == Reads::Outputs;
@@ -5472,11 +5602,13 @@ impl<'a> HeadPassesEncoder<'a> {
             unsafe { onto.then(ctx, n as u64, enc) }?;
             return Ok(onto);
         }
-        // The head's pool is built at its first forward, in the target's arena: the target's own
-        // pool exists by now — its forward, which this rides, built it — where at the step's start
-        // it may not have.
-        let hosted = hosted_by(self.target).map_err(|e| e.to_string())?;
-        self.device.host = Some(Box::new(hosted));
+        // The head's pool is built at its first forward, in the target's arena — unless it runs
+        // beside the target, in its own: the target's own pool exists by now — its forward, which
+        // this rides, built it — where at the step's start it may not have.
+        if !self.beside {
+            let hosted = hosted_by(self.target).map_err(|e| e.to_string())?;
+            self.device.host = Some(Box::new(hosted));
+        }
         // SAFETY: every view points at the passes' vectors, alive for the call; the forward is
         // encoded onto `enc`, which the target's command buffer outlives.
         unsafe {
@@ -6500,16 +6632,29 @@ fn free_argmax_slot(
     slot
 }
 
-/// A step committed without waiting for it: the tokens its rows sampled are on the device until it is
-/// resolved.
-/// An MTP head's passes committed after a step, in a command buffer of their own (`head_after`):
-/// that command buffer, and the chain buffer they draft into, held until they are done — no step
-/// lays out a chain in it before.
+/// An MTP head's passes committed after a step, on the queue after its forwards ([`HeadPlace`]):
+/// that command buffer, the chain buffer they draft into and the tokens they read, held until they
+/// are done — no step lays out a chain in it, nor picks its tokens into it, before.
 struct HeadAfter {
     in_flight: InFlight,
     _chain: Option<Arc<ChainBuffer>>,
+    _tokens: Arc<ArgmaxSlot>,
 }
 
+/// Where a step's MTP head passes run.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum HeadPlace {
+    /// On the step's own command buffer, after its target's forward.
+    Onto,
+    /// In a command buffer of their own on the queue after the forwards, which the forwards after
+    /// them do not wait for: they start once the step's forward and the passes before them are
+    /// done. `drafts`: the host waits for them and reads back their drafts; or it does not, and
+    /// the next step decodes without.
+    After { drafts: bool },
+}
+
+/// A step committed without waiting for it: the tokens its rows sampled are on the device until it is
+/// resolved.
 struct InFlightStep {
     done: Arc<InFlight>,
     argmax: Arc<ArgmaxSlot>,
@@ -7790,8 +7935,10 @@ impl Worker for MetalWorker {
         let reach = match self.model.as_deref() {
             Some(target) if hybrid_kv_layout(target, bs, METAL_KV_ELEM_BYTES).is_none() => {
                 let draft = self.draft_model.as_deref();
-                let draft_pb = (draft.filter(|_| self.draft_keeps_kv()))
-                    .map_or(0, |d| draft_block_bytes(d, bs.get(), self.draft_scratch()));
+                let draft_pb = (draft.filter(|_| self.draft_keeps_kv())).map_or(0, |d| {
+                    draft_block_bytes(d, bs.get(), self.draft_scratch())
+                        + self.head_kept_block_bytes(bs.get())
+                });
                 let pair = target_block_bytes(target, bs) + draft_pb;
                 kv_left(self.metal_peak_activation_estimate(None, None, Some(budget(total)), 1)?)
                     / pair.max(1)
@@ -7842,7 +7989,10 @@ impl Worker for MetalWorker {
             let t_pb = target_block_bytes(target.as_ref(), bs);
             let d_pb = match self.draft_keeps_kv() {
                 false => 0,
-                true => draft_block_bytes(draft.as_ref(), bs.get(), self.draft_scratch()),
+                true => {
+                    draft_block_bytes(draft.as_ref(), bs.get(), self.draft_scratch())
+                        + self.head_kept_block_bytes(bs.get())
+                }
             };
             let denom = t_pb.saturating_add(d_pb).max(1);
             // available * t_pb / (t_pb + d_pb), in u128 to dodge overflow.
@@ -7990,6 +8140,7 @@ impl Worker for MetalWorker {
 
         // ── 1. Lifecycle: drop finished requests ──────────────────
         for req_id in &scheduler_output.finished_req_ids {
+            self.head_kept_ran.remove(req_id);
             self.prompt_logprobs_acc.remove(req_id);
             self.annotation_buffers.remove(req_id);
             self.reused_block_buffers.remove(req_id);
@@ -8022,6 +8173,10 @@ impl Worker for MetalWorker {
                 alloc.release(recurrent_slot_key(req_id));
                 self.kv_cached_through.remove(req_id);
             }
+        }
+        // Its MTP head beside the target runs it over again, from the rows it recomputes into.
+        for req_id in (scheduler_output.preempted_req_ids.iter()).flatten() {
+            self.head_kept_ran.remove(req_id);
         }
         // So does its drafter's: it gives back its ring slot and its cycle in flight (the scheduler
         // dropped its drafts). Its re-admission plans its replay, whose commits, from the snapshot
@@ -8136,20 +8291,19 @@ impl Worker for MetalWorker {
         // one in flight; any other step — and an idle batch, whose KV may
         // shrink — needs every token on the host first.
         let deferrable = self.deferrable(scheduler_output);
-        while self.in_flight.len() > usize::from(deferrable) {
+        // A speculative step in flight keeps its tokens on the device at rows only its outcome
+        // picks: only a step behind it reads them there ([`Self::behind_selections`]); one after a
+        // speculative step that led none (its request might end on it) reads them from the host.
+        let behind = scheduler_output.spec_pipeline.behind;
+        while self.in_flight.len() > usize::from(deferrable)
+            || !behind && (self.in_flight.back()).is_some_and(|step| step.spec.is_some())
+        {
             self.resolve_oldest()?;
         }
-        // The head's passes after the step before, still on the device, read what this step
-        // writes: a step the host waits for writes from the host, so it waits for them first; a
-        // deferred one writes on the device, queued behind them. Their chain buffer is held until
-        // they are done.
-        if let Some(head) = self.head_in_flight.take() {
-            match deferrable && !head.in_flight.is_done() {
-                true => self.head_in_flight = Some(head),
-                false => (head.in_flight.wait()).map_err(|e| {
-                    ExecutorError::WorkerExecution(format!("MTP head passes after a step: {e}"))
-                })?,
-            }
+        // Head passes on the queue after the forwards, done: what they hold goes back. Each is
+        // done once the newest is, the queue's order.
+        if (self.head_in_flight.last()).is_some_and(|h| h.in_flight.is_done()) {
+            self.head_in_flight.clear();
         }
 
         if self.input_batch.num_active() == 0 {
@@ -8685,10 +8839,19 @@ impl Worker for MetalWorker {
                     Some(alloc) => alloc.hold_lane(recurrent_slot_key(r)),
                     None => true,
                 };
+                let ran = |r: &str| self.head_kept_ran.get(r).copied().unwrap_or(0);
+                let kept = (self.head_kept.is_some()).then_some(
+                    ::scratchy_serving_engine::spec_decode::Kept {
+                        ran: &ran,
+                        busy: !self.head_in_flight.is_empty(),
+                    },
+                );
                 drafter.passes(
                     &step_rows,
                     &history,
                     &scheduler_output.draft_req_ids,
+                    scheduler_output.primes_only,
+                    kept,
                     &mut holds_draft_state,
                 )
             }
@@ -8921,14 +9084,43 @@ impl Worker for MetalWorker {
                 w.saved[op.slot] = taken.iter().any(|t| t.block == block);
             }
         }
-        // A step that gives a request its first token runs the head's passes after it, in a command
-        // buffer the host does not wait for: that token is the target's alone, so its time to
-        // first token is the target's; the passes' prime over the prompt waits for the next step
-        // instead, which decodes without drafts.
-        let head_after = head_passes.is_some() && self.head_after(scheduler_output);
+        // A step that gives a request its first token runs the head's passes after it, on the
+        // queue after the forwards, unwaited for: that token is the target's alone, so its time to
+        // first token is the target's, and the passes' prime over the prompt runs beside the steps
+        // after it, which decode without drafts until it is done. A blocking step while passes are
+        // still there queues its own behind them, there too, and reads back its drafts once they are
+        // done: its forward does not wait for them.
+        if let Some(passes) = &head_passes {
+            for &(i, ran) in &passes.ran {
+                (self.head_kept_ran).insert(req_ids_in_order[i].clone(), ran);
+            }
+        }
+        // A head keeping its target's rows drafts in the step's command buffer, or — catching up
+        // over the rows it has not run — only primes, beside the target.
+        let catches_up =
+            self.head_kept.is_some() && head_passes.as_ref().is_some_and(|p| p.drafting.is_none());
+        let head_after = head_passes.is_some() && (catches_up || self.head_after(scheduler_output));
+        let place = match head_passes {
+            Some(_) if head_after => HeadPlace::After { drafts: false },
+            Some(_) if !self.head_in_flight.is_empty() && self.deferral.is_none() => {
+                HeadPlace::After { drafts: true }
+            }
+            _ => HeadPlace::Onto,
+        };
+        // Passes on this step's command buffer run on the head's worker after those still on the
+        // queue after the forwards; passes queued there too, after all but the newest (`HeadAfter`).
+        if head_passes.is_some() {
+            let keep = usize::from(place != HeadPlace::Onto);
+            while self.head_in_flight.len() > keep {
+                let head = self.head_in_flight.remove(0);
+                (head.in_flight.wait()).map_err(|e| {
+                    ExecutorError::WorkerExecution(format!("MTP head passes after a step: {e}"))
+                })?;
+            }
+        }
         tracing::debug!(
-            "step of {num_reqs} sequences: head passes {}, after the step {head_after}, behind \
-             {behind}, deferred {}",
+            "step of {num_reqs} sequences: head passes {}, placed {place:?}, behind {behind}, \
+             deferred {}",
             head_passes.is_some(),
             self.deferral.is_some(),
         );
@@ -9514,7 +9706,7 @@ impl Worker for MetalWorker {
                         &req,
                         &prompt_hidden_rows,
                         then,
-                        head_after,
+                        place,
                     )
                     .map_err(|e| {
                         ExecutorError::WorkerExecution(format!("spec verify forward: {e}"))

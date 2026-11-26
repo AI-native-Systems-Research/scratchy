@@ -373,6 +373,20 @@ impl StepRows<'_> {
     }
 }
 
+/// A head that keeps its target's hidden rows at their KV slots, on its worker, and runs over
+/// them later: its prompt's and its reply's hidden header's rows wait there until the first text a
+/// reader sees is out, so no step before it runs the head — every token through that text is its
+/// target's alone, and the head's pass over the prompt (as costly as a sixth of the target's) is
+/// none of the wait for it. The head then catches up over every row it has not run, beside the
+/// target's steps, and drafts once it has.
+#[derive(Clone, Copy)]
+pub struct Kept<'a> {
+    /// Each request's first position the head has not run.
+    pub ran: &'a dyn Fn(&str) -> usize,
+    /// The head's passes still run beside the target: a step runs none, and keeps its rows.
+    pub busy: bool,
+}
+
 /// The head's passes over a step (module docs), run in the step's command buffer after its target.
 #[derive(Debug, PartialEq)]
 pub struct HeadPasses {
@@ -384,6 +398,9 @@ pub struct HeadPasses {
     /// planned sequence gets a token from the step (prefill chunks short of their prompt's end),
     /// or the step is past the head's [`DraftBudget::max_seqs`]: nothing drafts.
     pub drafting: Option<Drafting>,
+    /// Per sequence the passes run, its index in the step and its first position they leave the
+    /// head not having run.
+    pub ran: Vec<(usize, usize)>,
 }
 
 /// The passes that draft: pass 1 over each drafting sequence's rows whose next token is the
@@ -421,6 +438,9 @@ pub struct PassOne {
     /// `(row, step row, rows)`: each sequence's rows, reading the target's final hidden states at
     /// its rows of the step.
     pub hidden_rows: Vec<(u32, u32, u32)>,
+    /// `(row, slot, rows)`: rows reading the target hidden rows its worker kept at their KV slots,
+    /// contiguous ones ([`Kept`]) — in place of the step's, for a head that keeps them.
+    pub kept_rows: Vec<(u32, u32, u32)>,
     /// Each sequence's index in the step: whose rows of the step's block tables it reads.
     pub steps: Vec<usize>,
 }
@@ -486,8 +506,39 @@ impl PassOne {
             sampled_rows: Vec::new(),
             token_rows: Vec::new(),
             hidden_rows: Vec::new(),
+            kept_rows: Vec::new(),
             steps: Vec::new(),
         }
+    }
+
+    /// Sequence `i`'s rows at `positions`, every one's next token the host's (`tokens`, its
+    /// history), reading the target hidden rows kept at their slots ([`Kept`]): a sequence's
+    /// rows the head has not run, its KV used through the last after them.
+    fn push_kept(
+        &mut self,
+        step: &StepRows<'_>,
+        i: usize,
+        positions: std::ops::Range<usize>,
+        tokens: &[u32],
+    ) {
+        if positions.is_empty() {
+            return;
+        }
+        for p in positions.clone() {
+            let row = self.input_ids.len() as u32;
+            let slot = step.slot(i, p);
+            self.input_ids.push(tokens[p + 1]);
+            self.positions.push(p as u32);
+            self.slot_mapping.push(slot);
+            match self.kept_rows.last_mut() {
+                Some((at, from, rows)) if *at + *rows == row && *from + *rows == slot => *rows += 1,
+                _ => self.kept_rows.push((row, slot, 1)),
+            }
+        }
+        self.cu_seqlens_q.push(self.input_ids.len() as u32);
+        self.seqused_k.push(positions.end as u32);
+        self.sampled_rows.push(self.input_ids.len() as u32 - 1);
+        self.steps.push(i);
     }
 
     /// Sequence `i`'s step rows `rows`, its KV used through `used` after them, appended; `tokens`
@@ -645,12 +696,21 @@ impl MtpDrafter {
     ///
     /// `holds_draft_state` is asked for each request that would draft: whether the target can
     /// keep what its next step's verify undoes (a Gated-DeltaNet target's draft lane,
-    /// `GdnSlotAllocator::hold_lane`). A request it refuses only primes, as past the gate.
+    /// `GdnSlotAllocator::hold_lane`). A request it refuses only primes, as past the gate. A step
+    /// the engine planned to only prime (`primes_only`) primes every row.
+    ///
+    /// A head that keeps its target's rows (`kept`) runs none of a step that only primes, gives a
+    /// request its first token, or comes while its passes still run beside the target. Any other
+    /// runs first over each request's rows it has not run: within its verify rows, with its
+    /// drafting; past them, they and the step's rows only prime — the step drafts none, and its
+    /// passes run beside its target.
     pub fn passes(
         &self,
         step: &StepRows<'_>,
         history: &dyn Fn(&str) -> Option<Vec<u32>>,
         plan: &HashSet<String>,
+        primes_only: bool,
+        kept: Option<Kept<'_>>,
         holds_draft_state: &mut dyn FnMut(&str) -> bool,
     ) -> Option<HeadPasses> {
         let stride = step.block_table_stride;
@@ -661,7 +721,7 @@ impl MtpDrafter {
         // token the host does not have draft — each can be its newest — and those before prime.
         // The step's sequences each draft what its verify rows leave room for.
         let passes = self.budget.drafts_at(step.req_ids.len());
-        let past_gate = passes == 0;
+        let past_gate = passes == 0 || primes_only;
         // The reply of sequence `i`, whose tokens so far are `tokens`: those past its prompt.
         let past_prefix = |i: usize, tokens: &[u32]| {
             let reply = tokens
@@ -670,10 +730,29 @@ impl MtpDrafter {
             (self.draft_vocab).is_some_and(|v| v.reaches_past(reply))
         };
         let mut wide = false;
+        let mut ran = Vec::new();
         for i in (0..step.req_ids.len()).filter(|&i| plan.contains(&step.req_ids[i])) {
             let tokens = history(&step.req_ids[i]).unwrap_or_default();
             let rows = step.cu_seqlens_q[i] as usize..step.cu_seqlens_q[i + 1] as usize;
             let known = |&r: &usize| tokens.get(step.positions[r] as usize + 1).is_some();
+            if let Some(kept) = kept {
+                let first = step.positions[rows.start] as usize;
+                let replied = tokens.len() > step.prompt_lens[i] as usize;
+                if primes_only || kept.busy || !replied {
+                    continue;
+                }
+                let from = (kept.ran)(&step.req_ids[i]).min(first);
+                // Past its verify rows, the head only primes, beside the target: every row it has
+                // not run whose next token the host has, the step's too.
+                if first - from > self.budget.verify_rows {
+                    let to = first + rows.clone().take_while(known).count();
+                    prime.push_kept(step, i, from..to, &tokens);
+                    ran.push((i, to));
+                    continue;
+                }
+                prime.push_kept(step, i, from..first, &tokens);
+                ran.push((i, step.positions[rows.end - 1] as usize + 1));
+            }
             let split = match past_gate {
                 true => rows.end,
                 false => rows.start + rows.clone().take_while(known).count(),
@@ -718,7 +797,11 @@ impl MtpDrafter {
             one,
             wide,
         });
-        (prime.is_some() || drafting.is_some()).then_some(HeadPasses { prime, drafting })
+        (prime.is_some() || drafting.is_some()).then_some(HeadPasses {
+            prime,
+            drafting,
+            ran,
+        })
     }
 
     /// The passes after `one` for the `drafting` sequences (each its index in the step and its
@@ -1091,6 +1174,8 @@ mod tests {
                 &step.rows(),
                 &step.before(),
                 &ids(&["a", "b", "c"]),
+                false,
+                None,
                 &mut any,
             )
             .expect("passes");
@@ -1099,7 +1184,14 @@ mod tests {
         assert_eq!(drafting.chain.next.len(), 1);
         let two = TwoSequences::new();
         let passes = DRAFTER
-            .passes(&two.rows(), &two.before(), &ids(&["a", "b"]), &mut any)
+            .passes(
+                &two.rows(),
+                &two.before(),
+                &ids(&["a", "b"]),
+                false,
+                None,
+                &mut any,
+            )
             .expect("passes");
         assert_eq!(passes.drafting.expect("a drafts").chain.passes(), 3);
     }
@@ -1118,7 +1210,14 @@ mod tests {
         };
         let step = TwoSequences::new();
         let passes = drafter
-            .passes(&step.rows(), &step.before(), &ids(&["a", "b"]), &mut any)
+            .passes(
+                &step.rows(),
+                &step.before(),
+                &ids(&["a", "b"]),
+                false,
+                None,
+                &mut any,
+            )
             .expect("passes");
         let Drafting { one, chain, .. } = passes.drafting.expect("a drafts");
         // Block 3 of 16-token blocks: position `p`'s slot is `48 + p`.
@@ -1161,7 +1260,14 @@ mod tests {
             false
         };
         let passes = DRAFTER
-            .passes(&step.rows(), &step.before(), &ids(&["a", "b"]), &mut refuse)
+            .passes(
+                &step.rows(),
+                &step.before(),
+                &ids(&["a", "b"]),
+                false,
+                None,
+                &mut refuse,
+            )
             .expect("passes");
         assert_eq!(asked, ["a"]);
         assert_eq!(passes.drafting, None);
@@ -1195,7 +1301,7 @@ mod tests {
                 prompt_lens: &prompt_lens,
                 ..step.rows()
             };
-            (drafter.passes(&rows, &history, &ids(&["a", "b"]), &mut any))
+            (drafter.passes(&rows, &history, &ids(&["a", "b"]), false, None, &mut any))
                 .and_then(|p| p.drafting)
                 .expect("a drafts")
                 .wide
@@ -1261,7 +1367,9 @@ mod tests {
     fn pass_one_primes_the_rows_no_draft_reads() {
         let step = TwoSequences::new();
         let history = step.before();
-        let passes = |plan: &[&str]| DRAFTER.passes(&step.rows(), &history, &ids(plan), &mut any);
+        let passes = |plan: &[&str]| {
+            DRAFTER.passes(&step.rows(), &history, &ids(plan), false, None, &mut any)
+        };
         let both = passes(&["a", "b"]).expect("passes");
         let prime = PassOne {
             input_ids: vec![701, 702, 703],
@@ -1274,6 +1382,7 @@ mod tests {
             sampled_rows: vec![2],
             token_rows: Vec::new(),
             hidden_rows: vec![(0, 4, 3)],
+            kept_rows: Vec::new(),
             steps: vec![1],
         };
         assert_eq!(both.prime, Some(prime));
@@ -1288,6 +1397,7 @@ mod tests {
             sampled_rows: vec![0, 1, 2, 3],
             token_rows: vec![(0, 0), (1, 1), (2, 2), (3, 3)],
             hidden_rows: vec![(0, 0, 4)],
+            kept_rows: Vec::new(),
             steps: vec![0],
         };
         let drafting = both.drafting.expect("a drafts");
@@ -1311,7 +1421,14 @@ mod tests {
             "b" => Some((700..703).collect()),
             _ => step.before()(id),
         };
-        let passes = DRAFTER.passes(&step.rows(), &ends, &ids(&["a", "b"]), &mut any);
+        let passes = DRAFTER.passes(
+            &step.rows(),
+            &ends,
+            &ids(&["a", "b"]),
+            false,
+            None,
+            &mut any,
+        );
         let passes = passes.expect("passes");
         let prime = passes.prime.expect("b primes");
         assert_eq!(
@@ -1342,7 +1459,14 @@ mod tests {
     #[test]
     fn the_chain_lays_out_every_accepted_count() {
         let step = TwoSequences::new();
-        let passes = DRAFTER.passes(&step.rows(), &step.before(), &ids(&["a", "b"]), &mut any);
+        let passes = DRAFTER.passes(
+            &step.rows(),
+            &step.before(),
+            &ids(&["a", "b"]),
+            false,
+            None,
+            &mut any,
+        );
         let chain = passes.expect("passes").drafting.expect("a drafts").chain;
         let at = |d: u32| -> Vec<u32> {
             (0..=3)
@@ -1369,7 +1493,14 @@ mod tests {
     #[test]
     fn drafts_are_the_device_s_up_to_the_model_length() {
         let step = TwoSequences::new();
-        let passes = DRAFTER.passes(&step.rows(), &step.before(), &ids(&["a", "b"]), &mut any);
+        let passes = DRAFTER.passes(
+            &step.rows(),
+            &step.before(),
+            &ids(&["a", "b"]),
+            false,
+            None,
+            &mut any,
+        );
         let chain = passes.expect("passes").drafting.expect("a drafts").chain;
         let picked = [901, 1000, 2000];
         for kept in 0..4u32 {
@@ -1405,6 +1536,74 @@ mod tests {
     }
 
     /// Two sequences' one draft each fits five verify rows; three sequences' does not.
+    /// A head keeping its target's rows runs none of a request with no reply yet (`b`, still in
+    /// its prompt), nor of a step that only primes, nor while its passes still run beside the
+    /// target. Within its verify rows it first runs the rows of `a` it has not (positions 7..=9,
+    /// read where they were kept: block 3's slots 55..=57), then drafts as ever; `a` has then run
+    /// through its step.
+    #[test]
+    fn a_head_keeping_its_target_s_rows_catches_up_then_drafts() {
+        let step = TwoSequences::new();
+        let ran = |r: &str| if r == "a" { 7 } else { 0 };
+        let kept = |busy| Some(Kept { ran: &ran, busy });
+        let plan = ids(&["a", "b"]);
+        let passes = |primes_only, kept| {
+            DRAFTER.passes(
+                &step.rows(),
+                &step.before(),
+                &plan,
+                primes_only,
+                kept,
+                &mut any,
+            )
+        };
+        assert_eq!(passes(false, kept(true)), None, "busy");
+        assert_eq!(passes(true, kept(false)), None, "primes only");
+        let caught = passes(false, kept(false)).expect("passes");
+        let prime = caught.prime.expect("a's rows behind");
+        assert_eq!(
+            (prime.positions, prime.input_ids, prime.slot_mapping),
+            (vec![7, 8, 9], vec![508, 509, 510], vec![55, 56, 57])
+        );
+        assert_eq!(
+            (prime.kept_rows, prime.hidden_rows),
+            (vec![(0, 55, 3)], vec![])
+        );
+        assert_eq!(
+            caught.drafting.expect("a drafts").one.positions,
+            [10, 11, 12, 13]
+        );
+        assert_eq!(caught.ran, [(0, 14)]);
+    }
+
+    /// Past its verify rows, a head keeping its target's rows only primes, over every row of a
+    /// request it has not run whose next token the host has: none of `a`'s step (each the target
+    /// samples), all ten before it. The step drafts nothing.
+    #[test]
+    fn a_head_far_behind_only_primes_what_it_kept() {
+        let step = TwoSequences::new();
+        let ran = |_: &str| 0;
+        let kept = Some(Kept {
+            ran: &ran,
+            busy: false,
+        });
+        let caught = (DRAFTER.passes(
+            &step.rows(),
+            &step.before(),
+            &ids(&["a"]),
+            false,
+            kept,
+            &mut any,
+        ))
+        .expect("passes");
+        assert_eq!(caught.drafting, None);
+        let prime = caught.prime.expect("a's rows behind");
+        assert_eq!(prime.positions, (0..10).collect::<Vec<_>>());
+        assert_eq!(prime.input_ids, (501..511).collect::<Vec<_>>());
+        assert_eq!(prime.kept_rows, [(0, 48, 10)]);
+        assert_eq!(caught.ran, [(0, 10)]);
+    }
+
     const GATED: MtpDrafter = MtpDrafter {
         budget: DraftBudget {
             drafts: 3,
@@ -1425,6 +1624,8 @@ mod tests {
                 &step.rows(),
                 &step.before(),
                 &ids(&["a", "b", "c"]),
+                false,
+                None,
                 &mut any,
             )
             .expect("passes");
@@ -1442,13 +1643,21 @@ mod tests {
                 sampled_rows: vec![3, 6, 7],
                 token_rows: vec![(0, 0), (1, 1), (2, 2), (3, 3), (7, 5)],
                 hidden_rows: vec![(0, 0, 4), (4, 4, 3), (7, 7, 1)],
+                kept_rows: Vec::new(),
                 steps: vec![0, 1, 2],
             })
         );
 
         let two = TwoSequences::new();
         let within = GATED
-            .passes(&two.rows(), &two.before(), &ids(&["a", "b"]), &mut any)
+            .passes(
+                &two.rows(),
+                &two.before(),
+                &ids(&["a", "b"]),
+                false,
+                None,
+                &mut any,
+            )
             .expect("passes");
         within.drafting.expect("a drafts");
     }
@@ -1467,19 +1676,35 @@ mod tests {
             &three.rows(),
             &three.before(),
             &ids(&["a", "b", "c"]),
+            false,
+            None,
             &mut any,
         );
         assert_eq!(gated, None);
 
         let two = TwoSequences::new();
-        let within = (drafter.passes(&two.rows(), &two.before(), &ids(&["a", "b"]), &mut any))
-            .expect("passes");
+        let within = (drafter.passes(
+            &two.rows(),
+            &two.before(),
+            &ids(&["a", "b"]),
+            false,
+            None,
+            &mut any,
+        ))
+        .expect("passes");
         assert_eq!(within.prime, None);
         let one = within.drafting.expect("a drafts").one;
         assert_eq!(one.positions, [11, 12, 13, 14]);
         assert!(one.slot_mapping.iter().all(|&s| s == u32::MAX));
         assert_eq!(
-            drafter.passes(&two.rows(), &two.before(), &ids(&["b"]), &mut any),
+            drafter.passes(
+                &two.rows(),
+                &two.before(),
+                &ids(&["b"]),
+                false,
+                None,
+                &mut any
+            ),
             None
         );
     }

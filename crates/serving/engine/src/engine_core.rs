@@ -225,6 +225,23 @@ impl<T> StepOutcome<T> {
 
 /// Whether `req_id` takes speculative drafts: it is running, and its sampling does not read its
 /// history (a verify row's would need the drafts before it).
+/// Whether the step just scheduled for `request` can give it its last token by length — every
+/// token it can keep counted (`num_output_placeholders`): a step behind it would run past that
+/// token on the device, holding the next request's first behind it.
+fn may_end(request: &Request) -> bool {
+    request.num_output_tokens() + request.num_output_placeholders as usize
+        >= request.max_tokens as usize
+}
+
+/// Whether `request`'s reply has no token yet past the one its hidden header ends with
+/// (`SamplingParams::drafts_after`).
+fn in_hidden_header(request: &Request) -> bool {
+    let reply = &request.output_token_ids;
+    (request.sampling_params.drafts_after).is_some_and(|end| {
+        !(reply.iter().position(|&t| t == end)).is_some_and(|at| at + 1 < reply.len())
+    })
+}
+
 fn takes_drafts(scheduler: &Scheduler, req_id: &str) -> bool {
     scheduler
         .get_request(req_id)
@@ -664,6 +681,7 @@ impl EngineCore {
             && sched.scheduled_spec_decode_tokens.contains_key(req_id)
             && takes_drafts(&self.scheduler, req_id)
             && self.scheduler.get_request_counts().1 == 0
+            && !may_end(request)
         {
             let req_id = req_id.clone();
             self.scheduler.set_spec_token_ids(&req_id, vec![0; drafts]);
@@ -705,9 +723,13 @@ impl EngineCore {
         // its last).
         let chunks = (sched.draft_req_ids.iter())
             .all(|r| scheduler.get_request(r).is_some_and(|r| r.is_prefill_chunk));
+        // A reply's hidden header — what its reader never sees — is its target's alone
+        // (`SamplingParams::drafts_after`): a step of a request with no token past it yet primes.
+        let headed = (sched.draft_req_ids.iter())
+            .any(|r| scheduler.get_request(r).is_some_and(in_hidden_header));
         sched.primes_only = proposer
             .max_seqs()
-            .is_some_and(|gate| sched.num_scheduled_tokens.len() > gate || chunks);
+            .is_some_and(|gate| sched.num_scheduled_tokens.len() > gate || chunks || headed);
     }
 
     /// Post-execution processing: update state from model output, process
@@ -1901,6 +1923,48 @@ mod tests {
             enable_prefix_caching: false,
             hybrid_kv: None,
         }
+    }
+
+    /// A reply's hidden header is its target's alone (`SamplingParams::drafts_after`): every step
+    /// until one has a token past the header's end only primes the head's KV, and is not
+    /// speculative; the step after that token drafts. A request without a header drafts from its
+    /// prompt's step.
+    #[test]
+    fn a_reply_s_hidden_header_only_primes() {
+        let config = || EngineCoreConfig {
+            proposer_config: Some(crate::spec_decode::ProposerConfig::Mtp(
+                crate::spec_decode::MtpProposerConfig {
+                    num_speculative_tokens: 2,
+                    max_seqs: 2,
+                    max_model_len: 4096,
+                },
+            )),
+            ..make_spec_decode_config()
+        };
+        // The no-op executor's tokens count up from 1000: its second, 1001, ends the header.
+        let primes = |drafts_after: Option<u32>| {
+            let mut engine = EngineCore::new(config(), Box::new(NoopExecutor::new(1024)));
+            let mut executor = engine.take_executor().expect("an executor");
+            let greedy = SamplingParams {
+                max_tokens: Some(8),
+                temperature: 0.0,
+                drafts_after,
+                ..Default::default()
+            };
+            let prompt: Vec<u32> = (1..=8).collect();
+            engine.add_request(Request::new("a".into(), prompt, greedy, 0.0, 0, 0, None));
+            (0..4)
+                .map(|_| {
+                    let step = engine.schedule_next().expect("a step");
+                    let out = executor.execute_model(&step).expect("runs");
+                    let _ = engine.finalize_step(&step, &out);
+                    assert!(step.draft_req_ids.contains("a"), "the head runs every step");
+                    step.primes_only
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(primes(Some(1001)), [true, true, true, false]);
+        assert_eq!(primes(None), [false; 4]);
     }
 
     /// A prompt past a step's token budget prefills in chunks. Every chunk but its last gets no

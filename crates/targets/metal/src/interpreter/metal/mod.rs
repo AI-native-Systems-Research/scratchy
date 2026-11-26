@@ -43,7 +43,7 @@ pub use pipelines::{GEMV_ROWS, PipelineLookupError, SpecializedPipelines};
 pub use crate::BLOCKS_PER_CHUNK;
 pub use bucket::{BakedBucket, BakedBuckets, Buckets, Door, Fits, Picked, bucket, bucket_row};
 pub use forward::{
-    AfterForward, Deferral, DeviceInput, DeviceInputInto, DraftInputs, ForwardAfter,
+    AfterForward, AfterLane, Deferral, DeviceInput, DeviceInputInto, DraftInputs, ForwardAfter,
     ForwardAfterEncode, ForwardError, ForwardInputs, ForwardReads, GpuSpan, InFlight,
     build_mrope_cos_sin_override, last_gpu_span,
 };

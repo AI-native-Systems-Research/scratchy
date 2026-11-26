@@ -31,8 +31,8 @@ pub use backend::{
 pub use block::{Block, BlockDrafter, BlockLane, BlockPasses, Commit};
 pub use draft_context::{DraftContextError, DraftContextPlan};
 pub use mtp::{
-    BLOCK_LANES, Chain, DraftBudget, DraftVocab, Drafting, HeadPasses, MtpDrafter, MtpProposer,
-    MtpProposerConfig, PassOne, PastFirst, StepRows,
+    BLOCK_LANES, Chain, DraftBudget, DraftVocab, Drafting, HeadPasses, Kept, MtpDrafter,
+    MtpProposer, MtpProposerConfig, PassOne, PastFirst, StepRows,
 };
 pub use ngram::{NgramProposer, NgramProposerConfig};
 pub use proposer::{DraftModelProposer, DraftSeedInputs, Proposer, ProposerStepCtx};
