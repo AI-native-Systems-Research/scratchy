@@ -8,15 +8,15 @@ description = "Build-graph placeholder. The dxp compile moved into the #[forward
 
 [features]
 default = []
-# Kept so the feature wiring that names `scratchy-builder-spyre/spyre-hw` keeps resolving. It no
-# longer turns anything on: the dxp compile happens inside the `#[forward]` emit and its output goes
+# Kept so the feature wiring that names `scratchy-builder-spyre/spyre-hw` keeps resolving. It
+# turns nothing on: the dxp compile happens inside the `#[forward]` emit and its output goes
 # into the binary via inventory.
 spyre-hw = []
 
-# ⛔ NO BUILD-DEPENDENCY ON `scratchy-models`. It used to live here as an ORDERING LEVER — a
+# ⛔ NO BUILD-DEPENDENCY ON `scratchy-models`. It would only be an ORDERING LEVER — a
 # build-dependency is the only edge cargo fully builds before a build script runs, so depending on the
-# model crate here guaranteed the `#[forward]` emit had filled the bundle cache before this crate's
-# build.rs walked it. That cache is gone (the emit compiles its own groups and embeds the result), so
-# the lever has nothing left to order — and it was expensive: a build-dependency compiles for the
-# HOST while the worker's normal edge compiles for the TARGET, which meant TWO cargo units each
+# model crate here would guarantee the `#[forward]` emit filled a bundle cache before this crate's
+# build.rs walked it. There is no such cache (the emit compiles its own groups and embeds the result),
+# so the lever has nothing to order — and it is expensive: a build-dependency compiles for the
+# HOST while the worker's normal edge compiles for the TARGET, which means TWO cargo units each
 # running the full model emission, in parallel, both writing the same ~13 GB.

@@ -208,6 +208,7 @@ Anything else, including a second checkpoint check outside that one door, is a v
 
 ### P11. Lock and comment hygiene
 Report these as one grouped line after the rules above.
+Enforced by the `p11_*` lints in `lints/scratchy-purity` (`scripts/purity.sh`); a finding there is the verdict.
 - No `#[allow]` anywhere: not at a site, and not in a `[lints]` table. Find the design the lint doesn't flag. (Main's `[lints]` tables only declare check-cfg.)
 - No escape-hatch constructors (`from_untyped`, `conflated_with_*`, a `pub` raw constructor on a checked type).
 - No weakened tests or ratchets ("did the number get smaller?").

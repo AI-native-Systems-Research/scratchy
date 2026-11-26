@@ -1,0 +1,95 @@
+error: P11: a lint allow opts this code out of a check; find the design the lint doesn't flag
+  --> $DIR/p11_lint_allow.rs:2:1
+   |
+LL | #![allow(unused_variables)]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: fix what the lint reports, then delete the attribute
+   = note: `#[forbid(p11_lint_allow)]` on by default
+
+error: P11: a lint allow opts this code out of a check; find the design the lint doesn't flag
+  --> $DIR/p11_lint_allow.rs:3:1
+   |
+LL | #![expect(unused_mut)]
+   | ^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: fix what the lint reports, then delete the attribute
+
+error: P11: a lint allow opts this code out of a check; find the design the lint doesn't flag
+  --> $DIR/p11_lint_allow.rs:4:1
+   |
+LL | #![allow(rustdoc::broken_intra_doc_links)]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: fix what the lint reports, then delete the attribute
+
+error: P11: a lint allow opts this code out of a check; find the design the lint doesn't flag
+  --> $DIR/p11_lint_allow.rs:6:1
+   |
+LL | #[allow(dead_code)]
+   | ^^^^^^^^^^^^^^^^^^^
+   |
+   = help: fix what the lint reports, then delete the attribute
+
+error: P11: a lint allow opts this code out of a check; find the design the lint doesn't flag
+  --> $DIR/p11_lint_allow.rs:9:1
+   |
+LL | #[expect(dead_code)]
+   | ^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: fix what the lint reports, then delete the attribute
+
+error: P11: a lint allow opts this code out of a check; find the design the lint doesn't flag
+  --> $DIR/p11_lint_allow.rs:12:1
+   |
+LL | #[allow(clippy::needless_return)]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: fix what the lint reports, then delete the attribute
+
+error: P11: a lint allow opts this code out of a check; find the design the lint doesn't flag
+  --> $DIR/p11_lint_allow.rs:17:1
+   |
+LL | #[cfg_attr(all(), allow(dead_code))]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: fix what the lint reports, then delete the attribute
+
+error: P11: a lint allow opts this code out of a check; find the design the lint doesn't flag
+  --> $DIR/p11_lint_allow.rs:20:1
+   |
+LL | #[cfg_attr(all(), cfg_attr(all(), expect(dead_code)))]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: fix what the lint reports, then delete the attribute
+
+error: P11: a lint allow opts this code out of a check; find the design the lint doesn't flag
+  --> $DIR/p11_lint_allow.rs:26:5
+   |
+LL |     #[allow(dead_code)]
+   |     ^^^^^^^^^^^^^^^^^^^
+   |
+   = help: fix what the lint reports, then delete the attribute
+
+error: P11: a lint allow opts this code out of a check; find the design the lint doesn't flag
+  --> $DIR/p11_lint_allow.rs:33:9
+   |
+LL |         #[allow(dead_code)]
+   |         ^^^^^^^^^^^^^^^^^^^
+   |
+   = help: fix what the lint reports, then delete the attribute
+
+error: P11: a lint allow opts this code out of a check; find the design the lint doesn't flag
+  --> $DIR/p11_lint_allow.rs:42:9
+   |
+LL |         #[$level(dead_code)]
+   |         ^^^^^^^^^^^^^^^^^^^^
+...
+LL | level!(allow, g);
+   | ---------------- in this macro invocation
+   |
+   = help: fix what the lint reports, then delete the attribute
+   = note: this error originates in the macro `level` (in Nightly b$DIRlds, run with -Z macro-backtrace for more info)
+
+error: aborting due to 11 previous errors
+

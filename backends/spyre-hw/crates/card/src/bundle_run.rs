@@ -189,7 +189,7 @@ fn split_raw(s: &str) -> Result<u32> {
 /// A producer's reserved device constants (see [`RESERVED_TID_FLOOR`]) are single values: an
 /// rmsnorm's `1/cols`, a `Program::ScalarMul`'s multiplier. They bind exactly like any other fp16
 /// tensor, so all this spelling saves is a two-byte file — but a two-byte file is precisely where a
-/// launch goes wrong in silence, because nothing about `t4294967275=/tmp/x.bin` says WHICH number is
+/// launch goes wrong in silence, because nothing about `t4294967275=<dir>/x.bin` says WHICH number is
 /// in it, and a scale is the one operand whose wrongness is a clean rescaling of an otherwise
 /// correct-looking answer. `const:t4294967275=12.0` puts the value in the command, where the run's
 /// own log records it.

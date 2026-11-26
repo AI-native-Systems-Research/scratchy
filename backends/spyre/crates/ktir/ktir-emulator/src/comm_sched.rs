@@ -1620,8 +1620,8 @@ fn compute_dies_at(ops: &[Operation]) -> Vec<Vec<Ssa>> {
     // Recursively record the highest TOP-LEVEL index at which each value is used.
     // Uses come from operands AND from the attributes that NAME values (`iter_var`
     // / `iter_args` / `result_names` / a dynamic `sizes_dyn`) — missing those frees
-    // a value too early. Those used to be recognized by a leading `%` on a string
-    // attribute, which both over-matched and under-matched; an [`Attr::Ssas`] IS
+    // a value too early. Recognizing those by a leading `%` on a string attribute
+    // would both over-match and under-match; an [`Attr::Ssas`] IS
     // the list of values the attribute names, so the walk is exact.
     fn note_uses(op: &Operation, top_idx: usize, last_use: &mut HashMap<Ssa, usize>) {
         for &operand in op.operands {

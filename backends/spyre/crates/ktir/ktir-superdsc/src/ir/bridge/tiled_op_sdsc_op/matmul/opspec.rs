@@ -237,7 +237,7 @@ pub fn matmul_opspec_off_operands_phys_gathered<DF: DataFormat>(
         // no second pin: the prefill-m>1 per-expert batched matmul. The kernel is re-declared
         // rank-3 with the PINNED DIM FIRST — `["mb","in","out"]`, NOT the KV arm's
         // `["in","out","mb"]` — because that is the spelling the one-matmul card probe measured
-        // (2026-10-09, `/tmp/prefill-m1-probe-report.md`): `maxDimSizes_ [1,-1,-1]` pins position 0,
+        // (2026-10-09): `maxDimSizes_ [1,-1,-1]` pins position 0,
         // dxp reads the operand list POSITIONALLY (`getMinParamBmm` front/.at(1)/.back), and the
         // scheduled tree engaged the vendor's paged loop nest at BOTH the small and 26b-gate
         // geometries with `RC=0`. A different dim order here is not a cosmetic choice: the pin

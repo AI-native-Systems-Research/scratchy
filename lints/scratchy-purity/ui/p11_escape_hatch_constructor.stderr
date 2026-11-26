@@ -1,0 +1,43 @@
+error: P11: `from_untyped` is an escape-hatch constructor; a checked type has one checking constructor, the only way in
+  --> $DIR/p11_escape_hatch_constructor.rs:8:12
+   |
+LL |     pub fn from_untyped(n: u32) -> Self {
+   |            ^^^^^^^^^^^^
+   |
+   = help: delete it, and mint the value through the type's checking constructor
+   = note: `#[forbid(p11_escape_hatch_constructor)]` on by default
+
+error: P11: `conflated_with_kv` is an escape-hatch constructor; a checked type has one checking constructor, the only way in
+  --> $DIR/p11_escape_hatch_constructor.rs:11:12
+   |
+LL |     pub fn conflated_with_kv(n: u32) -> Self {
+   |            ^^^^^^^^^^^^^^^^^
+   |
+   = help: delete it, and mint the value through the type's checking constructor
+
+error: P11: `conflated_with_heads` is an escape-hatch constructor; a checked type has one checking constructor, the only way in
+  --> $DIR/p11_escape_hatch_constructor.rs:16:8
+   |
+LL | pub fn conflated_with_heads(n: u32) -> Heads {
+   |        ^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: delete it, and mint the value through the type's checking constructor
+
+error: P11: `from_untyped` is an escape-hatch constructor; a checked type has one checking constructor, the only way in
+  --> $DIR/p11_escape_hatch_constructor.rs:23:20
+   |
+LL |             pub fn from_untyped(n: u32) -> Self {
+   |                    ^^^^^^^^^^^^
+   |
+   = help: delete it, and mint the value through the type's checking constructor
+
+error: P11: `from_untyped` is an escape-hatch constructor; a checked type has one checking constructor, the only way in
+  --> $DIR/p11_escape_hatch_constructor.rs:36:12
+   |
+LL |     pub fn from_untyped() {}
+   |            ^^^^^^^^^^^^
+   |
+   = help: delete it, and mint the value through the type's checking constructor
+
+error: aborting due to 5 previous errors
+

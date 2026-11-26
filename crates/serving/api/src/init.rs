@@ -392,7 +392,7 @@ const TEMPLATE_TURN_TERMINATORS: &[&str] = &[
     "<|endoftext|>",
 ];
 
-// Worker creation result now lives in `scratchy-serving-worker` alongside
+// Worker creation result lives in `scratchy-serving-worker` alongside
 // the `WorkerFactory` trait and `Box<dyn Worker>`/`HfModelConfig` it names.
 use scratchy_serving_worker::worker_factory::{
     Draft, ProgressCallback, VerifySeqs, WorkerCreationResult, linked_factory,

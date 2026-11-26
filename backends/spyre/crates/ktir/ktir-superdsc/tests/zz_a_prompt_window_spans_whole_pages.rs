@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //! ⭐⭐⭐ A PROMPT WINDOW MAY SPAN WHOLE PAGES — the pool laws a 512-row prefill chunk rests on.
 //!
-//! One page used to be the widest window: a chunk's cache write was ONE `[mq, hd]` copy, resolved to
-//! ONE page, so a padded write past the page end landed on the next kv head's keys. The write is now
+//! One page is not the widest window. A chunk's cache write as ONE `[mq, hd]` copy, resolved to
+//! ONE page, would land a padded write past the page end on the next kv head's keys, so the write is
 //! cut into one part per page, each aimed at its own page through the request's block table, so the
 //! window may span `PREFILL_WINDOW_PAGES` WHOLE pages — never part of one. These pin the three host
 //! laws that keep a part from ever straddling a page, and the map that gives every written page a host

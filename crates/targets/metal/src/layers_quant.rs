@@ -33,9 +33,9 @@ use crate::weights::GpuWeights;
 /// `(weight, n, k)`.
 ///
 /// Uses ONLY the frozen `WeightSource` vocabulary (`take_cpu` +
-/// `alloc_packed_from_host`); the dequant arithmetic is byte-for-byte the math
-/// that used to live in `GpuWeights::take_affine_dequant_b4_bytes`. NOTE: the
-/// `take_cpu` read copies the small packed 4-bit weight (vs the old zero-copy
+/// `alloc_packed_from_host`); the dequant arithmetic is the pure
+/// [`affine_dequant_b4_to_dtype`] math, byte for byte. NOTE: the
+/// `take_cpu` read copies the small packed 4-bit weight (not a zero-copy
 /// mmap read) — one extra small copy at load, correctness-preserving.
 /// Number of u32 columns MLX-affine packing produces for `k` elements at
 /// `bits` width: a continuous LSB-first bitstream, `ceil(k * bits / 32)`

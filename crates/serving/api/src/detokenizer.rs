@@ -187,7 +187,7 @@ impl IncrementalDetokenizer {
     ///
     /// Python: FastIncrementalDetokenizer.decode_next (line 209-220)
     /// This is a direct port of tokenizers' step_decode_stream function
-    /// from /tmp/zoo/tokenizers/tokenizers/src/tokenizer/mod.rs lines 1085-1128
+    /// in HuggingFace `tokenizers`, tokenizers/src/tokenizer/mod.rs lines 1085-1128
     ///
     /// Appends the token's new text to `output_text`. Every render decodes into a buffer the
     /// stream keeps ([`Tokenizer::decode_into`]), so a token allocates nothing once they have

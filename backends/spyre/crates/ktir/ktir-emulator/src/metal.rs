@@ -2253,9 +2253,9 @@ fn def_map_all<'o>(ops: &'o [Operation]) -> HashMap<Ssa, &'o Operation<'o>> {
     m
 }
 
-/// The MSL identifier a value's buffer is bound under. The buffer used to be
-/// named by the SSA SPELLING with its `%` stripped; a value has no spelling, so
-/// it is named by its identity.
+/// The MSL identifier a value's buffer is bound under. Not the SSA SPELLING
+/// with its `%` stripped: a value has no spelling, so the buffer is named by
+/// its identity.
 fn buf_ident(v: Ssa) -> String {
     format!("v{}", v.0)
 }

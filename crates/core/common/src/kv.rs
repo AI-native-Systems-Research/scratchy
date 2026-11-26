@@ -514,7 +514,7 @@ mod step_reach_proofs {
     ///
     /// What must hold, and does, for BOTH arms: if the step's write page is past a request's own pages, the
     /// request is given exactly one more page for it. That is what closes the window on admission — the arm
-    /// that used to be sized by token count alone.
+    /// that sizing by token count alone leaves open.
     #[kani::proof]
     fn neither_arm_leaves_the_write_page_unowned() {
         let (span, reach, block, own, writing) = inputs();

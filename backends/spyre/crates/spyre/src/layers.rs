@@ -27,8 +27,8 @@ use crate::weights::GpuWeights;
 // Neutral layer TYPE DEFINITIONS + the shared neutral load free fns. The spyre
 // `crate::__gpu::layers::*` field-type surface (LinearLayer, Embedding, RmsNorm,
 // LayerNorm, GatedDeltaNetLayer, GpuTensor handles, …) resolves through this
-// glob — it formerly lived inline in `lib.rs`, moved here so the whole layer
-// surface is in one place, peer to every other target's `layers.rs`.
+// glob, so the whole layer surface is in one place, peer to every other
+// target's `layers.rs`.
 pub use scratchy_layers::layers::*;
 
 // The quant payload TYPES live in `scratchy-quantizations` (a neutral leaf,

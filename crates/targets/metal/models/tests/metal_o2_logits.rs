@@ -10,8 +10,8 @@
 //! prints, per step, the greedy token and a SHA-256 of the full logits row the step produced (the
 //! terminal arena slot). Decoders hash the sampled row; encoders hash every row.
 //!
-//! The printed `O2` lines are the oracle: `/tmp/metal-unify/gate-o2.sh` records them once from a
-//! baseline tree and requires every later tree to print exactly the same lines.
+//! The printed `O2` lines are the oracle: record them once from a baseline tree, and every later
+//! tree must print exactly the same lines.
 //!
 //! `#[ignore]`d: a case needs a Metal 4 GPU and its checkpoint in the local Hub cache. Run one case
 //! per process — the wired KV pool and weights are never torn down between cases:
@@ -739,8 +739,8 @@ macro_rules! o2_cases {
 }
 
 // The runtime gate. Each case needs the compiled variant that claims its checkpoint, so each runs
-// only under the gate build whose features (and quant preset) select it — see
-// `/tmp/metal-unify/gate-builds.sh`. The suffix names the variant family the checkpoint matches.
+// only under the gate build whose features (and quant preset) select it. The suffix names the
+// variant family the checkpoint matches.
 o2_cases! {
     // Dense (no quant preset).
     "llama/smollm2-135m" => o2_smollm2_135m("HuggingFaceTB/SmolLM2-135M-Instruct", Sampled);

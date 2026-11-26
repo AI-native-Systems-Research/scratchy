@@ -1291,7 +1291,7 @@ fn time1_bundle_mlir_is_byte_identical_to_flat() {
 }
 
 // ── DUMP harness (run with `--ignored`): writes the two GATE-1 dxp probe bundles
-//    to /tmp/superdsc_gate/{fit64,ov4096} for an on-card `dxp_standalone --bundle`
+//    to `superdsc_gate/{fit64,ov4096}` under the `root` below, for an on-card `dxp_standalone --bundle`
 //    run. NOT a unit assertion — the de-risk instrument for "does the typed
 //    minimal frontend format (time=1) and the time-tiled format clear 1535 on the
 //    card?". Per THE LOOP: any residual DtException → a new Rust witness here.

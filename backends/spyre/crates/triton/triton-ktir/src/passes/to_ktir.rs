@@ -36,17 +36,17 @@
 //! fourteen `Linalg*` variants and zero `Tt*`. Triton cannot leak downstream even by
 //! accident. See [`crate::consumer`].
 //!
-//! # THE BROADCAST SHAPE IS A V1 CONSTRAINT, AND V1 IS NOT OUR PATH ANY MORE
+//! # THE BROADCAST SHAPE IS A V1 CONSTRAINT, AND V1 IS NOT OUR PATH
 //!
 //! `tt.broadcast` becomes a `linalg.generic` with a **yield-only body**, not the named
 //! `linalg.broadcast`, even though `ktir_core`'s enum has a `LinalgBroadcast` variant and
-//! the named form is obviously tidier. This used to be recorded here as "not a choice --
-//! do not improve it", on the strength of V1's legality check
-//! (`KTIRLegalityCheckPass::isLegalGenericBodyOp`), which ACCEPTS the generic and REJECTS
-//! the named op as an unsupported compute op. Probe p07.
+//! the named form is obviously tidier. V1's legality check
+//! (`KTIRLegalityCheckPass::isLegalGenericBodyOp`) ACCEPTS the generic and REJECTS
+//! the named op as an unsupported compute op (probe p07), which would make the shape
+//! "not a choice -- do not improve it".
 //!
-//! **That reason no longer applies to this pass.** V1's scheduler is routed around, so its
-//! legality check is not a gate we pass through. Two facts now point the other way: their
+//! **That reason does not apply to this pass.** V1's scheduler is routed around, so its
+//! legality check is not a gate we pass through. Two facts point the other way: their
 //! type names `LinalgBroadcast`, and their own producer uses it at exactly the place a
 //! reduction result has to reach the lanes again.
 //!
@@ -3353,10 +3353,9 @@ fn verify_only_scheduler_dialects(module: &Module) -> Result<()> {
 /// The pipeline is `triton -> ttir -> KTDP -> KTIR -> SuperDSC`, five stages each of which is its
 /// own thing, all named by IBM (`lib/Dialect/KTDP`, `lib/Dialect/KTDF`). This is the third arrow.
 ///
-/// It used to be two calls: [`run`], which rewrote the KTDP module in place, and a top-level
-/// `handoff` module that then mapped that module into `ktir_core`. That made the tree look like it
-/// held TWO FORMS OF KTIR with a converter between them, and I described it that way for a long
-/// time. It never did: the in-place form is the KTDP IR (`ktdp.*` ops mid-conversion, exactly what
+/// Not two calls — [`run`] rewriting the KTDP module in place, then a separate converter mapping
+/// that module into `ktir_core` — because that makes the tree look like it holds TWO FORMS OF KTIR
+/// with a converter between them. It does not: the in-place form is the KTDP IR (`ktdp.*` ops mid-conversion, exactly what
 /// the C++'s own `make_ktir` goldens contain at this point) and the emitted form is KTIR. One
 /// stage, one output type.
 ///
