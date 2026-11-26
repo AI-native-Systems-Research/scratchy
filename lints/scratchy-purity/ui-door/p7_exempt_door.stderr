@@ -1,0 +1,11 @@
+error: P7: `LlamaForCausalLM` is a model name deciding behavior; derive the fact from the config in one shared place, and name the math, not the model
+  --> $DIR/p7_exempt_door.rs:16:26
+   |
+LL |             arch_hint == "LlamaForCausalLM"
+   |                          ^^^^^^^^^^^^^^^^^^
+   |
+   = help: state the fact the model name stands for (a shape, a flag the config carries) and decide on that
+   = note: `#[forbid(p7_model_name_in_logic)]` on by default
+
+error: aborting due to 1 previous error
+

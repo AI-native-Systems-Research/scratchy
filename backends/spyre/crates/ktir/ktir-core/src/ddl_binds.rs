@@ -879,7 +879,7 @@ impl DeviceGen for Gen1 {
     /// 1-bit RIGHT rotation of the 4-bit group index — logical lane `4g+r`
     /// lands at buffer position `4·ror(g)+r`, `ror(g) = (g>>1) |
     /// ((g&1)<<3)`. The staging over this table stays in ktir-superdsc's
-    /// `element_arrangement`; only the table itself moved here, so a
+    /// `element_arrangement`; only the table itself lives here, so a
     /// generation is one impl with its own measured permutation.
     const DL16TOFP32_PERMUTATION: [u8; 64] = dl16tofp32_permutation();
 }

@@ -2,11 +2,11 @@
 
 //! THE CONSUMER CONTRACT: what scratchy's `ktir_to_superdsc` can actually accept.
 //!
-//! The KTIR → SuperDSC leg is no longer ours. scratchy's
+//! The KTIR → SuperDSC leg is not ours. scratchy's
 //! `backends/spyre/crates/spyre/src/ktir_to_superdsc/` walks
 //! `ktir_core::ir::{IRFunction, Operation}` directly -- no text, no printer, no
-//! parser -- and our text-reading `triton-superdsc-lower` is superseded. So the
-//! question for THIS crate stops being "does our KTIR match the C++'s" and becomes
+//! parser -- in place of our text-reading `triton-superdsc-lower`. So the
+//! question for THIS crate is not "does our KTIR match the C++'s" but
 //! "can our KTIR be EXPRESSED in their type and WALKED by their lowering".
 //!
 //! Those are different questions, and the second one currently answers NO. This

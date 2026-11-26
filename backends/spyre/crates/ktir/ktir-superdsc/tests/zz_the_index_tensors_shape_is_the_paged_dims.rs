@@ -202,26 +202,26 @@ fn a_paged_gather_pins_a_page_axis_and_a_per_position_axis() {
 /// assert properties of.
 ///
 /// `matmul_opspec_off_operands_phys_gathered` declares the Kᵗ kernel rank-3 so `mb` has somewhere to
-/// land, and the tests that used to live below measured that descriptor in detail: two pins, `mb`
+/// land, and tests can measure that descriptor in detail: two pins, `mb`
 /// pinned to 1, the 2-D order preserved as a prefix, the index shaped by the paged dims, the declared
-/// entry count. Every one of them passed.
+/// entry count. Every one of them passes.
 ///
-/// They were measuring a descriptor the card REFUSES. A gathered matmul has `KERNEL` in its
+/// They measure a descriptor the card REFUSES. A gathered matmul has `KERNEL` in its
 /// `primaryDsInfo_`, and `hasDimensionReuse` (`L3DlOpsScheduler.cpp:303-321`,
 /// `primaryDsInfo_.size() > 1 && count(DsTypes::KERNEL)`) turns on the arithmetic-intensity explorer at
 /// `:1550`, whose `calculateFlopPerByte` demands an LX allocate node for every HBM-pinned labeledDs
 /// (`:2334`/`:2337`) — which `allocAllMem` never gives an index. MEASURED on the card at BOTH possible
 /// index `memOrg_` values.
 ///
-/// ⭐ SUPERSEDED IN PART 2026-10-09: the probe (`/tmp/prefill-m1-probe-report.md`) root-caused those
+/// ⭐ ONE EXCEPTION, FROM THE 2026-10-09 PROBE: it root-caused those
 /// refusals to the exploration path only (a vendor ordering gap) and escaped them for the
-/// TOKEN-PLANE form — entries on `mb`, one position each, no second pin — which now EMITS
+/// TOKEN-PLANE form — entries on `mb`, one position each, no second pin — which EMITS
 /// (`zz_the_token_plane_gathered_matmul_is_the_probe_form.rs`, probe-proven `RC=0` at both
 /// geometries with `DISABLE_ABOVE_LX_CHUNK_EXPLORE=1` at bake). THIS form — `of_pool_blocks_per_row`,
 /// a Slot-paged kernel with a `per_position` batch pin — was never probed and stays refused.
 ///
 /// So a green test on this shape is worse than no test: it pins an unschedulable descriptor as correct,
-/// in full detail, with a vendor fixture cited. What replaces them is the REFUSAL, plus the same
+/// in full detail, with a vendor fixture cited. What this file asserts instead is the REFUSAL, plus the same
 /// properties asserted on the shape that ships — `zz_the_gather_op_is_kernel_less.rs`, whose harness is
 /// the vendor's own `identity` with both data operands typed `OUTPUT`.
 ///

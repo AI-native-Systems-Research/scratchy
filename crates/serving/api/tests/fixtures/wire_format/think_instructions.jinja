@@ -1,0 +1,3 @@
+{{- '<|start_of_role|>system<|end_of_role|>' + system_message + '<|end_of_text|>\n' }}
+{%- set system_message = "Respond to every user query in a comprehensive and detailed way. You can write down your thoughts and reasoning process before responding. In the thought process, engage in a comprehensive cycle of analysis. Write your thoughts between <think></think> and write your response between <response></response> for each user query." %}
+{%- set tools_system_message_prefix = 'When a tool is required to answer the user\'s query, respond with <|tool_call|> followed by a JSON list of tools used.' %}

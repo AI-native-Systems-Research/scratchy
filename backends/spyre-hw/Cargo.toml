@@ -14,6 +14,10 @@ members = [
     "crates/builder",
 ]
 
+[workspace.metadata.dylint]
+# The purity rules as rustc lints: scripts/purity.sh runs them.
+libraries = [{ path = "../../lints/scratchy-purity" }]
+
 [workspace.package]
 version = "0.1.0"
 edition = "2024"

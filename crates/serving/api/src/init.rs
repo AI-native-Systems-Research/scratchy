@@ -392,7 +392,7 @@ const TEMPLATE_TURN_TERMINATORS: &[&str] = &[
     "<|endoftext|>",
 ];
 
-// Worker creation result now lives in `scratchy-serving-worker` alongside
+// Worker creation result lives in `scratchy-serving-worker` alongside
 // the `WorkerFactory` trait and `Box<dyn Worker>`/`HfModelConfig` it names.
 use scratchy_serving_worker::worker_factory::{
     Draft, ProgressCallback, VerifySeqs, WorkerCreationResult, linked_factory,
@@ -1687,38 +1687,16 @@ pub fn initialize_stack_sync(config: &VllmConfig) -> Result<InitializedSyncStack
     })
 }
 
-/// The model's canonical architecture used to select parsers: `model_type` if
-/// present (e.g. `qwen3_5_moe`, `gemma4`, `llama`), else the first
-/// `architectures` entry. Never the model name/path.
-///
-/// Granite 4.2 keeps `model_type: granite` but switched to ChatML, ` MudThink`
-/// reasoning and Qwen3-Coder XML tool calls — and it is the first granite with
-/// an untied lm_head (`tie_word_embeddings: false`; every granite ≤4.1 ties).
-/// Untying is an architecture fact from `config.json`, so it keys the format
-/// split the same way `model_type` does: untied granites report `granite_4_2`.
-fn model_arch(hf: &HfModelConfig) -> &str {
-    let base = hf
-        .model_type
-        .as_deref()
-        .filter(|s| !s.is_empty())
-        .or_else(|| hf.architectures.first().map(String::as_str))
-        .unwrap_or("");
-    if base == "granite" && hf.tie_word_embeddings == Some(false) {
-        return "granite_4_2";
-    }
-    base
-}
-
-/// Install a tool-call parser on `engine`, chosen from the model **architecture**,
-/// unless one is already set. Called at every engine-construction site so any
+/// Install a tool-call parser on `engine`, chosen by its chat template's markers
+/// ([`crate::wire_format`]), unless one is already set. Called at every engine-construction site so any
 /// consumer of the engine — `scr serve` without a flag, `batch`, or a library
 /// embedder — gets tool-call parsing for free. An explicit `--tool-call-parser`
 /// applied by the caller after `initialize_stack` returns still overrides this.
-fn auto_install_tool_parser(engine: &mut AsyncEngine, arch: &str) {
+fn auto_install_tool_parser(engine: &mut AsyncEngine, template: Option<&str>) {
     if engine.tool_parser().is_some() {
         return;
     }
-    match crate::tool_parser::detect_tool_parser(arch) {
+    match crate::tool_parser::detect_tool_parser(template) {
         Some(name) => match crate::tool_parser::get_tool_parser(name) {
             Ok(parser) => {
                 info!("Auto-selected tool-call parser '{name}' (override with --tool-call-parser)");
@@ -1727,17 +1705,18 @@ fn auto_install_tool_parser(engine: &mut AsyncEngine, arch: &str) {
             Err(e) => tracing::warn!("tool-call parser '{name}' unavailable: {e}"),
         },
         None => tracing::warn!(
-            "no tool-call parser auto-detected for architecture '{arch}'; tool calls will not \
-             be extracted (pass --tool-call-parser to force one)"
+            "no tool-call parser auto-detected: the chat template renders no tool-call format \
+             a parser reads; tool calls will not be extracted (pass --tool-call-parser to \
+             force one)"
         ),
     }
 }
 
-/// Auto-select a reasoning parser from the model **architecture** so reasoning
-/// models route their thinking to the `reasoning` field instead of leaking it
-/// into content.
-fn auto_install_reasoning_parser(engine: &mut AsyncEngine, arch: &str) {
-    let Some(name) = crate::reasoning_parser::detect_reasoning_parser(arch) else {
+/// Auto-select a reasoning parser by the chat template's markers
+/// ([`crate::wire_format`]) so reasoning models route their thinking to the
+/// `reasoning` field instead of leaking it into content.
+fn auto_install_reasoning_parser(engine: &mut AsyncEngine, template: Option<&str>) {
+    let Some(name) = crate::reasoning_parser::detect_reasoning_parser(template) else {
         return;
     };
     // `<think>` parsers resolve token ids from the vocab; the harmony parser
@@ -1828,8 +1807,9 @@ pub fn initialize_stack(
     // 11. Finish progress bar and return the stack.
     progress.finish();
 
-    auto_install_tool_parser(&mut engine, model_arch(&core.hf_config));
-    auto_install_reasoning_parser(&mut engine, model_arch(&core.hf_config));
+    let template = engine.chat_template().map(|t| t.template_str().to_owned());
+    auto_install_tool_parser(&mut engine, template.as_deref());
+    auto_install_reasoning_parser(&mut engine, template.as_deref());
     Ok(InitializedStack {
         engine: Arc::new(engine),
         model_name,

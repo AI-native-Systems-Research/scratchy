@@ -1,7 +1,7 @@
 //! Run bridge two on a fixture's ttir golden and write the resulting KTIR as TEXT.
 //!
 //! ```bash
-//! cargo run --offline --example emit_ktir -- attention_flash_noncausal /tmp/out.ktir.mlir
+//! cargo run --offline --example emit_ktir -- attention_flash_noncausal <out-dir>/out.ktir.mlir
 //! ```
 //!
 //! THE TEXT IS A TEST INSTRUMENT, and this example is part of that instrument rather

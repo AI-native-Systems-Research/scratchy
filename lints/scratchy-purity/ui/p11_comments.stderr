@@ -1,0 +1,52 @@
+error: P11: this comment narrates history (`superseded`); comments describe the code as it is, in the present tense
+  --> $DIR/p11_comments.rs:1:1
+   |
+LL | //! Superseded by the typed table.
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: say what the code does now, or delete the comment
+   = note: `#[forbid(p11_tombstone_comment)]` on by default
+
+error: P11: this comment narrates history (`moved from`); comments describe the code as it is, in the present tense
+  --> $DIR/p11_comments.rs:5:1
+   |
+LL | // This helper moved from `old::module`.
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: say what the code does now, or delete the comment
+
+error: P11: this comment narrates history (`used to be`); comments describe the code as it is, in the present tense
+  --> $DIR/p11_comments.rs:8:1
+   |
+LL | /// The table used to be a Vec.
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: say what the code does now, or delete the comment
+
+error: P11: this comment narrates history (`was removed`); comments describe the code as it is, in the present tense
+  --> $DIR/p11_comments.rs:11:1
+   |
+LL | /* The cache was removed. */
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: say what the code does now, or delete the comment
+
+error: P11: this comment cites a path under the temp directory; a comment never points at scratch files
+  --> $DIR/p11_comments.rs:14:1
+   |
+LL | // See `/tmp/report.md` for the numbers.
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: cite the in-tree source, or use a placeholder such as <out-dir> in a command example
+   = note: `#[forbid(p11_tmp_path_comment)]` on by default
+
+error: P11: this comment cites a path under the temp directory; a comment never points at scratch files
+  --> $DIR/p11_comments.rs:17:1
+   |
+LL | /// Copied from (~/tmp/src/lib.rs).
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: cite the in-tree source, or use a placeholder such as <out-dir> in a command example
+
+error: aborting due to 6 previous errors
+

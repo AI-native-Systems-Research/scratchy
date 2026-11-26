@@ -2046,9 +2046,9 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
 
     /// ⛔⛔⛔ WHO FILLED THIS SOURCE — ONE ANSWER, FROM ONE PLACE.
     ///
-    /// This used to be an open-coded chain of negations inside `require_sources_filled`:
+    /// Not an open-coded chain of negations inside `require_sources_filled`:
     /// `places.contains && !weight_ids.contains && !bound.contains && !resident_sources.contains`.
-    /// The bug that shape produced: adding a FIFTH way to fill a source needs a fifth `&& !`, and
+    /// The bug that shape produces: adding a FIFTH way to fill a source needs a fifth `&& !`, and
     /// forgetting it does not fail to compile — it silently reads as "nobody filled this", so the
     /// executor refuses a launch that was perfectly well fed. That is exactly what happened to the
     /// prefill ladder, which fills its weights by ALIAS and was refused for 642 of them.
@@ -2283,10 +2283,10 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
     /// too, so "already narrowed" means "already f16", not "already staged". An int32 tensor has no
     /// fp16 encoding to survive that pass: see [`Self::raw_ids`] for what it does to a block number.
     ///
-    /// ⛔⛔⛔ IT TAKES A [`RawBind`], NOT `(id, bytes)`, AND THAT IS THE WHOLE GUARD. The signature
-    /// used to be `(PlaceId, Vec<u8>)` — bytes with NO relation to the placement they land in — and
-    /// the relation was re-checked, far away and at runtime, by `refill_activations`'s over-bind
-    /// `bail!`. A length that exceeds its placement now has no value to arrive in: see
+    /// ⛔⛔⛔ IT TAKES A [`RawBind`], NOT `(id, bytes)`, AND THAT IS THE WHOLE GUARD. A
+    /// `(PlaceId, Vec<u8>)` signature carries bytes with NO relation to the placement they land in,
+    /// leaving the relation to be re-checked, far away and at runtime, by an over-bind
+    /// `bail!`. A length that exceeds its placement has no value to arrive in: see
     /// [`Self::place_raw`], the only constructor.
     pub fn bind_input_raw(&mut self, b: RawBind) {
         if !self.prepared {
@@ -2592,9 +2592,9 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
 
         // ── Collect the weight placements, validating each against its own extent. ──
         // One bound tensor's staging transform — what the parallel stage loop does to its bytes.
-        // ⭐ VERBATIM IS A THIRD THING, NOT THE ABSENCE OF THE SECOND: this used to be
-        // `Option<(&KernelWeight, Element)>`, where `None` meant "convert", so an fp32 const
-        // had no honest spelling — its bytes are neither retiled nor IEEE-fp16-to-SEN
+        // ⭐ VERBATIM IS A THIRD THING, NOT THE ABSENCE OF THE SECOND: as an
+        // `Option<(&KernelWeight, Element)>`, where `None` means "convert", an fp32 const
+        // would have no honest spelling — its bytes are neither retiled nor IEEE-fp16-to-SEN
         // re-encoded, they are already the device's own (`Df::Fp32` = IEEE_FP32).
         #[derive(Clone, Copy)]
         enum StageMode<'a> {

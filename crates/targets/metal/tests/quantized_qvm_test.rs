@@ -76,7 +76,7 @@ fn make_inputs_bf16(
     (packed, scales, biases, x)
 }
 
-// CPU reference now lives in `scratchy_target_metal::cpu_reference`
+// CPU reference lives in `scratchy_target_metal::cpu_reference`
 // (imported above as `cpu_qvm_bf16`). Shares the transpose=false
 // matmul with qmm_n.
 

@@ -58,3 +58,7 @@ SCRATCHY_SKIP_SENDNN_CXX=1 cargo clippy -p scratchy-target-spyre-cli \
 
 # The card crate's compile_fail doctests (the nightly job's leg).
 SCRATCHY_SKIP_SENDNN_CXX=1 cargo +nightly test --doc -p scratchy-target-spyre-card --features snt1p0
+
+# The purity lints over the card workspace (scripts/purity.sh; needs cargo-dylint 6.4.0).
+scripts_dir=$(cd "$(dirname "$0")" && pwd)
+"${scripts_dir}/purity.sh" --scope spyre-hw

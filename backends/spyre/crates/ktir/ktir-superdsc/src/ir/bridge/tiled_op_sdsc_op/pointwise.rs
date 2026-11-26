@@ -473,8 +473,8 @@ pub fn assemble_gather_copy<T: crate::collective::Tp>(
             // first fp8 caller and states its own df at its own door.
             df: Df::Fp16,
             // ⛔ AND THE DESTINATION's base SEPARATELY, with the source's own base at its ZERO law. It
-            // used to be derived from the index base above; see `GatherCopy::dest_entry` for the
-            // measurement that separated them (a page-granular op names one entry at stick `r` but
+            // is not derived from the index base above; see `GatherCopy::dest_entry` for the
+            // measurement that separates them (a page-granular op names one entry at stick `r` but
             // writes run `r`, so the two advance at different rates). Both come from `copies()`, which
             // mints them from one request index. The KV pool's entries are GLOBAL block numbers — no
             // source base (the `GatherCopy` law).

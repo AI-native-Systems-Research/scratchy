@@ -797,9 +797,9 @@ impl InputBatch {
 pub struct PreparedInputs {
     /// Per-request slicing info.
     pub req_inputs: Vec<ReqSlice>,
-    /// Flat token IDs for all requests (moved from InputBatch).
+    /// Flat token IDs for all requests.
     pub flat_token_ids: Vec<u32>,
-    /// Flat positions for all requests (moved from InputBatch).
+    /// Flat positions for all requests.
     pub flat_positions: Vec<u32>,
     /// Attention metadata (also owns block_ids and tokens_before).
     pub attn_meta: AttentionMetadata,

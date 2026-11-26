@@ -12,15 +12,14 @@
 //! names appear in scratchy-forward-compiler, scratchy-forward-compiler-macro, or
 //! scratchy-serving-api — only in the per-arch data that owns the declaration.
 //!
-//! These facts used to be written as `const` items inside a `mod` DSL
-//! carrier, and scraped back out of the token stream here. That surface
-//! is gone, because it was a config file costumed as Rust: the type
-//! ascriptions (`Layout`, `Fingerprint`, `ScaleDtype`, …) never
-//! resolved to anything, so the macro string-matched const NAMES and
-//! pulled literals out of the expressions. Declarations about
-//! checkpoints now live WITH the checkpoints, as JSON — the same
-//! channel (and the same key names) the per-checkpoint
-//! `<stem>.overrides.json` drift files already used, so there is one
+//! These facts are not `const` items inside a `mod` DSL carrier,
+//! scraped back out of the token stream: that is a config file
+//! costumed as Rust, whose type ascriptions (`Layout`, `Fingerprint`,
+//! `ScaleDtype`, …) resolve to nothing, so the macro can only
+//! string-match const NAMES and pull literals out of the expressions.
+//! Declarations about checkpoints live WITH the checkpoints, as JSON —
+//! the same channel (and the same key names) the per-checkpoint
+//! `<stem>.overrides.json` drift files use, so there is one
 //! vocabulary instead of two.
 //!
 //! Precedence, widest to narrowest: verbatim HF `config.json`

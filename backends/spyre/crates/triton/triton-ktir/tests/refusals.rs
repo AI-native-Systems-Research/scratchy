@@ -261,8 +261,8 @@ fn every_refusal_names_its_pass_and_says_something() {
 /// argument. Every Granite extent is constexpr, so this path is unverified by all eleven of
 /// them, which is why it is worth more than its size suggests.
 ///
-/// THREE THINGS WERE WRONG, all on that path, and all found the moment these two kernels
-/// became comparable at all (they used to be refused, so nothing had ever diffed them):
+/// THREE THINGS GO WRONG on that path, all visible only because these two kernels are
+/// comparable at all (a refused kernel is never diffed):
 ///
 /// 1. A DYNAMIC EXTENT IS AN OPERAND, NOT A SENTINEL. The C++ emits an `arith.index_cast` of
 ///    the runtime shape value and passes it to the view; this port recorded `kDynamic` in the
@@ -296,7 +296,7 @@ fn the_runtime_extent_path_matches_the_cpp() {
          gap was pinned by, kept so a regression reads as the same number moving back"
     );
     // Still asserted: no op we emit is absent from the C++'s. A real miscompile here would not
-    // look like the omission this used to be.
+    // look like an omission.
     let theirs: Vec<&str> = golden_m
         .ops_deep()
         .iter()

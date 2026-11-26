@@ -164,6 +164,7 @@ Anything else, including a second checkpoint check outside that one door, is a v
   - The end state is ONE representation shared by every target and the runtime; a design that adds another copy of the facts is not progress.
 
 ### P7. A real compiler ladder: derived, never declared per model
+Enforced in part by the p7_* lint in lints/scratchy-purity (scripts/purity.sh); a finding there is the verdict.
 - No model, arch or stem names in logic: `match arch`, `.contains(&arch)`, `&[&str]` arch or preset allowlists, `RouteProgram::Qwen*`, `GEMMA_PROGRAM` template flags. Name the math ("top-k, scale, softmax"), never the model.
 - A fact that follows from configs the compiler loads is derived in ONE shared place: no new `overrides.json` hand entries, no arch branches, no model-wide "has X anywhere" proxies.
 - A kernel family covers the general shape space through instantiation, with a rung for off-tile shapes. If coverage is exactly the shapes of the checkpoints in hand, that is the finding: head dims {256, 512}, expert counts {128, 256}, "a tiny parity config's GEMMs sit off the tiles".
@@ -208,6 +209,7 @@ Anything else, including a second checkpoint check outside that one door, is a v
 
 ### P11. Lock and comment hygiene
 Report these as one grouped line after the rules above.
+Enforced by the `p11_*` lints in `lints/scratchy-purity` (`scripts/purity.sh`); a finding there is the verdict.
 - No `#[allow]` anywhere: not at a site, and not in a `[lints]` table. Find the design the lint doesn't flag. (Main's `[lints]` tables only declare check-cfg.)
 - No escape-hatch constructors (`from_untyped`, `conflated_with_*`, a `pub` raw constructor on a checked type).
 - No weakened tests or ratchets ("did the number get smaller?").

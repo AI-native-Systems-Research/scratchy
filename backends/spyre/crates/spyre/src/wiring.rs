@@ -37,11 +37,9 @@ use scratchy_tensors::GpuTensor;
 // reach through the same prefix every other wiring type uses.
 pub use ktir_superdsc::sdsc_abstract::{QueryExtent, RungCap, RungWidth};
 
-// ⭐ `act_name` MOVED TO `ktir_superdsc::place`, BESIDE THE `PlaceId` WHOSE `Display` IT CALLS. Its
-// whole body was `bundle::PlaceId::Act(tid).to_string()`, and that module's header already claimed
-// to hold "the ONE site that spells an operand" — so this was simply left behind when `PlaceId` and
-// the `SynthRole` vocabulary went. Its 22 call sites are all in the lowering, which is now in that
-// crate too.
+// ⭐ `act_name` LIVES IN `ktir_superdsc::place`, BESIDE THE `PlaceId` WHOSE `Display` IT CALLS:
+// that module is the one site that spells an operand, and every caller is in the lowering, in
+// that crate.
 
 /// The staged tensor of a linear layer, whatever its quant variant.
 ///
@@ -354,8 +352,8 @@ impl Wiring {
 
     /// THE FORWARD TAPE FOR THIS BUNDLE.
     ///
-    /// ⭐ EVERY FIELD IS GENERATED DATA. The shape used to be assembled in the worker out of a
-    /// `BundleMeta` the worker had itself built by scanning the artifact; here it is a projection
+    /// ⭐ EVERY FIELD IS GENERATED DATA. The shape is not assembled in the worker out of a
+    /// `BundleMeta` the worker builds by scanning the artifact; it is a projection
     /// of the emitted wiring, so there is nothing for a second opinion to disagree with.
     pub fn forward_shape(
         &self,
@@ -999,11 +997,11 @@ pub struct Wiring {
     pub tensor_shapes: &'static [(u32, u32)],
     /// The host-gathered hidden row's source id.
     ///
-    /// ⛔ THE ANSWER, NOT THE DATA TO COMPUTE IT FROM. This used to be a
-    /// `&[Source]` role array that the worker SCANNED at every model load
+    /// ⛔ THE ANSWER, NOT THE DATA TO COMPUTE IT FROM. Not a
+    /// `&[Source]` role array for the worker to SCAN at every model load
     /// (`.position(|s| matches!(s, EmbeddedHidden))`) — a compile-time fact
-    /// re-derived at runtime, which is the same tell as the JSON `role`
-    /// strings this replaced, just with a nicer type. The roles are still an
+    /// re-derived at runtime, which is the same tell as JSON `role`
+    /// strings, just with a nicer type. The roles are still an
     /// exhaustive enum where they belong: in the macro, over `SourceBinding`.
     pub embed_src: u32,
     /// Rotary `cos` / `sin` sources as `(id, full column width, rotary class)`.

@@ -13,9 +13,9 @@
 //! ## Region / yield handling
 //!
 //! `linalg.yield %v` RETURNS `%v`, as `scf.yield` does; [`run_region`] drives the
-//! body op by op and keeps the terminator's value. It used to be parked in the
-//! value table under a reserved NAME (`"__linalg_yield__"`), chosen never to
-//! collide with a real SSA name — a spelling an [`Ssa`] cannot express.
+//! body op by op and keeps the terminator's value. It is not parked in the
+//! value table under a reserved NAME (a `"__linalg_yield__"` chosen never to
+//! collide with a real SSA name) — a spelling an [`Ssa`] cannot express.
 //!
 //! ## N-dimensional tiles
 //!

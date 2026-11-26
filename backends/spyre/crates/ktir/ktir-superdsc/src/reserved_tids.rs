@@ -8,7 +8,7 @@
 //! fp8 clamp bounds, the head-major selectors. A third-party KTIR producer has to agree with these
 //! numbers to bind anything, so they are part of the interface, not of scratchy's plan.
 //!
-//! ⛔ AND THE ARITHMETIC IS THE POINT. Every id used to be raw `SOME_BASE - index` with no bound on
+//! ⛔ AND THE ARITHMETIC IS THE POINT. No id is a raw `SOME_BASE - index` with no bound on
 //! the index and nothing proving the regions disjoint — see [`TidRegion`] for what two tensors
 //! landing on one tid costs on a device with no stack to attach to.
 
@@ -497,9 +497,9 @@ pub const RESERVED_REGIONS: [TidRegion; 10] = [
     // regions, which are gone with the K-split itself. `kct_resident` keeps its ABSOLUTE base rather
     // than sliding up into the hole: every reserved id is a number that has been baked into
     // artifacts, and moving one to tidy the map would silently repoint it.
-    // ⛔ BOUNDED, WHERE IT USED TO BE OPEN-ENDED. `kct_resident_tid(k_id) = BASE - k_id` had no
-    // floor at all: a model with enough tensors walked it downward without limit. One million
-    // slots is far past any real tid count and is now a REFUSAL rather than a wrap.
+    // ⛔ BOUNDED, NOT OPEN-ENDED. A bare `kct_resident_tid(k_id) = BASE - k_id` has no
+    // floor at all: a model with enough tensors walks it downward without limit. One million
+    // slots is far past any real tid count, and past it is a REFUSAL rather than a wrap.
     TidRegion {
         name: "kct_resident",
         base: u32::MAX - 1_000_171,

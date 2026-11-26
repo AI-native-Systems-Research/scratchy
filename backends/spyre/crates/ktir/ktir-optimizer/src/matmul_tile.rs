@@ -16,17 +16,17 @@
 //!   expands into trips. main's `lower_matmul_node` says it outright — "the Spyre tape does NOT
 //!   K-chunk (each `MatmulTile` is a whole GEMM; SuperDSC owns the K-split via the cost model)".
 //!
-//! ⛔ SO A PRE-TILED KTIR WAS A BUG FOR ONE OF ITS TWO CONSUMERS. The nest below used to be built
-//! during KTIR construction, which meant `KTIR → SuperDSC` received a 64-trip `scf.for` where the
-//! proven emitter wanted one contraction — an `ScfFor` it had no mapping for, because there is no
-//! SuperDSC op that means "loop". Un-tiling it in the KTIR→SuperDSC direction would have meant
+//! ⛔ SO A PRE-TILED KTIR IS A BUG FOR ONE OF ITS TWO CONSUMERS. Building the nest below during
+//! KTIR construction would hand `KTIR → SuperDSC` a 64-trip `scf.for` where the
+//! proven emitter wants one contraction — an `ScfFor` it has no mapping for, because there is no
+//! SuperDSC op that means "loop". Un-tiling it in the KTIR→SuperDSC direction would mean
 //! pattern-matching a tiling back out of the IR; emitting untiled KTIR and tiling HERE, for the one
 //! consumer that needs it, is the same decision made in the right place.
 //!
-//! ⭐ MOVED VERBATIM, and that is the correctness argument. Every extent, block size, op order and
-//! attribute below is what the producer's `KtirFunc::matmul` built before (the splice reproduces it
-//! byte-for-byte), so the emulator sees the same KTIR it already runs at its measured rate. This
-//! pass is a relocation, not a redesign.
+//! ⭐ THE PRODUCER'S NEST, VERBATIM, and that is the correctness argument. Every extent, block size,
+//! op order and attribute below is what the producer's `KtirFunc::matmul` would build (the splice
+//! reproduces it byte-for-byte), so the emulator sees the same KTIR it runs at its measured rate.
+//! This pass places the tiling; it does not redesign it.
 
 use crate::name_gen::NameGen;
 use ktir_core::affine::{AffineExpr, AffineMap};

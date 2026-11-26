@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! ⭐⭐⭐⭐⭐ THE TOKEN-PLANE GATHERED MATMUL IS THE PROBE'S FORM — the prefill-m>1 per-expert batch
 //! matmul's descriptor, pinned field by field against the JSON the one-matmul card probe actually
-//! baked (2026-10-09, `/tmp/prefill-m1-probe-report.md`, artifacts `/tmp/gprobe-emit/fused/`).
+//! baked (2026-10-09).
 //!
 //! ## Why this file exists
 //! For a year the emitter refused EVERY gather on a KERNEL-bearing op, on two bracketing card

@@ -104,7 +104,7 @@ pub struct Region {
     /// ⭐ NOT ALWAYS THE TENSOR'S SHAPE, AND THAT IS THE POINT. The rope program views `x` as
     /// `[rows·heads, hd]`, so this states the HEAD DIM directly.
     ///
-    /// ⛔ `v_rows` USED TO BE DROPPED, AND THAT COST THE FIRST GENERATED TOKEN. The prefill lm-head
+    /// ⛔ DROPPING `v_rows` COSTS THE FIRST GENERATED TOKEN. The prefill lm-head
     /// tail's extraction addresses `hidden[mq, hidden]` as the tall-narrow `[(hidden/64)·mq, 64]` it
     /// physically is, and the row it copies is `j·mq + row` — so `mq` is a term of the ADDRESS, not
     /// decoration. Recovering it as `r_start + 1` from the SSOT identity `selector_lastrow_col(m) =
@@ -114,14 +114,14 @@ pub struct Region {
     /// The window the program takes of the buffer (the access tile's corner + `Shape`). Equal to the
     /// whole view when the program reads all of it.
     ///
-    /// ⛔⛔⛔ `r_start` USED TO BE DISCARDED INTO `_r_start`, AND THAT WAS THE DEFECT. The mq>1
+    /// ⛔⛔⛔ DISCARDING `r_start` INTO `_r_start` IS A DEFECT. The mq>1
     /// prefill lm-head tail states its row in the KTIR — the matmul puts
-    /// `selector_lastrow_col(mq)` on its activation access tile as an `arith.constant` — and this
-    /// walk threw it away, so `matmul` built `rb(&a.name(), m, k)` at the BUFFER BASE and the
-    /// vocab-wide tail read the wrong `hidden` bytes. MEASURED, granite-3.1-2b fp8, prompt `hi`
+    /// `selector_lastrow_col(mq)` on its activation access tile as an `arith.constant` — and a
+    /// walk that throws it away makes `matmul` build `rb(&a.name(), m, k)` at the BUFFER BASE, so the
+    /// vocab-wide tail reads the wrong `hidden` bytes. MEASURED, granite-3.1-2b fp8, prompt `hi`
     /// (14 tokens on the m=15 rung): first generated token `yun` where main gives `Hello`, then a
     /// perfectly fluent continuation — and still wrong on `hi there`, which fills the rung EXACTLY
-    /// (`m_used=15 prefill_m=15`), so it was never the zero-padded row it looked like.
+    /// (`m_used=15 prefill_m=15`), so it is not the zero-padded row it looks like.
     ///
     /// Every emitter here addresses the buffer BASE (`rb(name, rows, cols)` takes no offset — which
     /// is precisely why main MATERIALIZES the row, see [`lmlast`]). So a nonzero `r_start` reaching
@@ -5290,7 +5290,7 @@ pub fn rope_at<T: crate::collective::Tp, const HD: u32>(
         Ok(())
     };
     // ── HEAD-MAJOR COLLAPSE, AT ANY ROW COUNT ───────────────────────────────────────────────────
-    // This used to be `mq == 1` only, and the note below measures what that costs: ~40 per-(row,head)
+    // Not `mq == 1` only: the note below measures what that restriction costs: ~40 per-(row,head)
     // ops per op-type, ~150 extra ops a layer, "the single largest unaccounted-for chunk of the perf
     // gap". It is also a fixed cost — the body goes 271 ops a layer at one request to 372 at two, and
     // then only +16 per further request — so a batch pays it in full and amortizes none of it.
@@ -8207,8 +8207,8 @@ fn split_regions(
     Ok((ins, out))
 }
 
-/// The consumer door for `Program::Elementwise` — the op table, and the extent guard that used to be
-/// absent. Every operand shape below is a SHAPE THE PRODUCER ACTUALLY BUILDS, cited to it.
+/// The consumer door for `Program::Elementwise` — the op table, and its extent guard. Every operand
+/// shape below is a SHAPE THE PRODUCER ACTUALLY BUILDS, cited to it.
 #[cfg(test)]
 mod elementwise_tests {
     use super::*;
@@ -11339,9 +11339,9 @@ pub fn reshape<T: crate::collective::Tp>(
 /// descriptor.
 ///
 /// ⭐ AND THIS IS THE ONLY BODY. [`scalarmul`] DELEGATES here, so the two doors cannot drift about
-/// what a scalarmul emits — only about where its number came from. It used to be a COPY with that
-/// same sentence on it, and the copy drifted in the one arm nothing could reach; see the operand-order
-/// note below for what that cost.
+/// what a scalarmul emits — only about where its number came from. A COPY with that same sentence
+/// on it drifts in the one arm nothing can reach; see the operand-order note below for what that
+/// costs.
 pub fn scalarmul_at<T: crate::collective::Tp>(
     name: &str,
     scale: f32,
@@ -11704,11 +11704,11 @@ fn scalarmul_scaled<T: crate::collective::Tp>(
 /// kind. A producer whose program states a bare `linalg.reduce` — every Triton `tl.sum(x, 1)` or
 /// `tl.max(x, 1)` that is not part of a recognised rmsnorm — had no entry point at all.
 ///
-/// # ⭐ THE WIDE MULTI-ROW MAX LOWERS — THE REFUSAL THAT USED TO LIVE HERE MISREAD ITS ONE DIAGNOSTIC
+/// # ⭐ THE WIDE MULTI-ROW MAX LOWERS — A REFUSAL HERE WOULD MISREAD ITS ONE DIAGNOSTIC
 ///
-/// This door used to REFUSE `Max` at `rows > 1 && cols > 64` by name, on the reading that the
-/// on-card reduce-MAX "mis-combines the per-stick partial maxima and hands back the seed" inside
-/// exactly that cell. The template's own DDL refutes both halves of that sentence:
+/// This door does NOT refuse `Max` at `rows > 1 && cols > 64`. The reading behind such a refusal —
+/// that the on-card reduce-MAX "mis-combines the per-stick partial maxima and hands back the seed"
+/// inside exactly that cell — is one the template's own DDL refutes in both halves:
 ///
 /// * `summeanmaxexx2.ddl` seeds the identity ITSELF — `negInf`/`posInf`/`zero`/`one`
 ///   `ddl.define_constant`s (`:69-72`) that the PE accumulator LRFs are initialized from (negInf

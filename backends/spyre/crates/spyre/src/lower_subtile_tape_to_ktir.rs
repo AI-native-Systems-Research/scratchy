@@ -1238,13 +1238,13 @@ pub(crate) fn lower_one_node<T: ktir_superdsc::collective::Tp, F: RopeForm>(
 /// The PRODUCER half over a whole UNROLLED graph: one KTIR program per node, plus the bundle layout
 /// every one of them resolves its addresses through.
 ///
-/// ⛔⛔⛔ THIS USED TO BE CALLED `lower_graph_to_superdsc`, AND KEEPING THAT NAME THROUGH THE SPLIT IS
-/// WHAT WENT WRONG. It is `ibm/main`'s function, text unchanged — but main's `lower_one_node` returned
-/// SuperDSC descriptors and this one returns KTIR programs, so the body silently stopped producing what
-/// its name, its doc and its own worklist error (`"{} SuperDSC op(s) emitted ok"`) all still claim. A
-/// caller that asked it for descriptors got `EmittedOp::bare` — `op: None`, `time: 1` — and every
-/// question it then asked of them ("how many descriptors?", "is this op tiled?") was answered about a
-/// program instead. The WHOLE lowering is [`lower_graph_to_superdsc`] below; this is its first half.
+/// ⛔⛔⛔ THIS IS NOT `lower_graph_to_superdsc`, AND THE NAME IS WHAT KEEPS THE TWO APART. It is
+/// `ibm/main`'s function, text unchanged — but main's `lower_one_node` returns SuperDSC descriptors
+/// and this one returns KTIR programs, so under main's name the body would silently not produce what
+/// its name, its doc and its own worklist error (`"{} SuperDSC op(s) emitted ok"`) all claim. A
+/// caller asking it for descriptors would get `EmittedOp::bare` — `op: None`, `time: 1` — and every
+/// question it then asked of them ("how many descriptors?", "is this op tiled?") would be answered
+/// about a program instead. The WHOLE lowering is [`lower_graph_to_superdsc`] below; this is its first half.
 pub fn lower_graph_to_ktir<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     ir: &SubtileIR<F>,
     weight_ids: &std::collections::HashSet<u32>,

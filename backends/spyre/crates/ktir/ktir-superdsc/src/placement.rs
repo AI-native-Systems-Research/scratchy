@@ -124,7 +124,7 @@ pub enum WeightTail {
     /// Every weight sits in the weight segment: it fits one device region.
     #[default]
     InPlace,
-    /// The tail was moved to `segment` (one of [`WEIGHT_SPILL_SEGS`]) at `[0, bytes)`, which every
+    /// The tail sits in `segment` (one of [`WEIGHT_SPILL_SEGS`]) at `[0, bytes)`, which every
     /// borrowing session has to be handed its own copy of.
     Spilled { segment: u32, bytes: u64 },
 }
@@ -134,7 +134,7 @@ pub enum WeightTail {
 //
 // Both constants were hand-picked page ceilings on the prefix mask — 32 was chosen to keep the
 // reservation byte-identical to a pre-paged mask that no longer exists, and 64 was the pass budget
-// of an uncollapsed fold the gathered form superseded — and together they bound a row's context
+// of an uncollapsed fold, which the gathered form replaces — and together they bound a row's context
 // before the pool's memory ever got a vote. The mask's block count is now DERIVED at bake from the
 // device (`compute_bundle_layout`: `MAX_SEGMENT_BYTES / page_bytes`, the most pages one region of
 // KV can hold), one expression feeding the `rows_are_requests` and broadcast arms alike, so there

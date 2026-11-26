@@ -21,7 +21,7 @@
 //! The COMPOSITE-op decomposition itself (RoPE's rotate+xc+rs+add, AttnDecode's fused attention,
 //! SiluMul's internal multi-op sequence, and the `lower_*_node` dispatch functions) still lives in
 //! the live emitter: each of those already calls through to these families' functions as its own
-//! OWN primitive-op building blocks. RmsNorm's decomposition ([`rmsnorm`]) has moved here —
+//! OWN primitive-op building blocks. RmsNorm's decomposition ([`rmsnorm`]) lives here —
 //! it is the first composite decomposer ported, matching torch-spyre's `spyre_rms_norm` exactly
 //! (see that module's doc). Migrating the *remaining* composite decomposers here too is real,
 //! ongoing work, not yet complete for RoPE/AttnDecode/SiluMul.

@@ -2899,52 +2899,11 @@ pub fn get_tool_parser(name: &str) -> Result<Arc<dyn ToolCallParser>, String> {
     }
 }
 
-/// Best-effort tool-call parser selection from the model's **canonical
-/// architecture** (`config.json` `model_type` / `architectures`) — NOT its
-/// name or path. The tool-call format is a property of the model family/arch,
-/// so keying off a quant's filename is fragile; the arch is authoritative.
-/// Returns one of the names understood by [`get_tool_parser`], or `None`.
-///
-/// Note: architecture alone can't separate a finetune that changes the tool
-/// format from its base (e.g. Hermes-on-Llama, or Qwen3-Coder-30B which shares
-/// `qwen3_moe` with plain Qwen3-MoE); those need an explicit `--tool-call-parser`.
-/// Granite 4.2 is the one same-`model_type` split we can see: it untied the
-/// lm_head, and `model_arch` (init.rs) reports untied granites as
-/// `granite_4_2`.
-pub fn detect_tool_parser(arch: &str) -> Option<&'static str> {
-    let a = arch.to_lowercase();
-    if a.contains("kimi") {
-        Some("kimi_k2")
-    } else if a.contains("granite_4_2") {
-        // Granite 4.2 dropped the 3.x tool format for Qwen3-Coder-style XML
-        // `<function=…><parameter=…>` calls.
-        Some("qwen3_coder")
-    } else if a.contains("granite") {
-        Some("granite")
-    } else if a.contains("jamba") {
-        Some("jamba")
-    } else if a.contains("gemma") {
-        // Gemma 4's `<|tool_call>` format (gemma ≤3 has no native tool format).
-        Some("gemma4")
-    } else if a.contains("mistral")
-        || a.contains("mixtral")
-        || a.contains("ministral")
-        || a.contains("magistral")
-        || a.contains("devstral")
-    {
-        Some("mistral")
-    } else if a.contains("llama") {
-        Some("llama3_json")
-    } else if a.contains("qwen3_5") || a.contains("qwen3.5") || a.contains("nemotron_h") {
-        // Qwen3.5 / 3.6 (`qwen3_5_moe`) and Nemotron-H (its tokenizer config names
-        // `qwen3_coder`) emit the XML `<function=…><parameter=…>` format.
-        Some("qwen3_coder")
-    } else if a.contains("qwen") {
-        // Qwen (≤3) emits `<tool_call>{json}</tool_call>`.
-        Some("hermes")
-    } else {
-        None
-    }
+/// The tool-call parser the model's chat template selects, by the template's own markers
+/// ([`crate::wire_format`]), as a name [`get_tool_parser`] takes. `None` without a template, or
+/// for one that renders no tool-call format a parser reads: pass `--tool-call-parser` then.
+pub fn detect_tool_parser(template: Option<&str>) -> Option<&'static str> {
+    crate::wire_format::wire_formats(template).tool
 }
 
 // ---------------------------------------------------------------------------
@@ -3343,44 +3302,22 @@ mod tests {
         assert_eq!(refused_at(&one, two_calls), Some(comma));
     }
 
-    // -- Parser auto-detection from model id --
+    // -- Parser auto-detection from the chat template --
 
     #[test]
-    fn detects_common_families() {
+    fn detects_from_the_template() {
+        let hermes = "<tool_call>\\n{\\\"name\\\": <function-name>}\\n</tool_call>";
+        assert_eq!(detect_tool_parser(Some(hermes)), Some("hermes"));
         assert_eq!(
-            detect_tool_parser("meta-llama/Llama-3.2-1B-Instruct"),
-            Some("llama3_json")
-        );
-        assert_eq!(
-            detect_tool_parser("unsloth/Llama-3.2-1B-Instruct"),
-            Some("llama3_json")
-        );
-        assert_eq!(
-            detect_tool_parser("Qwen/Qwen2.5-7B-Instruct"),
-            Some("hermes")
-        );
-        assert_eq!(
-            detect_tool_parser("mistralai/Mistral-7B-Instruct-v0.3"),
+            detect_tool_parser(Some("{{- \"[TOOL_CALLS] [\" }}")),
             Some("mistral")
         );
-        assert_eq!(
-            detect_tool_parser("moonshotai/Kimi-K2-Instruct"),
-            Some("kimi_k2")
-        );
-        assert_eq!(
-            detect_tool_parser("ibm-granite/granite-3.1-8b-instruct"),
-            Some("granite")
-        );
-        assert_eq!(
-            detect_tool_parser("mlx-community/gemma-4-26b-a4b-it-4bit"),
-            Some("gemma4")
-        );
-        assert_eq!(detect_tool_parser("google/gemma-4-12b-it"), Some("gemma4"));
     }
 
     #[test]
-    fn unknown_family_is_none() {
-        assert_eq!(detect_tool_parser("some-random/exotic-model"), None);
+    fn no_template_is_none() {
+        assert_eq!(detect_tool_parser(None), None);
+        assert_eq!(detect_tool_parser(Some("{{ messages }}")), None);
     }
 
     // -- Hermes non-streaming tests --
@@ -5173,25 +5110,5 @@ mod qwen3_coder_tests {
         let args: serde_json::Value =
             serde_json::from_str(calls[0].function_arguments.as_deref().unwrap()).unwrap();
         assert_eq!(args["command"], "ls");
-    }
-
-    #[test]
-    fn routes_by_architecture() {
-        // model_type values from config.json.
-        assert_eq!(detect_tool_parser("qwen3_5_moe"), Some("qwen3_coder"));
-        assert_eq!(detect_tool_parser("nemotron_h"), Some("qwen3_coder"));
-        assert_eq!(detect_tool_parser("qwen3"), Some("hermes"));
-        assert_eq!(detect_tool_parser("gemma4"), Some("gemma4"));
-        assert_eq!(detect_tool_parser("llama"), Some("llama3_json"));
-        assert_eq!(detect_tool_parser("mistral"), Some("mistral"));
-        // Granite split: 4.2 (untied lm_head) vs ≤4.1.
-        assert_eq!(detect_tool_parser("granite_4_2"), Some("qwen3_coder"));
-        assert_eq!(detect_tool_parser("granite"), Some("granite"));
-        // Also works on the raw architecture string.
-        assert_eq!(
-            detect_tool_parser("Qwen3_5MoeForConditionalGeneration"),
-            Some("qwen3_coder")
-        );
-        assert_eq!(detect_tool_parser("LlamaForCausalLM"), Some("llama3_json"));
     }
 }
