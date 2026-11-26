@@ -1433,16 +1433,12 @@ impl MetalAllocator {
             let offset8 = offset8.lock().expect("offset8 ranges Mutex");
             let write = || -> std::io::Result<()> {
                 use std::io::Write;
-                let file = std::fs::File::create(&tmp)?;
-                // F_NOCACHE: don't dirty ~19 GiB of page cache for a
+                // Around the page cache: don't dirty ~19 GiB of it for a
                 // write-once blob — keeps the source/weight pages (and
                 // everything else) resident.
-                #[cfg(target_os = "macos")]
-                unsafe {
-                    use std::os::fd::AsRawFd;
-                    libc::fcntl(file.as_raw_fd(), libc::F_NOCACHE, 1);
-                }
-                let mut f = std::io::BufWriter::with_capacity(8 << 20, file);
+                let file =
+                    crate::uncached_file::UncachedFile::new(std::fs::File::create(&tmp)?)?;
+                let mut f = std::io::BufWriter::with_capacity(8 << 20, file.file());
                 const CHUNK: usize = 64 << 20;
                 let mut off = 0usize;
                 while off < len {

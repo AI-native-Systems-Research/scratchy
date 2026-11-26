@@ -22,32 +22,20 @@
 
 use std::cmp::Reverse;
 use std::collections::HashMap;
-use std::num::NonZeroUsize;
-use std::ops::Range;
 
 use super::output::{SnapshotDiskOps, SnapshotFill, SnapshotMove};
 
-/// ⭐ HOW A RECURRENT MODEL'S SNAPSHOTS SHARE THE KV BUDGET, as its worker lays the memory out
-/// (#495): KV is mapped and released [`Self::kv_granule_blocks`] blocks at a time and snapshots
-/// [`Self::unit_slots`] slots at a time — each the least run whose bytes are whole sparse tiles in
-/// every store it spans, so a release frees whole tiles and nothing else.
+/// ⭐ A RECURRENT MODEL'S SNAPSHOT SLOTS, as its worker lays the memory out: the device pool the
+/// worker maps once at startup, and the disk tier past it. A snapshot evicted from the pool is
+/// written out to a disk slot, and a hit on it is read back ([`SnapshotDiskOps`]).
+///
+/// [`SnapshotDiskOps`]: crate::scheduler::SnapshotDiskOps
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SnapshotBudget {
-    /// Bytes one KV block takes across every store a block lives in.
-    pub kv_block_bytes: u64,
-    /// Blocks per KV granule.
-    pub kv_granule_blocks: NonZeroUsize,
-    /// Bytes one snapshot slot takes across every recurrent-state store.
-    pub slot_bytes: u64,
-    /// Slots per snapshot unit.
-    pub unit_slots: NonZeroUsize,
-    /// Slots the worker can address: as many as the whole budget holds, a whole number of units.
+    /// Snapshot slots the worker's device pool holds, mapped at startup and never remapped.
     pub max_slots: usize,
-    /// Snapshots the worker's disk tier holds ([`SnapshotDiskOps`]), outside the budget: a
-    /// snapshot evicted from a slot is written out to one, and a hit on it reads it back. 0
-    /// without a disk tier.
-    ///
-    /// [`SnapshotDiskOps`]: crate::scheduler::SnapshotDiskOps
+    /// Snapshots the worker's disk tier holds, outside the pool: a snapshot evicted from a slot
+    /// is written out to one, and a hit on it reads it back. 0 without a disk tier.
     pub disk_slots: usize,
 }
 
@@ -194,11 +182,6 @@ impl StateSnapshots {
         self.by_key.contains_key(&key) || self.on_disk(key)
     }
 
-    /// Whether a ready snapshot evicted from its slot goes to a disk tier rather than away.
-    pub(crate) fn spills(&self) -> bool {
-        !self.disk.slots.is_empty()
-    }
-
     /// Number of snapshots the disk tier holds.
     pub(crate) fn num_on_disk(&self) -> usize {
         self.disk.by_key.len()
@@ -278,14 +261,9 @@ impl StateSnapshots {
         }
     }
 
-    /// The scheduling step now: the clock every `last_used` reads.
-    pub(crate) fn now(&self) -> u64 {
-        self.step
-    }
-
-    /// The first empty slot whose memory `mapped` says is there.
-    pub(crate) fn empty_slot(&self, mapped: impl Fn(usize) -> bool) -> Option<usize> {
-        (0..self.slots.len()).find(|&s| self.slots[s].is_none() && mapped(s))
+    /// The first empty slot.
+    pub(crate) fn empty_slot(&self) -> Option<usize> {
+        (0..self.slots.len()).find(|&s| self.slots[s].is_none())
     }
 
     /// The snapshot a save by `writer` would evict, and when it was last used: never one read or
@@ -306,20 +284,6 @@ impl StateSnapshots {
             .map(|(i, c)| (i, c.last_used))
     }
 
-    /// When the snapshots in `slots` were last used (0 with none there), or `None` while one of
-    /// them is read or written this step: whether, and how cheaply, their memory can be released.
-    pub(crate) fn age_of(&self, slots: Range<usize>) -> Option<u64> {
-        let step = self.step;
-        let mut age = 0;
-        for c in self.slots[slots].iter().flatten() {
-            if c.pinned == step {
-                return None;
-            }
-            age = age.max(c.last_used);
-        }
-        Some(age)
-    }
-
     /// Drop `key`'s snapshot, unless a step reads or writes it now: the KV it resumes over is gone
     /// (a block a step reads is held, so never evicted under it). Its disk copy goes too.
     pub(crate) fn evict_key(&mut self, key: u64) {
@@ -332,14 +296,6 @@ impl StateSnapshots {
         }
         if let Some(&d) = self.disk.by_key.get(&key) {
             self.disk.forget(d);
-        }
-    }
-
-    /// Drop every snapshot in `slots`, the ready ones to the disk tier: their memory is being
-    /// released.
-    pub(crate) fn evict_all(&mut self, slots: Range<usize>) {
-        for slot in slots {
-            self.evict(slot);
         }
     }
 
@@ -440,7 +396,7 @@ mod tests {
         if snaps.contains(key) {
             return None;
         }
-        let slot = (snaps.empty_slot(|_| true)).or_else(|| snaps.victim(writer).map(|(s, _)| s))?;
+        let slot = snaps.empty_slot().or_else(|| snaps.victim(writer).map(|(s, _)| s))?;
         snaps.place(slot, key, position, writer);
         Some(slot)
     }
