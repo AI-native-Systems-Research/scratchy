@@ -23,8 +23,8 @@
 //! `cpu_golden::attention_via_cache`, `cpu_golden::attention_prefill_paged`,
 //! `interpreter::metal::pipelines` test harness).
 //!
-//! Lives at the crate root (not feature-gated) so both `cpu_golden`
-//! (unconditional) and the metal-feature-gated callers can share one
+//! Lives in the cfg-free tensor core, which every target, the shared
+//! passes and `scratchy-layers` depend on, so each can share one
 //! definition. Args are bare `u32` to avoid pulling the metal-side
 //! `ids` newtypes into CPU paths; metal call sites can wrap their
 //! `PhysicalBlockIdx(_)` / `SlotInBlock(_)` payloads at the boundary.
@@ -47,8 +47,7 @@ impl PagedKvLayout {
     /// three within-block dims (`num_kv_heads`, `block_size`,
     /// `head_dim`). The CPU golden code paths know those three
     /// up-front and infer `num_blocks` from the K (or V) buffer
-    /// length — this constructor folds the stride math the call
-    /// site used to inline. Asserts that the inputs divide evenly.
+    /// length. Asserts that the inputs divide evenly.
     pub fn from_buffer_elems(
         buffer_elems: usize,
         num_kv_heads: u32,
@@ -102,7 +101,6 @@ impl PagedKvLayout {
 
     /// Convenience: element offset given a flat `global_slot` index
     /// that the engine writes into `RuntimeBindingKind::SlotMapping`.
-    /// Same arithmetic as `cpu_golden::rope_append_paged` did inline.
     pub fn elem_offset_for_global_slot(&self, global_slot: u32, kv_head: u32) -> usize {
         let block = global_slot / self.block_size;
         let slot = global_slot % self.block_size;
@@ -123,7 +121,7 @@ impl PagedKvLayout {
     /// then addresses within it with the *block-in-chunk* index in
     /// place of `physical_block`.
     ///
-    /// CUDA (and any single-buffer caller) passes
+    /// A single-buffer caller passes
     /// `blocks_per_chunk == num_blocks`, so `chunk_index` is always 0
     /// and `block_in_chunk == physical_block` — i.e. a no-op.
     ///
@@ -145,7 +143,7 @@ mod tests {
     #[test]
     fn chunk_decompose_single_buffer_is_noop() {
         // blocks_per_chunk == num_blocks: everything lands in chunk 0
-        // at its own index (the CUDA / single-buffer contract).
+        // at its own index (the single-buffer contract).
         for blk in [0u32, 1, 17, 255] {
             assert_eq!(PagedKvLayout::chunk_decompose(blk, 256), (0, blk));
         }
