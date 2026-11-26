@@ -45,8 +45,8 @@
 //   15 rope         2-byte elements, [n, MTP_DRAFTS + 1, MTP_ROPE]: per sequence and accepted
 //                   count, the next pass's rotary cos/sin row (MTP_ROPE 0: none)
 //   16 next_rope    2-byte elements, [n, MTP_ROPE]
-//   17 rows         uint: the rows a sequence a pass after the first runs (1 for a chained head;
-//                   a parallel-drafting head's rows past its newest, its drafts past the first)
+//   17 rows         uint: a parallel-drafting head's rows past a sequence's newest, its drafts
+//                   past the first (a chained head reads none: its passes run one row a sequence)
 //   18 mask_hidden  2-byte elements, [MTP_HIDDEN]: a parallel-drafting head's placeholder target
 //                   hidden row
 //
@@ -119,6 +119,8 @@ kernel void mtp_chain(
         }
         return;
     }
+    // A chained head's passes run one row a sequence: the constant, not `rows`.
+    const uint pass_rows = 1;
     if (tid == 0) {
         uint row;
         uint kept = 0;
@@ -133,17 +135,17 @@ kernel void mtp_chain(
         } else {
             kept = accepted[s];
             // This pass's rows a sequence draft after the ones before them.
-            for (uint j = 0; j < rows; ++j) {
-                drafts[s * MTP_DRAFTS + 1 + (depth - 2) * rows + j] = picked[s * rows + j];
+            for (uint j = 0; j < pass_rows; ++j) {
+                drafts[s * MTP_DRAFTS + 1 + (depth - 2) * pass_rows + j] = picked[s * pass_rows + j];
             }
-            row = s * rows + rows - 1;
+            row = s * pass_rows + pass_rows - 1;
         }
-        device const uint* at = next + (s * (MTP_DRAFTS + 1) + kept) * rows * 3;
-        for (uint j = 0; j < rows; ++j) {
-            next_pos[s * rows + j] = at[j * 3];
-            next_slot[s * rows + j] = at[j * 3 + 1];
+        device const uint* at = next + (s * (MTP_DRAFTS + 1) + kept) * pass_rows * 3;
+        for (uint j = 0; j < pass_rows; ++j) {
+            next_pos[s * pass_rows + j] = at[j * 3];
+            next_slot[s * pass_rows + j] = at[j * 3 + 1];
         }
-        next_used[s] = at[(rows - 1) * 3 + 2];
+        next_used[s] = at[(pass_rows - 1) * 3 + 2];
         next_ids[s] = picked[depth == 1 ? row - window_start : row];
         row_shared = row;
         kept_shared = kept;

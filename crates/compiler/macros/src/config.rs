@@ -1250,6 +1250,83 @@ fn apply_overrides_file(
         deep_merge(json, &override_json);
         tracked.push(path);
     }
+    fill_capture_default(dir, stem, json)
+}
+
+/// A head config naming none of the target layers it reads (its arch's `target_capture_layers`
+/// path) gets its arch's default (`target_capture_default`), from the target config its arch's
+/// `head_targets` names for it — every one of them, when it names several, which must agree.
+fn fill_capture_default(
+    dir: &Path,
+    stem: &str,
+    json: &mut serde_json::Value,
+) -> Result<(), ConfigError> {
+    if !dir.join("arch.json").exists() {
+        return Ok(());
+    }
+    let spec = load_arch_json(dir)?;
+    let (Some(at), Some(formulas)) = (&spec.target_capture_layers, &spec.target_capture_default)
+    else {
+        return Ok(());
+    };
+    if crate::arch_spec::json_path(json, at).is_some() {
+        return Ok(());
+    }
+    let configs = dir
+        .parent()
+        .ok_or_else(|| ConfigError::NotADirectory(dir.to_path_buf()))?;
+    let mut layers: Option<(String, Vec<u64>)> = None;
+    for (_, target) in spec.head_targets.iter().filter(|(s, _)| s == stem) {
+        let path = configs.join(format!("{target}.json"));
+        let (_, target_json) = read_json_file(&path)?;
+        let fail = |reason: String| ConfigError::ArchJson {
+            path: path.clone(),
+            reason,
+        };
+        let n = (target_json.get("num_hidden_layers"))
+            .or_else(|| target_json.get("text_config")?.get("num_hidden_layers"))
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| {
+                fail(format!(
+                    "the target of `{stem}` declares no `num_hidden_layers`"
+                ))
+            })?;
+        let env = BTreeMap::from([("num_hidden_layers".to_string(), n)]);
+        let these = (formulas.iter())
+            .map(|f| f.eval(&env))
+            .collect::<Result<Vec<u64>, String>>()
+            .map_err(|e| fail(format!("`target_capture_default` at {n} layers: {e}")))?;
+        match &layers {
+            Some((first, other)) if *other != these => {
+                return Err(fail(format!(
+                    "`{stem}` reads layers {these:?} of `{target}` but {other:?} of `{first}`: its \
+                     targets' defaults disagree"
+                )));
+            }
+            Some(_) => {}
+            None => layers = Some((target.clone(), these)),
+        }
+    }
+    let Some((_, layers)) = layers else {
+        return Ok(());
+    };
+    let mut at_json = json;
+    let mut keys = at.split('.').peekable();
+    while let Some(key) = keys.next() {
+        let obj = at_json
+            .as_object_mut()
+            .ok_or_else(|| ConfigError::ArchJson {
+                path: dir.join("arch.json"),
+                reason: format!("`{at}` runs through a non-object in `{stem}`'s config"),
+            })?;
+        at_json = match keys.peek() {
+            Some(_) => obj.entry(key).or_insert_with(|| serde_json::json!({})),
+            None => {
+                obj.insert(key.to_string(), serde_json::json!(layers));
+                return Ok(());
+            }
+        };
+    }
     Ok(())
 }
 
@@ -2342,6 +2419,17 @@ pub fn load_arch_json(dir: &Path) -> Result<crate::arch_spec::DeclaredArchSpec, 
     };
     spec.borrows = strings("borrows")?;
     spec.target_capture_layers = as_str("target_capture_layers");
+    spec.target_capture_default = strings("target_capture_default")?
+        .map(|formulas| {
+            (formulas.iter())
+                .map(|f| crate::hf_config::ParamExpr::parse(f))
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .transpose()
+        .map_err(|reason| ConfigError::ArchJson {
+            path: path.clone(),
+            reason: format!("`target_capture_default`: {reason}"),
+        })?;
     spec.top_level_weights = strings("top_level_weights")?.unwrap_or_default();
     // The facts the bounds read, by the one reader the macros crate's build script shares.
     let facts = crate::hf_config::arch_facts(&json).map_err(|reason| ConfigError::ArchJson {
@@ -2423,6 +2511,7 @@ const ARCH_JSON_KEYS: &[&str] = &[
     "borrows",
     "target_capture_layers",
     "target_capture_at",
+    "target_capture_default",
     "top_level_weights",
     "scale_dtype",
     "tie_default",
@@ -2966,7 +3055,6 @@ pub(crate) fn derive_layer_sets(
         .collect())
 }
 
-/// Returns each bound it derived, as the dim it derived it from.
 /// The layer set whose attention projections carry biases (`if layer in attention_bias_layers:`):
 /// every layer of a config with `attention_bias: true` (a Llama-family config's flag), none
 /// otherwise — so one DSL serves both (AWS's P-EAGLE drafters: 120B's has them, 20B's not).
@@ -2981,6 +3069,7 @@ fn attention_bias_layers(json: &serde_json::Value, bounds: &BTreeMap<String, u64
     LayerSet::of(0..layers)
 }
 
+/// Returns each bound it derived, as the dim it derived it from.
 fn derive_implicit_bounds(bounds: &mut BTreeMap<String, u64>) -> BTreeMap<String, crate::dim::Dim> {
     use crate::dim::Dim;
     let mut derived = BTreeMap::new();
@@ -3757,8 +3846,9 @@ mod tests {
     /// Qwen3.6's MTP head compiles on its target's config verbatim, whose block schedule names the
     /// target's 40 layers; the head's schema makes it 1. The target keeps its sets; the head gets
     /// none (a set naming layer 39 would have its fingerprint probe a layer it does not have) but
-    /// the capture set every decoder's layer loop tests, empty: its target's drafter captures the
-    /// target's layers, not the head's.
+    /// the sets every config derives, empty: the capture set every decoder's layer loop tests (its
+    /// target's drafter captures the target's layers, not the head's), and its biased attention
+    /// layers (its config's `attention_bias` is off).
     #[test]
     fn a_schema_replacing_the_layer_count_leaves_no_layer_sets() {
         let target_path = repo_model_archs("qwen3-5-moe").join("qwen3.6-35b-a3b.json");
@@ -3779,7 +3869,10 @@ mod tests {
         assert_eq!(captured, [1, 10, 19, 28, 37]);
         let head = parse("qwen3-5-mtp");
         assert_eq!(head.bounds["num_hidden_layers"], 1);
-        let none = BTreeMap::from([(DRAFT_CAPTURE_LAYERS.to_string(), LayerSet::default())]);
+        let none = BTreeMap::from([
+            (DRAFT_CAPTURE_LAYERS.to_string(), LayerSet::default()),
+            (ATTENTION_BIAS_LAYERS.to_string(), LayerSet::default()),
+        ]);
         assert_eq!(head.layer_sets, none);
         assert_eq!(
             head.checkpoint_prefix.as_deref(),

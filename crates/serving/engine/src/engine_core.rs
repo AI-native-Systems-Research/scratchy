@@ -223,8 +223,6 @@ impl<T> StepOutcome<T> {
     }
 }
 
-/// Whether `req_id` takes speculative drafts: it is running, and its sampling does not read its
-/// history (a verify row's would need the drafts before it).
 /// Whether the step just scheduled for `request` can give it its last token by length — every
 /// token it can keep counted (`num_output_placeholders`): a step behind it would run past that
 /// token on the device, holding the next request's first behind it.
@@ -242,6 +240,8 @@ fn in_hidden_header(request: &Request) -> bool {
     })
 }
 
+/// Whether `req_id` takes speculative drafts: it is running, and its sampling does not read its
+/// history (a verify row's would need the drafts before it).
 fn takes_drafts(scheduler: &Scheduler, req_id: &str) -> bool {
     scheduler
         .get_request(req_id)

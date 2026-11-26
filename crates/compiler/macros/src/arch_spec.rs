@@ -142,6 +142,10 @@ pub struct DeclaredArchSpec {
     pub target_capture_layers: Option<String>,
     /// Which stream of each of those layers it reads ([`CaptureAt`]).
     pub target_capture_at: CaptureAt,
+    /// The layers a head reads when its config names none (arch.json `target_capture_default`):
+    /// each a formula of its target's `num_hidden_layers` (an EAGLE-3 drafter's, vLLM's
+    /// `(2, n / 2, n - 3)`).
+    pub target_capture_default: Option<Vec<crate::hf_config::ParamExpr>>,
     /// Weights at the checkpoint's top level beside the decoder root, as `lm_head` is.
     pub top_level_weights: Vec<String>,
     pub tie_default: Option<bool>,

@@ -21,6 +21,11 @@
   },
   "target_capture_layers": "eagle_config.eagle_aux_hidden_state_layer_ids",
   "target_capture_at": "input",
+  "target_capture_default": [
+    "2",
+    "num_hidden_layers // 2",
+    "num_hidden_layers - 3"
+  ],
   "borrows": [
     "lm_head"
   ],

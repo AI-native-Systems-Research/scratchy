@@ -1535,7 +1535,6 @@ mod tests {
         assert_eq!(drafts(15), picked[..1], "draft 1 is pass 1's, never cut");
     }
 
-    /// Two sequences' one draft each fits five verify rows; three sequences' does not.
     /// A head keeping its target's rows runs none of a request with no reply yet (`b`, still in
     /// its prompt), nor of a step that only primes, nor while its passes still run beside the
     /// target. Within its verify rows it first runs the rows of `a` it has not (positions 7..=9,
@@ -1604,6 +1603,7 @@ mod tests {
         assert_eq!(caught.ran, [(0, 10)]);
     }
 
+    /// Two sequences' one draft each fits five verify rows; three sequences' does not.
     const GATED: MtpDrafter = MtpDrafter {
         budget: DraftBudget {
             drafts: 3,

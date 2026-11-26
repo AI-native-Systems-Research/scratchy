@@ -442,16 +442,6 @@ enum Lane {
     After,
 }
 
-impl Lane {
-    /// The queue a forward's work after it is committed on.
-    fn after(after: &dyn super::forward::AfterForward) -> Self {
-        match after.lane() {
-            super::forward::AfterLane::Behind => Self::Forwards,
-            super::forward::AfterLane::Beside => Self::After,
-        }
-    }
-}
-
 /// One MTL4 queue. The command buffer is re-created per forward (cheap — Metal pools internally).
 /// The shared event is monotonically signaled after each commit.
 struct Mtl4Lane {
@@ -1226,7 +1216,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             let ((), committed) = self.commit(Lane::Forwards, Some(writes), encode)?;
             deferral.committed(committed.in_flight);
             if let Some(after) = after {
-                let ((), committed) = self.commit(Lane::after(after), None, |enc| {
+                let ((), committed) = self.commit(Lane::After, None, |enc| {
                     after.encode(enc).map_err(ForwardError::Followup)
                 })?;
                 after.committed(committed.in_flight);
@@ -1238,7 +1228,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         // is done.
         if let Some(after) = after {
             let ((), forward) = self.commit(Lane::Forwards, Some(writes), encode)?;
-            let committed = self.commit(Lane::after(after), None, |enc| {
+            let committed = self.commit(Lane::After, None, |enc| {
                 after.encode(enc).map_err(ForwardError::Followup)
             });
             let waited = forward.in_flight.wait();
@@ -3373,7 +3363,9 @@ mod tests {
                 before,
                 "a recorded write leaves the host copy alone"
             );
-            let ((), committed) = pool.commit(Some(&writes), |_| Ok(())).expect("commits");
+            let ((), committed) = pool
+                .commit(Lane::Forwards, Some(&writes), |_| Ok(()))
+                .expect("commits");
             committed.in_flight.wait().expect("runs");
             input_ids()
         };
@@ -3450,7 +3442,9 @@ mod tests {
             backbone_rows: None,
         };
         let writes = begin_step(&guard, &inputs, pool.block_table_stride).expect("inputs fit");
-        let ((), committed) = pool.commit(Some(&writes), |_| Ok(())).expect("commits");
+        let ((), committed) = pool
+            .commit(Lane::Forwards, Some(&writes), |_| Ok(()))
+            .expect("commits");
         committed.in_flight.wait().expect("runs");
         assert_eq!(
             input_ids(),
@@ -3627,7 +3621,7 @@ mod tests {
             enc.barrierAfterEncoderStages_beforeEncoderStages_visibilityOptions(all, all, device);
         };
         let ((), committed) = pool
-            .commit(None, |enc| {
+            .commit(Lane::Forwards, None, |enc| {
                 let mut onto = pool.forward_onto(&inputs(&[1, 2], &[100, 101], &first), enc)?;
                 record(enc, &onto.guard.runtime, 0);
                 onto.then(&inputs(&[3], &[200], &second), enc)?;

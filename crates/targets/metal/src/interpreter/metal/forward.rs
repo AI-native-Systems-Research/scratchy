@@ -243,24 +243,15 @@ impl Deferral {
 }
 
 /// Work a forward's command buffer is followed by — an MTP head's passes after its target, which
-/// read what the target left — in a command buffer of its own the host does not wait for: the
-/// forward returns once its own is done, its outputs ready to read, while this runs on. It starts
-/// once the forward is done; nothing may write what it reads until it is ([`Self::take_in_flight`]).
+/// read what the target left — in a command buffer of its own the host does not wait for, on a
+/// queue beside the forwards': the forward returns once its own is done, its outputs ready to read,
+/// while this runs on, and the forwards after it do not wait for it. It starts once the forward is
+/// done; it shares none of their buffers (an arena of its own), and nothing may write what it reads
+/// until it is done ([`Self::take_in_flight`]).
 pub struct ForwardAfter<'a> {
     /// What the command buffer encodes, onto its compute encoder.
     encode: std::cell::RefCell<Option<ForwardAfterEncode<'a>>>,
-    lane: AfterLane,
     in_flight: std::sync::OnceLock<InFlight>,
-}
-
-/// Whether the forwards after a forward's work after it ([`ForwardAfter`]) wait for it.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum AfterLane {
-    /// They do: it shares their buffers — a head running in its target's arena.
-    Behind,
-    /// They run beside it, on the GPU at once: it shares none of their buffers — a head with an
-    /// arena of its own, reading what the forward left where no forward after it writes.
-    Beside,
 }
 
 /// [`ForwardAfter`]'s work, encoded onto its command buffer's compute encoder.
@@ -272,10 +263,9 @@ pub type ForwardAfterEncode<'a> = Box<
 >;
 
 impl<'a> ForwardAfter<'a> {
-    pub fn new(encode: ForwardAfterEncode<'a>, lane: AfterLane) -> Self {
+    pub fn new(encode: ForwardAfterEncode<'a>) -> Self {
         Self {
             encode: std::cell::RefCell::new(Some(encode)),
-            lane,
             in_flight: std::sync::OnceLock::new(),
         }
     }
@@ -298,9 +288,6 @@ pub trait AfterForward {
 
     /// Record the command buffer the work was committed in.
     fn committed(&self, in_flight: InFlight);
-
-    /// Whether the forwards after it wait for it.
-    fn lane(&self) -> AfterLane;
 }
 
 impl AfterForward for ForwardAfter<'_> {
@@ -310,10 +297,6 @@ impl AfterForward for ForwardAfter<'_> {
     ) -> Result<(), String> {
         let work = (self.encode.borrow_mut().take()).ok_or("a forward's work after it, again")?;
         work(enc)
-    }
-
-    fn lane(&self) -> AfterLane {
-        self.lane
     }
 
     fn committed(&self, in_flight: InFlight) {
