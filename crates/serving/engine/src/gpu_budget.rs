@@ -517,9 +517,9 @@ mod max_num_seqs_default_tests {
         assert_eq!(snapshot_pool_slots(&p(48 * MIB, GIB, false), 10 * GIB), 0);
     }
 
-    /// The audit's point 2: a recurrent model served WITHOUT prefix caching
-    /// holds no snapshot pool, so its default width is priced by the live
-    /// slot alone — never halved for snapshots that are never allocated.
+    /// A recurrent model served WITHOUT prefix caching holds no snapshot
+    /// pool, so its default width is priced by the live slot alone — never
+    /// halved for snapshots that are never allocated.
     #[test]
     fn caching_off_prices_no_snapshot_pool_against_the_width() {
         let no_pool = roomy(|f| {
