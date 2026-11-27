@@ -434,6 +434,15 @@ impl InprocClient {
         pipeline: &mut PipelineState,
     ) -> EngineResult<StepOutcome<StepOutputs>> {
         // 1. Pre-schedule: fill pipeline up to 2 in-flight batches.
+        // PIPE TRACE (SCRATCHY_PIPE_TRACE): the loop's own state per call — gif at entry,
+        // each iteration's outcome — beside the scheduler's SCRATCHY_SCHED_TRACE lines it
+        // names which world ran: gif=1 at entry is the pre-send firing (a step sent while
+        // the previous is in flight), gif=0 with a `None` on the second iteration is the
+        // starved pipeline. Same read-only diag-print practice as SCRATCHY_TTFT_PHASE.
+        let pipe_trace = std::env::var_os("SCRATCHY_PIPE_TRACE").is_some();
+        if pipe_trace {
+            eprintln!("[pipe-trace] call gif={} awaits={}", pipeline.gpu_in_flight, pipeline.awaits_step);
+        }
         while pipeline.gpu_in_flight < 2 && !pipeline.awaits_step {
             if let Some(sched) = engine.schedule_next() {
                 let speculative = sched.is_speculative() && !sched.spec_pipeline.leads;
@@ -446,7 +455,13 @@ impl InprocClient {
                 }
                 pipeline.gpu_in_flight += 1;
                 pipeline.awaits_step = speculative;
+                if pipe_trace {
+                    eprintln!("[pipe-trace]   sent gif={}", pipeline.gpu_in_flight);
+                }
             } else {
+                if pipe_trace {
+                    eprintln!("[pipe-trace]   schedule_next=None gif={}", pipeline.gpu_in_flight);
+                }
                 break;
             }
         }
