@@ -500,7 +500,7 @@ impl SeatWidth {
         )?))
     }
 
-    fn get(self) -> usize {
+    pub(crate) fn get(self) -> usize {
         self.0.get()
     }
 }

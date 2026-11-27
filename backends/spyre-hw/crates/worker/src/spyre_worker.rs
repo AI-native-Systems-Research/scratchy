@@ -224,4 +224,4 @@ inventory::submit!(
 );
 
 #[cfg(feature = "spyre-hw")]
-pub(crate) use crate::card::exec::{InFlightStep, OwedPick, OwedRow};
+pub(crate) use crate::card::exec::{InFlightStep, OwedRow};
