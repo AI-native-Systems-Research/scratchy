@@ -128,6 +128,15 @@ jobs:
         working-directory: backends/spyre-hw
         run: cargo clippy -p scratchy-target-spyre-cli --features claude,model/granite-3.1-8b-instruct,snt1p0
           --all-targets -- -D warnings
+      # The rag embedding client and the probe-weights fetcher are two of the client-TLS
+      # doors (scratchy-tls): no other clippy step enables the features that compile them,
+      # so the disallowed-methods ban on ureq's construction doors would not see a bare
+      # agent added there. `serve` rides along because the rag module's only consumer is
+      # the serve path — rag alone leaves its engine embedder dead code.
+      - name: Lint the rag augment door
+        run: cargo clippy -p scratchy-serving-api --features serve,rag -- -D warnings
+      - name: Lint the probe-weights door
+        run: cargo clippy -p scratchy-forward-compiler --features probe -- -D warnings
 
       # The separation-of-concerns guard: outside the target homes (crates/targets/ and
       # backends/, `TARGET_HOMES` in the test), no crate gates on a target's cfg, has a feature
