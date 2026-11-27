@@ -3937,7 +3937,7 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
                 } else if op.collective.is_some() {
                     // A COLLECTIVE IS ONE SUBMISSION even off the batched path: its send, wait and
                     // consume ride one doorbell, in order, so no diag mode can split them.
-                    stream.submit_batch(&cbs, barrier).map_err(fault)?;
+                    stream.submit_batch(&cbs, barrier, None).map_err(fault)?;
                 } else if d.submit_time {
                     // `submit` is the enqueue alone: no synchronize on purpose — a drain would make
                     // this measure the very pipeline it is trying to leave undisturbed.
@@ -4029,7 +4029,7 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
                 .collect();
             let stream = self.stream_ref()?;
             let st0 = Instant::now();
-            let r = stream.submit_batch(&items, batch_barrier);
+            let r = stream.submit_batch(&items, batch_barrier, None);
             let st1 = Instant::now();
             if let Err(e) = r {
                 // ⛔ EVERY FAULTING LAUNCH NAMES ITS OWN AIM — the flush's refusal must too.
@@ -5584,7 +5584,7 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
         let stream = self.stream_ref()?;
         let t1 = Instant::now();
         let cbs = image.data.canvas.len();
-        let r = stream.compute_wires(batch, image.barrier());
+        let r = stream.compute_wires(batch, image.barrier(), None);
         let t2 = Instant::now();
         if let Err(e) = r {
             // The image itself was proven at derivation (per-row gates); a refused submit here is
