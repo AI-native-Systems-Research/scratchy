@@ -247,9 +247,9 @@ pub(crate) fn run_request_step(
             ChunkOut::Owed(piece) => StepPick::Owed(piece),
             #[cfg(not(feature = "spyre-hw"))]
             ChunkOut::Tokens(ts) => {
-                let tok = *ts
-                    .last()
-                    .ok_or_else(|| werr("the pick step's decode launch picked no token".to_string()))?;
+                let tok = *ts.last().ok_or_else(|| {
+                    werr("the pick step's decode launch picked no token".to_string())
+                })?;
                 tokens.push_generated(id, tok);
                 StepPick::Token(tok)
             }

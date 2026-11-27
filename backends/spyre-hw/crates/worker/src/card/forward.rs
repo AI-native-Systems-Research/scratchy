@@ -96,15 +96,9 @@ pub(crate) struct SeatTables {
     ),
     /// hc1/hc2/hc3/c256 in order — `(read, tid)`; `None` when the bake placed
     /// that table for nobody (itself a finding: NOT-IN-CONSTS).
-    hash: [Option<(
-        scratchy_target_spyre_card::superdsc_exec::DeferredRead,
-        u32,
-    )>; 4],
+    hash: [Option<(scratchy_target_spyre_card::superdsc_exec::DeferredRead, u32)>; 4],
     /// The lane table's first words — `None` when not placed.
-    lane: Option<(
-        scratchy_target_spyre_card::superdsc_exec::DeferredRead,
-        u32,
-    )>,
+    lane: Option<(scratchy_target_spyre_card::superdsc_exec::DeferredRead, u32)>,
     /// The launch's own typed width — the row count the seat was staged at
     /// and every table is read back at.
     rows: usize,
@@ -183,10 +177,8 @@ fn defer_seat_tables(
     // table's own) is what measures whether every stick head the launch
     // addresses actually holds the constant — a staged one-word stream
     // leaves rows past 0 reading ZERO.
-    let mut hash: [Option<(
-        scratchy_target_spyre_card::superdsc_exec::DeferredRead,
-        u32,
-    )>; 4] = [None, None, None, None];
+    let mut hash: [Option<(scratchy_target_spyre_card::superdsc_exec::DeferredRead, u32)>; 4] =
+        [None, None, None, None];
     for (h, operand) in [(0usize, 10u8), (1, 11), (2, 12), (3, 13)] {
         hash[h] = uniform(b.wiring.load_consts, operand).and_then(|(tid, trows)| {
             defer_words(pf, tid, trows.max(rows) * U32_ELEMS_PER_STICK).map(|r| (r, tid))
@@ -345,12 +337,11 @@ impl LaunchEnd for Picks {
         // only): the greedy-draw localization's byte-groups, each through the
         // same ring door and the same stream order — stated at the drain by
         // [`log_seat_tables`], never blocking this submit.
-        let dbg_tables =
-            if tracing::enabled!(tracing::Level::DEBUG) {
-                defer_seat_tables(pf, seat, seat_width, b)
-            } else {
-                None
-            };
+        let dbg_tables = if tracing::enabled!(tracing::Level::DEBUG) {
+            defer_seat_tables(pf, seat, seat_width, b)
+        } else {
+            None
+        };
         Ok((
             SubmittedDecode {
                 kind,
@@ -1458,7 +1449,10 @@ fn log_seat_tables(
                 }
             }
             Err(e) => {
-                tracing::debug!("SEAT_READBACK {:?}: seat word table t{tid} read failed ({e})", sub.kind);
+                tracing::debug!(
+                    "SEAT_READBACK {:?}: seat word table t{tid} read failed ({e})",
+                    sub.kind
+                );
                 return;
             }
         }
@@ -1473,7 +1467,10 @@ fn log_seat_tables(
                 .collect()
         }
         Err(e) => {
-            tracing::debug!("SEAT_READBACK {:?}: inv_t t{itid} read failed ({e})", sub.kind);
+            tracing::debug!(
+                "SEAT_READBACK {:?}: inv_t t{itid} read failed ({e})",
+                sub.kind
+            );
             return;
         }
     };

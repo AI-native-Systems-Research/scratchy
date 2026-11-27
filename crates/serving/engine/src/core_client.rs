@@ -15,7 +15,7 @@ use tracing::info;
 
 use crate::engine_core::{EngineCore, EngineCoreConfig, StepOutcome, StepOutputs};
 use crate::error::{EngineError, EngineResult};
-use crate::executor::{drain_knock, Executor, ModelRunnerOutput, Pumped};
+use crate::executor::{Executor, ModelRunnerOutput, Pumped, drain_knock};
 
 // ---------------------------------------------------------------------------
 // EngineCoreClient trait
@@ -487,7 +487,10 @@ impl InprocClient {
         // starved pipeline. Same read-only diag-print practice as SCRATCHY_TTFT_PHASE.
         let pipe_trace = std::env::var_os("SCRATCHY_PIPE_TRACE").is_some();
         if pipe_trace {
-            eprintln!("[pipe-trace] call gif={} awaits={}", pipeline.gpu_in_flight, pipeline.awaits_step);
+            eprintln!(
+                "[pipe-trace] call gif={} awaits={}",
+                pipeline.gpu_in_flight, pipeline.awaits_step
+            );
         }
         while pipeline.gpu_in_flight < 2 && !pipeline.awaits_step {
             if let Some(sched) = engine.schedule_next() {
@@ -506,7 +509,10 @@ impl InprocClient {
                 }
             } else {
                 if pipe_trace {
-                    eprintln!("[pipe-trace]   schedule_next=None gif={}", pipeline.gpu_in_flight);
+                    eprintln!(
+                        "[pipe-trace]   schedule_next=None gif={}",
+                        pipeline.gpu_in_flight
+                    );
                 }
                 break;
             }
