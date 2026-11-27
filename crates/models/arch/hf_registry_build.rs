@@ -458,6 +458,13 @@ enum Fetch {
     Failed,
 }
 
+/// The agents below take the tree's one client-TLS door (pure-Rust provider,
+/// no C): ureq is built rustls-no-provider, so a bare `ureq::get` one-shot
+/// would panic — it has no provider to fall back to.
+fn agent() -> ureq::Agent {
+    scratchy_tls::agent_config().build().into()
+}
+
 /// Fetches with `HF_TOKEN` (same env var `hf-hub-downloader` reads at
 /// runtime) when set — without it, a gated repo (e.g. `meta-llama/*`, which
 /// requires accepting a license) 401s and its shape can't be verified, so
@@ -466,16 +473,6 @@ enum Fetch {
 /// the builder's own token (already required to download those checkpoints at
 /// all), the same gate that's already been cleared for real usage is cleared
 /// here too.
-/// The agents below take the tree's one client-TLS door (pure-Rust provider,
-/// no C): ureq is built rustls-no-provider, so a bare `ureq::get` one-shot
-/// would panic — it has no provider to fall back to.
-fn agent() -> ureq::Agent {
-    ureq::Agent::config_builder()
-        .tls_config(scratchy_tls::tls_config())
-        .build()
-        .into()
-}
-
 fn fetch_config(id: &str) -> Result<String, Fetch> {
     let url = format!("https://huggingface.co/{id}/raw/main/config.json");
     let mut req = agent().get(&url);

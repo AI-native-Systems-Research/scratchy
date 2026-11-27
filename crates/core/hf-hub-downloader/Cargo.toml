@@ -23,7 +23,7 @@ name = "hf_hub_downloader"
 # Features come from the workspace row: rustls-no-provider, with the
 # pure-Rust RustCrypto provider installed by scratchy-tls (no C toolchain).
 ureq = { workspace = true }
-# The TLS config both agents below take.
+# Both agents below are born here (agent_config owns their construction).
 scratchy-tls = { workspace = true }
 sha2 = "0.11"
 sha1 = "0.11"

@@ -29,18 +29,17 @@ pub(crate) use ureq::Agent;
 /// hour timeout matches the previous reqwest client and exists because a
 /// cold-start server can take minutes to answer the first request.
 pub(crate) fn agent(insecure: bool) -> Agent {
-    let config = Agent::config_builder().timeout_global(Some(Duration::from_secs(3600)));
-
-    // The tree's one client-TLS door (pure-Rust provider, no C), kept even on
-    // the insecure path — verification is disabled, but the handshake still
-    // needs cipher suites, and ureq is built rustls-no-provider.
     let config = if insecure {
-        config.tls_config(scratchy_tls::builder().disable_verification(true).build())
+        scratchy_tls::insecure_agent_config()
     } else {
-        config.tls_config(scratchy_tls::tls_config())
+        scratchy_tls::agent_config()
     };
 
-    config.http_status_as_error(false).build().into()
+    config
+        .timeout_global(Some(Duration::from_secs(3600)))
+        .http_status_as_error(false)
+        .build()
+        .into()
 }
 
 /// GET a URL and return the raw body.

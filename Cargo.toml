@@ -172,10 +172,10 @@ rcgen = "0.14"
 # rustls-no-provider (not `rustls`, which resolves to `_ring,
 # rustls-no-provider`): the CLIENT side of the tree runs rustls on the
 # pure-Rust RustCrypto provider (see `scratchy-tls`), so no C toolchain is
-# compiled for it. Every ureq agent in the workspace takes its TLS config from
-# `scratchy-tls::tls_config`; with no default provider installed, an agent
-# that forgets panics on its first HTTPS call instead of silently linking
-# ring. The SERVER side (`scratchy-serving-api/tls`, server.rs) still runs
+# compiled for it. scratchy-tls owns agent construction — every agent comes
+# from `scratchy_tls::agent_config()`, and root clippy.toml bans the ureq
+# construction doors, so skipping it is a CI failure, not a first-HTTPS
+# panic. The SERVER side (`scratchy-serving-api/tls`, server.rs) still runs
 # ring — production TLS termination is not covered by the RustCrypto
 # acceptance.
 #

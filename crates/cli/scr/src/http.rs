@@ -47,10 +47,8 @@ impl RemoteClient {
             // transport error. The previous reqwest client did not check
             // status at all, which meant a rejected request streamed its error
             // body through the SSE parser and printed nothing.
-            agent: ureq::Agent::config_builder()
+            agent: scratchy_tls::agent_config()
                 .timeout_global(Some(timeout))
-                // The tree's one client-TLS door: pure-Rust provider, no C.
-                .tls_config(scratchy_tls::tls_config())
                 .http_status_as_error(false)
                 .build()
                 .into(),
