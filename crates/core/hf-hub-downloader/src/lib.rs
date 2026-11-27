@@ -181,13 +181,13 @@ impl ClientBuilder {
         // idle connections per host would close most of them between pieces
         // and pay a fresh TLS handshake for the next.
         let pooled = self.max_concurrency;
-        let probing: ureq::Agent = ureq::Agent::config_builder()
+        let probing: ureq::Agent = scratchy_tls::agent_config()
             .max_redirects(0)
             .max_idle_connections(pooled)
             .max_idle_connections_per_host(pooled)
             .build()
             .into();
-        let following: ureq::Agent = ureq::Agent::config_builder()
+        let following: ureq::Agent = scratchy_tls::agent_config()
             .max_redirects(8)
             .max_idle_connections(pooled)
             .max_idle_connections_per_host(pooled)

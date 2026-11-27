@@ -11,6 +11,7 @@ members = [
     "crates/serving/worker",
     "crates/core/model",
     "crates/core/hf-hub-downloader",
+    "crates/core/tls",
     "crates/serving/transport",
     "crates/benches",
     "crates/targets/metal/power-sampler",
@@ -71,7 +72,9 @@ tokio = "1"
 axum = "0.8"
 # tls-rustls-no-provider (not tls-rustls) so axum-server does NOT force
 # rustls/aws-lc-rs — server.rs supplies its own ServerConfig built with the
-# ring provider. Keeps the whole TLS build on ring (no aws-lc-sys C toolchain).
+# ring provider. The SERVER side stays on ring (production TLS termination);
+# the CLIENT side moved to the pure-Rust RustCrypto provider (scratchy-tls),
+# so this is now the only edge that compiles ring.
 axum-server = { version = "0.9", default-features = false, features = ["tls-rustls-no-provider"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 rustls-pemfile = "2"
@@ -163,25 +166,42 @@ tokio-stream = "0.1"
 tempfile = "3"
 rcgen = "0.14"
 
-ureq = { version = "3", default-features = false, features = ["rustls"] }
-
 # HTTP client. rustls instead of the default native-tls so the whole tree shares
-# one TLS stack (rustls+ring), with no native-tls/tokio-native-tls/hyper-tls.
+# one TLS stack, with no native-tls/tokio-native-tls/hyper-tls.
+#
+# rustls-no-provider (not `rustls`, which resolves to `_ring,
+# rustls-no-provider`): the CLIENT side of the tree runs rustls on the
+# pure-Rust RustCrypto provider (see `scratchy-tls`), so no C toolchain is
+# compiled for it. scratchy-tls owns agent construction — every agent comes
+# from `scratchy_tls::agent_config()`, and root clippy.toml bans the ureq
+# construction doors, so skipping it is a CI failure, not a first-HTTPS
+# panic. The SERVER side (`scratchy-serving-api/tls`, server.rs) still runs
+# ring — production TLS termination is not covered by the RustCrypto
+# acceptance.
 #
 # reqwest is TEST-ONLY: scratchy-e2e, and scratchy-serving-api's
 # dev-dependencies. Nothing shipped links it — the CLI, the benchmarks and the
 # rag embedding client all talk HTTP through `ureq` above.
 #
-# rustls-no-provider for the same reason axum-server gets tls-rustls-no-provider
-# above: reqwest's plain `rustls` feature hard-wires `rustls?/aws-lc-rs`, adding
-# aws-lc-rs + aws-lc-sys (a bindgen'd BoringSSL fork needing a C/asm toolchain)
-# on top of the ring build we already have. `ureq` takes this same door — its
-# `rustls` feature resolves to `_ring, rustls-no-provider`.
+# reqwest keeps rustls-no-provider for the same reason as ureq: its plain
+# `rustls` feature hard-wires `rustls?/aws-lc-rs`, adding aws-lc-rs +
+# aws-lc-sys (a bindgen'd BoringSSL fork needing a C/asm toolchain).
 #
 # The provider reqwest then declines to pick is installed by each test entry
 # point that builds a client: scratchy-e2e's `Client::new` and `server.rs`, and
 # the serving-api TLS tests. Being test-only, it needs no install in scr's
 # `main()`.
+ureq = { version = "3", default-features = false, features = ["rustls-no-provider", "rustls-webpki-roots"] }
+
+# The RustCrypto provider scratchy-tls installs into every ureq agent. Exact
+# pin: it is a pre-release ("DO NOT USE IN PRODUCTION" upstream — accepted for
+# the non-critical client paths it guards, user order 2026-11-27), and its
+# `provider()` signature is what scratchy-tls consumes; a bump is a review,
+# not a semver hop.
+rustls-rustcrypto = "=0.1.0-pre.0"
+
+# The tree's one client-TLS door: ureq agents with the provider above.
+scratchy-tls = { version = "0.1.0", path = "crates/core/tls" }
 reqwest = { version = "0.13", default-features = false, features = ["charset", "http2", "json", "stream", "rustls-no-provider"] }
 
 # Internal workspace crates: one row each, the one place an internal crate's path and

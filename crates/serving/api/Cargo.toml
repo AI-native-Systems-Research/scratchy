@@ -39,7 +39,7 @@ metrics = ["prometheus"]
 #
 # No-op without `serve` (everything it gates lives in modules `serve` owns).
 tool-spans = []
-rag = ["spnl-core/rag", "dep:leann-core", "dep:ndarray", "dep:ureq"]
+rag = ["spnl-core/rag", "dep:leann-core", "dep:ndarray", "dep:ureq", "dep:scratchy-tls"]
 
 [dependencies]
 scratchy-core-common = { workspace = true }
@@ -89,6 +89,8 @@ leann-core = { workspace = true, optional = true }
 ndarray = { workspace = true, optional = true }
 # ureq, not reqwest: one blocking POST to an embedding endpoint.
 ureq = { workspace = true, optional = true }
+# The TLS config that agent takes (pure-Rust provider, no C).
+scratchy-tls = { workspace = true, optional = true }
 itertools = "0.14"
 
 [dev-dependencies]

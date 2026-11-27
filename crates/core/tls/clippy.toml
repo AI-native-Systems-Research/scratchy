@@ -1,0 +1,6 @@
+# This crate is the one place a ureq agent may be constructed, so the root
+# clippy.toml's disallowed-methods bans on `ureq::Agent::config_builder`,
+# `ureq::get`/`post`/…, `ureq::agent`/`run` and `TlsConfig::builder` must not
+# reach it. Clippy reads the nearest clippy.toml from the crate's manifest
+# directory, so this (deliberately ban-free) file shadows the root one for
+# this crate alone — no `#[allow]` needed in the source.

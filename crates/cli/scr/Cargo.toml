@@ -77,6 +77,8 @@ libc = { workspace = true }
 # and `complete` are always built, and ureq is already in the tree via
 # hf-hub-downloader, so they cost no additional crates.
 ureq = { workspace = true }
+# The TLS config every agent below takes (pure-Rust provider, no C).
+scratchy-tls = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

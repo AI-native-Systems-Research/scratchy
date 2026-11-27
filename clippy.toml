@@ -11,6 +11,26 @@
 # or `interpreter::metal::run_bucket_mtl4` (production). MTL4 builds
 # command buffers via `device.newCommandBuffer()` +
 # `beginCommandBufferWithAllocator`, never `queue.commandBuffer()`.
+#
+# 🛑 ONE CLIENT-TLS DOOR.
+#
+# ureq is built rustls-no-provider: an agent constructed without
+# scratchy-tls's config panics on its first HTTPS call. Every agent therefore
+# comes from `scratchy_tls::agent_config()` (or `insecure_agent_config()`,
+# bench loopback only), which is the one place the provider law is stated.
+# The bans below make skipping that door a clippy error (CI runs `-D
+# warnings`) instead of a field panic. `crates/core/tls` carries its own
+# clippy.toml so its single construction site is exempt without an #[allow].
 disallowed-methods = [
     { path = "objc2_metal::MTLCommandQueue::commandBuffer", reason = "classic MTL3 is banned — the metal backend is Metal 4 only; dispatch via mtl4_dispatch / run_bucket_mtl4" },
+    { path = "ureq::Agent::config_builder", reason = "the one client-TLS door: build agents from scratchy_tls::agent_config(), never a bare config_builder (rustls-no-provider panics without it)" },
+    { path = "ureq::Agent::new_with_defaults", reason = "the one client-TLS door: build agents from scratchy_tls::agent_config(), never a default agent (rustls-no-provider panics without it)" },
+    { path = "ureq::agent", reason = "the one client-TLS door: build agents from scratchy_tls::agent_config(), never a default agent (rustls-no-provider panics without it)" },
+    { path = "ureq::run", reason = "the one client-TLS door: runs on a default agent with no provider; build agents from scratchy_tls::agent_config()" },
+    { path = "ureq::get", reason = "the one client-TLS door: one-shots run on a default agent with no provider; build agents from scratchy_tls::agent_config()" },
+    { path = "ureq::post", reason = "the one client-TLS door: one-shots run on a default agent with no provider; build agents from scratchy_tls::agent_config()" },
+    { path = "ureq::put", reason = "the one client-TLS door: one-shots run on a default agent with no provider; build agents from scratchy_tls::agent_config()" },
+    { path = "ureq::delete", reason = "the one client-TLS door: one-shots run on a default agent with no provider; build agents from scratchy_tls::agent_config()" },
+    { path = "ureq::head", reason = "the one client-TLS door: one-shots run on a default agent with no provider; build agents from scratchy_tls::agent_config()" },
+    { path = "ureq::tls::TlsConfig::builder", reason = "the one client-TLS door: the RustCrypto provider is installed by scratchy-tls; take the whole config from scratchy_tls::agent_config()" },
 ]

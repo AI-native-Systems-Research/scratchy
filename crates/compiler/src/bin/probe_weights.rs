@@ -485,7 +485,7 @@ fn fetch_safetensors_header(url: &str) -> Result<Vec<u8>> {
 /// body. Follows redirects (HF Hub returns 302 → CDN URL). HF's CDN
 /// honours ranges.
 fn fetch_range(url: &str, start: u64, end_inclusive: u64) -> Result<Vec<u8>> {
-    let agent: ureq::Agent = ureq::Agent::config_builder()
+    let agent: ureq::Agent = scratchy_tls::agent_config()
         .max_redirects(5)
         .timeout_global(Some(std::time::Duration::from_secs(60)))
         .build()
@@ -525,10 +525,9 @@ fn fetch_range(url: &str, start: u64, end_inclusive: u64) -> Result<Vec<u8>> {
 fn strip_layer_and_suffix(name: &str) -> Option<(String, TensorKind, bool)> {
     let (body, kind) = if let Some(stem) = name.strip_suffix(".weight") {
         (stem, TensorKind::Weight)
-    } else if let Some(stem) = name.strip_suffix(".bias") {
-        (stem, TensorKind::Bias)
     } else {
-        return None;
+        let stem = name.strip_suffix(".bias")?;
+        (stem, TensorKind::Bias)
     };
     // Try layer-scoped strip: model.layers.<N>.<path>
     if let Some(rest) = body.strip_prefix("model.layers.")
@@ -733,6 +732,6 @@ fn pick_formula_for_dim(
         .iter()
         .map(|c| (c, score_formula(c, d0, &[])))
         .collect();
-    scored.sort_by(|a, b| b.1.cmp(&a.1));
+    scored.sort_by_key(|&(_, score)| std::cmp::Reverse(score));
     Ok(scored[0].0.clone())
 }

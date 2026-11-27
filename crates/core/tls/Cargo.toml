@@ -1,0 +1,16 @@
+[package]
+name = "scratchy-tls"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+# Publishable (no `publish = false`): the published set depends on it
+# (hf-hub-downloader names it unconditionally), so it must package — the CI
+# publish dry-run resolves every publishable member's deps from the
+# workspace-or-crates.io set.
+description = "The tree's one client-TLS door: ureq agents with the pure-Rust rustls-rustcrypto provider, so the client side compiles no C"
+
+[dependencies]
+ureq = { workspace = true }
+# Exact-pinned in the workspace row (pre-release; the `provider()` signature
+# is what `builder()` consumes — a bump is a review, not a semver hop).
+rustls-rustcrypto = { workspace = true }

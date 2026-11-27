@@ -458,6 +458,13 @@ enum Fetch {
     Failed,
 }
 
+/// The agents below take the tree's one client-TLS door (pure-Rust provider,
+/// no C): ureq is built rustls-no-provider, so a bare `ureq::get` one-shot
+/// would panic — it has no provider to fall back to.
+fn agent() -> ureq::Agent {
+    scratchy_tls::agent_config().build().into()
+}
+
 /// Fetches with `HF_TOKEN` (same env var `hf-hub-downloader` reads at
 /// runtime) when set — without it, a gated repo (e.g. `meta-llama/*`, which
 /// requires accepting a license) 401s and its shape can't be verified, so
@@ -468,7 +475,7 @@ enum Fetch {
 /// here too.
 fn fetch_config(id: &str) -> Result<String, Fetch> {
     let url = format!("https://huggingface.co/{id}/raw/main/config.json");
-    let mut req = ureq::get(&url);
+    let mut req = agent().get(&url);
     if let Some(token) = std::env::var("HF_TOKEN").ok().filter(|t| !t.is_empty()) {
         req = req.header("Authorization", format!("Bearer {token}"));
     }
@@ -679,7 +686,7 @@ fn query_hub(tags: &[&str]) -> Option<Vec<Ranked>> {
     let url = format!(
         "https://huggingface.co/api/models?{filters}&sort=downloads&direction=-1&limit=200"
     );
-    let res = ureq::get(&url).call().ok()?;
+    let res = agent().get(&url).call().ok()?;
     let mut body = String::new();
     std::io::Read::read_to_string(&mut res.into_body().into_reader(), &mut body).ok()?;
     let json: serde_json::Value = serde_json::from_str(&body).ok()?;

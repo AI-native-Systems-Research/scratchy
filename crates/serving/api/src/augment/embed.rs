@@ -81,7 +81,7 @@ impl HttpEmbeddingProvider {
             dimensions,
             base_url,
             api_key,
-            agent: ureq::Agent::config_builder()
+            agent: scratchy_tls::agent_config()
                 .http_status_as_error(false)
                 .build()
                 .into(),
