@@ -376,7 +376,7 @@ pub trait Worker: Send {
     /// still running. The pop is the single authority over which drain owns a
     /// step. Default: nothing to drain — a worker that never defers has no
     /// knock to answer.
-    fn drain_ready(&mut self, _cell: &std::sync::Arc<crate::executor::DrainCell>) -> bool {
+    fn drain_ready(&mut self, _cell: &std::sync::Arc<dyn crate::executor::KnockCell>) -> bool {
         true
     }
 

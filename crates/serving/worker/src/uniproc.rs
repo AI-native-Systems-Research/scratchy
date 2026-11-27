@@ -229,7 +229,7 @@ impl Executor for UniProcExecutor {
     /// have landed (the knock's pump feeds the executor while it waits).
     fn drain_ready(
         &mut self,
-        cell: &std::sync::Arc<scratchy_serving_engine::executor::DrainCell>,
+        cell: &std::sync::Arc<dyn scratchy_serving_engine::executor::KnockCell>,
     ) -> bool {
         self.worker.drain_ready(cell)
     }

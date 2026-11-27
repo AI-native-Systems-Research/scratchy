@@ -473,24 +473,45 @@ impl LaunchRows<'_> {
 /// launch's own rows, so no call site spells a number — the width a
 /// batching launch takes is this type's value, never a field overwritten on
 /// a copy of the seat.
+///
+/// ⭐ NON-EMPTY BY TYPE: a batched launch's width is the rung's own
+/// ([`RungWidth`], non-zero at its mint), and a seat that bakes zero rows
+/// refuses at the ONE mint — no draw can land in a zero-row seat — so every
+/// width a pick law divides by has a last row.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct SeatWidth(usize);
+pub(crate) struct SeatWidth(std::num::NonZeroUsize);
 
 impl SeatWidth {
-    /// The ONE mint — the launch's own row count over the seat.
+    /// The ONE mint — the launch's own row count over the seat. A batched
+    /// launch takes the rung's width (non-zero by [`RungWidth`]'s own type);
+    /// every other launch takes the seat's baked row count, and a seat that
+    /// bakes zero rows refuses here — the bake's gate, stated once.
     fn of_launch(
         seat: &scratchy_target_spyre::wiring::SampleSeat,
         rows_in: &LaunchRows<'_>,
-        mq: usize,
-    ) -> Self {
-        Self(match rows_in {
-            LaunchRows::Batch { .. } => mq,
+        width: ktir_superdsc::sdsc_abstract::RungWidth,
+    ) -> ExecutorResult<Self> {
+        let rows = match rows_in {
+            LaunchRows::Batch { .. } => width.count(),
             _ => seat.rows as usize,
-        })
+        };
+        Ok(Self(std::num::NonZeroUsize::new(rows).ok_or_else(
+            || werr("the launch's seat bakes zero rows — no draw can land in it".to_string()),
+        )?))
     }
 
     fn get(self) -> usize {
-        self.0
+        self.0.get()
+    }
+}
+
+impl SubmittedDecode {
+    /// ⭐ ONE SLOT PER SEAT ROW THE LAUNCH LAID — the submitted step hands
+    /// out its own slots ([`SeatWidth::slots`], the only mint), so every
+    /// reader — the owed rows a submit lays, the exit's laid rows, the drain
+    /// — consumes the launch's own, and none mints a second count.
+    pub(crate) fn slots(&self) -> impl Iterator<Item = crate::card::exec::SeatSlot> {
+        self.rows.slots()
     }
 }
 
@@ -732,11 +753,10 @@ pub(crate) fn run_card_launch<E: LaunchEnd>(
     // ⭐ THE LAUNCH'S SEAT AND WIDTH, BOUND ONCE: the width is [`SeatWidth`]'s
     // ONE mint for the whole launch — the staging block and the end's read
     // below read this one value, never a second mint.
-    let seat_launch = b
-        .wiring
-        .sample_seat
-        .as_ref()
-        .map(|seat| (seat, SeatWidth::of_launch(seat, &rows_in, mq)));
+    let seat_launch = match b.wiring.sample_seat.as_ref() {
+        Some(seat) => Some((seat, SeatWidth::of_launch(seat, &rows_in, width)?)),
+        None => None,
+    };
     // ⭐ THE END'S SEAT, TAKEN BEFORE ANYTHING STAGES: a launch that picks takes the launch's own
     // (seat, width) pair as its binding — never a second Option walk and never an unwrap over a
     // guard established lines earlier — and a picking launch whose bundle mints no draw is refused
@@ -1350,10 +1370,11 @@ pub(crate) fn collect_decode_tokens(
     if let Some(tables) = &sub.dbg_tables {
         log_seat_tables(session, sub, &toks, tables);
     }
-    // ⭐ THE LAUNCH'S OWN TYPED PICKS — minted against the launch's width (the
-    // row count the stick was decoded at), so every pick reader downstream is
-    // total; the bounds law is stated here, once.
-    Ok(crate::card::exec::LaunchPicks::mint(toks, sub.rows.get()))
+    // ⭐ THE LAUNCH'S OWN TYPED PICKS — minted from the submitted step, so the
+    // count is the stick's own law (one token per row it was given, decoded at
+    // the step's own width): every pick reader downstream is total, and the
+    // bounds law is stated here, once.
+    Ok(crate::card::exec::LaunchPicks::of(sub, toks))
 }
 
 /// ⭐ THE DECODE SEAT'S OWN READBACK — the collect half of the debug seat read:
@@ -1768,26 +1789,24 @@ pub(crate) fn superdsc_forward_packed(
                 laws: SeatLaws::Packed { draws: &draws },
             },
         )?;
+        // ⭐ THE WAVE'S SLOTS, MINTED BY THE LAUNCH ITSELF — one per window
+        // the rung's seat laid ([`SubmittedDecode::slots`]), tail `r` riding
+        // window `r`. ONE mint, consumed by the drain's owed rows and the
+        // exit's laid rows alike; a mid-prompt tail's pick is computed and
+        // never read — the wave's own law.
+        let wave_rows: Vec<crate::card::exec::OwedTail> = tails
+            .iter()
+            .zip(sub.slots())
+            .map(|(t, slot)| crate::card::exec::OwedTail {
+                id: t.id.clone(),
+                pick: t.finishes.then_some(slot),
+            })
+            .collect();
         Some(crate::card::exec::InFlightStep {
             cell: std::sync::Arc::new(scratchy_serving_engine::executor::DrainCell::new()),
             sub,
             seat: crate::card::types::StepSeat::Prefix(rung),
-            owed: crate::card::exec::Owed::Wave {
-                rows: tails
-                    .iter()
-                    .enumerate()
-                    .map(|(r, t)| crate::card::exec::OwedTail {
-                        id: t.id.clone(),
-                        // A mid-prompt tail's pick is computed and never read — the
-                        // wave's own law. The slot is minted against the wave's
-                        // window count (one window per tail the rung seats).
-                        pick: t.finishes.then(|| {
-                            crate::card::exec::SeatSlot::mint(r, tails.len())
-                                .expect("the wave seats one window per tail")
-                        }),
-                    })
-                    .collect(),
-            },
+            owed: crate::card::exec::Owed::Wave { rows: wave_rows },
         })
     } else {
         run_card_launch::<Forwards>(
@@ -1922,7 +1941,8 @@ mod pad_clamp_tests {
         };
         let binds = sample_binds(
             seat,
-            SeatWidth::of_launch(seat, &rows_in, seat.rows as usize),
+            SeatWidth::of_launch(seat, &rows_in, ktir_superdsc::sdsc_abstract::RungWidth::ONE)
+                .expect("the seat's width mints"),
             laws,
         )
         .expect("the seat stages");

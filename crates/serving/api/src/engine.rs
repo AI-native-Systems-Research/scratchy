@@ -3887,7 +3887,7 @@ enum ExecutorWork {
     /// filled. Sent by a deferred output's resolver through its
     /// [`DrainDoor`]; answered by the arm below, mirroring the pipelined
     /// client's `executor_bg_loop`.
-    Knock(std::sync::Arc<scratchy_serving_engine::executor::DrainCell>),
+    Knock(std::sync::Arc<dyn scratchy_serving_engine::executor::KnockCell>),
     /// Shut down the executor.
     Shutdown,
 }
@@ -7628,14 +7628,18 @@ mod tests {
         inner: NoopExecutor,
         step: usize,
         door: Option<scratchy_serving_engine::core_client::DrainDoor>,
-        pending: Vec<(
-            std::sync::Arc<scratchy_serving_engine::executor::DrainCell>,
-            Vec<u32>,
-            usize,
-        )>,
+        pending: Vec<PendingStep>,
         events: Arc<std::sync::Mutex<Vec<String>>>,
         answered: Arc<std::sync::atomic::AtomicUsize>,
     }
+
+    /// One deferred step the double holds until its drain looks at it: its cell,
+    /// its tokens (the answer the drain fills in with), and its step number.
+    struct PendingStep(
+        std::sync::Arc<scratchy_serving_engine::executor::DrainCell<Vec<u32>>>,
+        Vec<u32>,
+        usize,
+    );
 
     impl scratchy_serving_engine::executor::Executor for KnockingExecutor {
         /// It samples no grammar.
@@ -7664,7 +7668,7 @@ mod tests {
             let step = self.step;
             self.step += 1;
             self.pending
-                .push((std::sync::Arc::clone(&cell), tokens, step));
+                .push(PendingStep(std::sync::Arc::clone(&cell), tokens, step));
             self.events.lock().unwrap().push(format!("exec:{step}"));
             let (events, answered) = (Arc::clone(&self.events), Arc::clone(&self.answered));
             Ok(
@@ -7677,7 +7681,7 @@ mod tests {
                         // its shutdown, and shutdown error-fills every pending cell (the law
                         // `shutdown` below states) — so the resolver falls through to the
                         // wait and is answered either way. Never parked.
-                        let _ = door.knock(std::sync::Arc::clone(&cell));
+                        let _ = door.knock(cell.clone());
                         let tokens = match &*cell.wait() {
                             Ok(tokens) => Ok(tokens.clone()),
                             Err(e) => Err(e.to_string()),
@@ -7696,14 +7700,16 @@ mod tests {
         /// drain looks at them, so the non-blocking spelling never returns "not yet".
         fn drain_ready(
             &mut self,
-            cell: &std::sync::Arc<scratchy_serving_engine::executor::DrainCell>,
+            cell: &std::sync::Arc<dyn scratchy_serving_engine::executor::KnockCell>,
         ) -> bool {
             while !cell.is_filled() {
-                let Some((oldest, tokens, step)) = self
+                let Some(PendingStep(oldest, tokens, step)) = self
                     .pending
                     .iter()
-                    .find(|(c, _, _)| !c.is_filled())
-                    .map(|(c, t, s)| (std::sync::Arc::clone(c), t.clone(), *s))
+                    .find(|PendingStep(c, _, _)| !c.is_filled())
+                    .map(|PendingStep(c, t, s)| {
+                        PendingStep(std::sync::Arc::clone(c), t.clone(), *s)
+                    })
                 else {
                     break;
                 };
@@ -7716,7 +7722,11 @@ mod tests {
         /// A shutdown never leaves a resolver parked: every step still in flight is answered
         /// with its failure, as a deferring worker's shutdown error-fills its in-flight cells.
         fn shutdown(&mut self) {
-            for (cell, _, step) in self.pending.iter().filter(|(c, _, _)| !c.is_filled()) {
+            for PendingStep(cell, _, step) in self
+                .pending
+                .iter()
+                .filter(|PendingStep(c, _, _)| !c.is_filled())
+            {
                 cell.fill(Err(scratchy_serving_engine::error::EngineError::Executor(
                     format!("shutdown with step {step} still in flight"),
                 )));

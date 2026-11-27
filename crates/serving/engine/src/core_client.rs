@@ -189,7 +189,7 @@ enum PipelineMsg {
     /// pump, which feeds the executor every message that arrives while the
     /// knock waits — a queued Step is submitted before the knock parks on a
     /// step the card is still running.
-    Knock(std::sync::Arc<crate::executor::DrainCell>),
+    Knock(std::sync::Arc<dyn crate::executor::KnockCell>),
     /// ⭐ #32 (C) — TEARDOWN. The worker holds a [`DrainDoor`] (a sender
     /// clone) for exactly this channel, so dropping the client's sender alone
     /// would never close it — the thread would outlive the client and a join
@@ -213,7 +213,7 @@ enum PipelineMsg {
 #[derive(Clone)]
 pub struct DrainDoor {
     knock: std::sync::Arc<
-        dyn Fn(std::sync::Arc<crate::executor::DrainCell>) -> EngineResult<()> + Send + Sync,
+        dyn Fn(std::sync::Arc<dyn crate::executor::KnockCell>) -> EngineResult<()> + Send + Sync,
     >,
 }
 
@@ -238,7 +238,7 @@ impl DrainDoor {
     /// `blocking_send` from a blocking thread (see the server's
     /// construction site for the panic-hazard contract).
     pub fn from_knock(
-        knock: impl Fn(std::sync::Arc<crate::executor::DrainCell>) -> EngineResult<()>
+        knock: impl Fn(std::sync::Arc<dyn crate::executor::KnockCell>) -> EngineResult<()>
         + Send
         + Sync
         + 'static,
@@ -251,7 +251,7 @@ impl DrainDoor {
     /// Knock: drain until `cell` is filled. Returns `Err` only when the
     /// executor thread is gone — a resolver that cannot knock resolves its
     /// cell with the error rather than hang.
-    pub fn knock(&self, cell: std::sync::Arc<crate::executor::DrainCell>) -> EngineResult<()> {
+    pub fn knock(&self, cell: std::sync::Arc<dyn crate::executor::KnockCell>) -> EngineResult<()> {
         (self.knock)(cell)
     }
 }
