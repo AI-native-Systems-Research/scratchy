@@ -1458,36 +1458,12 @@ impl<'a> Stream<'a> {
             .map_err(HwError::Stream)
     }
 
-    /// One ComputeOnDevice launch (async). `tensor_allocs` is POSITIONAL — entry i backs the
-    /// program's logical segment i.
-    pub fn compute(
-        &self,
-        prog: &DevAddr,
-        tensor_allocs: &[&DevAddr],
-        kernel_name: &str,
-        bootstrap_offset: u64,
-        tensor_byte_offsets: &[u64],
-        pipeline_barrier: bool,
-    ) -> Result<(), HwError> {
-        let stream = self.live()?;
-        let allocs: Vec<Arc<CompositeAddress>> =
-            tensor_allocs.iter().map(|a| a.0.clone()).collect();
-        let tbo: Vec<ByteOffset> = tensor_byte_offsets.iter().map(|o| ByteOffset(*o)).collect();
-        let params = ComputeParams::new(
-            prog.0.clone(),
-            allocs,
-            KernelName(kernel_name.to_owned()),
-            BootstrapOffset(bootstrap_offset),
-            tbo,
-        )
-        .with_pipeline_barrier(pipeline_barrier);
-        stream.launch_compute(params, None).map_err(HwError::Stream)
-    }
-
     /// N compute launches as ONE submission — one doorbell for the whole list (the vendor's
     /// multi-CB branch; see `flex_rs::stream::RuntimeStream::launch_compute_batch` for the
     /// semantics, including why `pipeline_barrier` is the OR of what the caller would have
-    /// passed per op). Device-side order is the list order, same as N `compute` calls.
+    /// passed per op). Device-side order is the list order — and a single launch IS a list of
+    /// one, which is why there is no single-op compute door: every launch, plain or collective,
+    /// takes this one.
     ///
     /// ⛔ THE ITEMS OWN THEIR HANDLES. A batch outlives the loop that builds it (the whole
     /// rung is collected, then flushed once), and that loop's shifted bases and `&DevAddr`
