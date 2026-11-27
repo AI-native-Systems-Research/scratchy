@@ -74,6 +74,45 @@ pub struct SubmitSegs {
     pub busy: bool,
 }
 
+/// ⭐ THE SERIALIZATION HUNT'S OWN ROWS — what each `execute_model` found on entry and
+/// where each step's collect ran, recorded by the worker's own executor arm. The depth
+/// and busy rows read the CARD's state at submit; these read the WORKER's, and the two
+/// sides of that pair are what the hunt needed: a pipeline that pre-schedules lands a
+/// `Step` message while the previous step is still uncollected (entry ≥ 1), while a
+/// starved one finds the queue empty at every entry (entry 0) and the knock — not the
+/// pre-schedule — is what retires each step. `exit` says which world the exit itself
+/// chose (the door's deferral, or the no-door in-call drain); `drain` says who actually
+/// collected (a knock, a seating churn, the in-call exit, shutdown).
+///
+/// `pub` for the reason [`SubmitSegs`] states: the only caller is a target's worker
+/// crate, which a build may not link.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExitSite {
+    /// The door was set: the owed rows travelled out in a resolver for the caller
+    /// to knock and wait on.
+    Deferred,
+    /// No door: the exit drained every in-flight step itself, in-call.
+    InCall,
+    /// Nothing was owed — the schedule's rows all answered in the output (a chunk
+    /// wave, a readless step).
+    NothingOwed,
+}
+
+/// Who drained each in-flight step — the collect's caller, recorded once per step
+/// popped from the worker's in-flight queue. `pub` for the reason [`SubmitSegs`]
+/// states.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DrainSite {
+    /// A knock: the executor's `drain_until`, sent by a deferred output's resolver.
+    Knock,
+    /// A seating churn (a rung or seating change) draining the queue it replaces.
+    Churn,
+    /// The no-door in-call exit.
+    Exit,
+    /// Shutdown — no deferred step outlives the worker.
+    Shutdown,
+}
+
 /// One step's COLLECT-half segments — the fence wait (at depth ≥ 2 it waits
 /// everything enqueued behind the read too, which is the pipeline's own cadence, not
 /// an artifact) and the pick decode. Recorded where the reads are fenced, which under
@@ -284,6 +323,16 @@ struct Stats {
     busy: BusyStats,
     fence: Acc,
     pick: Acc,
+    /// ⭐ The serialization hunt's rows: what each `execute_model` found on entry
+    /// (steps still uncollected), which exit it took, and who drained each step.
+    entry: DepthStats,
+    exit_deferred: u64,
+    exit_in_call: u64,
+    exit_nothing_owed: u64,
+    drain_knock: u64,
+    drain_churn: u64,
+    drain_exit: u64,
+    drain_shutdown: u64,
     /// The prompt-chunk table's accumulators, one slot per [`ChunkKind`].
     chunks: [ChunkAcc; 3],
 }
@@ -301,6 +350,14 @@ impl Stats {
         busy: BusyStats::ZERO,
         fence: Acc::ZERO,
         pick: Acc::ZERO,
+        entry: DepthStats::ZERO,
+        exit_deferred: 0,
+        exit_in_call: 0,
+        exit_nothing_owed: 0,
+        drain_knock: 0,
+        drain_churn: 0,
+        drain_exit: 0,
+        drain_shutdown: 0,
         chunks: [ChunkAcc::ZERO, ChunkAcc::ZERO, ChunkAcc::ZERO],
     };
 }
@@ -342,6 +399,39 @@ pub fn record_collect(s: CollectSegs) {
         StepKind::Chunk(k) => {
             t.chunks[k.slot()].fence.add(s.fence);
         }
+    }
+}
+
+/// ⭐ Flush one `execute_model`'s entry fact: how many steps were still uncollected
+/// when this schedule arrived. The pre-schedule's own proof on the worker's side of
+/// the channel — entry ≥ 1 means a `Step` landed while the previous step was still
+/// in flight; entry 0 at every decode step is the starved pipeline the hunt named.
+/// (`pub` for the reason [`SubmitSegs`]'s doc states.)
+pub fn record_exec_entry(in_flight: usize) {
+    stats().entry.add(in_flight);
+}
+
+/// ⭐ Flush the exit's own choice for one `execute_model` — the door's deferral, the
+/// no-door in-call drain, or nothing owed. (`pub` for the reason [`SubmitSegs`]'s
+/// doc states.)
+pub fn record_exit(site: ExitSite) {
+    let mut t = stats();
+    match site {
+        ExitSite::Deferred => t.exit_deferred += 1,
+        ExitSite::InCall => t.exit_in_call += 1,
+        ExitSite::NothingOwed => t.exit_nothing_owed += 1,
+    }
+}
+
+/// ⭐ Flush who drained one in-flight step. (`pub` for the reason [`SubmitSegs`]'s
+/// doc states.)
+pub fn record_drain(site: DrainSite) {
+    let mut t = stats();
+    match site {
+        DrainSite::Knock => t.drain_knock += 1,
+        DrainSite::Churn => t.drain_churn += 1,
+        DrainSite::Exit => t.drain_exit += 1,
+        DrainSite::Shutdown => t.drain_shutdown += 1,
     }
 }
 
@@ -439,6 +529,39 @@ pub fn step_segment_table() -> Option<String> {
         t.busy.busy,
         t.busy.n,
         100.0 * t.busy.busy as f64 / t.busy.n.max(1) as f64,
+    ));
+    // ⭐ THE ENTRY ROW — the pre-schedule's proof on the worker's side: steps still
+    // uncollected when each schedule arrived. The chunk population pipes this to 19;
+    // the decode tail is the question — entry 0 there at every step is the starved
+    // pipeline (the knock retires each step, the pre-schedule sends nothing ahead),
+    // entry ≥ 1 is a Step landing on an uncollected one.
+    let entry_dist = t
+        .entry
+        .at_depth
+        .iter()
+        .enumerate()
+        .filter(|&(_, &c)| c > 0)
+        .map(|(d, &c)| format!("{d}:{c}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    out.push_str(&format!(
+        "[step-segs]   entry  (steps uncollected at each execute_model entry): mean {:>5.2}, max {}, \
+         distribution {}\n",
+        t.entry.sum as f64 / t.entry.n.max(1) as f64,
+        t.entry.max,
+        entry_dist,
+    ));
+    // ⭐ THE EXIT ROW — which world the exit itself chose, per schedule.
+    out.push_str(&format!(
+        "[step-segs]   exit   (the exit's choice): deferred {} / in-call {} / nothing-owed {} over {} \
+         schedule(s)\n",
+        t.exit_deferred, t.exit_in_call, t.exit_nothing_owed, t.entry.n,
+    ));
+    // ⭐ THE DRAIN ROW — who collected each in-flight step.
+    out.push_str(&format!(
+        "[step-segs]   drain  (who drained each in-flight step): knock {} / churn {} / exit {} / \
+         shutdown {}\n",
+        t.drain_knock, t.drain_churn, t.drain_exit, t.drain_shutdown,
     ));
     Some(out)
 }

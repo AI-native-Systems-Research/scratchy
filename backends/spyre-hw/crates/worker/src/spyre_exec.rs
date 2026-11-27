@@ -197,6 +197,12 @@ impl Worker for SpyreWorker {
         // next step already in flight; the schedule after names it in `finished_req_ids`, so the
         // cleanup below drops it before that step is drained. The drain skips a gone request's
         // bookkeeping (`collect_rows`), and fills every step's cell whatever the collect did.
+        // ⭐ THE ENTRY ROW: what this schedule found — steps still uncollected when it
+        // arrived. The pre-schedule's worker-side proof: a Step landing on an
+        // uncollected one is a pipeline; entry 0 at every decode step is the starved
+        // one, where the knock — not a pre-scheduled Step — retires each step.
+        #[cfg(feature = "spyre-hw")]
+        scratchy_serving_worker::step_segs::record_exec_entry(self.in_flight.len());
         let Self {
             model,
             requests,
@@ -613,6 +619,9 @@ impl Worker for SpyreWorker {
             if rung.is_none() && !decode_ids.is_empty() {
                 self.seating = None;
                 while let Some(infl) = self.in_flight.pop_front() {
+                    scratchy_serving_worker::step_segs::record_drain(
+                        scratchy_serving_worker::step_segs::DrainSite::Churn,
+                    );
                     Self::drain_one(infl, model, requests, input_batch)?;
                 }
             }
@@ -641,6 +650,9 @@ impl Worker for SpyreWorker {
                 self.seating = Some((ri, seating_now));
                 if churned {
                     while let Some(infl) = self.in_flight.pop_front() {
+                        scratchy_serving_worker::step_segs::record_drain(
+                            scratchy_serving_worker::step_segs::DrainSite::Churn,
+                        );
                         Self::drain_one(infl, model, requests, input_batch)?;
                     }
                 }
@@ -828,6 +840,9 @@ impl Worker for SpyreWorker {
                     door.knock(last.clone()).map_err(|e| e.to_string())?;
                     rows.iter().map(|r| r.token()).collect()
                 };
+                scratchy_serving_worker::step_segs::record_exit(
+                    scratchy_serving_worker::step_segs::ExitSite::Deferred,
+                );
                 return Ok(ModelRunnerOutput::deferred(req_ids, Box::new(resolver)));
             }
             // NO DRAIN DOOR — a synchronous driver: drain the queue right here, through the
@@ -839,12 +854,24 @@ impl Worker for SpyreWorker {
             // churn re-seeded the request from the OLDER pick and it decoded that token twice
             // (granite-3.1-2b: "Title: A A …" at a second request's join). The older steps
             // drain first; the queue's order is the submission order.
+            scratchy_serving_worker::step_segs::record_exit(
+                scratchy_serving_worker::step_segs::ExitSite::InCall,
+            );
             while let Some(infl) = self.in_flight.pop_front() {
+                scratchy_serving_worker::step_segs::record_drain(
+                    scratchy_serving_worker::step_segs::DrainSite::Exit,
+                );
                 Self::drain_one(infl, model, requests, input_batch)?;
             }
             for row in &owed_rows {
                 sampled[row.index] = Some(row.token().map_err(werr)?);
             }
+        } else {
+            // Nothing owed: the schedule's rows all answer in the output itself.
+            #[cfg(feature = "spyre-hw")]
+            scratchy_serving_worker::step_segs::record_exit(
+                scratchy_serving_worker::step_segs::ExitSite::NothingOwed,
+            );
         }
 
         // One sampled token per request, in processing order; intermediate
@@ -866,6 +893,9 @@ impl Worker for SpyreWorker {
         // on the client's drop.
         #[cfg(feature = "spyre-hw")]
         while let Some(infl) = self.in_flight.pop_front() {
+            scratchy_serving_worker::step_segs::record_drain(
+                scratchy_serving_worker::step_segs::DrainSite::Shutdown,
+            );
             match self.model.as_mut() {
                 Some(model) => {
                     let _ = Self::drain_one(infl, model, &mut self.requests, &mut self.input_batch);
@@ -925,6 +955,10 @@ impl Worker for SpyreWorker {
                 cell.fill(Err(e));
                 return;
             };
+            // (the knock's own drain — the site tag records before the collect runs)
+            scratchy_serving_worker::step_segs::record_drain(
+                scratchy_serving_worker::step_segs::DrainSite::Knock,
+            );
             if let Err(e) = Self::drain_one(infl, model, &mut self.requests, &mut self.input_batch)
             {
                 // The step's own cell carries its error to its resolver. A failed collect
