@@ -17,7 +17,7 @@ vision = ["dep:scratchy-vision"]
 # `probe-weights` binary — these are only needed when somebody
 # runs the prober, so they're gated off by default to keep the
 # ordinary library build fast.
-probe = ["dep:hf-hub-downloader", "dep:clap", "dep:ureq", "dep:serde"]
+probe = ["dep:hf-hub-downloader", "dep:clap", "dep:ureq", "dep:scratchy-tls", "dep:serde"]
 
 # Target-neutral: the model-facts trait, the shared registry row and walk, the head registry. No
 # target feature and no target dependency — each target crate depends on this one and extends it.
@@ -50,7 +50,11 @@ inventory = { workspace = true }
 # multi-GB full-shard downloads a plain `get` would do).
 hf-hub-downloader = { workspace = true, optional = true }
 clap = { workspace = true, optional = true }
-ureq = { version = "3", optional = true, features = ["rustls"] }
+# The workspace row (rustls-no-provider + the RustCrypto provider via
+# scratchy-tls below) — the same door every other ureq agent takes, so the
+# prober compiles no C.
+ureq = { workspace = true, optional = true }
+scratchy-tls = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true }
 # `half::f16` / `half::bf16` are part of the `cpu_golden::affine_dequantize_b4_*`

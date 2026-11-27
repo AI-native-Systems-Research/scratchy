@@ -31,14 +31,13 @@ pub(crate) use ureq::Agent;
 pub(crate) fn agent(insecure: bool) -> Agent {
     let config = Agent::config_builder().timeout_global(Some(Duration::from_secs(3600)));
 
+    // The tree's one client-TLS door (pure-Rust provider, no C), kept even on
+    // the insecure path — verification is disabled, but the handshake still
+    // needs cipher suites, and ureq is built rustls-no-provider.
     let config = if insecure {
-        config.tls_config(
-            ureq::tls::TlsConfig::builder()
-                .disable_verification(true)
-                .build(),
-        )
+        config.tls_config(scratchy_tls::builder().disable_verification(true).build())
     } else {
-        config
+        config.tls_config(scratchy_tls::tls_config())
     };
 
     config.http_status_as_error(false).build().into()

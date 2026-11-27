@@ -1,0 +1,13 @@
+[package]
+name = "scratchy-tls"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "The tree's one client-TLS door: ureq agents with the pure-Rust rustls-rustcrypto provider, so the client side compiles no C"
+
+[dependencies]
+ureq = { workspace = true }
+# Exact-pinned in the workspace row (pre-release; the `provider()` signature
+# is what `builder()` consumes — a bump is a review, not a semver hop).
+rustls-rustcrypto = { workspace = true }

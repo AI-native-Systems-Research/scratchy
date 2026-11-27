@@ -487,6 +487,8 @@ fn fetch_safetensors_header(url: &str) -> Result<Vec<u8>> {
 fn fetch_range(url: &str, start: u64, end_inclusive: u64) -> Result<Vec<u8>> {
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .max_redirects(5)
+        // The tree's one client-TLS door: pure-Rust provider, no C.
+        .tls_config(scratchy_tls::tls_config())
         .timeout_global(Some(std::time::Duration::from_secs(60)))
         .build()
         .into();

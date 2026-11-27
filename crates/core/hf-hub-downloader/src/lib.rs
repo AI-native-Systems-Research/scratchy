@@ -181,13 +181,19 @@ impl ClientBuilder {
         // idle connections per host would close most of them between pieces
         // and pay a fresh TLS handshake for the next.
         let pooled = self.max_concurrency;
+        // Both agents take the tree's one client-TLS door (pure-Rust
+        // provider, no C); ureq is built rustls-no-provider, so leaving it
+        // out would panic on the first HTTPS fetch rather than fall back.
+        let tls = scratchy_tls::tls_config();
         let probing: ureq::Agent = ureq::Agent::config_builder()
+            .tls_config(tls.clone())
             .max_redirects(0)
             .max_idle_connections(pooled)
             .max_idle_connections_per_host(pooled)
             .build()
             .into();
         let following: ureq::Agent = ureq::Agent::config_builder()
+            .tls_config(tls)
             .max_redirects(8)
             .max_idle_connections(pooled)
             .max_idle_connections_per_host(pooled)

@@ -20,7 +20,11 @@ name = "hf_hub_downloader"
 # need eight calls out of that library; owning them costs four dependencies
 # we control the upgrade cadence of.
 [dependencies]
-ureq = { version = "3", default-features = false, features = ["rustls"] }
+# Features come from the workspace row: rustls-no-provider, with the
+# pure-Rust RustCrypto provider installed by scratchy-tls (no C toolchain).
+ureq = { workspace = true }
+# The TLS config both agents below take.
+scratchy-tls = { workspace = true }
 sha2 = "0.11"
 sha1 = "0.11"
 hex = "0.4"

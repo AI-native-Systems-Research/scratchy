@@ -82,6 +82,8 @@ impl HttpEmbeddingProvider {
             base_url,
             api_key,
             agent: ureq::Agent::config_builder()
+                // The tree's one client-TLS door: pure-Rust provider, no C.
+                .tls_config(scratchy_tls::tls_config())
                 .http_status_as_error(false)
                 .build()
                 .into(),
