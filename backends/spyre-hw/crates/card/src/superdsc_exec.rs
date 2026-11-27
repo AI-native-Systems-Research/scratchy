@@ -5607,19 +5607,17 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
             .ok_or_else(|| anyhow!("seg{i} has no region"))?
             .total_size()
             .as_u64();
-        // The shadow, the region and the stream are three disjoint fields of `self`; splitting the
-        // borrow here is what lets the DMA write into a real `&mut [u8]` instead of a pointer
-        // conjured from a shared reference.
+        // The shadow, the region and the card (whose launch stream the DMA rides) are disjoint
+        // fields of `self`; splitting the borrow here is what lets the DMA write into a real
+        // `&mut [u8]` instead of a pointer conjured from a shared reference.
         let Executor {
             seg_addr,
             seg_host,
-            stream,
+            card,
             ..
         } = self;
         let addr = seg_addr[i].as_ref().expect("checked above");
-        let stream = stream
-            .as_ref()
-            .ok_or_else(|| anyhow!("no stream — prepare was not called"))?;
+        let stream = card.launches();
         let Some(shadow) = seg_host[i].host_buf_mut() else {
             bail!(
                 "read seg{i}: DEVICE-ONLY — no host mirror to read into. A read door that wants \
@@ -5880,10 +5878,12 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
             };
             (&mut v[a as usize..b as usize], None)
         };
+        // Field-direct on purpose — `host` holds a live `&mut` into `seg_host`/`read_ring`
+        // here, so the stream comes by field path off the card, never through a method
+        // on `self` (which would borrow the whole executor).
         let done = self
-            .stream
-            .as_ref()
-            .ok_or_else(|| anyhow!("no stream — prepare was not called"))?
+            .card
+            .launches()
             .d2h_on_compute_signaled(host, src)
             .map_err(|e| anyhow!("read_tensor_raw({id}) D2H: {e}"))?;
         Ok(DeferredRead {
