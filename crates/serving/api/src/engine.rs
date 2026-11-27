@@ -7685,7 +7685,10 @@ mod tests {
                         // `shutdown` below states) — so the resolver falls through to the
                         // wait and is answered either way. Never parked.
                         let _ = door.knock(std::sync::Arc::clone(&cell));
-                        let tokens = cell.wait().map_err(|e| e.to_string());
+                        let tokens = match &*cell.wait() {
+                            Ok(tokens) => Ok(tokens.clone()),
+                            Err(e) => Err(e.to_string()),
+                        };
                         events.lock().unwrap().push(format!("answer:{step}"));
                         answered.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         tokens

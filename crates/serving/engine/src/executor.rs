@@ -35,11 +35,22 @@ use crate::error::EngineResult;
 /// race to paper over. `wait` parks until the fill; the resolver that knocks
 /// and then waits is the deadlock fix's own order (a resolver that WAITED
 /// first would block the one thread that can fill the cell).
+///
+/// ⭐ THE ANSWER IS EVERY ROW'S, NOT THE FIRST READER'S. One cell serves a
+/// whole step's owed rows — a wave of k tails, a decode batch of k requests —
+/// and the knock loop's `is_filled` polls the same fill, so the read must not
+/// consume: the answer is held behind an [`Arc`] and `wait` hands out shares.
+/// A consuming wait made the second row of a multi-row piece park on an
+/// emptied cell forever (serve c4: the wave's row 0 took the answer, row 1
+/// hung), and made a consumed cell read unfilled to the knock loop, which
+/// then drained an empty queue and errored the parked row ("the in-flight
+/// queue emptied before this step landed"). One answer, many readers — the
+/// type says so; a consuming read is unrepresentable.
 #[derive(Clone)]
 pub struct DrainCell(std::sync::Arc<DrainCellInner>);
 
 struct DrainCellInner {
-    filled: std::sync::Mutex<Option<EngineResult<Vec<u32>>>>,
+    filled: std::sync::Mutex<Option<std::sync::Arc<EngineResult<Vec<u32>>>>>,
     cv: std::sync::Condvar,
 }
 
@@ -60,23 +71,28 @@ impl DrainCell {
             g.is_none(),
             "a deferred step's DrainCell was filled twice — two drains took one step"
         );
-        *g = Some(tokens);
+        *g = Some(std::sync::Arc::new(tokens));
         self.0.cv.notify_all();
     }
 
     /// Has this cell been filled? The knock loop's own ask — it drains only
-    /// while the step it was knocked for is unanswered.
+    /// while the step it was knocked for is unanswered. A cell stays filled
+    /// through every read: the answer is the rows' to share, not the first
+    /// reader's to take.
     pub fn is_filled(&self) -> bool {
         self.0.filled.lock().unwrap().is_some()
     }
 
-    /// Park until the fill, then the answer. A cell that was filled with an
-    /// error hands that error back — the resolver surfaces it as the
-    /// deferred output's own failure, never as a hang.
-    pub fn wait(&self) -> EngineResult<Vec<u32>> {
+    /// Park until the fill, then a share of the answer. Every row of the
+    /// step waits this one cell, so the share — not the answer itself — is
+    /// what a reader takes; the latch stays set for the rows behind it and
+    /// for the knock loop's poll. A cell that was filled with an error hands
+    /// that error to every row — the resolver surfaces it as the deferred
+    /// output's own failure, never as a hang.
+    pub fn wait(&self) -> std::sync::Arc<EngineResult<Vec<u32>>> {
         let mut g = self.0.filled.lock().unwrap();
         loop {
-            if let Some(t) = g.take() {
+            if let Some(t) = g.clone() {
                 return t;
             }
             g = self.0.cv.wait(g).unwrap();
@@ -712,6 +728,62 @@ impl Executor for NoopExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_drain_cell_answer_is_every_rows() {
+        // One cell serves a whole step's owed rows: filled once, every row's
+        // wait must hand back the same answer. A consuming wait parked the
+        // second row of a multi-row piece on an emptied cell forever (the
+        // serve c4 deadlock: a wave's row 0 took the answer, row 1 hung).
+        let cell = DrainCell::new();
+        assert!(!cell.is_filled());
+        cell.fill(Ok(vec![7, 8, 9]));
+        assert!(cell.is_filled());
+        let first = cell.wait();
+        // The latch stays set through the read — the knock loop's poll and
+        // the rows behind this one read the same answer, not an emptied cell.
+        assert!(cell.is_filled());
+        let second = cell.wait();
+        assert!(cell.is_filled());
+        assert!(matches!(&*first, Ok(v) if v.as_slice() == [7, 8, 9]));
+        assert!(matches!(&*second, Ok(v) if v.as_slice() == [7, 8, 9]));
+    }
+
+    #[test]
+    fn test_drain_cell_error_reaches_every_row() {
+        // A cell filled with an error hands that error to every row — the
+        // resolver surfaces it as the deferred output's own failure, never
+        // as a hang.
+        let cell = DrainCell::new();
+        cell.fill(Err(crate::error::EngineError::Executor("boom".into())));
+        let first = cell.wait();
+        let second = cell.wait();
+        assert!(first.is_err());
+        assert!(second.is_err());
+        assert!(cell.is_filled());
+    }
+
+    #[test]
+    fn test_drain_cell_wait_parks_until_the_fill() {
+        // The resolver parks before the drain fills: the fill's notify must
+        // wake it, and a row that waits again behind the first reads the
+        // same answer (the share, not a take).
+        let cell = DrainCell::new();
+        let parked = cell.clone();
+        let handle = std::thread::spawn(move || {
+            let answer = parked.wait();
+            match &*answer {
+                Ok(v) => Some(v.clone()),
+                Err(_) => None,
+            }
+        });
+        assert!(!handle.is_finished());
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        cell.fill(Ok(vec![42]));
+        assert_eq!(handle.join().unwrap(), Some(vec![42]));
+        // The answer is still there for the rows behind the parked one.
+        assert!(matches!(&*cell.wait(), Ok(v) if v.as_slice() == [42]));
+    }
 
     #[test]
     fn test_model_runner_output_empty() {

@@ -232,9 +232,15 @@ pub(crate) enum OwedPick {
 
 impl OwedRow {
     /// The row's token, from its piece's landed answer: waits the piece's cell (filled
-    /// once the drain popped it) and takes the row's own pick of it.
+    /// once the drain popped it) and takes a share of it — the answer is every row's,
+    /// so this row's read leaves the cell filled for the rows behind it — then picks
+    /// this row's own token out of the share.
     pub(crate) fn token(&self) -> Result<u32, String> {
-        let toks = self.cell.wait().map_err(|e| e.to_string())?;
+        let answer = self.cell.wait();
+        let toks = match &*answer {
+            Ok(toks) => toks,
+            Err(e) => return Err(e.to_string()),
+        };
         match self.pick {
             OwedPick::Slot(slot) => toks.get(slot).copied().ok_or_else(|| {
                 format!(
