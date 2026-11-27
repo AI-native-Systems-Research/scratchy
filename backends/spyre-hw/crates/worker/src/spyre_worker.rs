@@ -60,13 +60,14 @@ pub struct SpyreWorker {
     pub(crate) is_shutdown: bool,
     pub(crate) model: Option<Loaded>,
     pub(crate) requests: HashMap<String, ReqState>,
-    /// ⭐ #32 (c4) — THE IN-FLIGHT DECODE QUEUE: submitted-but-uncollected batched decode
-    /// steps, oldest first. Every decode step goes through submit → defer → drain; a step
-    /// whose schedule can defer waits here for the drain (its output's resolver knocks the
-    /// drain door), and one that cannot is drained in-call through the SAME pop — the door
-    /// decides WHERE the drain runs, never WHETHER the step is submitted.
+    /// ⭐ #32 (c4) / §3.3 — THE IN-FLIGHT STEP QUEUE: submitted-but-uncollected steps,
+    /// oldest first — every kind a schedule submits (a decode batch, a prompt's final
+    /// chunk, a wave of tails), in submission order. A step whose driver can defer waits
+    /// here for the drain (its output's resolver knocks the drain door), and one that
+    /// cannot is drained in-call through the SAME pop — the door decides WHERE the drain
+    /// runs, never WHETHER the step is submitted.
     #[cfg(feature = "spyre-hw")]
-    pub(crate) in_flight: std::collections::VecDeque<InFlightDecode>,
+    pub(crate) in_flight: std::collections::VecDeque<InFlightStep>,
     /// ⭐ #32 (c4) — THE ENGINE'S DRAIN DOOR, handed down by the pipeline's `start_pipeline`.
     /// `None` on every synchronous driver (no pipelined engine thread), which is exactly the
     /// "cannot defer" case: those steps still submit and defer, then drain themselves in-call.
@@ -223,4 +224,4 @@ inventory::submit!(
 );
 
 #[cfg(feature = "spyre-hw")]
-pub(crate) use crate::card::exec::InFlightDecode;
+pub(crate) use crate::card::exec::{InFlightStep, OwedRow};

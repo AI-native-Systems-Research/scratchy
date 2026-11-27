@@ -13,6 +13,10 @@ pub(crate) type World = scratchy_target_spyre::bundle_code::collective::Build;
 pub(crate) type SuperDscSession =
     scratchy_target_spyre_card::sdsc_runner::SuperDscSession<'static, 'static, World>;
 
+/// A submitted step's landing over the build's world — rank `r`'s forward latch,
+/// one per card the step spans BY TYPE ([`PerRank`] behind a private field).
+pub(crate) type StepLanding = scratchy_target_spyre_card::sdsc_runner::StepLanding<World>;
+
 /// The world's OPENED CARDS — phase 1's product, leaked once for the process at the load site, so
 /// every runtime phase 2 builds over them borrows a card for `'static`.
 pub(crate) type OpenedCards = scratchy_target_spyre::bundle_code::collective::PerRank<
@@ -73,10 +77,6 @@ impl LogitsGeom {
     // refusal and the rung's own log line.
 }
 
-/// What a forward should hand back from its lm-head tail. An enum rather than a `bool` because the
-/// per-request case CANNOT be served without the tensor's geometry — see [`LogitsGeom`] — and a bare
-/// `want_logits: true` gave no place to put it, which is exactly how the batched path came to slice
-/// one row's worth and hand it to eight requests.
 /// One rung of the batched-decode ladder: a bundle baked for exactly `seqs` requests, aliasing the
 /// one-request decode session's weights and page pool.
 // ⛔ `sendnn`-ONLY, restored from 8bd5c755b. My branch was cut BEFORE that commit added
@@ -110,28 +110,27 @@ pub(crate) enum RungId {
     Ladder(usize),
 }
 
+/// ⭐ WHICH SESSION A SUBMITTED STEP RAN ON — the identity its owed piece carries to the
+/// drain ([`SuperDscBundle::step_session`]). One of the bundle's own ladders named the
+/// session at the submit (the decode ladder, the position-0 prefill ladder, the prefix
+/// ladder), and the drain resolves the value back to the session — the one fact a
+/// deferred read cannot hold itself, stated as a value instead of a probe.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum StepSeat {
+    /// The decode ladder's rung — `Owner` is the W=1 decode session itself.
+    Decode(RungId),
+    /// The position-0 prefill ladder's rung `i` (a fresh prompt's chunk).
+    Prefill(usize),
+    /// The prefix ladder's rung — a continuation chunk, or a packed wave.
+    Prefix(PrefixRung),
+}
+
 /// ONE DECODE SEAT: the launch-width facts plus the session they describe, whichever rung
 /// was chosen. The fields are exactly `DecodeRung`'s, so the launch reads one shape and
 /// never re-derives an owner fact it could get wrong — `seqs` is `1` on the owner.
 pub(crate) struct DecodeSeat<'a> {
     pub(crate) seqs: ktir_superdsc::sdsc_abstract::RungWidth,
     pub(crate) sess: &'a mut SuperDscSession,
-}
-
-pub(crate) enum LogitsWanted {
-    /// Nothing — every prompt chunk but the final one, which launches no suffix and reads
-    /// nothing back.
-    None,
-    /// The FINAL prompt chunk: its suffix runs, the rung's own minted sampler picks the
-    /// first generated token on the card from the folded lm-head row, and the idx stick
-    /// is read back exactly like a decode launch's.
-    LastRow,
-    /// A DECODE BATCH: one row per request, every row a different request. The
-    /// rung's sampler picks every token on the card; the idx stick's raw read is
-    /// deferred and comes back through the one collect door
-    /// (`collect_decode_tokens`) — in-call when the schedule cannot defer, from
-    /// the drain when it can. There is no synchronous decode arm.
-    PerRequestDeferred,
 }
 
 /// The sendnn session type. ONE variant: the dxp-compiled SuperDSC bundle is the only thing that
@@ -352,6 +351,18 @@ impl PrefixLadder {
 }
 
 impl SuperDscBundle {
+    /// ⭐ THE SESSION A SUBMITTED STEP RAN ON — the seat its owed piece carries, resolved back
+    /// to the session at the drain. Only the submitting session can finish a step's read (each
+    /// rung is its own executor and stream), so the piece states which one it was as a VALUE,
+    /// decided at the submit and carried — never recovered by probing the sessions.
+    pub(crate) fn step_session(&mut self, seat: StepSeat) -> &mut SuperDscSession {
+        match seat {
+            StepSeat::Decode(r) => self.decode_seat(r).sess,
+            StepSeat::Prefill(i) => &mut self.prefill_rungs[i].1,
+            StepSeat::Prefix(r) => self.prefill_prefix.session(r),
+        }
+    }
+
     /// THE RUNG A DECODE STEP RUNS ON — [`RungId::Owner`] when one request is live (the W=1
     /// rung IS the owner session, by the loader's `rn <= 1 → continue`), else the index of the
     /// SMALLEST ladder rung that holds `live` requests. `None` when `live` exceeds the widest

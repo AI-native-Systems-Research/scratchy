@@ -338,6 +338,14 @@ fn run_chat_inproc(args: &ChatArgs, model: &str) -> Result<()> {
         {
             eprintln!("{table}");
         }
+        // The prompt-chunk table, the same gate and the same law: the worker
+        // accumulates every chunk launch unconditionally and answers `None` by
+        // type when none ran (the emulator, every decode-only run).
+        if args.bench
+            && let Some(table) = scratchy_serving_api::chunk_segment_table()
+        {
+            eprintln!("{table}");
+        }
         return Ok(());
     }
 

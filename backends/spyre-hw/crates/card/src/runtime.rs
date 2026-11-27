@@ -15,6 +15,8 @@
 //!   `Executor` in [`crate::superdsc_exec`]) — see the ⛔ doc on [`DevAddr`].
 //! - No process-wide card: one [`CardRuntime`] per open card, over the real senlib scheduler, and
 //!   every stream and allocation names the `CardRuntime` it acts on.
+//! - ONE LAUNCH STREAM PER CARD, minted at bring-up ([`CardRuntime::launches`]) with the step
+//!   queue over it ([`CardRuntime::steps`]) — executors borrow it; the card's teardown drains it.
 
 use std::fmt;
 use std::num::NonZeroU64;
@@ -93,6 +95,27 @@ pub struct CardRuntime<'a, T: ktir_superdsc::collective::Tp> {
     cpus: CardCpus,
     memory: CardMemory,
     rt: Arc<RuntimeContext<'a>>,
+    /// ⭐ THE CARD'S ONE LAUNCH STREAM — minted once here, at bring-up, and
+    /// BORROWED by every executor that launches on this card; never a
+    /// per-session stream, whose serialization would hide what the card
+    /// still owed from every host side. One stream per card is
+    /// the law the step cadence rides: its FIFO is the submission order the
+    /// [`steps`](Self::steps) queue's landings are drained in, and its
+    /// teardown drain (this runtime's [`shutdown`](Self::shutdown), plus the
+    /// handle's own Drop) is the one place a card's outstanding work is
+    /// waited out.
+    launches: Stream<'a>,
+    /// ⭐ THE CARD'S STEP QUEUE — the landings of the steps submitted on
+    /// [`launches`](Self::launches), in submission order (the flex step
+    /// door's own law). ONE queue exists per card because one thread arms
+    /// it: the worker's pipeline thread, which is also the only submitter —
+    /// so the arm order IS the submission order, and draining pops landings
+    /// in exactly the order the card retires them. In a sharded world only
+    /// the LEAD rank's queue is ever armed (a step's landing is armed on the
+    /// lead's doorbell; the collectives tie the peers, which settle through
+    /// the lead's pick) — a peer's queue exists and stays empty, the same
+    /// shape every card gets.
+    steps: flex_rs::step::StepQueue<'a>,
     /// This card's p2p link, when it runs one rank of a sharded world — set once, by
     /// [`link_peers`]. A card's `XSEG` entries point at one window's slots, so the card holds at
     /// most one link for its life.
@@ -175,11 +198,26 @@ impl<'a, T: ktir_superdsc::collective::Tp> CardRuntime<'a, T> {
         .map_err(BringUpError::Scheduler)?;
 
         let rt = RuntimeContext::create(DeviceId(i64::from(index)), scheduler, allocator);
+        // ⭐ THE ONE LAUNCH STREAM, minted at bring-up — serialized with every
+        // other stream creation (see the ⛔ doc on [`Stream::create`]), with
+        // the step queue over it in the same breath: a card whose launch
+        // stream cannot open does not open at all ([`BringUpError::LaunchStream`]),
+        // so an executor never reaches for a launch stream that is not there.
+        let launches = Stream::open(
+            &rt,
+            RuntimeStreamPriority::Normal,
+            RuntimeStreamMode::StrictOrdering,
+            false,
+        )
+        .map_err(BringUpError::LaunchStream)?;
+        let steps = launches.step_queue().map_err(BringUpError::LaunchStream)?;
         Ok(Self {
             card,
             cpus,
             memory,
             rt,
+            launches,
+            steps,
             link: std::sync::OnceLock::new(),
         })
     }
@@ -213,6 +251,24 @@ impl<'a, T: ktir_superdsc::collective::Tp> CardRuntime<'a, T> {
         &self.rt
     }
 
+    /// ⭐ THE CARD'S ONE LAUNCH STREAM — the stream every executor on this
+    /// card borrows to launch. Executors do NOT mint streams: one stream per
+    /// card is the law (see the field's ⭐ doc), so a card's submissions all
+    /// ride one FIFO and the [`steps`](Self::steps) queue's order is that
+    /// FIFO's order.
+    pub fn launches(&self) -> &Stream<'a> {
+        &self.launches
+    }
+
+    /// ⭐ THE CARD'S STEP QUEUE — the landings of this card's submitted
+    /// steps, in submission order. The worker's pipeline thread (the one
+    /// submitter) arms a step's landing right after the submit that carries
+    /// it; the drain pops from the front. See the field's ⭐ doc for the
+    /// single-submitter law and the lead-rank law.
+    pub fn steps(&self) -> &flex_rs::step::StepQueue<'a> {
+        &self.steps
+    }
+
     /// THE CARD'S REAL MEMORY CAPACITY, read from the card at [`Self::open`] — the one
     /// [`CardMemory`] constructor. A card that cannot report its capacity does not open, so a
     /// caller holding a `CardRuntime` never has a capacity to guess.
@@ -232,7 +288,16 @@ impl<'a, T: ktir_superdsc::collective::Tp> CardRuntime<'a, T> {
     /// After this the card's sessions are dead; [`Self::reset`] is the mid-process probe, this
     /// is teardown — the serve span calls it on every card before it releases the scope the
     /// completion threads live on.
+    ///
+    /// ⭐ THE LAUNCH STREAM DRAINS FIRST: the one stream every executor on
+    /// this card borrowed is the card's own, so the card's teardown — not
+    /// each borrower's — is where its outstanding work is waited out
+    /// (`drain_for_teardown`, the door that also waits on an errored
+    /// stream). Its deferred error, if any, is logged by the stream's own
+    /// teardown path, never swallowed into this void return's silence on
+    /// purpose: teardown is past the point a caller could act on it.
     pub fn shutdown(&self) {
+        let _ = self.launches.drain_for_teardown();
         self.rt.shutdown();
     }
 }
@@ -802,6 +867,10 @@ pub enum BringUpError {
     Placement(PlacementError),
     /// The bring-up thread could not be run on the card's NUMA node.
     Pin(PinError),
+    /// The card's ONE LAUNCH STREAM ([`CardRuntime::launches`]) could not be
+    /// created — a card that cannot open its launch stream does not open at
+    /// all, so no executor is ever left to mint its own.
+    LaunchStream(HwError),
 }
 
 impl fmt::Display for BringUpError {
@@ -813,6 +882,7 @@ impl fmt::Display for BringUpError {
             Self::Scheduler(e) => write!(f, "{e}"),
             Self::Placement(e) => write!(f, "card NUMA placement: {e}"),
             Self::Pin(e) => write!(f, "bring-up thread: {e}"),
+            Self::LaunchStream(e) => write!(f, "card launch stream: {e}"),
         }
     }
 }
@@ -845,14 +915,14 @@ impl std::error::Error for AllocError {}
 /// every seat door has always passed `None`), parked on by the read's finish
 /// half instead of a whole-stream synchronize.
 ///
-/// NOT flex-rs's `Event`, and the difference is load-bearing: an op that FAILS
-/// never fires its user callback — the stream records a deferred error and goes
-/// sticky-shutdown instead (`make_completion_callback`'s Err arm) — so a waiter
-/// with no timeout would hang on a dead device. This latch parks on a condvar
-/// with a TIMEOUT tick whose only job is that escape: in the healthy path the
-/// callback's notify returns the park and the tick never fires; when the tick
-/// does fire it hands the wait back so the caller can surface the stream's
-/// deferred error by the same door the whole-stream wait used.
+/// ⛔ THE LATCH ITSELF IS flex-rs's STEP DOOR's ([`flex_rs::step::Landing`]) —
+/// refounded, not restated. The completion form ([`UserCallback::Latch`]), the
+/// park, and the timeout tick whose only job is the dead-stream escape (an op
+/// that FAILS never fires its user callback — the stream records a deferred
+/// error and goes sticky-shutdown instead — so a waiter with no tick would
+/// hang on a dead device) are stated ONCE, in `flex_rs::step`; this type names
+/// that latch as a read's own landing and adds nothing the latch does not
+/// already carry.
 ///
 /// One signal names one transfer, and the finish half that parks on it is
 /// its only WAITER (the ring law — a slot's bytes are read exactly once, by
@@ -862,7 +932,7 @@ impl std::error::Error for AllocError {}
 /// by a comment: a handle with no `wait` method cannot break the ring law,
 /// so the signal itself is not `Clone`.
 pub struct ReadSignal {
-    done: std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+    landing: std::sync::Arc<flex_rs::step::Landing>,
 }
 
 /// ⭐ #32 (E) — THE PEEK HANDLE: a read-only view of one transfer's
@@ -871,7 +941,7 @@ pub struct ReadSignal {
 /// byte of the slot — so the overlap probe can hold it across a step
 /// without being able to wait on it. The waiter's law stays on
 /// `ReadSignal` itself, which this type deliberately cannot become.
-pub struct ReadPeek(std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>);
+pub struct ReadPeek(flex_rs::step::Peek);
 
 impl ReadPeek {
     /// Has the transfer's callback fired? The card-busy answer the overlap
@@ -881,37 +951,38 @@ impl ReadPeek {
     /// pre-schedule could inflate while the card sat idle; this cannot lie
     /// that way).
     pub fn fired(&self) -> bool {
-        let (mtx, _cv) = &*self.0;
-        *mtx.lock().unwrap()
+        self.0.fired()
     }
 }
-
-/// The timeout tick — the error-escape cadence. An order past a decode step
-/// (~24 ms measured, ~48 ms at depth 2), so it never fires on a healthy wait;
-/// it exists only to notice a dead stream (≤ this much latency on a path that
-/// is already a hard failure).
-const READ_SIGNAL_DEAD_TICK: std::time::Duration = std::time::Duration::from_millis(250);
 
 impl ReadSignal {
     pub fn new() -> Self {
         Self {
-            done: std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new())),
+            landing: std::sync::Arc::new(flex_rs::step::Landing::new()),
         }
     }
 
-    /// The latch handed to `launch_d2h`/`launch_h2d` as the op's user callback:
-    /// the signal's own `(flag, condvar)` pair, by `Arc` clone — the LAST
-    /// per-crossing heap allocation on the seam, gone. Firing it (flex-rs's
-    /// `UserCallback::Latch` arm, under the same catch_unwind protection the
-    /// boxed closure got) sets the flag and wakes the parker; it runs on the
-    /// scheduler's completion thread, touches nothing but this latch, and
-    /// cannot borrow the transfer's host buffer — the buffer outlives the call
-    /// site by the caller's own laws (the ring slot's index, the shadow's seat
-    /// ownership). The latch's pair is `ReadSignal`'s own `done` field verbatim
-    /// — the waiter parks on the same pair the callback fires, with no
-    /// intermediary state to agree on.
+    /// ⭐ THE QUEUE-ARM FORM — the landing's own `Arc`, for arming a card's step queue
+    /// ([`CardRuntime::steps`]). The queue holds landings by `Arc` and parks the oldest at its
+    /// drain; this is the SAME latch the finish half parks, handed to the one cadence that
+    /// drains landings in submission order — not a second completion form, and not a waiter:
+    /// the queue's drain and the read's finish are the same thread, one after the other.
+    pub fn landing(&self) -> std::sync::Arc<flex_rs::step::Landing> {
+        self.landing.clone()
+    }
+
+    /// The latch handed to `launch_d2h`/`launch_h2d` as the op's user
+    /// callback: the landing's own `(flag, condvar)` pair, by `Arc` clone —
+    /// the LAST per-crossing heap allocation on the seam, gone. Firing it
+    /// (flex-rs's `UserCallback::Latch` arm, under the same catch_unwind
+    /// protection the boxed closure got) sets the flag and wakes the parker;
+    /// it runs on the scheduler's completion thread, touches nothing but
+    /// this latch, and cannot borrow the transfer's host buffer — the buffer
+    /// outlives the call site by the caller's own laws (the ring slot's
+    /// index, the shadow's seat ownership). The waiter parks on the same
+    /// pair the callback fires, with no intermediary state to agree on.
     fn arm(&self) -> UserCallback {
-        UserCallback::Latch(self.done.clone())
+        self.landing.callback()
     }
 
     /// ⭐ #32 (E) — MINT THE PEEK HANDLE: the overlap probe's non-blocking
@@ -920,29 +991,16 @@ impl ReadSignal {
     /// cannot wait, so the drain's park on this signal stays its one waiter
     /// no matter who holds a peek.
     pub fn peek_handle(&self) -> ReadPeek {
-        ReadPeek(self.done.clone())
+        ReadPeek(self.landing.peek())
     }
 
-    /// Park until the read's own callback fires. `dead` runs ONLY on the
-    /// timeout tick — the error escape above — and answers "can the op this
-    /// wait is for still complete at all". Returns `true` when the transfer
-    /// landed, `false` when the stream died underneath it.
+    /// Park until the read's own callback fires — the step door's one park,
+    /// over this read's landing. `dead` runs ONLY on the latch's timeout
+    /// tick and answers "can the op this wait is for still complete at
+    /// all". Returns `true` when the transfer landed, `false` when the
+    /// stream died underneath it.
     pub fn wait_or(&self, dead: impl Fn() -> bool) -> bool {
-        let (mtx, cv) = &*self.done;
-        let mut guard = mtx.lock().unwrap();
-        loop {
-            if *guard {
-                return true;
-            }
-            let (guard_next, _timeout) = cv.wait_timeout(guard, READ_SIGNAL_DEAD_TICK).unwrap();
-            guard = guard_next;
-            if *guard {
-                return true;
-            }
-            if dead() {
-                return false;
-            }
-        }
+        self.landing.wait_or(dead)
     }
 }
 
@@ -1011,14 +1069,38 @@ impl<'a> Stream<'a> {
         mode: RuntimeStreamMode,
         track_hazards: bool,
     ) -> Result<Stream<'a>, HwError> {
+        Self::open(&card.rt, priority, mode, track_hazards)
+    }
+
+    /// The one creation body behind every stream door, over a context the
+    /// caller already holds — factored out so [`CardRuntime::build`] can
+    /// mint the card's launch stream from its own freshly built context
+    /// without going through a `CardRuntime` that does not exist yet.
+    /// Carries the ⛔ serialization law's lock (see the doc above): every
+    /// stream creation in the process, the launch stream's included, is one
+    /// at a time.
+    fn open(
+        rt: &Arc<RuntimeContext<'a>>,
+        priority: RuntimeStreamPriority,
+        mode: RuntimeStreamMode,
+        track_hazards: bool,
+    ) -> Result<Stream<'a>, HwError> {
         // A poisoned lock still serializes (nothing is protected but the CALL), so recover rather than
         // panic: a panic here would turn one thread's failure into the whole load's.
         let _serialize = STREAM_CREATE.lock().unwrap_or_else(|e| e.into_inner());
-        let rt = card.rt.clone();
         let id = rt
             .create_stream(priority, mode, track_hazards)
             .map_err(HwError::StreamCreate)?;
-        Ok(Stream { rt, id })
+        Ok(Stream { rt: rt.clone(), id })
+    }
+
+    /// ⭐ THE STEP QUEUE OVER THIS STREAM — the flex step door's landings,
+    /// in this stream's submission order. Minted once per card, over the
+    /// card's launch stream ([`CardRuntime::steps`]); a stream handle cannot
+    /// outlive the queue it minted, so the queue borrows nothing the stream
+    /// does not already hold.
+    pub fn step_queue(&self) -> Result<flex_rs::step::StepQueue<'a>, HwError> {
+        Ok(flex_rs::step::StepQueue::on(&self.live()?))
     }
 
     /// The live `RuntimeStream` this handle names. `Err(StreamGone)` after the stream was destroyed
@@ -1382,36 +1464,12 @@ impl<'a> Stream<'a> {
             .map_err(HwError::Stream)
     }
 
-    /// One ComputeOnDevice launch (async). `tensor_allocs` is POSITIONAL — entry i backs the
-    /// program's logical segment i.
-    pub fn compute(
-        &self,
-        prog: &DevAddr,
-        tensor_allocs: &[&DevAddr],
-        kernel_name: &str,
-        bootstrap_offset: u64,
-        tensor_byte_offsets: &[u64],
-        pipeline_barrier: bool,
-    ) -> Result<(), HwError> {
-        let stream = self.live()?;
-        let allocs: Vec<Arc<CompositeAddress>> =
-            tensor_allocs.iter().map(|a| a.0.clone()).collect();
-        let tbo: Vec<ByteOffset> = tensor_byte_offsets.iter().map(|o| ByteOffset(*o)).collect();
-        let params = ComputeParams::new(
-            prog.0.clone(),
-            allocs,
-            KernelName(kernel_name.to_owned()),
-            BootstrapOffset(bootstrap_offset),
-            tbo,
-        )
-        .with_pipeline_barrier(pipeline_barrier);
-        stream.launch_compute(params, None).map_err(HwError::Stream)
-    }
-
     /// N compute launches as ONE submission — one doorbell for the whole list (the vendor's
     /// multi-CB branch; see `flex_rs::stream::RuntimeStream::launch_compute_batch` for the
     /// semantics, including why `pipeline_barrier` is the OR of what the caller would have
-    /// passed per op). Device-side order is the list order, same as N `compute` calls.
+    /// passed per op). Device-side order is the list order — and a single launch IS a list of
+    /// one, which is why there is no single-op compute door: every launch, plain or collective,
+    /// takes this one.
     ///
     /// ⛔ THE ITEMS OWN THEIR HANDLES. A batch outlives the loop that builds it (the whole
     /// rung is collected, then flushed once), and that loop's shifted bases and `&DevAddr`
@@ -1424,15 +1482,28 @@ impl<'a> Stream<'a> {
     /// JobPlanStepCompute (the resident binary runs by its bootstrap address; dxp does not
     /// apply `tensor_byte_offsets` to per-op addresses). Widening this to a general batch
     /// door means growing [`BatchedCompute`], not a new method.
+    ///
+    /// ⭐ THE `*_signaled` TWIN OF THE DMA DOORS: `land` is the per-op
+    /// completion hook (`launch_compute_batch`'s `user_cb`) — `None` leaves
+    /// the submission silent (every door's behavior until now), `Some` arms
+    /// the given landing on the ONE callback the whole-list submission
+    /// carries. One callback per submission is the vendor's own semantics
+    /// (one in-flight increment, fired when the whole list retires), so the
+    /// landing armed here is the fact "this step's last control block has
+    /// retired" — a READLESS completion door: no bytes cross, no D2H is
+    /// owed, and the submitter returns while the card still owes the work.
+    /// The submitter arms the card's step queue with the landing right
+    /// after this call returns (the step door's arm-order law).
     fn compute_batch<'l>(
         &self,
         launches: impl Iterator<Item = &'l BatchedCompute>,
         pipeline_barrier: bool,
+        land: Option<&ReadSignal>,
     ) -> Result<(), HwError> {
         let stream = self.live()?;
         let params: Vec<ComputeParams> = launches.map(BatchedCompute::params).collect();
         stream
-            .launch_compute_batch(params, pipeline_barrier, None)
+            .launch_compute_batch(params, pipeline_barrier, land.map(ReadSignal::arm))
             .map_err(HwError::Stream)
     }
 
@@ -1495,7 +1566,17 @@ impl<'a> Stream<'a> {
     /// control blocks is rendered through [`Self::render_batch`] and submitted as wires
     /// ([`Self::compute_wires`]) with the leased tags stamped on, so the sends, waits and consumes
     /// ride the same FIFO as the compute that produces and consumes their bytes.
-    pub fn submit_batch(&self, items: &[BatchedCb], pipeline_barrier: bool) -> Result<(), HwError> {
+    ///
+    /// ⭐ `land` is the `*_signaled` twin's hook — see [`Self::compute_batch`]'s
+    /// ⭐ doc: `Some` arms the given landing on this submission's ONE
+    /// completion callback, a readless door for a step whose pick (if it
+    /// owes one) rides a LATER read. Rides both arms unchanged.
+    pub fn submit_batch(
+        &self,
+        items: &[BatchedCb],
+        pipeline_barrier: bool,
+        land: Option<&ReadSignal>,
+    ) -> Result<(), HwError> {
         if items.iter().all(|i| matches!(i, BatchedCb::Compute(_))) {
             return self.compute_batch(
                 items.iter().filter_map(|i| match i {
@@ -1503,6 +1584,7 @@ impl<'a> Stream<'a> {
                     _ => None,
                 }),
                 pipeline_barrier,
+                land,
             );
         }
         let canvas = Arc::new(self.render_batch(items, 0)?);
@@ -1516,6 +1598,7 @@ impl<'a> Stream<'a> {
                 }),
             },
             pipeline_barrier,
+            land,
         )
     }
 
@@ -1529,14 +1612,20 @@ impl<'a> Stream<'a> {
     /// host fences), one fence, one capacity gate, in-flight accounting per
     /// CB — so the step is ordered on the ring exactly as its per-rung
     /// `compute_batch` calls were, with the same CBs in the same order.
+    ///
+    /// ⭐ `land` is the `*_signaled` twin's hook — see [`Self::compute_batch`]'s
+    /// ⭐ doc: `Some` arms the given landing on this submission's ONE
+    /// completion callback, a readless door for a step whose pick (if it
+    /// owes one) rides a LATER read.
     pub fn compute_wires(
         &self,
         batch: ComputeWireBatch,
         pipeline_barrier: bool,
+        land: Option<&ReadSignal>,
     ) -> Result<(), HwError> {
         let stream = self.live()?;
         stream
-            .launch_compute_wires(batch, pipeline_barrier, None)
+            .launch_compute_wires(batch, pipeline_barrier, land.map(ReadSignal::arm))
             .map_err(HwError::Stream)
     }
 }

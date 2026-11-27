@@ -15,7 +15,7 @@ use tracing::info;
 
 use crate::engine_core::{EngineCore, EngineCoreConfig, StepOutcome, StepOutputs};
 use crate::error::{EngineError, EngineResult};
-use crate::executor::{Executor, ModelRunnerOutput};
+use crate::executor::{Executor, ModelRunnerOutput, Pumped, drain_knock};
 
 // ---------------------------------------------------------------------------
 // EngineCoreClient trait
@@ -185,8 +185,11 @@ enum PipelineMsg {
     ),
     /// ⭐ #32 (C) — A KNOCK: drain the worker's in-flight queue until the named
     /// cell is filled. Sent by a deferred output's resolver (another thread);
-    /// handled by [`executor_bg_loop`] through [`crate::executor::Executor::drain_until`].
-    Knock(std::sync::Arc<crate::executor::DrainCell>),
+    /// handled by [`executor_bg_loop`] through [`crate::executor::drain_knock`]'s
+    /// pump, which feeds the executor every message that arrives while the
+    /// knock waits — a queued Step is submitted before the knock parks on a
+    /// step the card is still running.
+    Knock(std::sync::Arc<dyn crate::executor::KnockCell>),
     /// ⭐ #32 (C) — TEARDOWN. The worker holds a [`DrainDoor`] (a sender
     /// clone) for exactly this channel, so dropping the client's sender alone
     /// would never close it — the thread would outlive the client and a join
@@ -210,7 +213,7 @@ enum PipelineMsg {
 #[derive(Clone)]
 pub struct DrainDoor {
     knock: std::sync::Arc<
-        dyn Fn(std::sync::Arc<crate::executor::DrainCell>) -> EngineResult<()> + Send + Sync,
+        dyn Fn(std::sync::Arc<dyn crate::executor::KnockCell>) -> EngineResult<()> + Send + Sync,
     >,
 }
 
@@ -235,7 +238,7 @@ impl DrainDoor {
     /// `blocking_send` from a blocking thread (see the server's
     /// construction site for the panic-hazard contract).
     pub fn from_knock(
-        knock: impl Fn(std::sync::Arc<crate::executor::DrainCell>) -> EngineResult<()>
+        knock: impl Fn(std::sync::Arc<dyn crate::executor::KnockCell>) -> EngineResult<()>
         + Send
         + Sync
         + 'static,
@@ -248,7 +251,7 @@ impl DrainDoor {
     /// Knock: drain until `cell` is filled. Returns `Err` only when the
     /// executor thread is gone — a resolver that cannot knock resolves its
     /// cell with the error rather than hang.
-    pub fn knock(&self, cell: std::sync::Arc<crate::executor::DrainCell>) -> EngineResult<()> {
+    pub fn knock(&self, cell: std::sync::Arc<dyn crate::executor::KnockCell>) -> EngineResult<()> {
         (self.knock)(cell)
     }
 }
@@ -258,6 +261,37 @@ enum PipelineResult {
     Step(Box<SchedulerOutput>, EngineResult<ModelRunnerOutput>),
 }
 
+/// ⭐ ONE DISPATCH, BOTH CALLERS OF IT. Every `PipelineMsg` this channel can
+/// carry is handled here, once — the loop's own `recv` and the knock's pump
+/// ([`crate::executor::drain_knock`]) both route through this statement, so a
+/// new variant is written in exactly one place per channel, never once per
+/// caller. The verdict is the pump's own vocabulary: a message ran, a knock
+/// joins the pending set, or the loop must stop (the teardown arrived, or the
+/// client is gone — the caller breaks to its own shutdown tail).
+fn dispatch_pipeline_msg(
+    executor: &mut dyn Executor,
+    tx: &std::sync::mpsc::SyncSender<PipelineResult>,
+    msg: PipelineMsg,
+) -> Pumped {
+    match msg {
+        PipelineMsg::Step(sched) => {
+            let result = executor.execute_model(&sched);
+            if tx.send(PipelineResult::Step(sched, result)).is_err() {
+                // The client is gone: the loop's own exit tail runs the
+                // shutdown drain.
+                return Pumped::Stop;
+            }
+            Pumped::Ran
+        }
+        PipelineMsg::Embed(token_id_seqs, reply) => {
+            let _ = reply.send(executor.embed(token_id_seqs));
+            Pumped::Ran
+        }
+        PipelineMsg::Knock(cell) => Pumped::Knock(cell),
+        PipelineMsg::Shutdown => Pumped::Stop,
+    }
+}
+
 /// Background executor thread loop: receives scheduler outputs, runs
 /// `execute_model`, and sends back results.
 fn executor_bg_loop(
@@ -265,6 +299,7 @@ fn executor_bg_loop(
     rx: std::sync::mpsc::Receiver<PipelineMsg>,
     tx: std::sync::mpsc::SyncSender<PipelineResult>,
 ) {
+    use std::sync::mpsc::TryRecvError;
     // First act: run where the executor's devices want their driver. A refusal ends the thread
     // by name; the client's next receive reports the thread gone.
     if let Err(e) = executor.pin_driving_thread() {
@@ -273,20 +308,31 @@ fn executor_bg_loop(
         return;
     }
     while let Ok(msg) = rx.recv() {
-        match msg {
-            PipelineMsg::Step(sched) => {
-                let result = executor.execute_model(&sched);
-                if tx.send(PipelineResult::Step(sched, result)).is_err() {
+        match dispatch_pipeline_msg(&mut *executor, &tx, msg) {
+            Pumped::Ran => {}
+            // ⭐ FEED BEFORE HARVEST ([`drain_knock`]): while this knock waits
+            // for its landing, every message that arrives runs first — the
+            // card is fed before it is harvested, so a queued Step's submit
+            // never waits behind the collect of a step already on the card.
+            // Without the pump, the knock for step N lands ahead of the
+            // pre-scheduled Step for N+1 (the resolver resolves before the next
+            // call pre-sends), the executor parks on N's landing, and decode
+            // serializes at depth 1 with the card idle behind every collect.
+            Pumped::Knock(cell) => {
+                let mut knocks = vec![cell];
+                let answered = drain_knock(&mut *executor, &mut knocks, |ex| match rx.try_recv() {
+                    Ok(msg) => dispatch_pipeline_msg(ex, &tx, msg),
+                    Err(TryRecvError::Empty) => Pumped::Idle,
+                    Err(TryRecvError::Disconnected) => Pumped::Stop,
+                });
+                if !answered {
                     break;
                 }
             }
-            PipelineMsg::Embed(token_id_seqs, reply) => {
-                let _ = reply.send(executor.embed(token_id_seqs));
-            }
-            PipelineMsg::Knock(cell) => {
-                executor.drain_until(&cell);
-            }
-            PipelineMsg::Shutdown => break,
+            Pumped::Stop => break,
+            // Only the pump's channel-empty arm produces this; a dispatched
+            // message never does.
+            Pumped::Idle => {}
         }
     }
     executor.shutdown();
@@ -434,6 +480,18 @@ impl InprocClient {
         pipeline: &mut PipelineState,
     ) -> EngineResult<StepOutcome<StepOutputs>> {
         // 1. Pre-schedule: fill pipeline up to 2 in-flight batches.
+        // PIPE TRACE (SCRATCHY_PIPE_TRACE): the loop's own state per call — gif at entry,
+        // each iteration's outcome — beside the scheduler's SCRATCHY_SCHED_TRACE lines it
+        // names which world ran: gif=1 at entry is the pre-send firing (a step sent while
+        // the previous is in flight), gif=0 with a `None` on the second iteration is the
+        // starved pipeline. Same read-only diag-print practice as SCRATCHY_TTFT_PHASE.
+        let pipe_trace = std::env::var_os("SCRATCHY_PIPE_TRACE").is_some();
+        if pipe_trace {
+            eprintln!(
+                "[pipe-trace] call gif={} awaits={}",
+                pipeline.gpu_in_flight, pipeline.awaits_step
+            );
+        }
         while pipeline.gpu_in_flight < 2 && !pipeline.awaits_step {
             if let Some(sched) = engine.schedule_next() {
                 let speculative = sched.is_speculative() && !sched.spec_pipeline.leads;
@@ -446,7 +504,16 @@ impl InprocClient {
                 }
                 pipeline.gpu_in_flight += 1;
                 pipeline.awaits_step = speculative;
+                if pipe_trace {
+                    eprintln!("[pipe-trace]   sent gif={}", pipeline.gpu_in_flight);
+                }
             } else {
+                if pipe_trace {
+                    eprintln!(
+                        "[pipe-trace]   schedule_next=None gif={}",
+                        pipeline.gpu_in_flight
+                    );
+                }
                 break;
             }
         }

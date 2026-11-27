@@ -47,7 +47,7 @@ use scratchy_core_common::{
 use scratchy_serving_engine::core_client::{DrainDoor, EngineCoreClient};
 use scratchy_serving_engine::engine_core::StepOutcome;
 use scratchy_serving_engine::error::EngineError;
-use scratchy_serving_engine::executor::{Executor, ModelRunnerOutput};
+use scratchy_serving_engine::executor::{Executor, ModelRunnerOutput, Pumped};
 use tokio::sync::{Mutex, Notify, mpsc, oneshot, watch};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
@@ -2227,7 +2227,9 @@ impl AsyncEngine {
         // the pipelined client hands its executor (`InprocClient::
         // start_pipeline`); here the knock rides THIS channel as
         // `ExecutorWork::Knock`, and the loop's arm answers it with
-        // `drain_until` — the one thread that owns the in-flight queue.
+        // `drain_knock`'s pump — the one thread that owns the in-flight queue,
+        // fed first: every message that arrives while a knock waits runs before
+        // the drain parks on a step the card is still running.
         // ⚠️ `blocking_send` PANICS from an async runtime thread: knocks
         // arrive only from BLOCKING threads — this loop resolves every
         // deferred output inside `spawn_blocking` (step 4 below), never on a
@@ -3885,7 +3887,7 @@ enum ExecutorWork {
     /// filled. Sent by a deferred output's resolver through its
     /// [`DrainDoor`]; answered by the arm below, mirroring the pipelined
     /// client's `executor_bg_loop`.
-    Knock(std::sync::Arc<scratchy_serving_engine::executor::DrainCell>),
+    Knock(std::sync::Arc<dyn scratchy_serving_engine::executor::KnockCell>),
     /// Shut down the executor.
     Shutdown,
 }
@@ -3937,6 +3939,58 @@ impl Drop for ExecutorPipeline {
     }
 }
 
+/// ⭐ ONE DISPATCH, BOTH CALLERS OF IT. Every `ExecutorWork` this channel can
+/// carry is handled here, once — the loop's own `blocking_recv` and the knock's
+/// pump ([`drain_knock`]) both route through this statement, so a new variant
+/// is written in exactly one place per channel, never once per caller. The
+/// verdict is the pump's own vocabulary: a message ran, a knock joins the
+/// pending set, or the loop must stop (the teardown arrived, or the far end of
+/// the channel is gone — the caller breaks to its own shutdown tail).
+fn dispatch_executor_work(
+    executor: &mut dyn Executor,
+    tx: &tokio::sync::mpsc::Sender<ExecutorResult>,
+    work: ExecutorWork,
+) -> Pumped {
+    match work {
+        ExecutorWork::Execute(sched) => {
+            let result = executor.execute_model(&sched);
+            // Send the sched back so the step loop can finalize without cloning.
+            if tx
+                .blocking_send(ExecutorResult::Model(result, sched))
+                .is_err()
+            {
+                // The step loop is gone: the loop's own exit tail runs the
+                // shutdown drain.
+                return Pumped::Stop;
+            }
+            Pumped::Ran
+        }
+        ExecutorWork::Embed(seqs, reply) => {
+            let result = executor
+                .embed(seqs)
+                .map_err(|e| ServeError::Engine(e.to_string()));
+            let _ = reply.send(result);
+            Pumped::Ran
+        }
+        ExecutorWork::Sleep(level, reply) => {
+            let result = executor.sleep(level).map_err(|e| e.to_string());
+            let _ = reply.send(result);
+            Pumped::Ran
+        }
+        ExecutorWork::WakeUp(tags, reply) => {
+            let result = executor.wake_up(tags.as_deref()).map_err(|e| e.to_string());
+            let _ = reply.send(result);
+            Pumped::Ran
+        }
+        ExecutorWork::IsSleeping(reply) => {
+            let _ = reply.send(executor.is_sleeping());
+            Pumped::Ran
+        }
+        ExecutorWork::Knock(cell) => Pumped::Knock(cell),
+        ExecutorWork::Shutdown => Pumped::Stop,
+    }
+}
+
 /// The executor thread's main loop.
 ///
 /// Receives work items from the step loop, executes them, and sends results
@@ -3946,6 +4000,8 @@ fn executor_thread_loop(
     mut rx: tokio::sync::mpsc::Receiver<ExecutorWork>,
     tx: tokio::sync::mpsc::Sender<ExecutorResult>,
 ) {
+    use scratchy_serving_engine::executor::drain_knock;
+    use tokio::sync::mpsc::error::TryRecvError;
     // First act: run where the executor's devices want their driver (a multi-card worker: its cards'
     // NUMA node). A refusal ends the thread by name, through the same teardown as every exit.
     if let Err(e) = executor.pin_driving_thread() {
@@ -3954,45 +4010,35 @@ fn executor_thread_loop(
         return;
     }
     while let Some(work) = rx.blocking_recv() {
-        match work {
-            ExecutorWork::Execute(sched) => {
-                let result = executor.execute_model(&sched);
-                // Send the sched back so the step loop can finalize without cloning.
-                if tx
-                    .blocking_send(ExecutorResult::Model(result, sched))
-                    .is_err()
-                {
-                    break; // Step loop dropped its receiver.
+        match dispatch_executor_work(&mut *executor, &tx, work) {
+            Pumped::Ran => {}
+            // ⭐ #916 — A KNOCK: drain until the cell is filled, FEEDING FIRST.
+            // Runs on the executor thread (the knock arrived from a resolver on
+            // another thread); [`drain_knock`]'s pump routes every message that
+            // arrives while the knock waits through the same dispatch above —
+            // a queued Step is submitted before the drain parks on a step the
+            // card is still running, so the card is never idle behind a
+            // collect. The pop inside the worker's drain is the single
+            // authority, so the double-fill assert on `DrainCell` is the loud
+            // boundary if two drains ever take one step.
+            Pumped::Knock(cell) => {
+                let mut knocks = vec![cell];
+                let answered = drain_knock(&mut *executor, &mut knocks, |ex| match rx.try_recv() {
+                    Ok(work) => dispatch_executor_work(ex, &tx, work),
+                    Err(TryRecvError::Empty) => Pumped::Idle,
+                    Err(TryRecvError::Disconnected) => Pumped::Stop,
+                });
+                if !answered {
+                    break;
                 }
             }
-            ExecutorWork::Embed(seqs, reply) => {
-                let result = executor
-                    .embed(seqs)
-                    .map_err(|e| ServeError::Engine(e.to_string()));
-                let _ = reply.send(result);
-            }
-            ExecutorWork::Sleep(level, reply) => {
-                let result = executor.sleep(level).map_err(|e| e.to_string());
-                let _ = reply.send(result);
-            }
-            ExecutorWork::WakeUp(tags, reply) => {
-                let result = executor.wake_up(tags.as_deref()).map_err(|e| e.to_string());
-                let _ = reply.send(result);
-            }
-            ExecutorWork::IsSleeping(reply) => {
-                let _ = reply.send(executor.is_sleeping());
-            }
-            // ⭐ #916 — A KNOCK: drain until the cell is filled. Runs on the
-            // executor thread (the knock arrived from a resolver on another
-            // thread); the pop inside the worker's drain is the single
-            // authority, so the double-fill assert on `DrainCell` is the loud
-            // boundary if two drains ever take one step. Mirrors
-            // `executor_bg_loop`'s arm in `core_client`.
-            ExecutorWork::Knock(cell) => executor.drain_until(&cell),
             // The teardown itself runs once, below the loop: `Shutdown`
             // breaks out of it, and a channel that closed without `Shutdown`
             // must reach the same call.
-            ExecutorWork::Shutdown => break,
+            Pumped::Stop => break,
+            // Only the pump's channel-empty arm produces this; a dispatched
+            // message never does.
+            Pumped::Idle => {}
         }
     }
     // Shut down on EVERY exit from the loop, not just the explicit
@@ -7574,7 +7620,7 @@ mod tests {
     }
 
     /// A deferring executor: every step DEFERS once the engine has handed it a drain door —
-    /// the resolver knocks the door, then parks on the step's `DrainCell` — and `drain_until`
+    /// the resolver knocks the door, then parks on the step's `DrainCell` — and `drain_ready`
     /// answers the queue's oldest unfilled cell, the order a device's steps land in. With no
     /// door it resolves in the call (depth 1), which is what `scr serve`'s loop did before it
     /// wired #916's door through. The event log records the order things actually ran in.
@@ -7582,14 +7628,18 @@ mod tests {
         inner: NoopExecutor,
         step: usize,
         door: Option<scratchy_serving_engine::core_client::DrainDoor>,
-        pending: Vec<(
-            std::sync::Arc<scratchy_serving_engine::executor::DrainCell>,
-            Vec<u32>,
-            usize,
-        )>,
+        pending: Vec<PendingStep>,
         events: Arc<std::sync::Mutex<Vec<String>>>,
         answered: Arc<std::sync::atomic::AtomicUsize>,
     }
+
+    /// One deferred step the double holds until its drain looks at it: its cell,
+    /// its tokens (the answer the drain fills in with), and its step number.
+    struct PendingStep(
+        std::sync::Arc<scratchy_serving_engine::executor::DrainCell<Vec<u32>>>,
+        Vec<u32>,
+        usize,
+    );
 
     impl scratchy_serving_engine::executor::Executor for KnockingExecutor {
         /// It samples no grammar.
@@ -7618,7 +7668,7 @@ mod tests {
             let step = self.step;
             self.step += 1;
             self.pending
-                .push((std::sync::Arc::clone(&cell), tokens, step));
+                .push(PendingStep(std::sync::Arc::clone(&cell), tokens, step));
             self.events.lock().unwrap().push(format!("exec:{step}"));
             let (events, answered) = (Arc::clone(&self.events), Arc::clone(&self.answered));
             Ok(
@@ -7631,8 +7681,11 @@ mod tests {
                         // its shutdown, and shutdown error-fills every pending cell (the law
                         // `shutdown` below states) — so the resolver falls through to the
                         // wait and is answered either way. Never parked.
-                        let _ = door.knock(std::sync::Arc::clone(&cell));
-                        let tokens = cell.wait().map_err(|e| e.to_string());
+                        let _ = door.knock(cell.clone());
+                        let tokens = match &*cell.wait() {
+                            Ok(tokens) => Ok(tokens.clone()),
+                            Err(e) => Err(e.to_string()),
+                        };
                         events.lock().unwrap().push(format!("answer:{step}"));
                         answered.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         tokens
@@ -7643,29 +7696,37 @@ mod tests {
 
         /// The knock's answer: run the queue in order — the oldest unfilled step lands first —
         /// until the knocked cell is filled, exactly what a worker's drain does for the steps
-        /// its queue holds behind the one asked for.
-        fn drain_until(
+        /// its queue holds behind the one asked for. This double's steps land the moment the
+        /// drain looks at them, so the non-blocking spelling never returns "not yet".
+        fn drain_ready(
             &mut self,
-            cell: &std::sync::Arc<scratchy_serving_engine::executor::DrainCell>,
-        ) {
+            cell: &std::sync::Arc<dyn scratchy_serving_engine::executor::KnockCell>,
+        ) -> bool {
             while !cell.is_filled() {
-                let Some((oldest, tokens, step)) = self
+                let Some(PendingStep(oldest, tokens, step)) = self
                     .pending
                     .iter()
-                    .find(|(c, _, _)| !c.is_filled())
-                    .map(|(c, t, s)| (std::sync::Arc::clone(c), t.clone(), *s))
+                    .find(|PendingStep(c, _, _)| !c.is_filled())
+                    .map(|PendingStep(c, t, s)| {
+                        PendingStep(std::sync::Arc::clone(c), t.clone(), *s)
+                    })
                 else {
                     break;
                 };
                 oldest.fill(Ok(tokens));
                 self.events.lock().unwrap().push(format!("fill:{step}"));
             }
+            true
         }
 
         /// A shutdown never leaves a resolver parked: every step still in flight is answered
         /// with its failure, as a deferring worker's shutdown error-fills its in-flight cells.
         fn shutdown(&mut self) {
-            for (cell, _, step) in self.pending.iter().filter(|(c, _, _)| !c.is_filled()) {
+            for PendingStep(cell, _, step) in self
+                .pending
+                .iter()
+                .filter(|PendingStep(c, _, _)| !c.is_filled())
+            {
                 cell.fill(Err(scratchy_serving_engine::error::EngineError::Executor(
                     format!("shutdown with step {step} still in flight"),
                 )));
