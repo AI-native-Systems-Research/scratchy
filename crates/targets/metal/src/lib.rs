@@ -298,6 +298,7 @@ pub mod weights_metal;
 pub use weights_metal::MetalWeightsExt;
 pub mod metal_allocator;
 pub mod metal_mem;
+pub mod uncached_file;
 // A loaded model as metal runs it (`MetalWeights`), and the registry its loaders live in.
 pub mod model;
 pub use model::{MetalArchRegistration, MetalKvCodec, MetalWeights, try_load};

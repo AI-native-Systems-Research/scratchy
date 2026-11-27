@@ -2790,10 +2790,6 @@ mod tests {
         fn snapshot_budget(&self) -> Option<scratchy_serving_scheduler::scheduler::SnapshotBudget> {
             // Four slots that take none of the KV budget: the test sees the snapshots alone.
             Some(scratchy_serving_scheduler::scheduler::SnapshotBudget {
-                kv_block_bytes: 1,
-                kv_granule_blocks: std::num::NonZeroUsize::MIN,
-                slot_bytes: 0,
-                unit_slots: std::num::NonZeroUsize::MIN,
                 max_slots: 4,
                 disk_slots: 0,
             })
@@ -2880,10 +2876,6 @@ mod tests {
         }
         fn snapshot_budget(&self) -> Option<scratchy_serving_scheduler::scheduler::SnapshotBudget> {
             Some(scratchy_serving_scheduler::scheduler::SnapshotBudget {
-                kv_block_bytes: 1,
-                kv_granule_blocks: std::num::NonZeroUsize::MIN,
-                slot_bytes: 0,
-                unit_slots: std::num::NonZeroUsize::MIN,
                 max_slots: 1,
                 disk_slots: 2,
             })

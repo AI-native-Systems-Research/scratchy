@@ -306,8 +306,6 @@ pub struct RecurrentStateOps {
     pub saves: Vec<StateSnapshotOp>,
     /// Requests (re)admitted this step whose recompute runs over cached KV.
     pub cached_kv: Vec<CachedKvOp>,
-    /// The memory KV and the snapshots hand each other this step (see [`SharedMemoryOps`]).
-    pub memory: SharedMemoryOps,
     /// The snapshots this step moves between device memory and the disk tier (see
     /// [`SnapshotDiskOps`]).
     pub disk: SnapshotDiskOps,
@@ -319,7 +317,6 @@ impl RecurrentStateOps {
         self.restores.is_empty()
             && self.saves.is_empty()
             && self.cached_kv.is_empty()
-            && self.memory.is_empty()
             && self.disk.is_empty()
     }
 }
@@ -349,8 +346,8 @@ pub struct SnapshotFill {
 /// Without the disk tier, a pool of snapshots smaller than the prompts a workload comes back to
 /// keeps none of them: LRU evicts each one just before it is needed again.
 ///
-/// The worker writes every spill first: before this step's memory ops release a unit and before
-/// anything this step rewrites a slot. It reads every fill after the memory ops map, and has it in
+/// The worker writes every spill first: before anything this step rewrites a slot. It reads every
+/// fill while the step's forward runs, and has it in
 /// its slot before the step's output comes back; no request restores a fill in the step that reads
 /// it, so that step's forward runs while the fill is read. The scheduler never names a disk slot in
 /// a spill that a fill reads in the same step, so this order is the one it decided in.
@@ -366,45 +363,6 @@ pub struct SnapshotDiskOps {
 impl SnapshotDiskOps {
     pub fn is_empty(&self) -> bool {
         self.spills.is_empty() && self.fills.is_empty()
-    }
-}
-
-/// A run of [`SnapshotBudget::kv_granule_blocks`] KV blocks from block `index × that`: what KV
-/// maps and releases at a time when it shares its budget with recurrent-state snapshots.
-///
-/// [`SnapshotBudget::kv_granule_blocks`]: crate::scheduler::SnapshotBudget::kv_granule_blocks
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct KvGranule(pub u32);
-
-/// A run of [`SnapshotBudget::unit_slots`] snapshot slots from slot `index × that`: what the
-/// snapshots map and release at a time.
-///
-/// [`SnapshotBudget::unit_slots`]: crate::scheduler::SnapshotBudget::unit_slots
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct SnapshotUnit(pub u32);
-
-/// ⭐ THE MEMORY ONE STEP MOVES BETWEEN KV AND THE RECURRENT-STATE SNAPSHOTS, which share one
-/// budget: the scheduler decides, the worker maps and releases. The worker releases before it
-/// maps — a release makes room for a map in the same step — and only once every step in flight
-/// is done, since a step scheduled before this one may still read what is released.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SharedMemoryOps {
-    /// KV granules released: none of their blocks is held, and their cached contents are gone.
-    pub release_kv: Vec<KvGranule>,
-    /// Snapshot units released: their snapshots are gone.
-    pub release_snapshots: Vec<SnapshotUnit>,
-    /// KV granules mapped before this step's forward.
-    pub map_kv: Vec<KvGranule>,
-    /// Snapshot units mapped before this step's forward.
-    pub map_snapshots: Vec<SnapshotUnit>,
-}
-
-impl SharedMemoryOps {
-    pub fn is_empty(&self) -> bool {
-        self.release_kv.is_empty()
-            && self.release_snapshots.is_empty()
-            && self.map_kv.is_empty()
-            && self.map_snapshots.is_empty()
     }
 }
 

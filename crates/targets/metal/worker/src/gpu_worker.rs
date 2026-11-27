@@ -22,9 +22,7 @@ use scratchy_core_model::weight::HfModelConfig;
 use scratchy_serving_engine::executor::ModelRunnerOutput;
 use scratchy_serving_engine::spec_decode::{DraftBudget, Drafting};
 use scratchy_serving_scheduler::scheduler::SnapshotBudget;
-use scratchy_serving_scheduler::scheduler::output::{
-    KvGranule, SchedulerOutput, SharedMemoryOps, SnapshotUnit, StateSnapshotOp,
-};
+use scratchy_serving_scheduler::scheduler::output::{SchedulerOutput, StateSnapshotOp};
 use tracing::info;
 
 use scratchy_serving_engine::worker_factory::VerifySeqs;
@@ -133,26 +131,20 @@ pub struct MetalWorker {
     /// recurrent_is_fresh}`. `None` between steps / for non-hybrid arches.
     gdn_pending: Option<(Vec<i32>, Vec<u32>)>,
     /// How many recurrent-state snapshot slots the prefix cache can address: past the live ones in
-    /// every GDN state buffer, as many as the whole KV budget holds, a whole number of units. Their
-    /// memory comes out of the budget KV draws on, as the scheduler hands it over (#495). 0
-    /// without recurrent state or prefix caching.
+    /// every GDN state buffer, all mapped at startup and never remapped. 0 without recurrent state
+    /// or prefix caching.
     gdn_snapshot_cap: usize,
     /// The prefix hash each snapshot slot was last saved under. A restore whose key differs is a
     /// scheduler/worker disagreement, refused rather than run on another prefix's state.
     gdn_snapshot_keys: Vec<Option<u64>>,
-    /// The GDN state buffers' placement-sparse pages: a live slot mapped once a sequence first
-    /// takes it, the snapshot slots (from `gdn_snapshots_from`) a unit at a time as the scheduler
-    /// maps and releases them (`SharedKv`).
+    /// The GDN state buffers' placement-sparse pages: the live slots and the snapshot slots (from
+    /// `gdn_snapshots_from`) as ONE grown range, mapped once at startup and never remapped.
     gdn_state_stores: Option<scratchy_target_metal::sparse_kv::SparseStores>,
-    /// The first snapshot slot: past the live ones, at the first slot every GDN state buffer
-    /// starts on a whole sparse tile (`SparseStores::with_tail`).
+    /// The first snapshot slot: past the live ones.
     gdn_snapshots_from: usize,
     /// The snapshots' disk tier (`SnapshotDiskOps`): `None` without snapshot slots, or without
     /// disk space for one.
     gdn_snapshot_disk: Option<crate::snapshot_disk::SnapshotDisk>,
-    /// How KV and the snapshots share the KV budget, and what of it is mapped (`SharedKv`).
-    /// `None` without snapshots.
-    shared_kv: Option<SharedKv>,
     /// Requests resumed short of their KV hit (`CachedKvOp`): the position below which their KV
     /// is the cached blocks', which their steps leave unwritten.
     kv_cached_through: HashMap<String, usize>,
@@ -416,20 +408,7 @@ pub struct MetalWorker {
     /// at the layer base — both target's and draft's pipelines see the
     /// same kernel function constants (set process-wide by lowering).
     draft_kv_stores: Option<scratchy_target_metal::sparse_kv::SparseStores>,
-    /// When the target KV batch first went idle (no active requests), or `None`
-    /// while a batch is active. The reactive shrink is deferred until the GPU
-    /// has been idle for [`KV_SHRINK_IDLE_AFTER`]: dropping grown chunks frees
-    /// their StorageModePrivate pages, which the next request would re-fault on
-    /// first GPU touch — a multi-second stall on a long prefill. Deferring keeps
-    /// back-to-back requests fast while still releasing memory when genuinely
-    /// idle.
-    kv_idle_since: Option<std::time::Instant>,
 }
-
-/// How long the target KV batch must stay idle before the reactive shrink
-/// releases grown chunks back to the OS. Long enough that interactive,
-/// back-to-back requests never pay the re-fault cost.
-const KV_SHRINK_IDLE_AFTER: std::time::Duration = std::time::Duration::from_secs(30);
 
 // Safety: MetalWorker contains raw GPU pointers (via GpuDevice, model weights,
 // KV cache) and raw pointer fields in OwnedTensor. All GPU resources are
@@ -779,6 +758,20 @@ fn int8_kv(model: &dyn scratchy_target_metal::MetalWeights) -> bool {
     model.kv_codec().is_int8()
 }
 
+/// A DFlash2 checkpoint's context window — the ONE read of its config's
+/// `dflash_config.swa_window_size` (and the `hidden_size` its bytes need), consumed by the
+/// drafter's own load and by every site that prices a snapshot's window before that load
+/// runs (the width resolver).
+fn dflash2_window(config: &HfModelConfig) -> Option<scratchy_target_metal::dflash2::WindowLayout> {
+    let window = config
+        .extra
+        .get("dflash_config")
+        .and_then(|d| d.get("swa_window_size"))
+        .and_then(|v| v.as_u64())? as u32;
+    let hidden = config.hidden_size()?;
+    Some(scratchy_target_metal::dflash2::WindowLayout { window, hidden })
+}
+
 /// Bytes one block of the TARGET pool costs: built with int8 KV, every layer's codes and
 /// scales at its class's geometry and the scratch of the widest; otherwise a hybrid model's
 /// page in each of its group-shared tensors, every other model's dense rows.
@@ -853,48 +846,6 @@ fn draft_store_block_bytes(
     row.kv_heads * block_size * row.head_size * METAL_KV_ELEM_BYTES
 }
 
-/// ⭐ HOW THE KV POOL AND THE PREFIX CACHE'S RECURRENT-STATE SNAPSHOTS SHARE THE KV BUDGET (#495),
-/// and what of it is mapped. The scheduler decides every map and release (`SharedMemoryOps`); the
-/// worker applies them before each step's forward, and refuses a step that names memory it has not
-/// mapped — on Apple Silicon a GPU read of un-wired memory hangs the command buffer past the
-/// watchdog rather than faulting.
-struct SharedKv {
-    budget: SnapshotBudget,
-    /// The pool's blocks: the last granule ends with them.
-    num_blocks: usize,
-    granules: Vec<bool>,
-    units: Vec<bool>,
-    /// Whose stores a granule maps: the dense pools' (target, draft) or the int8 stores'
-    /// (`SparseRegistry`), as the models' codecs lay their KV out.
-    dense_target: bool,
-    dense_draft: bool,
-    int8: bool,
-}
-
-impl SharedKv {
-    fn blocks(&self, g: KvGranule) -> std::ops::Range<usize> {
-        let n = self.budget.kv_granule_blocks.get();
-        let g = g.0 as usize;
-        g * n..((g + 1) * n).min(self.num_blocks)
-    }
-
-    /// Unit `u`'s snapshot slots, counted from the first.
-    fn slots(&self, u: SnapshotUnit) -> std::ops::Range<usize> {
-        let n = self.budget.unit_slots.get();
-        u.0 as usize * n..(u.0 as usize + 1) * n
-    }
-
-    fn block_mapped(&self, block: usize) -> bool {
-        let g = block / self.budget.kv_granule_blocks;
-        self.granules.get(g).copied().unwrap_or(false)
-    }
-
-    fn slot_mapped(&self, slot: usize) -> bool {
-        let u = slot / self.budget.unit_slots;
-        self.units.get(u).copied().unwrap_or(false)
-    }
-}
-
 /// Where a int8 draft stages its KV: its own fp16 scratch, or — a head, which runs after its
 /// target and never beside it, of the target's KV geometry — the target's
 /// (`HostArena::kv_scratch`).
@@ -952,7 +903,9 @@ struct MetalBudget {
 // `recurrent_slot_key` and the shared unset-`--max-num-seqs` resolver are
 // backend-neutral; they live in `scratchy-serving-engine` (cycle-free for
 // every worker) and are re-exported here.
-use scratchy_serving_engine::gpu_budget::MaxNumSeqsFacts;
+use scratchy_serving_engine::gpu_budget::{
+    MaxNumSeqsFacts, SnapshotPoolFacts, snapshot_pool_slots,
+};
 pub use scratchy_serving_engine::gpu_budget::{recurrent_slot_key, resolve_default_max_num_seqs};
 
 impl MetalWorker {
@@ -968,7 +921,6 @@ impl MetalWorker {
             gdn_state_stores: None,
             gdn_snapshots_from: 0,
             gdn_snapshot_disk: None,
-            shared_kv: None,
             kv_cached_through: HashMap::new(),
             model_dir: None,
             hf_config: None,
@@ -1048,7 +1000,6 @@ impl MetalWorker {
             kv_full_block_size: 0,
             kv_is_hybrid: false,
             draft_kv_stores: None,
-            kv_idle_since: None,
         }
     }
 
@@ -1169,6 +1120,7 @@ impl MetalWorker {
         model: &dyn scratchy_target_metal::MetalWeights,
         arch: &str,
         gpu_device: &scratchy_target_metal::GpuDevice,
+        draft_hf_config: Option<&HfModelConfig>,
     ) -> ExecutorResult<()> {
         if self.resolved_max_num_seqs.is_some() {
             return Ok(());
@@ -1206,6 +1158,12 @@ impl MetalWorker {
                         gdn_bytes(0, lanes(usize::MAX)),
                     ),
                 };
+                // The width resolver does not see `gdn_reserve` (that fold happens later, in
+                // `determine_available_memory`, from the width this picks) — so it prices a
+                // sequence's LIVE slot here (its documented meaning in
+                // `MaxNumSeqsFacts::recurrent_per_slot_bytes`, metered once by `gdn_reserve`),
+                // and the snapshot pool beside it through the ONE law's facts below, at
+                // whatever width the resolver tests.
                 let (budget, allocated) = self
                     .metal_device
                     .as_ref()
@@ -1237,15 +1195,7 @@ impl MetalWorker {
                 // sized by the width itself: n·(vocab + 2·max_hist)·4 plus
                 // the sliced buffers' terms — count its per-row cost so the
                 // default accounts for what it triggers.
-                let max_model_len = self
-                    .config
-                    .max_model_len
-                    .or_else(|| {
-                        self.hf_config
-                            .as_ref()
-                            .and_then(|c| c.max_position_embeddings())
-                    })
-                    .unwrap_or(4096);
+                let max_model_len = self.max_model_len();
                 let sampler_row = scratchy_target_metal::sampling::SamplerArena::bytes_per_row(
                     u32::try_from(model.vocab_size()).unwrap_or(u32::MAX),
                     u32::try_from(max_model_len.max(1)).unwrap_or(u32::MAX),
@@ -1266,6 +1216,7 @@ impl MetalWorker {
                     allocated_bytes: allocated + draft_rows * sampler_row + gdn_lanes,
                     peak_activation_bytes: peak,
                     recurrent_per_slot_bytes: gdn_per_slot,
+                    snapshot_pool: self.snapshot_pool_facts(Some(model), draft_hf_config),
                     sampler_bytes_per_row: sampler_row,
                 };
                 resolve_default_max_num_seqs(&facts, false)
@@ -1584,9 +1535,12 @@ impl MetalWorker {
                 .map_err(|e| init(&format!("acceptance compile: {e:?}")))?
                 .ok_or_else(|| init("its bake has no acceptance kernel"))?;
         let dflash = config.extra.get("dflash_config");
-        let window = (dflash.and_then(|d| d.get("swa_window_size")))
-            .and_then(|v| v.as_u64())
-            .ok_or_else(|| init("its config names no dflash_config.swa_window_size"))?;
+        // The ONE read of the window (see `dflash2_window`): its tokens size the rings'
+        // slots, its bytes the window a snapshot keeps beside the state.
+        let window = dflash2_window(config).ok_or_else(|| {
+            init("its config names no dflash_config.swa_window_size or hidden_size")
+        })?;
+        let window_bytes = window.bytes();
         let taps = (dflash.and_then(|d| d.get("target_layer_ids")))
             .and_then(|v| v.as_array())
             .map(|ids| ids.len())
@@ -1600,14 +1554,10 @@ impl MetalWorker {
         let elem_bytes = size_of::<u16>();
         let slot_bytes = scratchy_target_metal::dflash2::DraftRingPool::slot_bytes(
             kv_heads,
-            window as usize,
+            window.window as usize,
             head_dim,
             elem_bytes,
         );
-        let hidden =
-            (config.hidden_size()).ok_or_else(|| init("its config names no hidden_size"))?;
-        let window_bytes =
-            scratchy_target_metal::dflash2::DraftRingPool::window_bytes(window as usize, hidden);
         let (device, residency) = (&gpu_device.device, gpu_device.allocator.residency());
         let rings = scratchy_target_metal::dflash2::DraftRingPool::new(
             layers,
@@ -1619,8 +1569,9 @@ impl MetalWorker {
         .map_err(|e| init(&format!("rings: {e}")))?;
         residency.commit();
         info!(
-            "ScratchyWorker(metal): DFlash2 drafter — {layers} layers' rings of {window} positions \
+            "ScratchyWorker(metal): DFlash2 drafter — {layers} layers' rings of {} positions \
              for {slots} sequences, and their context windows ({} MiB)",
+            window.window,
             (2 * layers * slots * slot_bytes + slots * window_bytes) >> 20
         );
         let target_kernels =
@@ -1636,7 +1587,7 @@ impl MetalWorker {
             drafter: ::scratchy_serving_engine::spec_decode::BlockDrafter {
                 budget,
                 max_model_len: self.max_model_len(),
-                window: window as usize,
+                window: window.window as usize,
             },
             accept,
             sampling,
@@ -1646,10 +1597,7 @@ impl MetalWorker {
             captured_row_bytes: taps * target.hidden_size() as usize * elem_bytes,
             cycle_buffer: None,
             cost,
-            window: scratchy_target_metal::dflash2::WindowLayout {
-                window: window as u32,
-                hidden,
-            },
+            window,
             contexts: HashMap::new(),
             snapshot_windows: None,
         })
@@ -2753,15 +2701,8 @@ impl MetalWorker {
         let snapshots_from = self.gdn_snapshots_from;
         let bad = |what: String| ExecutorError::WorkerExecution(format!("state snapshot: {what}"));
         let cap = self.gdn_snapshot_cap;
-        let shared = self.shared_kv.as_ref();
         let slot = |op: &StateSnapshotOp| match op.slot < cap {
-            true if shared.is_some_and(|s| s.slot_mapped(op.slot)) => {
-                Ok(GdnSlot::new(snapshots_from + op.slot))
-            }
-            true => Err(bad(format!(
-                "{} names slot {}, whose memory is not mapped",
-                op.req_id, op.slot
-            ))),
+            true => Ok(GdnSlot::new(snapshots_from + op.slot)),
             false => Err(bad(format!(
                 "{} names slot {} of {cap}",
                 op.req_id, op.slot
@@ -2822,26 +2763,6 @@ impl MetalWorker {
         let alloc = (self.gdn_slot_allocator.as_mut()).expect("a recurrent model's allocator");
         let (entries, codes) =
             (alloc.step(rows)).map_err(|e| ExecutorError::WorkerExecution(e.to_string()))?;
-        // Map every live slot this step's sequences took before its forward runs (the lowest free,
-        // so through the most ever resident at once). The snapshot slots its restores and saves
-        // name were mapped with their units (`apply_shared_memory`).
-        let live_reach = (entries.iter().map(|e| e.slot().index() + 1).max()).unwrap_or(0);
-        let live = self.max_num_seqs_resolved();
-        let (Some(stores), Some(mapper)) =
-            (self.gdn_state_stores.as_mut(), self.kv_mapper.as_ref())
-        else {
-            return Err(bad("this worker keeps no GDN state stores".into()));
-        };
-        let t_grow = std::time::Instant::now();
-        if (stores.grow_to(live_reach, mapper))
-            .map_err(|e| bad(format!("mapping live slots through {live_reach}: {e}")))?
-        {
-            let mapped = stores.mapped().load(std::sync::atomic::Ordering::Relaxed);
-            info!(
-                "ScratchyWorker(metal): {mapped} of {live} live GDN state slots mapped in {:.1} ms",
-                t_grow.elapsed().as_secs_f64() * 1e3,
-            );
-        }
         for (s, key) in saved {
             self.gdn_snapshot_keys[s] = Some(key);
         }
@@ -3016,109 +2937,6 @@ impl MetalWorker {
         output
     }
 
-    /// ⭐ APPLY THE MEMORY THIS STEP MOVES BETWEEN KV AND THE SNAPSHOTS (`SharedMemoryOps`):
-    /// releases first — they make the room a map in the same step takes — and only once every
-    /// step in flight is done, since one scheduled before this may still read what is released;
-    /// then maps, before the forward that reads them. Every KV store a granule spans — the dense
-    /// pools', the int8 stores' — and the GDN state buffers' snapshot run.
-    fn apply_shared_memory(&mut self, ops: &SharedMemoryOps) -> ExecutorResult<()> {
-        if ops.is_empty() {
-            return Ok(());
-        }
-        let bad =
-            |what: String| ExecutorError::WorkerExecution(format!("shared KV budget: {what}"));
-        let (Some(shared), Some(device), Some(mapper)) = (
-            self.shared_kv.as_ref(),
-            self.gpu_device.as_ref(),
-            self.kv_mapper.as_ref(),
-        ) else {
-            return Err(bad("memory ops for a worker that shares no budget".into()));
-        };
-        let t = std::time::Instant::now();
-        if !ops.release_kv.is_empty() || !ops.release_snapshots.is_empty() {
-            for step in &self.in_flight {
-                (step.done.wait()).map_err(|e| bad(format!("a step in flight: {e}")))?;
-            }
-        }
-        let kv = |gs: &[KvGranule]| {
-            gs.iter()
-                .map(|&g| (g, shared.blocks(g)))
-                .collect::<Vec<_>>()
-        };
-        let (release_kv, map_kv) = (kv(&ops.release_kv), kv(&ops.map_kv));
-        let from = self.gdn_snapshots_from;
-        let units = |us: &[SnapshotUnit]| {
-            let runs = us.iter().map(|&u| (u, shared.slots(u)));
-            runs.map(|(u, r)| (u, from + r.start..from + r.end))
-                .collect::<Vec<_>>()
-        };
-        let (release_units, map_units) = (units(&ops.release_snapshots), units(&ops.map_snapshots));
-        let (dense_target, dense_draft, int8) =
-            (shared.dense_target, shared.dense_draft, shared.int8);
-        let registry = device.allocator.sparse_kv.lock();
-        let mut registry = registry.expect("sparse KV registry");
-        let mut each_kv_store = |run: &std::ops::Range<usize>, map: bool| -> Result<(), String> {
-            let act = |s: &mut scratchy_target_metal::sparse_kv::SparseStores| match map {
-                true => s.map_apart(run.clone(), mapper),
-                false => s.release(run.clone(), mapper),
-            };
-            if int8 {
-                match map {
-                    true => registry.map_apart(run.clone(), mapper)?,
-                    false => registry.release(run.clone(), mapper)?,
-                }
-            }
-            if dense_target && let Some(s) = self.target_kv_stores.as_mut() {
-                act(s)?;
-            }
-            if dense_draft && let Some(s) = self.draft_kv_stores.as_mut() {
-                act(s)?;
-            }
-            Ok(())
-        };
-        for (g, run) in &release_kv {
-            each_kv_store(run, false).map_err(|e| bad(format!("releasing {g:?}: {e}")))?;
-        }
-        let gdn = self.gdn_state_stores.as_mut();
-        let gdn = gdn.ok_or_else(|| bad("no GDN state stores".into()))?;
-        for (u, run) in &release_units {
-            (gdn.release(run.clone(), mapper)).map_err(|e| bad(format!("releasing {u:?}: {e}")))?;
-        }
-        for (g, run) in &map_kv {
-            each_kv_store(run, true).map_err(|e| bad(format!("mapping {g:?}: {e}")))?;
-        }
-        for (u, run) in &map_units {
-            (gdn.map_apart(run.clone(), mapper)).map_err(|e| bad(format!("mapping {u:?}: {e}")))?;
-        }
-        let shared = self.shared_kv.as_mut().expect("checked above");
-        for (g, _) in &release_kv {
-            shared.granules[g.0 as usize] = false;
-        }
-        for (g, _) in &map_kv {
-            shared.granules[g.0 as usize] = true;
-        }
-        for (u, _) in &release_units {
-            shared.units[u.0 as usize] = false;
-            // A released slot holds no prefix's state: a restore naming it is refused.
-            for slot in shared.slots(*u) {
-                self.gdn_snapshot_keys[slot] = None;
-            }
-        }
-        for (u, _) in &map_units {
-            shared.units[u.0 as usize] = true;
-        }
-        info!(
-            "ScratchyWorker(metal): shared KV budget — {} KV granules and {} snapshot units \
-             released, {} and {} mapped, in {:.1} ms",
-            release_kv.len(),
-            release_units.len(),
-            map_kv.len(),
-            map_units.len(),
-            t.elapsed().as_secs_f64() * 1e3,
-        );
-        Ok(())
-    }
-
     /// Allocate the draft model's KV pool. Mirrors `initialize_cache`'s
     /// target-pool path: StorageModePrivate buffers pinned into the
     /// allocator's shared residency set so attention reads don't race
@@ -3147,15 +2965,9 @@ impl MetalWorker {
         // int8's stores hold every group's blocks (`build_int8_provision`), each as the scheduler
         // numbers its own: mapped through the highest any names (a span block's table entry
         // carries `UNROTATED_BLOCK_BIT`; its ID here does not).
-        // A budget shared with the snapshots maps the granules the scheduler names, before the step
-        // (`apply_shared_memory`), and none past them.
-        let shared = self.shared_kv.is_some();
         let registry = device.allocator.sparse_kv.lock();
-        let reached = match shared {
-            true => Ok(false),
-            false => (registry.expect("sparse KV registry"))
-                .reach(max_block.max(max_full_block) + 1, mapper),
-        };
+        let reached = (registry.expect("sparse KV registry"))
+            .reach(max_block.max(max_full_block) + 1, mapper);
         if reached.map_err(refused("int8 KV", max_block.max(max_full_block)))? {
             info!(
                 "ScratchyWorker(metal): int8 KV mapped through block {} in {:.1} ms",
@@ -3180,11 +2992,9 @@ impl MetalWorker {
         let bpc = scratchy_target_metal::interpreter::metal::BLOCKS_PER_CHUNK as usize;
         let target = kv.growth_target(max_block);
         let through = ((target.min(kv.num_blocks - 1) / bpc + 1) * bpc).min(kv.num_blocks);
-        if !shared {
-            stores
-                .grow_to(through, mapper)
-                .map_err(refused("KV pool", max_block))?;
-        }
+        stores
+            .grow_to(through, mapper)
+            .map_err(refused("KV pool", max_block))?;
         let (n_slots, first) = (kv.num_tensors * 2, kv.allocated_blocks().div_ceil(bpc));
         let alloc_chunk_counter = std::cell::Cell::new(0usize);
         // Returns Ok(n) where n = number of NEW chunks allocated (Ok(0) = the pool
@@ -3212,41 +3022,17 @@ impl MetalWorker {
         Ok(())
     }
 
-    /// Reactive KV (2c): when the batch is fully idle (no live blocks), drop
-    /// the pool back to 1 chunk. The stores keep the dropped chunks mapped
-    /// (`SparseStores::chunk` hands the same ranges back on regrowth), so
-    /// memory stays at its high-water mark. Only call when
-    /// `input_batch.num_active() == 0` so no in-flight forward references a
-    /// dropped chunk index.
-    fn shrink_metal_kv_idle(&mut self) {
-        let freed = match self.kv_cache.as_mut() {
-            Some(kv) => kv.shrink_to_chunks(1),
-            None => return,
-        };
-        if freed.is_empty() {
-            return;
-        }
-        let n = freed.len();
-        drop(freed);
-        info!(
-            "ScratchyWorker(metal): reactive KV shrink — {} chunk handles dropped",
-            n,
-        );
-    }
-
-    /// A snapshot slot's bytes across every GDN state buffer, and the slots a unit of them takes:
-    /// the least run every buffer maps on whole tiles (`whole_tile_blocks`). `None` without
-    /// recurrent state, prefix caching or a device; refused on a device that maps no sparse tiles.
-    fn snapshot_slot(&self) -> ExecutorResult<Option<(usize, std::num::NonZeroUsize)>> {
-        let Some(cfg) = (self.model.as_ref())
-            .and_then(|m| m.recurrent_state())
-            .filter(|_| self.config.enable_prefix_caching)
-        else {
-            return Ok(None);
-        };
-        let Some(dev) = self.gpu_device.as_ref() else {
-            return Ok(None);
-        };
+    /// One live state slot's bytes across every GDN state buffer. `None` without recurrent
+    /// state. `load_model` runs the width resolver before `self.model` takes the
+    /// loaded target, so the caller hands the just-loaded model in; every later site passes
+    /// `None` and the field serves.
+    fn recurrent_slot_bytes(
+        &self,
+        model: Option<&dyn scratchy_target_metal::MetalWeights>,
+    ) -> Option<usize> {
+        let cfg = model
+            .or(self.model.as_deref())
+            .and_then(|m| m.recurrent_state())?;
         let dims = cfg.state_dims();
         let bytes = GdnStatePool::<scratchy_target_metal::PoolMem>::reserve_bytes(
             cfg.num_linear_layers(),
@@ -3255,82 +3041,42 @@ impl MetalWorker {
             dims,
             scratchy_target_metal::gdn_state::GDN_SSM_STATE_DTYPE,
         );
-        let (conv, ssm) = dims.slot_bytes(scratchy_target_metal::gdn_state::GDN_SSM_STATE_DTYPE);
-        // A DFlash2 drafter's snapshot keeps its context window beside the state (Splash
-        // `QwenStateStorage::acquire` takes a `DFlashContextWindow` with every cached state).
-        let window = self.snapshot_window_bytes();
-        let unit =
-            scratchy_target_metal::sparse_kv::whole_tile_blocks(&dev.device, [conv, ssm, window])
-                .map_err(|e| ExecutorError::WorkerInit(format!("snapshot unit: {e}")))?;
-        Ok((bytes > 0).then_some((bytes + window, unit)))
+        (bytes > 0).then_some(bytes)
     }
 
-    /// A snapshot's DFlash2 context window, in bytes: 0 without a DFlash2 drafter.
-    fn snapshot_window_bytes(&self) -> usize {
-        self.dflash2.as_ref().map_or(0, |d| d.window.bytes())
-    }
-
-    /// ⭐ HOW A POOL OF `num_gpu_blocks` BLOCKS SHARES ITS BUDGET WITH THE SNAPSHOTS: a block costs
-    /// what the engine sized the pool by — the target's and a draft's of its own
-    /// (`target_block_bytes`, `draft_block_bytes`) — and a granule is the least run of blocks every
-    /// KV store maps on whole tiles: the target's dense rows (`target_layout`) or its int8
-    /// stores, and a draft's.
-    fn shared_kv_layout(
+    /// The snapshot pool law's ONE input derivation (the law itself is
+    /// `gpu_budget::snapshot_pool_slots`): a snapshot slot's typed bytes, the KV a longest
+    /// prompt holds, and the caching mode. `None` without recurrent state.
+    ///
+    /// `load_model` runs the width resolver before `self.model` takes the target and before a
+    /// DFlash2 drafter loads, so the caller hands both in; every later site passes `None`s and
+    /// the fields serve.
+    fn snapshot_pool_facts(
         &self,
-        num_gpu_blocks: usize,
-        target_layout: &[(usize, bool)],
-    ) -> ExecutorResult<SharedKv> {
-        let err = |what: &str| ExecutorError::WorkerInit(format!("shared KV budget: {what}"));
-        let model = self.model.as_deref().ok_or_else(|| err("no model"))?;
-        let dev = self.gpu_device.as_ref().ok_or_else(|| err("no device"))?;
-        let (slot_bytes, unit) = self
-            .snapshot_slot()?
-            .ok_or_else(|| err("no snapshot slot"))?;
+        model: Option<&dyn scratchy_target_metal::MetalWeights>,
+        draft_hf_config: Option<&HfModelConfig>,
+    ) -> Option<SnapshotPoolFacts> {
+        let model = model.or(self.model.as_deref())?;
+        let slot = self.recurrent_slot_bytes(Some(model))?;
         let bs = self.config.block_size;
-        let int8_stores = |m: &dyn scratchy_target_metal::MetalWeights| {
-            if !m.kv_codec().is_int8() {
-                return Vec::new();
-            }
-            let (heads, head_dim) = (kv_row(m).kv_heads, kv_row(m).head_size);
-            let b = scratchy_target_metal::kv_int8::Int8BlockBytes::of(bs.get(), heads, head_dim);
-            vec![b.codes(), b.scales(), b.scratch()]
-        };
-        let dense_target = !int8_kv(model);
-        let mut store_bytes: Vec<usize> = match dense_target {
-            true => target_layout.iter().map(|&(bytes, _)| bytes).collect(),
-            false => int8_stores(model),
-        };
-        let draft = (self.draft_model.as_deref()).filter(|_| self.draft_keeps_kv());
-        let dense_draft = draft.is_some_and(|d| !int8_kv(d));
-        let draft_block = match draft {
-            Some(d) => {
-                store_bytes.extend(match dense_draft {
-                    true => vec![draft_store_block_bytes(d, bs.get())],
-                    false => int8_stores(d),
-                });
-                draft_block_bytes(d, bs.get(), self.draft_scratch())
-            }
-            None => 0,
-        };
-        let granule = scratchy_target_metal::sparse_kv::whole_tile_blocks(&dev.device, store_bytes)
-            .map_err(|e| err(&e))?;
-        let budget = SnapshotBudget {
-            kv_block_bytes: (target_block_bytes(model, bs) + draft_block) as u64,
-            kv_granule_blocks: granule,
-            slot_bytes: slot_bytes as u64,
-            unit_slots: unit,
-            max_slots: self.gdn_snapshot_cap,
-            disk_slots: (self.gdn_snapshot_disk.as_ref()).map_or(0, |d| d.slots()),
-        };
-        Ok(SharedKv {
-            budget,
-            num_blocks: num_gpu_blocks,
-            granules: vec![false; num_gpu_blocks.div_ceil(granule.get())],
-            units: vec![false; self.gdn_snapshot_cap / unit],
-            dense_target,
-            dense_draft,
-            int8: !dense_target || (draft.is_some() && !dense_draft),
+        Some(SnapshotPoolFacts {
+            // A snapshot is a slot like any other, without draft lanes; a DFlash2 drafter's
+            // context window sits beside the state.
+            slot_bytes: slot + self.snapshot_window_bytes(draft_hf_config),
+            kv_len_bytes: self.max_model_len().div_ceil(bs.get()) * target_block_bytes(model, bs),
+            prefix_caching: self.config.enable_prefix_caching,
         })
+    }
+
+    /// A snapshot's DFlash2 context window, in bytes: 0 without a DFlash2 drafter. The drafter
+    /// loads after the width resolver, which prices the same window from the same checkpoint
+    /// config — hence the parameter.
+    fn snapshot_window_bytes(&self, draft_hf_config: Option<&HfModelConfig>) -> usize {
+        match (self.dflash2.as_ref(), draft_hf_config) {
+            (Some(d), _) => d.window.bytes(),
+            (None, Some(c)) => dflash2_window(c).map_or(0, |w| w.bytes()),
+            (None, None) => 0,
+        }
     }
 
     /// The MTP head reads its target's KV and has none of its own (Gemma 4's assistant).
@@ -3414,24 +3160,14 @@ impl MetalWorker {
         })?;
         let layout = vec![(block_bytes_draft, false); num_tensors_draft * 2];
         let seeded = (draft_chunks * blocks_per_chunk).min(draft_blocks);
-        // Sharing the budget with the snapshots, a dense draft pool maps the granules the target's
-        // does (`SharedKv`): its block views exist up front, its pages as the scheduler maps them.
-        let draft_stores = match self.shared_kv.as_ref().is_some_and(|s| s.dense_draft) {
-            true => scratchy_target_metal::sparse_kv::SparseStores::apart(
-                &mtl_device,
-                &residency,
-                draft_blocks,
-                &layout,
-            ),
-            false => scratchy_target_metal::sparse_kv::SparseStores::new(
-                &mtl_device,
-                &residency,
-                draft_blocks,
-                blocks_per_chunk,
-                &layout,
-            )
-            .and_then(|mut s| s.grow_to(seeded, &kv_mapper).map(|_| s)),
-        }
+        let draft_stores = scratchy_target_metal::sparse_kv::SparseStores::new(
+            &mtl_device,
+            &residency,
+            draft_blocks,
+            blocks_per_chunk,
+            &layout,
+        )
+        .and_then(|mut s| s.grow_to(seeded, &kv_mapper).map(|_| s))
         .map_err(|e| ExecutorError::WorkerInit(format!("draft KV stores: {e}")))?;
         info!(
             "ScratchyWorker(metal): draft KV layer buffers — {} buffers",
@@ -6589,10 +6325,10 @@ impl Worker for MetalWorker {
     }
 
     fn snapshot_budget(&self) -> Option<SnapshotBudget> {
-        self.gdn_state
-            .as_ref()
-            .and(self.shared_kv.as_ref())
-            .map(|s| s.budget)
+        (self.gdn_state.is_some() && self.gdn_snapshot_cap > 0).then(|| SnapshotBudget {
+            max_slots: self.gdn_snapshot_cap,
+            disk_slots: (self.gdn_snapshot_disk.as_ref()).map_or(0, |d| d.slots()),
+        })
     }
 
     fn sequence_state(&self) -> SequenceState {
@@ -6867,7 +6603,12 @@ impl Worker for MetalWorker {
         // `initialize_cache`, spec-decode chain bounds). The target and the
         // `gpu_device` it needs for rung picking are still locals here
         // (fields assigned at the end of load_model) — pass them in.
-        self.resolve_max_num_seqs(model.as_ref(), &arch, &gpu_device)?;
+        self.resolve_max_num_seqs(
+            model.as_ref(),
+            &arch,
+            &gpu_device,
+            draft.as_ref().map(|(_, _, c)| c),
+        )?;
         gpu_device.max_decode_rows = Some(decode_rows(
             self.config.verify_seqs,
             self.max_num_seqs_resolved(),
@@ -7181,41 +6922,45 @@ impl Worker for MetalWorker {
             .map(|slot| (slot_block_bytes(slot), false))
             .collect();
         let capacity = (max_chunks * blocks_per_chunk).min(num_gpu_blocks);
-        // ⭐ Sharing its budget with the snapshots (#495), a dense pool maps the granules the
-        // scheduler names, apart (`SharedKv`), and every int8 store does (`SparseRegistry`);
-        // a int8 model's dense rows stay a one-chunk seed nothing reads.
-        let shares = self.gdn_snapshot_cap > 0;
-        if shares {
+        // A recurrent model's KV pool is mapped whole at startup and never remapped while
+        // serving — whether or not prefix caching gave it a snapshot pool; every other model's
+        // keeps its one-chunk seed and grows — doubling, never unmapping — as the pool reaches
+        // its blocks. An int8 model's canonical cache is its stores, built at its first forward
+        // (a warmup): the registry's watermark set here is how far they map whole when they
+        // register.
+        let shares = self.recurrent_slot_bytes(None).is_some();
+        if shares && kv_codec.is_int8() {
             let registry = device.allocator.sparse_kv.lock();
-            (registry.expect("sparse KV registry").share_budget())
-                .map_err(|e| ExecutorError::WorkerInit(format!("int8 KV: {e}")))?;
+            (registry
+                .expect("sparse KV registry")
+                .reach(num_gpu_blocks, &kv_mapper))
+            .map_err(|e| ExecutorError::WorkerInit(format!("int8 KV: {e}")))?;
         }
-        let kv_stores = match shares && max_chunks == num_chunks_total {
-            true => scratchy_target_metal::sparse_kv::SparseStores::apart(
-                &mtl_device,
-                &residency,
-                capacity,
-                &layout,
-            ),
-            false => scratchy_target_metal::sparse_kv::SparseStores::new(
-                &mtl_device,
-                &residency,
-                capacity,
-                blocks_per_chunk,
-                &layout,
-            )
-            .and_then(|mut s| {
-                s.grow_to(blocks_per_chunk.min(capacity), &kv_mapper)
-                    .map(|_| s)
-            }),
-        }
+        let kv_stores = scratchy_target_metal::sparse_kv::SparseStores::new(
+            &mtl_device,
+            &residency,
+            capacity,
+            blocks_per_chunk,
+            &layout,
+        )
+        .and_then(|mut s| {
+            let through = match shares {
+                true => capacity,
+                false => blocks_per_chunk.min(capacity),
+            };
+            s.grow_to(through, &kv_mapper).map(|_| s)
+        })
         .map_err(|e| ExecutorError::WorkerInit(format!("KV stores: {e}")))?;
         info!(
             "ScratchyWorker(metal): KV layers — {} tensors × K/V, up to {} chunks of {} bytes \
-             each, mapped as the pool grows",
+             each, {}",
             layout.len() / 2,
             num_chunks_total,
             chunk_bytes_logical,
+            match shares {
+                true => "mapped whole at startup",
+                false => "mapped as the pool grows",
+            },
         );
 
         let pool = unsafe {
@@ -7330,26 +7075,22 @@ impl Worker for MetalWorker {
             let t_gdn = std::time::Instant::now();
             // Conv f32, ssm at the worker's declared dtype, placement-sparse like the KV pool:
             // one store per linear layer's conv and ssm buffer, a block per slot, pinned in
-            // the KV pool's set so the lazy pager can't drop it mid-scan. A live slot is
-            // mapped once a sequence first takes it
-            // (`gdn_step`; the allocator hands out the lowest free slot, so what is mapped is the
-            // most sequences ever resident at once), snapshot slots a unit at a time as the
-            // scheduler maps them out of the KV budget they share (`SharedKv`) — an unused one
-            // costs nothing. Slot 0 is mapped now: a forward run without a step's
-            // records (the warmups) reads zeroed ones, a plain step on slot 0. The forwards bind
-            // these buffers whole and never read them from the host, so Private storage serves.
-            // Nothing reads a slot before writing it — a live slot's first step starts from zero
-            // (`GdnSlotAllocator`), a snapshot is saved before it is restored — so a newly mapped
-            // one is not zeroed. A model that drafts keeps its draft lanes apart, in plain
-            // buffers: as many as the sequences that draft at once, and every lane in use while
-            // they do.
+            // the KV pool's set so the lazy pager can't drop it mid-scan. Every slot — live and
+            // snapshot — is mapped once, here at startup, and never remapped while serving. A
+            // forward run without a step's records (the warmups) reads zeroed ones, a plain step
+            // on slot 0. The forwards bind these buffers whole and never read them from the
+            // host, so Private storage serves. Nothing reads a slot before writing it — a live
+            // slot's first step starts from zero (`GdnSlotAllocator`), a snapshot is saved before
+            // it is restored — so a mapped one is not zeroed. A model that drafts keeps its draft
+            // lanes apart, in plain buffers: as many as the sequences that draft at once, and
+            // every lane in use while they do.
             let (conv_slot, ssm_slot) =
                 dims.slot_bytes(scratchy_target_metal::gdn_state::GDN_SSM_STATE_DTYPE);
             // A DFlash2 drafter's snapshots keep its context window: one more store, past the GDN
             // state's, a window a slot. Nothing reads a snapshot's before a save writes it.
             let window_bytes = match self.gdn_snapshot_cap {
                 0 => 0,
-                _ => self.snapshot_window_bytes(),
+                _ => self.snapshot_window_bytes(None),
             };
             let layout: Vec<(usize, bool)> = (0..gdn_cfg.num_linear_layers())
                 .flat_map(|_| [(conv_slot, false), (ssm_slot, false)])
@@ -7358,17 +7099,19 @@ impl Worker for MetalWorker {
             let mapper = self.kv_mapper.clone().ok_or_else(|| {
                 ExecutorError::WorkerInit("GDN state pool before the KvMapper".into())
             })?;
-            let stores = scratchy_target_metal::sparse_kv::SparseStores::with_tail(
+            // The live slots and the snapshot slots are ONE grown range, mapped once here and
+            // never remapped while serving.
+            let snapshots_from = live;
+            let num_slots = snapshots_from + self.gdn_snapshot_cap;
+            let stores = scratchy_target_metal::sparse_kv::SparseStores::new(
                 &mtl_device,
                 &residency,
-                live,
-                self.gdn_snapshot_cap,
+                num_slots,
+                1,
                 &layout,
             )
-            .and_then(|mut s| s.grow_to(1, &mapper).map(|_| s))
+            .and_then(|mut s| s.grow_to(num_slots, &mapper).map(|_| s))
             .map_err(|e| ExecutorError::WorkerInit(format!("GDN state stores: {e}")))?;
-            let snapshots_from = stores.tail_start().expect("the snapshot slots' run");
-            let num_slots = snapshots_from + self.gdn_snapshot_cap;
             let next = std::cell::Cell::new(0usize);
             let gdn_pool = unsafe {
                 GdnStatePool::new(
@@ -7431,23 +7174,6 @@ impl Worker for MetalWorker {
             self.gdn_snapshots_from = snapshots_from;
             self.gdn_snapshot_keys = vec![None; self.gdn_snapshot_cap];
             self.gdn_slot_allocator = Some(GdnSlotAllocator::new(live, lanes));
-        }
-        if self.gdn_state.is_some() && self.gdn_snapshot_cap > 0 {
-            let shared = self.shared_kv_layout(num_gpu_blocks, &layout)?;
-            info!(
-                "ScratchyWorker(metal): KV and up to {} state snapshots share the budget — KV maps \
-                 {}-block granules ({:.1} MiB), the snapshots {}-slot units ({:.1} MiB), as the \
-                 scheduler hands memory between them",
-                shared.budget.max_slots,
-                shared.budget.kv_granule_blocks,
-                (shared.budget.kv_granule_blocks.get() as u64 * shared.budget.kv_block_bytes)
-                    as f64
-                    / 1_048_576.0,
-                shared.budget.unit_slots,
-                (shared.budget.unit_slots.get() as u64 * shared.budget.slot_bytes) as f64
-                    / 1_048_576.0,
-            );
-            self.shared_kv = Some(shared);
         }
 
         // Allocate the draft model's
@@ -7691,26 +7417,34 @@ impl Worker for MetalWorker {
             _ => 0,
         };
         let available = kv_left(peak_activation_estimate);
-        // ⭐ THE PREFIX CACHE'S RECURRENT-STATE SNAPSHOTS SHARE THE KV BUDGET (#495): as many slots as
-        // the whole budget holds are addressable — a whole number of units, the least run of slots
-        // every GDN state buffer maps on whole tiles — none is mapped until a save needs it, and the
-        // scheduler hands memory between KV and the snapshots as each needs it. Nothing is carved
-        // out of the budget for them. A snapshot is a slot like any other, without draft lanes.
-        let snapshot_slot = self.snapshot_slot()?;
-        self.gdn_snapshot_cap = match snapshot_slot {
-            Some((bytes, unit)) => (available / bytes) / unit * unit.get(),
-            None => 0,
+        // ⭐ THE STATE BUDGET'S ONE SPLIT, made here, once: live state is metered by `gdn_reserve`
+        // above (one slot per sequence the width resolved, folded into `weights_and_overhead`
+        // because the pool is built after this runs), and the snapshot pool is carved out of what
+        // is left by the ONE law (`gpu_budget::snapshot_pool_slots`, the same statement the width
+        // resolver priced the default against), mapped whole at startup, never remapped while
+        // serving; everything else is KV.
+        let available = match self.snapshot_pool_facts(None, None) {
+            None => {
+                self.gdn_snapshot_cap = 0;
+                available
+            }
+            Some(p) => {
+                // The live slots are metered exactly once, by `gdn_reserve` above: the pool's
+                // bytes are already out of `available`. What is left buys the SNAPSHOT pool
+                // through the ONE law, and the KV pool takes the rest.
+                let pool = snapshot_pool_slots(&p, available);
+                self.gdn_snapshot_cap = pool;
+                info!(
+                    "ScratchyWorker(metal): state budget — {} live + {} snapshot slots × \
+                     {:.1} MiB mapped at startup, {:.2} GiB left for KV",
+                    self.max_num_seqs_resolved(),
+                    pool,
+                    p.slot_bytes as f64 / 1_048_576.0,
+                    (available - pool * p.slot_bytes) as f64 / 1_073_741_824.0,
+                );
+                available - pool * p.slot_bytes
+            }
         };
-        if let Some((bytes, unit)) = snapshot_slot.filter(|_| self.gdn_snapshot_cap > 0) {
-            info!(
-                "ScratchyWorker(metal): up to {} state snapshots × {:.1} MiB, mapped {} at a time \
-                 as the prefix cache saves into them, out of the {:.2} GiB KV budget they share",
-                self.gdn_snapshot_cap,
-                bytes as f64 / 1_048_576.0,
-                unit,
-                available as f64 / 1_073_741_824.0,
-            );
-        }
         // Per-pair split: when a draft model is loaded, every target KV
         // block has a 1:1 mirror in the draft pool, so the engine should
         // think it has only `target / (target + draft)` of the budget.
@@ -8023,29 +7757,11 @@ impl Worker for MetalWorker {
             self.resolve_oldest()?;
         }
 
-        if self.input_batch.num_active() == 0 {
-            // Reactive KV (2c): batch fully idle → no live blocks. Defer the
-            // shrink until the GPU has been idle for `KV_SHRINK_IDLE_AFTER`.
-            // Shrinking on every idle (i.e. after every request) drops the
-            // grown chunks' StorageModePrivate pages; the next request then
-            // re-faults them on first GPU touch — a multi-second stall on a
-            // long prefill. Deferring keeps back-to-back requests fast while
-            // still releasing memory once genuinely idle.
-            let now = std::time::Instant::now();
-            let idle_since = *self.kv_idle_since.get_or_insert(now);
-            if now.duration_since(idle_since) >= KV_SHRINK_IDLE_AFTER {
-                self.shrink_metal_kv_idle();
-            }
-        } else {
-            // A batch is active again — cancel any pending idle-shrink timer.
-            self.kv_idle_since = None;
-        }
-        // The memory KV and the snapshots hand each other this step, before anything reads it:
-        // the snapshots leaving for disk first, out of slots the step releases or rewrites, then
-        // those coming back, into slots it maps (`SnapshotDiskOps`), read while the step runs.
+        // The snapshots leaving for disk this step go first, out of slots the step releases or
+        // rewrites, then those coming back, into their slots (`SnapshotDiskOps`), read while the
+        // step runs.
         let disk = &scheduler_output.recurrent_state.disk;
         self.spill_snapshots(disk.spills.iter().map(|m| (m.slot, m.disk, m.key)))?;
-        self.apply_shared_memory(&scheduler_output.recurrent_state.memory)?;
         let fills = self.begin_fills(
             disk.fills.iter().map(|f| (f.slot, f.disk, f.key)),
             scheduler_output.total_num_scheduled_tokens > 0,
@@ -8128,14 +7844,6 @@ impl Worker for MetalWorker {
                 }
                 scratchy_core_common::HybridKvStores::GlobalApart => max_sliding_block,
             };
-            if let Some(shared) = &self.shared_kv
-                && let Some(&block) =
-                    (attn.block_ids.iter().flatten()).find(|&&b| !shared.block_mapped(b))
-            {
-                return Err(ExecutorError::WorkerExecution(format!(
-                    "the step names KV block {block}, whose granule is not mapped"
-                )));
-            }
             self.grow_metal_kv_to_cover(max_block.unwrap_or(0), max_full_block.unwrap_or(0))?;
         }
 
@@ -9914,15 +9622,18 @@ impl Worker for MetalWorker {
     }
 
     /// Every model's KV stores take no memory until a step maps them (`grow_metal_kv_to_cover`),
-    /// and stay mapped — unless they share their budget with recurrent-state snapshots, whose runs
-    /// are mapped apart and released (`SharedKv`). Uniform models too: the stores map through the
-    /// highest block a step names, so the scheduler must hand out blocks already mapped before
-    /// never-used ones, or distinct prompts one at a time map the pool far past what they hold.
+    /// and stay mapped — a recurrent model's are mapped whole at startup beside its state, every
+    /// other's grown as the pool reaches its blocks. A model that grows maps through the highest
+    /// block a step names, so the scheduler must hand out blocks already mapped before never-used
+    /// ones, or distinct prompts one at a time map the pool far past what they hold.
     fn kv_backing(&self) -> scratchy_core_common::KvBacking {
-        if self.gdn_snapshot_cap == 0 {
-            scratchy_core_common::KvBacking::OnFirstUse
-        } else {
+        // The recurrent-state fact, not the snapshot count: a recurrent model's KV is
+        // allocated whole at startup even when prefix caching is off (pool empty) — mapping
+        // while serving is what this backend never does for them.
+        if self.recurrent_slot_bytes(None).is_some() {
             scratchy_core_common::KvBacking::Allocated
+        } else {
+            scratchy_core_common::KvBacking::OnFirstUse
         }
     }
 

@@ -1316,6 +1316,7 @@ fn resolve_max_num_seqs(
                     allocated_bytes: 0,
                     peak_activation_bytes: 0,
                     recurrent_per_slot_bytes: None,
+                    snapshot_pool: None,
                     sampler_bytes_per_row: 0,
                 },
                 is_offline,
@@ -2217,10 +2218,6 @@ mod tests {
         let llama = ["LlamaForCausalLM".to_string()];
         let (kv, recurrent) = (SequenceState::Kv, SequenceState::KvAndRecurrent);
         let snapshots = scratchy_serving_scheduler::scheduler::SnapshotBudget {
-            kv_block_bytes: 1,
-            kv_granule_blocks: std::num::NonZeroUsize::MIN,
-            slot_bytes: 0,
-            unit_slots: std::num::NonZeroUsize::MIN,
             max_slots: 4,
             disk_slots: 0,
         };

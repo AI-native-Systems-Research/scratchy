@@ -8,8 +8,10 @@
 //! returns, and every hit resumed cold over a full KV match. Here a snapshot a slot is taken from
 //! is written to a file and read back on a hit: 65 MiB of I/O against a prefill of every token.
 //!
-//! The file is unlinked once open, so it goes with the process however that ends. A disk slot
-//! holds one snapshot slot's bytes in every GDN state store, in store order, at
+//! The file is unlinked once open, so it goes with the process however that ends, and it is
+//! written and read around the page cache ([`UncachedFile`]): a snapshot is read back at most
+//! once, and through the cache each write takes memory the GPU's buffers hold most of. A disk
+//! slot holds one snapshot slot's bytes in every GDN state store, in store order, at
 //! `disk × slot_bytes`.
 //!
 //! ⛔ A SPILL COSTS ITS STEP ONE COPY, NOT A WRITE. The step that evicts a snapshot is the
@@ -36,14 +38,15 @@ use scratchy_target_metal::device_metal::Device;
 use scratchy_target_metal::dflash2::{WindowCopy, encode_window_copies};
 use scratchy_target_metal::mtl4_dispatch::Mtl4DispatchBatch;
 use scratchy_target_metal::residency::MetalResidencySet;
+use scratchy_target_metal::uncached_file::UncachedFile;
 
 /// One snapshot slot's bytes in one GDN state store: `(buffer, offset, bytes)`
 /// (`SparseStores::block_regions`).
 pub(crate) type Region = (Buffer, usize, usize);
 
 /// Writes under way at once before a spill waits for the oldest: each holds a staging buffer of
-/// one slot's bytes. A step evicts at most a unit's slots, and a write is done well before the
-/// next prefill evicts again.
+/// one slot's bytes. A step evicts at most a unit's slots, and a write around the page cache is
+/// done well before the next prefill evicts again.
 const MAX_WRITES: usize = 2;
 
 /// A spill's write to the file, from a staging buffer it holds until it is done.
@@ -54,7 +57,7 @@ struct Write {
 }
 
 pub(crate) struct SnapshotDisk {
-    file: Arc<File>,
+    file: Arc<UncachedFile>,
     slot_bytes: usize,
     /// Staging buffers of one slot's bytes that no write holds.
     spare: Vec<Buffer>,
@@ -80,7 +83,7 @@ impl SnapshotDisk {
             .ok()?;
         std::fs::remove_file(&path).ok()?;
         Some(Self {
-            file: Arc::new(file),
+            file: Arc::new(UncachedFile::new(file).ok()?),
             slot_bytes,
             spare: Vec::new(),
             writes: VecDeque::new(),
@@ -131,7 +134,7 @@ impl SnapshotDisk {
                 // write's `Write` holds — out of `spare`, so no copy touches it — until it is
                 // joined.
                 let bytes = unsafe { std::slice::from_raw_parts(from as *const u8, len) };
-                file.write_all_at(bytes, at)
+                file.file().write_all_at(bytes, at)
             });
         let done = match spawned {
             Ok(done) => done,
@@ -165,7 +168,7 @@ impl SnapshotDisk {
                 self.slot_bytes,
             )
         };
-        let read = self.file.read_exact_at(bytes, self.at(disk));
+        let read = self.file.file().read_exact_at(bytes, self.at(disk));
         self.staged(disk, window, staging, read)
     }
 
@@ -187,7 +190,7 @@ impl SnapshotDisk {
                 // `Reading` holds — out of `spare`, so no other move touches it — until it is
                 // joined.
                 let bytes = unsafe { std::slice::from_raw_parts_mut(to as *mut u8, len) };
-                file.read_exact_at(bytes, at)
+                file.file().read_exact_at(bytes, at)
             });
         match spawned {
             Ok(read) => Ok(Reading {

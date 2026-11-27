@@ -4,9 +4,7 @@
 //! reaches its blocks, on a worker's [`KvMapper`]. Its mapping step ([`map_step`]) also maps a
 //! worker's activations as its buckets reach them ([`crate::sparse_arena`]).
 
-use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
-use std::ops::Range;
 use std::ptr::NonNull;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -25,49 +23,12 @@ use crate::residency::{MetalResidencySet, Pinned};
 
 pub(crate) const PAGE: MTLSparsePageSize = MTLSparsePageSize::Size64;
 
-/// ⭐ THE LEAST RUN OF BLOCKS WHOSE BYTES ARE WHOLE SPARSE TILES IN EVERY STORE, each store's
-/// block taking one of `block_bytes`: what a run mapped apart is made of, so releasing one frees
-/// whole tiles and nothing of another ([`SparseStores::map_apart`]). A KV granule, a snapshot
-/// unit. Refused only when the device maps no sparse tiles at [`PAGE`] ([`sparse_tile`]).
-pub fn whole_tile_blocks(
-    device: &ProtocolObject<dyn MTLDevice>,
-    block_bytes: impl IntoIterator<Item = usize>,
-) -> Result<NonZeroUsize, String> {
-    Ok(tile_run(sparse_tile(device)?, block_bytes))
-}
-
 /// The bytes of one sparse tile at [`PAGE`]: the unit every sparse buffer, heap and run of this
 /// target is whole multiples of, and the one way it reads the device's answer. A device that
 /// answers zero maps no sparse tiles at that page size, and is refused rather than divided by.
 pub fn sparse_tile(device: &ProtocolObject<dyn MTLDevice>) -> Result<NonZeroUsize, String> {
     NonZeroUsize::new(device.sparseTileSizeInBytesForSparsePageSize(PAGE))
         .ok_or_else(|| format!("the device maps no sparse tiles at {PAGE:?} pages"))
-}
-
-/// [`whole_tile_blocks`]' arithmetic, for a non-zero `tile`. A store whose block takes `b` bytes
-/// fills whole tiles every `tile / gcd(tile, b)` blocks, a divisor of `tile`; the least run whole
-/// in every store is those divisors' lcm, which is `tile / gcd(tile, b₁, b₂, …)`. So the run is a
-/// division of `tile` by a divisor of it: at least one, and at most `tile`. A zero-byte block
-/// fills nothing (`gcd(g, 0) = g`); no blocks at all is a run of one.
-fn tile_run(tile: NonZeroUsize, block_bytes: impl IntoIterator<Item = usize>) -> NonZeroUsize {
-    /// `gcd(a, b)`: non-zero, since it divides the non-zero `a`.
-    fn gcd(a: NonZeroUsize, b: usize) -> NonZeroUsize {
-        match NonZeroUsize::new(b) {
-            None => a,
-            Some(b) => gcd(b, a.get() % b),
-        }
-    }
-    tile.div_ceil(block_bytes.into_iter().fold(tile, gcd))
-}
-
-/// How a [`SparseStores`]' blocks from block 0 are mapped.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Mapping {
-    /// Through the furthest block reached, at least doubling a step ([`SparseStores::grow_to`]).
-    Grown,
-    /// In runs of their own, mapped and released as a budget the KV shares with recurrent-state
-    /// snapshots says ([`SparseStores::map_apart`]).
-    Apart,
 }
 
 /// The queue a worker's KV mappings run on, and the event that says they have.
@@ -122,22 +83,7 @@ pub struct SparseStores {
     /// holds (a whole number of `unit`s).
     mapped: Arc<AtomicUsize>,
     capacity: usize,
-    /// The blocks asked for: past the last of them no run maps, so the run that ends there may
-    /// end mid-tile ([`Self::map_apart`]).
-    blocks: usize,
     heaps: Vec<Pinned<ProtocolObject<dyn MTLHeap>>>,
-    mapping: Mapping,
-    /// Runs mapped apart ([`Self::map_apart`]): each run's first block -> its end and its heap.
-    apart: BTreeMap<usize, (usize, Pinned<ProtocolObject<dyn MTLHeap>>)>,
-    /// A second run of blocks past the first, mapped apart (`Self::with_tail`).
-    tail: Option<Tail>,
-}
-
-/// [`SparseStores`]' second run of blocks: `blocks` of them from block `start` — the first block
-/// whose offset is a whole number of tiles in every store, so no tile is shared with the first run.
-struct Tail {
-    start: usize,
-    blocks: usize,
 }
 
 impl SparseStores {
@@ -173,158 +119,8 @@ impl SparseStores {
             tile: tile_bytes,
             mapped: Arc::default(),
             capacity,
-            blocks,
             heaps: Vec::new(),
-            mapping: Mapping::Grown,
-            apart: BTreeMap::new(),
-            tail: None,
         })
-    }
-
-    /// Stores of `blocks` blocks, `(block_bytes, zeroed)` each, mapped in runs apart from block 0
-    /// ([`Self::map_apart`]) — a KV pool whose budget recurrent-state snapshots share. Nothing is
-    /// mapped until a run is.
-    pub fn apart(
-        device: &ProtocolObject<dyn MTLDevice>,
-        residency: &MetalResidencySet,
-        blocks: usize,
-        stores: &[(usize, bool)],
-    ) -> Result<Self, String> {
-        Self::new(device, residency, blocks, 1, stores)?.into_apart()
-    }
-
-    /// These stores, mapped in runs apart from now on: nothing may be grown yet.
-    pub fn into_apart(mut self) -> Result<Self, String> {
-        if !self.heaps.is_empty() || self.tail.is_some() {
-            return Err("stores already grown, or with a second run, cannot map apart".into());
-        }
-        self.mapping = Mapping::Apart;
-        Ok(self)
-    }
-
-    /// Stores of `head` blocks grown from block 0 ([`Self::grow_to`]) and, past them, `tail` more
-    /// from [`Self::tail_start`], mapped and released in runs of their own ([`Self::map_apart`]) — a
-    /// recurrent model's live state slots and its prefix-cache snapshot slots. Neither takes memory
-    /// until a step maps it.
-    pub fn with_tail(
-        device: &ProtocolObject<dyn MTLDevice>,
-        residency: &MetalResidencySet,
-        head: usize,
-        tail: usize,
-        stores: &[(usize, bool)],
-    ) -> Result<Self, String> {
-        let tile = sparse_tile(device)?.get();
-        let aligned = |b: usize| {
-            stores
-                .iter()
-                .all(|&(bytes, _)| (b * bytes).is_multiple_of(tile))
-        };
-        let start = (head..)
-            .find(|&b| aligned(b))
-            .expect("a tile-aligned block");
-        let mut s = Self::new(device, residency, start + tail, 1, stores)?;
-        s.capacity = head;
-        s.tail = Some(Tail {
-            start,
-            blocks: tail,
-        });
-        Ok(s)
-    }
-
-    /// The first block of the second run (`Self::with_tail`).
-    pub fn tail_start(&self) -> Option<usize> {
-        self.tail.as_ref().map(|t| t.start)
-    }
-
-    /// ⭐ MAP BLOCKS `run` OF EVERY STORE FROM A HEAP OF THEIR OWN, so the run can be released
-    /// alone ([`Self::release`]): a KV granule, or a unit of snapshot slots, of a budget KV and the
-    /// snapshots share. `run` starts on a whole tile of every store and ends with the tile its last
-    /// block ends in, which no other run may share: it ends on a whole tile too, or with the
-    /// blocks asked for. Wired, and zeroed where a store's blocks must read zero, when this
-    /// returns.
-    pub fn map_apart(&mut self, run: Range<usize>, mapper: &KvMapper) -> Result<(), String> {
-        let tile = self.tile.get();
-        let (first, last) = match (&self.tail, self.mapping) {
-            (Some(t), _) => (t.start, t.start + t.blocks),
-            (None, Mapping::Apart) => (0, self.blocks),
-            (None, Mapping::Grown) => return Err("these stores grow from block 0".into()),
-        };
-        if run.is_empty() || run.start < first || run.end > last {
-            return Err(format!("run {run:?} outside blocks {first}..{last}"));
-        }
-        let whole =
-            |b: usize| (self.stores.iter()).all(|(_, bytes, _)| (b * bytes).is_multiple_of(tile));
-        if !whole(run.start) || (run.end < last && !whole(run.end)) {
-            return Err(format!("run {run:?} does not start and end on whole tiles"));
-        }
-        let before = self.apart.range(..run.end).next_back();
-        if before.is_some_and(|(_, (e, _))| *e > run.start) {
-            return Err(format!("run {run:?} overlaps a mapped one"));
-        }
-        let ranges = self.ranges(&run);
-        let heap = map_step(&self.device, &self.residency, mapper, &ranges)?;
-        self.apart.insert(run.start, (run.end, heap));
-        self.publish_apart();
-        Ok(())
-    }
-
-    /// Unmap blocks `run`, mapped by [`Self::map_apart`], and free its heap: its memory goes back
-    /// to the budget. ⛔ The caller has waited out every forward that could read it — releasing
-    /// pages a command buffer still reads hangs it past the watchdog.
-    pub fn release(&mut self, run: Range<usize>, mapper: &KvMapper) -> Result<(), String> {
-        match self.apart.get(&run.start) {
-            Some((end, _)) if *end == run.end => {}
-            _ => return Err(format!("run {run:?} is not mapped apart")),
-        }
-        let (_, heap) = self.apart.remove(&run.start).expect("checked above");
-        let tile = self.tile.get();
-        for r in self.ranges(&run) {
-            let op = MTL4UpdateSparseBufferMappingOperation {
-                mode: MTLSparseTextureMappingMode::Unmap,
-                bufferRange: NSRange::new(r.from / tile, (r.to - r.from) / tile),
-                heapOffset: 0,
-            };
-            // SAFETY: `op` unmaps whole tiles this buffer mapped from `heap`, which no command
-            // buffer reads any more (the caller's contract).
-            unsafe {
-                (mapper.queue).updateBufferMappings_heap_operations_count(
-                    r.buffer,
-                    Some(&heap),
-                    NonNull::from(&op),
-                    1,
-                )
-            };
-        }
-        mapper.wait();
-        drop(heap);
-        self.residency.commit();
-        self.publish_apart();
-        Ok(())
-    }
-
-    /// Every store's bytes of blocks `run`: from its first block, through the tile its last ends
-    /// in.
-    fn ranges(&self, run: &Range<usize>) -> Vec<MapRange<'_>> {
-        let tile = self.tile.get();
-        (self.stores.iter())
-            .map(|(buffer, bytes, zeroed)| MapRange {
-                buffer,
-                from: run.start * bytes,
-                to: (run.end * bytes).next_multiple_of(tile),
-                zeroed: *zeroed,
-            })
-            .filter(|r| r.to > r.from)
-            .collect()
-    }
-
-    /// Stores whose first run is mapped apart (a KV pool sharing its budget) publish, as
-    /// [`Self::mapped`], the end of the highest run: no block past it is mapped. A forward's guard
-    /// against reading un-wired memory reads that; the worker checks each block's own run.
-    fn publish_apart(&self) {
-        if self.mapping == Mapping::Apart {
-            let end = self.apart.values().map(|(end, _)| *end).max().unwrap_or(0);
-            self.mapped.store(end, Ordering::Relaxed);
-        }
     }
 
     /// Map blocks `from..to` of every store: one heap, wired, and zeroed where a store's blocks must
@@ -367,15 +163,9 @@ impl SparseStores {
     }
 
     /// `bytes` of store `i` from block `block` on, for a pool's chunk table.
-    ///
-    /// Stores mapped apart give views of blocks not mapped yet: the scheduler maps a granule
-    /// before any step names its blocks, and the worker refuses a step that names one it has not.
     pub fn chunk(&self, i: usize, block: usize, bytes: usize) -> Result<MetalMem, String> {
         let (buffer, block_bytes, _) = &self.stores[i];
-        let mapped = match self.mapping {
-            Mapping::Grown => self.mapped.load(Ordering::Relaxed),
-            Mapping::Apart => self.capacity,
-        } * block_bytes;
+        let mapped = self.mapped.load(Ordering::Relaxed) * block_bytes;
         let offset = block * block_bytes;
         match offset + bytes <= mapped {
             true => Ok(MetalMem::from_buffer_with_offset(
@@ -394,9 +184,6 @@ impl SparseStores {
     /// where a store's blocks must read zero — in place when this returns. No forward in flight
     /// names a block past what was mapped before, so this races none. Whether it mapped a step.
     pub fn grow_to(&mut self, blocks: usize, mapper: &KvMapper) -> Result<bool, String> {
-        if self.mapping == Mapping::Apart {
-            return Err("these stores map their blocks in runs apart".into());
-        }
         if blocks > self.capacity {
             return Err(format!("{blocks} blocks, of {}", self.capacity));
         }
@@ -482,65 +269,21 @@ pub(crate) fn map_step(
 pub struct SparseRegistry {
     stores: Vec<SparseStores>,
     blocks: usize,
-    /// `Some` once the pool shares its budget with recurrent-state snapshots
-    /// ([`Self::share_budget`]): the runs mapped apart, each one's first block -> its end.
-    apart: Option<BTreeMap<usize, usize>>,
     mapper: Option<Arc<KvMapper>>,
 }
 
 impl SparseRegistry {
-    /// From now on every store maps its blocks in runs apart, as the budget the pool shares with
-    /// recurrent-state snapshots says ([`Self::map_apart`]) — stores registered later too.
-    pub fn share_budget(&mut self) -> Result<(), String> {
-        if !self.stores.is_empty() || self.blocks > 0 {
-            return Err("a pool that has grown cannot share its budget".into());
-        }
-        self.apart = Some(BTreeMap::new());
-        Ok(())
-    }
-
     pub fn register(&mut self, stores: SparseStores) -> Result<(), String> {
-        let stores = match (&self.apart, &self.mapper) {
-            (Some(runs), Some(mapper)) => {
-                let mut stores = stores.into_apart()?;
-                for (&start, &end) in runs {
-                    stores.map_apart(start..end, mapper)?;
-                }
-                stores
-            }
-            (Some(_), None) => stores.into_apart()?,
-            (None, Some(mapper)) => {
+        let stores = match &self.mapper {
+            Some(mapper) => {
                 let mut stores = stores;
                 stores.grow_to(self.blocks, mapper)?;
                 stores
             }
-            (None, None) => stores,
+            None => stores,
         };
         self.stores.push(stores);
         Ok(())
-    }
-
-    /// Map blocks `run` of every store apart ([`SparseStores::map_apart`]), and of every store
-    /// registered later.
-    pub fn map_apart(&mut self, run: Range<usize>, mapper: &Arc<KvMapper>) -> Result<(), String> {
-        let runs = self
-            .apart
-            .as_mut()
-            .ok_or("a pool that does not share its budget")?;
-        runs.insert(run.start, run.end);
-        self.mapper = Some(mapper.clone());
-        (self.stores.iter_mut()).try_for_each(|s| s.map_apart(run.clone(), mapper))
-    }
-
-    /// Release blocks `run` of every store ([`SparseStores::release`]): the caller has waited out
-    /// every forward that could read them.
-    pub fn release(&mut self, run: Range<usize>, mapper: &Arc<KvMapper>) -> Result<(), String> {
-        let runs = self
-            .apart
-            .as_mut()
-            .ok_or("a pool that does not share its budget")?;
-        runs.remove(&run.start);
-        (self.stores.iter_mut()).try_for_each(|s| s.release(run.clone(), mapper))
     }
 
     /// The blocks every registered store has mapped — what a step can name without mapping more —
@@ -553,9 +296,6 @@ impl SparseRegistry {
 
     /// Map every store through `blocks` blocks, on `mapper`. Whether any mapped a step.
     pub fn reach(&mut self, blocks: usize, mapper: &Arc<KvMapper>) -> Result<bool, String> {
-        if self.apart.is_some() {
-            return Err("a pool sharing its budget maps runs apart".into());
-        }
         self.blocks = self.blocks.max(blocks);
         self.mapper = Some(mapper.clone());
         let blocks = self.blocks;
@@ -679,210 +419,5 @@ mod tests {
         );
         assert!(stores.grow_to(5, &mapper).expect("the rest"));
         assert_eq!(stores.mapped().load(Ordering::Relaxed), 5);
-    }
-
-    /// Two runs grown apart — a recurrent model's live slots and its snapshot slots: the second
-    /// starts on a whole tile of every store, past the first's last block, and maps on its own
-    /// with the first untouched; each run stays within its blocks.
-    #[test]
-    fn a_tail_maps_apart_from_the_head() {
-        let Some(device) = crate::detect_device().map(|d| d.device) else {
-            eprintln!("skipping: no Metal 4 GPU");
-            return;
-        };
-        let residency = MetalResidencySet::new(&device);
-        let mapper = KvMapper::new(&device).expect("mapper");
-        // 1.5 tiles a block: three head blocks end mid-tile, so the tail starts at block 4.
-        let big = 3 * 32 * 1024;
-        let mut stores =
-            SparseStores::with_tail(&device, &residency, 3, 2, &[(big, false)]).expect("stores");
-        assert_eq!(stores.tail_start(), Some(4));
-        let host = shared_zeroed(&device, big);
-        let a = stores.buffer(0);
-        let gpu = |body: &dyn Fn(&ProtocolObject<dyn MTL4ComputeCommandEncoder>)| {
-            let batch = Mtl4DispatchBatch::begin(&device).expect("MTL4 queue");
-            batch.declare(&residency);
-            let _host = batch.residency().pin(host.clone());
-            body(batch.encoder());
-            batch.commit(true);
-        };
-        assert!(
-            stores.map_apart(4..5, &mapper).is_err(),
-            "one slot ends mid-tile, short of the tail's end"
-        );
-        assert!(
-            stores.map_apart(5..6, &mapper).is_err(),
-            "a run starts on a whole tile"
-        );
-        stores
-            .map_apart(4..6, &mapper)
-            .expect("the tail's two slots");
-        assert_eq!(
-            stores.mapped().load(Ordering::Relaxed),
-            0,
-            "the head maps nothing"
-        );
-        // SAFETY (both): tail block 0 is mapped and resident, and `host` is shared.
-        gpu(&|e| unsafe { e.fillBuffer_range_value(&a, NSRange::new(4 * big, big), 0xcd) });
-        gpu(&|e| unsafe {
-            e.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(
-                &a,
-                4 * big,
-                &host,
-                0,
-                big,
-            )
-        });
-        let got: Vec<u8> = read_slice(&host, big);
-        assert!(
-            got.iter().all(|&x| x == 0xcd),
-            "the tail block holds its writes"
-        );
-        assert!(stores.grow_to(3, &mapper).expect("the head"));
-        assert!(
-            stores.grow_to(4, &mapper).is_err(),
-            "past the head's blocks"
-        );
-        assert!(
-            stores.map_apart(4..7, &mapper).is_err(),
-            "past the tail's blocks"
-        );
-        assert!(stores.map_apart(4..6, &mapper).is_err(), "mapped already");
-        stores.release(4..6, &mapper).expect("released");
-        assert!(stores.release(4..6, &mapper).is_err(), "released already");
-        stores.map_apart(4..6, &mapper).expect("mapped again");
-    }
-
-    /// The run is the lcm of every store's whole-tile period, as the fold it replaces computed it
-    /// (`run / gcd(run, per_store) * per_store` over `per_store = tile / gcd(tile, bytes)`): the
-    /// same run for every block-size pair, a zero-byte block and no blocks included.
-    #[test]
-    fn a_run_is_the_least_whole_tile_period_of_every_store() {
-        fn gcd(mut a: usize, mut b: usize) -> usize {
-            while b != 0 {
-                (a, b) = (b, a % b);
-            }
-            a
-        }
-        let lcm_fold = |tile: usize, bytes: &[usize]| {
-            (bytes.iter().filter(|&&b| b > 0)).fold(1, |run, &b| {
-                let per_store = tile / gcd(tile, b);
-                run / gcd(run, per_store) * per_store
-            })
-        };
-        let tile = NonZeroUsize::new(64 << 10).expect("64 KiB");
-        let sizes = [
-            0,
-            1,
-            3,
-            512,
-            1000,
-            1024,
-            4096,
-            12_288,
-            65_536,
-            98_304,
-            1 << 20,
-        ];
-        for &a in &sizes {
-            for &b in &sizes {
-                let bytes = [a, b];
-                assert_eq!(
-                    tile_run(tile, bytes).get(),
-                    lcm_fold(tile.get(), &bytes),
-                    "{bytes:?}"
-                );
-            }
-        }
-        assert_eq!(
-            tile_run(tile, [512, 1024]).get(),
-            128,
-            "a 64 KiB tile of 512-byte blocks"
-        );
-        assert_eq!(tile_run(tile, []).get(), 1, "no stores: a run of one");
-    }
-
-    /// A KV pool sharing its budget maps granules of blocks apart and releases them alone: a run
-    /// keeps its writes, a released run mapped again reads zero in a store that must, runs neither
-    /// overlap nor start or end mid-tile — but the last, which ends with the pool's blocks — and
-    /// the stores publish the end of their highest run.
-    #[test]
-    fn granules_map_and_release_apart() {
-        let Some(device) = crate::detect_device().map(|d| d.device) else {
-            eprintln!("skipping: no Metal 4 GPU");
-            return;
-        };
-        let residency = MetalResidencySet::new(&device);
-        let mapper = KvMapper::new(&device).expect("mapper");
-        // 128 blocks of the first store are one 64 KB tile, of the second two; 1000 blocks end
-        // mid-tile.
-        let layout = [(512, true), (1024, false)];
-        let mut stores = SparseStores::apart(&device, &residency, 1000, &layout).expect("stores");
-        assert_eq!(
-            whole_tile_blocks(&device, layout.iter().map(|&(bytes, _)| bytes))
-                .expect("a sparse tile")
-                .get(),
-            128
-        );
-        assert!(stores.grow_to(128, &mapper).is_err(), "runs apart only");
-        let mapped = |s: &SparseStores| s.mapped().load(Ordering::Relaxed);
-        stores.map_apart(0..128, &mapper).expect("granule 0");
-        stores.map_apart(256..384, &mapper).expect("granule 2");
-        assert_eq!(mapped(&stores), 384, "the highest run's end");
-        assert!(
-            stores.map_apart(64..192, &mapper).is_err(),
-            "mid-tile start"
-        );
-        assert!(stores.map_apart(128..200, &mapper).is_err(), "mid-tile end");
-        assert!(
-            stores.map_apart(300..512, &mapper).is_err(),
-            "overlaps granule 2"
-        );
-        stores
-            .map_apart(896..1000, &mapper)
-            .expect("the last granule, to the pool's end");
-        let host = shared_zeroed(&device, 128 * 512);
-        let a = stores.buffer(0);
-        let gpu = |body: &dyn Fn(&ProtocolObject<dyn MTL4ComputeCommandEncoder>)| {
-            let batch = Mtl4DispatchBatch::begin(&device).expect("MTL4 queue");
-            batch.declare(&residency);
-            let _host = batch.residency().pin(host.clone());
-            body(batch.encoder());
-            batch.commit(true);
-        };
-        let first = |host: &Retained<ProtocolObject<dyn MTLBuffer>>| {
-            // SAFETY: granule 2 of `a` is mapped and resident, and `host` is shared.
-            gpu(&|e| unsafe {
-                e.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(
-                    &a,
-                    256 * 512,
-                    host,
-                    0,
-                    128 * 512,
-                )
-            });
-            read_slice::<u8>(host, 128 * 512)
-        };
-        // SAFETY: granule 2 of `a` is mapped and resident.
-        gpu(&|e| unsafe { e.fillBuffer_range_value(&a, NSRange::new(256 * 512, 128 * 512), 0xab) });
-        assert!(
-            first(&host).iter().all(|&x| x == 0xab),
-            "a run keeps its writes"
-        );
-        stores
-            .release(896..1000, &mapper)
-            .expect("release the last");
-        stores
-            .release(256..384, &mapper)
-            .expect("release granule 2");
-        assert_eq!(mapped(&stores), 128);
-        stores
-            .map_apart(256..384, &mapper)
-            .expect("granule 2 again");
-        assert!(
-            first(&host).iter().all(|&x| x == 0),
-            "fresh pages: a zeroed store reads zero"
-        );
-        assert!(stores.release(0..64, &mapper).is_err(), "not a run");
     }
 }
