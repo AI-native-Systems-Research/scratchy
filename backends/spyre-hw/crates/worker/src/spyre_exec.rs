@@ -349,7 +349,7 @@ impl Worker for SpyreWorker {
                     &mut self.in_flight,
                     &mut owed_rows,
                     &mut sampled,
-                    piece,
+                    *piece,
                     &nr.req_id,
                 ),
             }
@@ -505,7 +505,7 @@ impl Worker for SpyreWorker {
                         &mut self.in_flight,
                         &mut owed_rows,
                         &mut sampled,
-                        piece,
+                        *piece,
                         &t.id,
                     ),
                 }
@@ -804,7 +804,7 @@ impl Worker for SpyreWorker {
                     &mut self.in_flight,
                     &mut owed_rows,
                     &mut sampled,
-                    piece,
+                    *piece,
                     req_id,
                 ),
             }

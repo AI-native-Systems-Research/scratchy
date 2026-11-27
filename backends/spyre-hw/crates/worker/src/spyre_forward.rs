@@ -33,13 +33,16 @@ pub(crate) enum ChunkOut {
     /// exists, on the card and on the emulator alike (the bake mints the draw into
     /// both tiers' bundles). The shared readers go through
     /// [`ChunkOut::minted_pick`], so no reader names the variant.
+    #[cfg(not(feature = "spyre-hw"))]
     Tokens(Vec<u32>),
     /// ⭐ THE CHUNK'S PICK IS OWED (card only): the prompt-final launch's read is
     /// deferred and its piece rides the executor's step queue — the caller's output
     /// defers on the piece's cell. The card tier collects nothing in-call; the
     /// emulator's twin has no queue and keeps its synchronous [`ChunkOut::Tokens`].
+    /// Boxed: the piece IS this enum's whole weight, and a prompt pays one box at
+    /// its final chunk — never per token.
     #[cfg(feature = "spyre-hw")]
-    Owed(crate::card::exec::InFlightStep),
+    Owed(Box<crate::card::exec::InFlightStep>),
 }
 
 impl ChunkOut {
@@ -52,6 +55,7 @@ impl ChunkOut {
     /// chunk loop takes the piece before this door.
     pub(crate) fn minted_pick(&self) -> Option<&[u32]> {
         match self {
+            #[cfg(not(feature = "spyre-hw"))]
             ChunkOut::Tokens(ts) => Some(ts),
             ChunkOut::Prompt => None,
             #[cfg(feature = "spyre-hw")]
@@ -70,9 +74,10 @@ pub(crate) enum StepPick {
     None,
     /// The step's token, collected — the step waited its own pick.
     Token(u32),
-    /// The step's token is OWED: the piece rides the executor's queue.
+    /// The step's token is OWED: the piece rides the executor's queue. Boxed — the piece
+    /// is the enum's whole weight, paid once per step, never per token.
     #[cfg(feature = "spyre-hw")]
-    Owed(crate::card::exec::InFlightStep),
+    Owed(Box<crate::card::exec::InFlightStep>),
 }
 
 /// ⭐ ONE ROW'S LAW FOR THE SEAT — what the launch's row `r` draws. `None` is
@@ -235,7 +240,7 @@ pub(crate) fn run_request_step(
     #[cfg(not(feature = "spyre-hw"))]
     let mut prompt_pick: Option<u32> = None;
     #[cfg(feature = "spyre-hw")]
-    let mut prompt_owed: Option<crate::card::exec::InFlightStep> = None;
+    let mut prompt_owed: Option<Box<crate::card::exec::InFlightStep>> = None;
     for chunk in toks[..prefill_n].chunks(chunk_w) {
         // ⭐ A PROMPT CHUNK RUNS ON THE SMALLEST PREFILL RUNG THAT REACHES IT. A rung's
         // attention walks the request's pages through the page table and the step's mask
@@ -291,12 +296,11 @@ pub(crate) fn run_request_step(
         // ⭐ THE CARD'S CHUNK OWES ITS PICK (the emulator's collected it): the piece
         // rides the executor's step queue and this loop keeps staging the prompt's
         // next chunk behind it — nothing here waits on the card.
+        // A mid-prompt chunk (`ChunkOut::Prompt`) forwards — the card tier never
+        // collects in-call, so nothing is owed for it.
         #[cfg(feature = "spyre-hw")]
-        match out {
-            ChunkOut::Owed(piece) => prompt_owed = Some(piece),
-            // A mid-prompt chunk forwarded; the card tier never collects in-call, so
-            // `Tokens` is not a case it can meet.
-            _ => {}
+        if let ChunkOut::Owed(piece) = out {
+            prompt_owed = Some(piece);
         }
         #[cfg(not(feature = "spyre-hw"))]
         if let Some(ts) = out.minted_pick() {

@@ -1390,7 +1390,7 @@ pub(crate) fn superdsc_forward_chunk(
     // when it launched, and the next chunk's geometry reads it before any drain.
     tokens.set_tokens_in_pool(id, end);
     Ok(match owed {
-        Some(piece) => ChunkOut::Owed(piece),
+        Some(piece) => ChunkOut::Owed(Box::new(piece)),
         None => ChunkOut::Prompt,
     })
 }
