@@ -2441,13 +2441,7 @@ impl Recording<'_> {
                     GemmWeight::Affine { affine } => {
                         let (group_size, bits) =
                             self.affine(i, affine.group().get(), affine.bits().get())?;
-                        let vector_limit =
-                            st::QmvBatchLimit(affine_qmm_vector_limit(k, n / heads.get()));
-                        st::HeadWeight::Affine {
-                            group_size,
-                            bits,
-                            vector_limit,
-                        }
+                        st::HeadWeight::Affine { group_size, bits }
                     }
                     GemmWeight::Fp8Dynamic => {
                         return Err(self.no(i, Refused::Fp8Gemm));

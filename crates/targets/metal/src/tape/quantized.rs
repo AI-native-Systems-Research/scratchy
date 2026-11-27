@@ -570,15 +570,8 @@ pub fn pick_qmm_t_kernel(
     is_nax: bool,
 ) -> QmmTKernel {
     let group_size = group.get();
-    // NAX's 64×64 tiling wastes work and yields too few threadgroups at
-    // tiny M: it regresses to ~0.8× vs SplitK at M=16 but wins (≥1.7×)
-    // from M=32 up (see `nax_vs_standard_qmm_t_bench`). Gate it to
-    // M ≥ 32 so very short prefills keep the SplitK/Standard path.
-    // (Belt-and-suspenders: the production qmm_t buckets start at 64,
-    // so this threshold isn't normally reached.)
-    const NAX_MIN_M: u32 = 32;
-    if is_nax && m >= NAX_MIN_M && k.is_multiple_of(64) && group.nax().is_some() {
-        return QmmTKernel::Nax(NaxDequant::for_shape(m, n, k));
+    if let QmmTBatchKernel::Nax(dequant) = pick_qmm_t_batch_kernel(m, n, k, group, is_nax) {
+        return QmmTKernel::Nax(dequant);
     }
     // Split-K is instantiated for int4 codes alone: any other width takes the standard kernel.
     if let (1, Some(bits)) = (b, bits.int4()) {
@@ -592,6 +585,45 @@ pub fn pick_qmm_t_kernel(
         }
     }
     QmmTKernel::Standard
+}
+
+/// A qmm_t over a batch of matmuls (grid z, one weight block each): a batch's matmuls fill the
+/// grid split-K would, so there is none.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QmmTBatchKernel {
+    Standard,
+    Nax(NaxDequant),
+}
+
+impl From<QmmTBatchKernel> for QmmTKernel {
+    fn from(k: QmmTBatchKernel) -> Self {
+        match k {
+            QmmTBatchKernel::Standard => Self::Standard,
+            QmmTBatchKernel::Nax(dequant) => Self::Nax(dequant),
+        }
+    }
+}
+
+/// The qmm_t a batch of `m`×`n`×`k` matmuls runs: [`pick_qmm_t_kernel`]'s matrix-unit gate, else
+/// the standard tile.
+pub fn pick_qmm_t_batch_kernel(
+    m: u32,
+    n: u32,
+    k: u32,
+    group: AffineGroupSize,
+    is_nax: bool,
+) -> QmmTBatchKernel {
+    // NAX's 64×64 tiling wastes work and yields too few threadgroups at
+    // tiny M: it regresses to ~0.8× vs SplitK at M=16 but wins (≥1.7×)
+    // from M=32 up (see `nax_vs_standard_qmm_t_bench`). Gate it to
+    // M ≥ 32 so very short prefills keep the SplitK/Standard path.
+    // (Belt-and-suspenders: the production qmm_t buckets start at 64,
+    // so this threshold isn't normally reached.)
+    const NAX_MIN_M: u32 = 32;
+    match is_nax && m >= NAX_MIN_M && k.is_multiple_of(64) && group.nax().is_some() {
+        true => QmmTBatchKernel::Nax(NaxDequant::for_shape(m, n, k)),
+        false => QmmTBatchKernel::Standard,
+    }
 }
 
 /// Threadgroup grid + threads-per-group for a picked qmm_t variant.

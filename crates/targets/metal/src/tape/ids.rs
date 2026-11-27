@@ -556,6 +556,8 @@ u32_newtype!(
     WarpLanes,
     /// The cached rows one warp of a tiled latent attention scores a step: a page group.
     KeysPerStep,
+    /// The queries one threadgroup of a tiled latent attention takes.
+    TileQueries,
     /// A reshape's row divisor (`num_tokens / d` rows — the vision merger's factor).
     RowsDivisor,
     /// Iterations of a rolled loop.

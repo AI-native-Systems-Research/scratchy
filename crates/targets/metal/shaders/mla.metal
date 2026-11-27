@@ -22,7 +22,7 @@
 //   1 = LATENT      the compressed latent's width
 //   2 = NOPE        a query head's un-rotated part
 //   3 = ROPE        a query head's rotated part, the shared key's width
-//   4 = BLOCK_SIZE  rows per paged block (with 5, 6 and 14: the cache's)
+//   4 = BLOCK_SIZE  rows per paged block (with 5, 6, 14 and 23: the cache's)
 //   5 = MAX_BLOCKS  the block table's row stride
 //   6 = BLOCKS_PER_CHUNK
 //   7 = SCALE       the softmax scale
@@ -39,7 +39,12 @@
 //                   halves `(i, i + ROPE / 2)` (NeoX)
 //  16 = WARP_LANES  the tiled attention's: the latent lanes of a warp's output
 //  17 = KEYS        the tiled attention's: the cached rows a warp scores a step
-//  18 = BLOCKS      the tiled attention's: the 16-query blocks of a threadgroup
+//  18 = BLOCKS      the tiled attention's: the query blocks of a threadgroup
+//  19 = FRAGMENT    the tiled attention's: the edge of its unit's fragment
+//  20 = BLOCK_ROWS  the tiled attention's: the queries of a block
+//  21 = SLICE       the matrix unit's tiled attention's: the lanes of one P @ V op
+//  22 = TG_BYTES    the tiled attention's: a threadgroup's memory
+//  23 = BLOCK_MASK  a block-table or slot-mapping entry's block index bits
 
 #include <metal_stdlib>
 #include "baked.h"
@@ -136,7 +141,7 @@ template <typename T>
         if (slot_raw != 0xFFFFFFFFu) {
             uint chunk;
             bool in_v;
-            const uint at = mla_cache_at(slot_raw & 0x7FFFFFFFu, e, chunk, in_v);
+            const uint at = mla_cache_at(slot_raw & MLA_BLOCK_MASK, e, chunk, in_v);
             ((device T*)(in_v ? v_cache[chunk] : k_cache[chunk]))[at] = v;
         }
     }
@@ -223,7 +228,7 @@ template <typename T>
 
     float k[MLA_ELEMS];
     for (uint pos = first + sg; pos < last; pos += MLA_SG) {
-        const uint slot = (blocks[pos / MLA_BLOCK_SIZE] & 0x7FFFFFFFu) * MLA_BLOCK_SIZE
+        const uint slot = (blocks[pos / MLA_BLOCK_SIZE] & MLA_BLOCK_MASK) * MLA_BLOCK_SIZE
             + pos % MLA_BLOCK_SIZE;
         uint chunk;
         bool in_v;
@@ -311,7 +316,7 @@ template <typename T>
 // latent query, then its rotated rope part) against the cached rows, its
 // output the softmax-weighted latent lanes of the rows. This kernel is the
 // steel wide paged attention's FA-2 (`attention_steel_paged_wide`) over those
-// queries: a threadgroup takes BLOCKS blocks of 16 of them, a block LATENT /
+// queries: a threadgroup takes BLOCKS blocks of BLOCK_ROWS of them, a block LATENT /
 // WARP_LANES warps; warp `wn` of a block scores page group `wn` of a step (KEYS cached
 // rows) over the whole query, the block's scores cross its warps through
 // threadgroup memory once a step, and each warp applies the online softmax
@@ -322,18 +327,15 @@ template <typename T>
 // causal limit; a query attends to the cached rows up to its row's position.
 //
 // Bindings as `mla_attend`'s, less the partials (buffer(8)).
-// Dispatch: threadgroups (ceil(rows * HEADS / (16 * BLOCKS)), 1, seqs), threads
+// Dispatch: threadgroups (ceil(rows * HEADS / (BLOCK_ROWS * BLOCKS)), 1, seqs), threads
 // (32 * BLOCKS * LATENT / WARP_LANES, 1, 1); threadgroups past a sequence's
 // queries return.
-// Unset (another kernel's compile of this file): one fragment each, never dispatched.
-constant constexpr uint MLA_TILE_LANES = MLA_WARP_LANES_SET ? MLA_WARP_LANES : 8u;
-constant constexpr uint MLA_TILE_KEYS = MLA_KEYS_SET ? MLA_KEYS : 8u;
-static_assert(!MLA_WARP_LANES_SET || (MLA_LATENT % MLA_WARP_LANES == 0 && MLA_WARP_LANES % 8u == 0),
-              "whole fragments a warp");
-static_assert(!MLA_WARP_LANES_SET || (MLA_ROPE % 8u == 0 && MLA_HALF % 8u == 0),
-              "a fragment never straddles the query's parts or the row's stores");
-static_assert(!MLA_KEYS_SET || (MLA_KEYS % 8u == 0 && MLA_BLOCK_SIZE % MLA_KEYS == 0),
-              "whole page groups a step");
+// The tile's shape is `MlaAttendTiles`' (the lowering's `mla_attend_tiles`), its numbers these
+// slots. Unset (another kernel's compile of this file): one fragment each, never dispatched.
+constant constexpr uint MLA_TILE_FRAG = MLA_FRAGMENT_SET ? MLA_FRAGMENT : 8u;
+constant constexpr uint MLA_TILE_ROWS = MLA_BLOCK_ROWS_SET ? MLA_BLOCK_ROWS : MLA_TILE_FRAG;
+constant constexpr uint MLA_TILE_LANES = MLA_WARP_LANES_SET ? MLA_WARP_LANES : MLA_TILE_FRAG;
+constant constexpr uint MLA_TILE_KEYS = MLA_KEYS_SET ? MLA_KEYS : MLA_TILE_FRAG;
 
 template <typename T>
 [[kernel, max_total_threads_per_threadgroup(MLA_TILE_THREADS)]]
@@ -352,8 +354,8 @@ void mla_attend_tiles(
 {
     using namespace mlx::steel;
     typedef float AccumType;
-    constexpr short kU = 8;                    // a fragment's edge
-    constexpr short ROWS = 16;                 // queries a warp's block
+    constexpr short kU = short(MLA_TILE_FRAG);
+    constexpr short ROWS = short(MLA_TILE_ROWS);
     constexpr int TQ = ROWS / kU;
     constexpr int WM = int(MLA_TILE_BLOCKS);
     constexpr int BQ = WM * ROWS;
@@ -536,7 +538,7 @@ void mla_attend_tiles(
     // a step parity where two fit.
     constexpr int kSPerLane = stile_t::kElemsPerTile;
     constexpr int kPart = 32 * kSPerLane;
-    constexpr int kBufs = 2 * WM * WN * kPart * int(sizeof(AccumType)) <= 32768 ? 2 : 1;
+    constexpr int kBufs = 2 * WM * WN * kPart * int(sizeof(AccumType)) <= int(MLA_TG_BYTES) ? 2 : 1;
     threadgroup AccumType sx[kBufs * WM * WN * kPart];
 
     for (int kb0 = 0; kb0 < kb_lim; kb0 += WN) {

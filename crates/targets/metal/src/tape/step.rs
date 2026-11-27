@@ -392,13 +392,10 @@ pub struct ColOffset(pub u32);
 pub enum HeadWeight {
     /// Dense rows in the activation dtype.
     Dense,
-    /// MLX-affine rows packed `bits` wide in groups of `group_size`: a matvec a row below
-    /// `vector_limit` rows, a matmul a head from it (`get_qmv_batch_limit`, as an
-    /// [`AffineMatmul`]'s).
+    /// MLX-affine rows packed `bits` wide in groups of `group_size`.
     Affine {
         group_size: AffineGroupSize,
         bits: AffineBits,
-        vector_limit: QmvBatchLimit,
     },
 }
 

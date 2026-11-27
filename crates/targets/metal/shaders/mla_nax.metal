@@ -5,18 +5,19 @@
 // `matmul2d` ops as `attention_nax_paged_wide`'s
 // (steel_attention_nax_paged_kernel.h) are, which this kernel's loop follows.
 //
-// A threadgroup takes BLOCKS blocks of 16 of a sequence's queries (its rows'
-// heads, consecutive), each a block of LATENT / WARP_LANES warps.
+// A threadgroup takes BLOCKS blocks of BLOCK_ROWS of a sequence's queries (its
+// rows' heads, consecutive), each a block of LATENT / WARP_LANES warps.
 // A step, warp `wn` of a block scores page group `wn` (KEYS cached rows) over
 // the whole query: one op over the lanes both the latent query and the K store
 // hold, one over the latent lanes the V store holds, one over the rope lanes.
 // The block's scores meet in threadgroup memory, and each warp accumulates its
-// WARP_LANES output lanes as ops of 32 lanes — a 32-lane slice never straddles
-// the K and V stores (HALF is whole slices) — P converted to their left input
-// in registers. Every op reads its operands from device memory itself.
+// WARP_LANES output lanes as ops of SLICE lanes — a slice never straddles the K
+// and V stores (HALF is whole slices) — P converted to their left input in
+// registers. Every op reads its operands from device memory itself.
 //
 // Bindings and dispatch as `mla_attend_tiles`'.
-// Constants: `mla.h`'s.
+// Constants: `mla.h`'s; the tile's shape is `MlaAttendTiles`' (the lowering's
+// `mla_attend_tiles`), its numbers slots 16 to 22.
 
 #include <metal_stdlib>
 #include "baked.h"
@@ -27,17 +28,16 @@
 using namespace metal;
 using namespace mlx::steel;
 
-// Unset (another kernel's compile of this file): one op each, never dispatched.
-constant constexpr uint MLA_NAX_LANES = MLA_WARP_LANES_SET ? MLA_WARP_LANES : 32u;
-constant constexpr uint MLA_NAX_KEYS = MLA_KEYS_SET ? MLA_KEYS : 16u;
-// The lanes of one P @ V op.
-constant constexpr uint MLA_NAX_SLICE = 32u;
-static_assert(!MLA_WARP_LANES_SET
-                  || (MLA_LATENT % MLA_WARP_LANES == 0 && MLA_WARP_LANES % MLA_NAX_SLICE == 0
-                      && MLA_HALF % MLA_NAX_SLICE == 0 && MLA_ROPE % 16u == 0),
-              "whole 32-lane slices a warp, none straddling the stores");
-static_assert(!MLA_KEYS_SET || (MLA_KEYS % 16u == 0 && MLA_BLOCK_SIZE % MLA_KEYS == 0),
-              "whole ops a page group");
+// Unset (another kernel's compile of this file): one fragment each, never dispatched.
+constant constexpr uint MLA_NAX_FRAG = MLA_FRAGMENT_SET ? MLA_FRAGMENT : uint(BaseNAXFrag::kFragRows);
+constant constexpr uint MLA_NAX_ROWS = MLA_BLOCK_ROWS_SET ? MLA_BLOCK_ROWS : MLA_NAX_FRAG;
+constant constexpr uint MLA_NAX_SLICE = MLA_SLICE_SET ? MLA_SLICE : MLA_NAX_FRAG;
+constant constexpr uint MLA_NAX_LANES = MLA_WARP_LANES_SET ? MLA_WARP_LANES : MLA_NAX_SLICE;
+constant constexpr uint MLA_NAX_KEYS = MLA_KEYS_SET ? MLA_KEYS : MLA_NAX_FRAG;
+// The tiles' registers lie as the matrix unit's fragments do.
+static_assert(MLA_NAX_FRAG == uint(BaseNAXFrag::kFragRows), "the matrix unit's fragment");
+// A block's queries are one fragment's rows: the ops' destinations lie as a row of fragments.
+static_assert(MLA_NAX_ROWS == MLA_NAX_FRAG, "a block of one fragment's rows");
 
 template <typename T>
 [[kernel, max_total_threads_per_threadgroup(MLA_TILE_THREADS)]]
@@ -57,9 +57,10 @@ void mla_attend_tiles_nax(
     using namespace mpp::tensor_ops;
     using Ext = dextents<int32_t, 2>;
     typedef float AccumType;
-    constexpr short kU = 16;
+    constexpr short kU = short(MLA_NAX_FRAG);
+    constexpr short BR = short(MLA_NAX_ROWS);
     constexpr int WM = int(MLA_TILE_BLOCKS);
-    constexpr int BQ = WM * kU;
+    constexpr int BQ = WM * BR;
     constexpr int WN = int(MLA_TILE_WN);
     constexpr int DW = int(MLA_NAX_LANES);
     constexpr int SL = int(MLA_NAX_SLICE);
@@ -87,12 +88,14 @@ void mla_attend_tiles_nax(
 
     using stile_t = NAXTile<AccumType, 1, TK>;
     using otile_t = NAXTile<AccumType, 1, SL / kU>;
+    // A lane's scores of a page group.
+    constexpr short kSPerLane = stile_t::kElemsPerTile;
 
     const short rb = short(simd_group_id / uint(WN));
     const short wn = short(simd_group_id % uint(WN));
-    const short tm = kU * rb;
+    const short tm = BR * rb;
     const short lim_rows = short(int(tile_items) - int(tm));
-    const int rows = max(min(int(lim_rows), int(kU)), 1);
+    const int rows = max(min(int(lim_rows), int(BR)), 1);
     // A block past the tile's queries still meets every step: it reads the tile's first queries
     // and stores nothing.
     const uint load_item = seq_start * MLA_HEADS + item0 + (lim_rows > 0 ? uint(tm) : 0u);
@@ -123,16 +126,16 @@ void mla_attend_tiles_nax(
     };
 
     constexpr auto qk_k_desc = matmul2d_descriptor(
-        16, KQ, D_K, false, true, true, matmul2d_descriptor::mode::multiply_accumulate);
+        BR, KQ, D_K, false, true, true, matmul2d_descriptor::mode::multiply_accumulate);
     constexpr auto qk_v_desc = matmul2d_descriptor(
-        16, KQ, D_V, false, true, true, matmul2d_descriptor::mode::multiply_accumulate);
+        BR, KQ, D_V, false, true, true, matmul2d_descriptor::mode::multiply_accumulate);
     constexpr auto qk_r_desc = matmul2d_descriptor(
-        16, KQ, D_R, false, true, true, matmul2d_descriptor::mode::multiply_accumulate);
+        BR, KQ, D_R, false, true, true, matmul2d_descriptor::mode::multiply_accumulate);
     matmul2d<qk_k_desc, execution_simdgroup> qk_k_op;
     matmul2d<qk_v_desc, execution_simdgroup> qk_v_op;
     matmul2d<qk_r_desc, execution_simdgroup> qk_r_op;
     constexpr auto pv_desc = matmul2d_descriptor(
-        16, SL, KQ, false, false, true, matmul2d_descriptor::mode::multiply_accumulate);
+        BR, SL, KQ, false, false, true, matmul2d_descriptor::mode::multiply_accumulate);
     matmul2d<pv_desc, execution_simdgroup> pv_op;
 
     // Tensor extents bound the rows the ops read: queries past the tile's and V rows past kv_len
@@ -160,33 +163,23 @@ void mla_attend_tiles_nax(
     using sv_t = decltype(v_slice(nullptr, 1));
     using pin_t = typename decltype(pv_op)::template cooperative_tensor_left_input_t<
         AccumType, T, AccumType>;
-    // A warp's output lanes, four 32-lane slices (WARP_LANES 128), each its own op's destination.
-    static_assert(!MLA_WARP_LANES_SET || NSL == 4, "four 32-lane slices a warp");
-    auto Oc0 = pv_op.template get_destination_cooperative_tensor<pin_t, sv_t, AccumType>();
-    auto Oc1 = pv_op.template get_destination_cooperative_tensor<pin_t, sv_t, AccumType>();
-    auto Oc2 = pv_op.template get_destination_cooperative_tensor<pin_t, sv_t, AccumType>();
-    auto Oc3 = pv_op.template get_destination_cooperative_tensor<pin_t, sv_t, AccumType>();
-    auto each_slice = [&](auto f) {
-        f(Oc0, 0);
-        f(Oc1, 1);
-        f(Oc2, 2);
-        f(Oc3, 3);
-    };
-    each_slice([&](thread auto& oc, short) {
-        STEEL_PRAGMA_UNROLL
-        for (uint16_t i = 0; i < oc.get_capacity(); ++i) oc[i] = 0;
-    });
+    // A warp's output lanes, NSL slices of SL lanes, each a P @ V op's destination: its
+    // registers lie as the op's destination's (fragments of kU columns, a lane's 4 of row sm then
+    // 4 of row sm + 8), as S's do.
+    otile_t O[NSL];
+    STEEL_PRAGMA_UNROLL
+    for (short s = 0; s < NSL; s++) O[s].clear();
 
-    constexpr int kPart = 32 * KQ / 2;
-    constexpr int kBufs = 2 * WM * WN * kPart * int(sizeof(AccumType)) <= 32768 ? 2 : 1;
+    constexpr int kPart = 32 * kSPerLane;
+    constexpr int kBufs = 2 * WM * WN * kPart * int(sizeof(AccumType)) <= int(MLA_TG_BYTES) ? 2 : 1;
     threadgroup AccumType sx[kBufs * WM * WN * kPart];
 
     for (int kb0 = 0; kb0 < kb_lim; kb0 += WN) {
         // This warp's page group's scores over the whole query, its three parts' ops summed.
         const int g = kb0 + wn;
-        AccumType Sg[KQ / 2];
+        AccumType Sg[kSPerLane];
         STEEL_PRAGMA_UNROLL
-        for (short i = 0; i < KQ / 2; i++) Sg[i] = 0;
+        for (short i = 0; i < kSPerLane; i++) Sg[i] = 0;
         if (g < kb_lim) {
             device T* kg = rows_at(k_cache, g * KQ);
             device T* vg = rows_at(v_cache, g * KQ);
@@ -208,12 +201,12 @@ void mla_attend_tiles_nax(
             qk_v_op.run(q_v, k_v, cv);
             qk_r_op.run(q_r, k_r, cr);
             STEEL_PRAGMA_UNROLL
-            for (short i = 0; i < KQ / 2; i++) Sg[i] = ck[i] + cv[i] + cr[i];
+            for (short i = 0; i < kSPerLane; i++) Sg[i] = ck[i] + cv[i] + cr[i];
         }
         threadgroup AccumType* part = sx + (kb0 / WN % kBufs) * (WM * WN * kPart);
         STEEL_PRAGMA_UNROLL
-        for (short i = 0; i < KQ / 2; i++) {
-            part[(simd_group_id * (KQ / 2) + i) * 32 + simd_lane_id] = Sg[i];
+        for (short i = 0; i < kSPerLane; i++) {
+            part[(simd_group_id * kSPerLane + i) * 32 + simd_lane_id] = Sg[i];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -227,7 +220,7 @@ void mla_attend_tiles_nax(
             stile_t S;
             STEEL_PRAGMA_UNROLL
             for (short i = 0; i < stile_t::kElemsPerTile; i++) {
-                S.elems()[i] = part[((rb * WN + t) * (KQ / 2) + i) * 32 + simd_lane_id];
+                S.elems()[i] = part[((rb * WN + t) * kSPerLane + i) * 32 + simd_lane_id];
             }
             STEEL_PRAGMA_UNROLL
             for (short i = 0; i < stile_t::kElemsPerTile; i++) {
@@ -262,27 +255,29 @@ void mla_attend_tiles_nax(
                 sum_score[i] = sum_score[i] * factor[i];
             }
             S.template row_reduce<SumOp>(sum_score);
-            // O's elements lie as S's: fragments of 16 columns, a lane's 4 of row sm then 4 of
-            // row sm + 8.
-            each_slice([&](thread auto& oc, short) {
-                STEEL_PRAGMA_UNROLL
-                for (uint16_t i = 0; i < oc.get_capacity(); ++i) oc[i] *= factor[(i % 8) / 4];
-            });
+            STEEL_PRAGMA_UNROLL
+            for (short s = 0; s < NSL; s++) O[s].template row_bin_op<MulOp>(factor);
 
-            // O += P V, this warp's lanes 32 at a time from the store that holds them.
+            // O += P V, this warp's lanes SL at a time from the store that holds them.
             const int live = min(int(kv_len) - key0, KQ);
             auto p = qk_k_op.template get_destination_cooperative_tensor<sqk_t, skk_t, AccumType>();
             STEEL_PRAGMA_UNROLL
-            for (short i = 0; i < KQ / 2; i++) p[i] = S.elems()[i];
+            for (short i = 0; i < kSPerLane; i++) p[i] = S.elems()[i];
             auto P = pv_op.template get_left_input_cooperative_tensor<AccumType, T, AccumType>(p);
             device T* kg = rows_at(k_cache, key0);
             device T* vg = rows_at(v_cache, key0);
-            each_slice([&](thread auto& oc, short s) {
+            STEEL_PRAGMA_UNROLL
+            for (short s = 0; s < NSL; s++) {
                 const int lane = int(wn) * DW + s * SL;
                 device T* base = lane < int(MLA_HALF) ? kg + lane : vg + (lane - int(MLA_HALF));
                 auto sV = v_slice(base, live);
+                auto oc = pv_op.template get_destination_cooperative_tensor<pin_t, sv_t, AccumType>();
+                STEEL_PRAGMA_UNROLL
+                for (uint16_t i = 0; i < oc.get_capacity(); ++i) oc[i] = O[s].elems()[i];
                 pv_op.run(P, sV, oc);
-            });
+                STEEL_PRAGMA_UNROLL
+                for (uint16_t i = 0; i < oc.get_capacity(); ++i) O[s].elems()[i] = oc[i];
+            }
         }
         if (kBufs == 1) {
             threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -297,18 +292,15 @@ void mla_attend_tiles_nax(
         return;
     }
     device T* o = out + (seq_start * MLA_HEADS + item0 + uint(tm)) * MLA_LATENT + uint(wn) * uint(DW);
-    each_slice([&](thread auto& oc, short s) {
-        otile_t Otile;
-        STEEL_PRAGMA_UNROLL
-        for (uint16_t i = 0; i < oc.get_capacity(); ++i) {
-            Otile.elems()[i] = oc[i] * rcp[(i % 8) / 4];
-        }
-        if (lim_rows < kU) {
-            Otile.store_rows(o + s * SL, int(MLA_LATENT), lim_rows);
+    STEEL_PRAGMA_UNROLL
+    for (short s = 0; s < NSL; s++) {
+        O[s].template row_bin_op<MulOp>(rcp);
+        if (lim_rows < BR) {
+            O[s].store_rows(o + s * SL, int(MLA_LATENT), lim_rows);
         } else {
-            Otile.store(o + s * SL, int(MLA_LATENT));
+            O[s].store(o + s * SL, int(MLA_LATENT));
         }
-    });
+    }
 }
 
 SCRATCHY_KERNEL(mla_attend_tiles_nax_f16, mla_attend_tiles_nax<half>)

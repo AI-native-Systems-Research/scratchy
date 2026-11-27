@@ -15,14 +15,19 @@ mod common;
 
 use common::Dtype;
 use objc2_metal::{MTLBuffer, MTLSize};
+use scratchy_ir::model_facts as mf;
 use scratchy_target_metal::aot::baked_build;
 use scratchy_target_metal::detect_device;
 use scratchy_target_metal::specialized_pipeline_cache::{
     ConstantValue, PipelineKey, SpecializedPipelineCache,
 };
-use scratchy_target_metal::tape::kernel_constants::MlaTileUnit;
+use scratchy_target_metal::tape::ids;
+use scratchy_target_metal::tape::kernel_constants::{
+    MlaAttendKernel, MlaAttendTiles, MlaAttendTiling, MlaCacheConstants, MlaConstants,
+    MlaPairing as Pairing, MlaRowConstants, MlaTileUnit,
+};
 use scratchy_target_metal::tape::lowered::MetalDtype;
-use scratchy_target_metal::tape::lowering::{mla_attend_tiles, mla_attend_tiling};
+use scratchy_target_metal::tape::lowering::mla_attend_tiling;
 use scratchy_target_metal::targets::is_nax_capable;
 
 type Device = objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLDevice>>;
@@ -438,7 +443,7 @@ fn head_mv_matches_reference() {
 
 // ── The MLA kernels ────────────────────────────────────────────────────────────────────────
 
-/// A latent attention's geometry, as the kernels' constants (slots 0 to 3) take it.
+/// A latent attention's geometry.
 #[derive(Clone, Copy)]
 struct Geom {
     heads: usize,
@@ -457,14 +462,31 @@ impl Geom {
     fn half(self) -> usize {
         self.row() / 2
     }
-    fn constants(self) -> Vec<ConstantValue> {
-        vec![
-            uint(0, self.heads),
-            uint(1, self.latent),
-            uint(2, self.nope),
-            uint(3, self.rope),
-        ]
+    /// The softmax scale the reference attends at.
+    fn scale(self) -> f32 {
+        1.0 / (self.q_head() as f32).sqrt()
     }
+    /// The geometry as the kernels' constants take it (its value head unread: the nope width).
+    fn mla(self) -> mf::Mla {
+        mf::Mla::new(
+            mf::QueryHeads::new(self.heads as u32),
+            mf::LatentRank::new(self.latent as u32),
+            mf::HeadDim::new(self.nope as u32),
+            mf::RotDim::new(self.rope as u32),
+            mf::HeadDim::new(self.nope as u32),
+            mf::AttnScale::new(self.scale()),
+        )
+        .expect("the geometry's latent attention")
+    }
+}
+
+/// `c`'s slots, its block table's stride `max_blocks`.
+fn constants(c: MlaConstants, max_blocks: usize) -> Vec<ConstantValue> {
+    let variant = scratchy_target_metal::tape::constants::TapeVariant {
+        cap: ids::MaxBlocksPerSeq(max_blocks as u32),
+    };
+    let slots: Vec<ConstantValue> = c.into();
+    slots.into_iter().map(|c| c.resolve(variant)).collect()
 }
 
 /// A paged pool of one layer's latent rows: its K and V halves, each one buffer of every block
@@ -525,13 +547,12 @@ impl Pool {
         (BF16.decode(&self.k, n), BF16.decode(&self.v, n))
     }
 
-    fn cache_constants(&self, g: Geom, max_blocks: usize) -> Vec<ConstantValue> {
-        vec![
-            uint(4, self.block_size),
-            uint(5, max_blocks),
-            uint(6, self.blocks_per_chunk),
-            uint(14, g.half()),
-        ]
+    fn cache(&self, g: Geom) -> MlaCacheConstants {
+        MlaCacheConstants {
+            block_size: ids::BlockSize(self.block_size as u32),
+            blocks_per_chunk: ids::BlocksPerChunk(self.blocks_per_chunk as u32),
+            half_row: ids::HalfRow(g.half() as u32),
+        }
     }
 }
 
@@ -551,28 +572,8 @@ fn rotary(positions: usize, rope: usize) -> Vec<f32> {
         .collect()
 }
 
-/// How a rope part's lanes pair, as slot 15 (`MLA_PAIRING`) states it.
-#[derive(Clone, Copy, Debug)]
-enum Pairing {
-    /// Lanes `(2i, 2i + 1)`: slot value 0.
-    Interleaved,
-    /// Lanes `(i, i + rope / 2)`, the NeoX split: slot value 1.
-    Halves,
-}
-
-impl Pairing {
-    const ALL: [Self; 2] = [Self::Interleaved, Self::Halves];
-
-    fn constant(self) -> ConstantValue {
-        uint(
-            15,
-            match self {
-                Self::Interleaved => 0,
-                Self::Halves => 1,
-            },
-        )
-    }
-}
+/// Every rope lane pairing an MLA kernel takes.
+const PAIRINGS: [Pairing; 2] = [Pairing::Interleaved, Pairing::Halves];
 
 /// `x`'s rope part rotated at `pos`, its lanes paired as `pairing` states.
 fn rotate(x: &[f32], table: &[f32], rope: usize, pos: usize, pairing: Pairing) -> Vec<f32> {
@@ -608,10 +609,20 @@ fn mla_rope_q_rotates_each_heads_rope_part() {
     let rows = positions.len();
     let q = fill(rows * g.heads * g.q_head(), 29);
     let table = rotary(512, g.rope);
-    for pairing in Pairing::ALL {
-        let mut constants = g.constants();
-        constants.push(uint(13, 32));
-        constants.push(pairing.constant());
+    for pairing in PAIRINGS {
+        let row = MlaRowConstants {
+            threads: ids::ThreadCount(32),
+            pairing,
+        };
+        let constants = constants(
+            MlaConstants {
+                mla: g.mla(),
+                cache: None,
+                attend: None,
+                row: Some(row),
+            },
+            1,
+        );
         let key = PipelineKey::new("mla", "mla_rope_q_bf16", constants);
         let pso = baked_build(&cache, &key).expect("mla_rope_q pipeline");
         let out = common::shared_zeroed(&device, q.len() * 2);
@@ -675,7 +686,7 @@ fn mla_append_writes_each_tokens_latent_row() {
         },
     ]
     .into_iter()
-    .flat_map(|g| Pairing::ALL.map(|p| (g, p)))
+    .flat_map(|g| PAIRINGS.map(|p| (g, p)))
     {
         let (block_size, bpc, blocks) = (4usize, 2usize, 6usize);
         let marker = 7.0;
@@ -688,10 +699,19 @@ fn mla_append_writes_each_tokens_latent_row() {
         let table = rotary(64, g.rope);
         // Fewer threads than lanes: each thread takes several.
         let threads = 256usize;
-        let mut constants = g.constants();
-        constants.extend(pool.cache_constants(g, 8));
-        constants.push(uint(13, threads));
-        constants.push(pairing.constant());
+        let row = MlaRowConstants {
+            threads: ids::ThreadCount(threads as u32),
+            pairing,
+        };
+        let constants = constants(
+            MlaConstants {
+                mla: g.mla(),
+                cache: Some(pool.cache(g)),
+                attend: None,
+                row: Some(row),
+            },
+            8,
+        );
         let key = PipelineKey::new("mla", "mla_append_bf16", constants);
         let pso = baked_build(&cache, &key).expect("mla_append pipeline");
         let out = common::shared_zeroed(&device, rows * g.rope * 2);
@@ -811,17 +831,23 @@ fn mla_attend_matches_reference() {
             &[0, 3, 5],
             &[vec![7, 2, 9], vec![4, 0]],
         );
-        let (rows, scale, max_blocks) = (case.rows, case.scale, case.max_blocks);
-        let mut constants = g.constants();
-        constants.extend(case.pool.cache_constants(g, max_blocks));
-        constants.extend([
-            ConstantValue::float(7, scale),
-            uint(8, heads_per_tg),
-            uint(9, simdgroups),
-            uint(10, parts),
-            uint(11, g.latent + 2),
-            uint(12, 256),
-        ]);
+        let (rows, max_blocks) = (case.rows, case.max_blocks);
+        let tiling = MlaAttendTiling {
+            heads_per_tg: ids::NumQHeads(heads_per_tg as u32),
+            simdgroups: ids::SimdgroupCount(simdgroups as u32),
+            parts: ids::KvPartitions(parts as u32),
+            partial: ids::PartialStride(g.latent as u32 + 2),
+            merge_threads: ids::ThreadCount(256),
+        };
+        let constants = constants(
+            MlaConstants {
+                mla: g.mla(),
+                cache: Some(case.pool.cache(g)),
+                attend: Some(MlaAttendKernel::Rows(tiling)),
+                row: None,
+            },
+            max_blocks,
+        );
         let key = PipelineKey::new("mla", "mla_attend_bf16", constants.clone());
         let pso = baked_build(&cache, &key).expect("mla_attend pipeline");
         let out = common::shared_zeroed(&device, rows * g.heads * g.latent * 2);
@@ -887,7 +913,6 @@ struct AttendCase {
     q: Buffer,
     rows: usize,
     max_blocks: usize,
-    scale: f32,
     want: Vec<f32>,
 }
 
@@ -939,7 +964,7 @@ impl AttendCase {
         let rows = *cu.last().unwrap() as usize;
         let q_latent = fill(rows * g.heads * g.latent, 43);
         let q = fill(rows * g.heads * g.q_head(), 47);
-        let scale = 1.0 / (g.q_head() as f32).sqrt();
+        let scale = g.scale();
         let mut want = vec![0.0f32; rows * g.heads * g.latent];
         for row in 0..rows {
             let s = (1..=seqs).find(|&s| row < cu[s] as usize).unwrap() - 1;
@@ -979,7 +1004,6 @@ impl AttendCase {
             q: bf16_buf(device, &q),
             rows,
             max_blocks,
-            scale,
             want,
         }
     }
@@ -1015,20 +1039,19 @@ fn mla_attend_tiles_matches_reference() {
         [(small, 16usize), (small, 32), (glm, 16), (glm, 32)].map(|(g, page)| (u, g, page))
     });
     for (unit, g, block_size) in shapes {
-        let half = (g.latent + g.rope) as u32 / 2;
-        let tile = mla_attend_tiles(
-            unit,
-            g.latent as u32,
-            g.rope as u32,
-            block_size as u32,
-            half,
-        );
-        let Some(tile) = tile else {
+        let mla = g.mla();
+        // Two blocks a chunk: a sequence's pages straddle chunks.
+        let blocks_per_chunk = 2;
+        let pool = MlaCacheConstants {
+            block_size: ids::BlockSize(block_size as u32),
+            blocks_per_chunk: ids::BlocksPerChunk(blocks_per_chunk as u32),
+            half_row: ids::HalfRow(g.half() as u32),
+        };
+        let Some(tile) = MlaAttendTiles::new(unit, &mla, &pool) else {
             // The matrix unit's 32-lane slices: the small row's 40-lane halves are none.
             assert!(unit == MlaTileUnit::Matrix && g.latent == small.latent);
             continue;
         };
-        let (warp_lanes, keys) = (tile.warp_lanes.get() as usize, tile.keys.get() as usize);
         // Sequence 0: a fresh 45-row prompt; 1: 70 cached rows, the last 21 this step's; 2: one
         // decode row over 37.
         let seq_used = [45u32, 70, 37];
@@ -1061,19 +1084,20 @@ fn mla_attend_tiles_matches_reference() {
         let case = AttendCase::new(
             &device,
             g,
-            (block_size, 2, blocks, max_blocks),
+            (block_size, blocks_per_chunk, blocks, max_blocks),
             &seq_used,
             &cu,
             &tables,
         );
-        let mut constants = g.constants();
-        constants.extend(case.pool.cache_constants(g, max_blocks));
-        constants.extend([
-            ConstantValue::float(7, case.scale),
-            uint(16, warp_lanes),
-            uint(17, keys),
-            uint(18, tile.blocks() as usize),
-        ]);
+        let constants = constants(
+            MlaConstants {
+                mla,
+                cache: Some(pool),
+                attend: Some(MlaAttendKernel::Tiles(tile)),
+                row: None,
+            },
+            max_blocks,
+        );
         let (library, function) = tile.kernel(MetalDtype::Bf16);
         let key = PipelineKey::new(library, function, constants);
         let pso = baked_build(&cache, &key).expect("mla_attend_tiles pipeline");
@@ -1098,11 +1122,11 @@ fn mla_attend_tiles_matches_reference() {
                 &case.v,
             ],
             size(
-                (most * g.heads).div_ceil(tile.queries() as usize),
+                (most * g.heads).div_ceil(tile.queries().get() as usize),
                 1,
                 seq_used.len(),
             ),
-            size(tile.threads() as usize, 1, 1),
+            size(tile.threads().get() as usize, 1, 1),
         ) {
             return;
         }
