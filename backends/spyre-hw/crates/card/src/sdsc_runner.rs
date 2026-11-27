@@ -11,9 +11,11 @@
 //! caller: the worker routes every sendnn bundle to `SuperDsc`. Under `sendnn` the only bundle that
 //! runs is the dxp-compiled SuperDSC bundle.
 
+/// The worker's [`LaunchEnd`] machinery names which suffix a forward launches by this enum's
+/// path through this module — re-exported, never restated.
+pub use crate::superdsc_exec::SuffixLaunch;
 use crate::superdsc_exec::{
-    DeferredRead, Executor, ForwardLatch, KvDim, NewTokens, PoolPages, SegIdx, SeqPos,
-    SuffixLaunch, Vocab,
+    DeferredRead, Executor, ForwardLatch, KvDim, NewTokens, PoolPages, SegIdx, SeqPos, Vocab,
 };
 use anyhow::{Result, anyhow};
 use scratchy_tensors::DType as SDType;

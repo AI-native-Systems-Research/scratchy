@@ -1161,7 +1161,13 @@ pub(crate) fn collect_decode_tokens(
     // landing: the arm order IS the submission order, and the FIFO guarantees
     // every older landing has fired once this read has landed — so the pops
     // are free, and the depth row returns to truth at every collect.
-    session.drain_steps_through(&sub.read.landing())?;
+    session
+        .drain_steps_through(&sub.read.landing())
+        .map_err(|e| {
+            werr(format!(
+                "draining the lead queue through the read's landing: {e}"
+            ))
+        })?;
     scratchy_serving_worker::step_segs::record_collect(
         scratchy_serving_worker::step_segs::CollectSegs {
             kind: sub.kind,
