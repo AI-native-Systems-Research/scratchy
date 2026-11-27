@@ -28,7 +28,7 @@ use crate::error::EngineResult;
 
 /// ⭐ #32 (C) — ONE DEFERRED STEP'S ANSWER CELL: filled by the drain that owns
 /// the step ([`crate::core_client::DrainDoor`]'s knock → the executor thread's
-/// `drain_until`), waited on by the resolver the deferred output carries.
+/// `drain_knock` pump), waited on by the resolver the deferred output carries.
 ///
 /// `fill` is ONE-WAY and single-shot — the double fill is an assert, because
 /// two drains taking one step is a queue-law violation, not a load-bearing
@@ -497,12 +497,19 @@ pub trait Executor: Send {
         Ok(())
     }
 
-    /// ⭐ #32 (C) — A KNOCK: drain the worker's in-flight queue until `cell`
-    /// is filled. Runs on the executor thread (the knock arrived from a
-    /// resolver on another thread); the pop inside the worker's drain is the
-    /// single authority, so the double-fill assert on [`DrainCell`] is the
-    /// loud boundary if two drains ever take one step. Default no-op.
-    fn drain_until(&mut self, _cell: &std::sync::Arc<DrainCell>) {}
+    /// ⭐ #32 (C) — A KNOCK'S NON-BLOCKING HALF: drain every step whose landing
+    /// has already fired, in submission order, stopping at the first that has
+    /// not, and say whether `cell` is filled. The knock's caller runs this in
+    /// [`drain_knock`]'s pump — feeding the executor every message that arrives
+    /// while the knock waits — so a queued Step's submit is never made to wait
+    /// behind the collect of a step already on the card. The pop inside the
+    /// worker's drain stays the single authority, so the double-fill assert on
+    /// [`DrainCell`] is the loud boundary if two drains ever take one step.
+    /// Default: nothing to drain — an executor whose worker never defers has no
+    /// knock to answer.
+    fn drain_ready(&mut self, _cell: &std::sync::Arc<DrainCell>) -> bool {
+        true
+    }
 
     /// Whether the executor is currently sleeping.
     fn is_sleeping(&self) -> bool {
@@ -535,6 +542,68 @@ pub trait Executor: Send {
 
     /// Shut down the executor and all workers.
     fn shutdown(&mut self);
+}
+
+/// ⭐ WHAT THE KNOCK'S PUMP LEARNED FROM THE CHANNEL: a message ran (keep
+/// feeding), another knock arrived (it joins the pending set), nothing is
+/// waiting (harvest what has landed), or the loop must stop — the teardown
+/// arrived, or the channel died, and the caller honors it through its own.
+pub enum Pumped {
+    /// A message ran — a Step fed the executor, or a side channel answered.
+    Ran,
+    /// Another knock arrived: the pump queues it with the rest.
+    Knock(std::sync::Arc<DrainCell>),
+    /// Nothing is waiting on the channel.
+    Idle,
+    /// The teardown arrived mid-pump.
+    Stop,
+}
+
+/// ⭐ FEED BEFORE HARVEST — the knock's drain loop, the one statement of the law.
+///
+/// A knock asks the executor to drain until its cell lands; a Step queued behind
+/// it asks to be submitted. The drain's park only ever waits on the device, and
+/// the device can only complete MORE work if the queued Step is submitted first
+/// — so while a knocked cell is unfilled, every message that arrives RUNS (a
+/// Step feeds the card; a later knock joins the pending set; the teardown stops
+/// the pump), only LANDED steps are harvested ([`Executor::drain_ready`], in
+/// submission order, never parking), and the loop sleeps a slice between
+/// attempts instead of parking the executor's one thread. FIFO is otherwise both
+/// callers' law; this is its one permitted reordering, safe because a Step's own
+/// churn drain fills cells through the same pop the knock takes — the pop in the
+/// worker's drain is the single authority over which drain owns a step.
+///
+/// Returns `true` when every knocked cell is filled, `false` when the teardown
+/// arrived (the caller breaks to its own shutdown tail).
+pub fn drain_knock(
+    executor: &mut dyn Executor,
+    knocks: &mut Vec<std::sync::Arc<DrainCell>>,
+    mut pump: impl FnMut(&mut dyn Executor) -> Pumped,
+) -> bool {
+    loop {
+        // FEED: everything that arrived runs before anything is harvested.
+        match pump(executor) {
+            Pumped::Ran => continue,
+            Pumped::Knock(cell) => {
+                knocks.push(cell);
+                continue;
+            }
+            Pumped::Stop => return false,
+            Pumped::Idle => {}
+        }
+        // HARVEST: the oldest unfilled knock, and only what has landed.
+        knocks.retain(|c| !c.is_filled());
+        let Some(oldest) = knocks.first().cloned() else {
+            return true;
+        };
+        if executor.drain_ready(&oldest) {
+            continue;
+        }
+        // PARK A SLICE: nothing landed, nothing queued — the device is still
+        // running the knocked step. The next round feeds the channel first: the
+        // Step that arrives is what keeps the device busy past this landing.
+        std::thread::sleep(std::time::Duration::from_micros(250));
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -367,11 +367,18 @@ pub trait Worker: Send {
         Ok(())
     }
 
-    /// ⭐ #32 (C) — A KNOCK: drain the in-flight queue until `cell` is filled.
-    /// The worker's own spelling of the executor trait's hook — the drain's
-    /// pop is the single authority over which drain owns a step. Default
-    /// no-op.
-    fn drain_until(&mut self, _cell: &std::sync::Arc<crate::executor::DrainCell>) {}
+    /// ⭐ #32 (C) — A KNOCK'S NON-BLOCKING HALF: the worker's spelling of the
+    /// executor trait's hook — drain every landed step in submission order,
+    /// stop at the first whose landing has not fired, and say whether `cell`
+    /// is filled. The knock's caller ([`crate::executor::drain_knock`]) feeds
+    /// the executor every message that arrives while the knock waits, so this
+    /// drain never parks the executor's one thread behind a step the device is
+    /// still running. The pop is the single authority over which drain owns a
+    /// step. Default: nothing to drain — a worker that never defers has no
+    /// knock to answer.
+    fn drain_ready(&mut self, _cell: &std::sync::Arc<crate::executor::DrainCell>) -> bool {
+        true
+    }
 
     /// The worker's global rank.
     fn rank(&self) -> usize;

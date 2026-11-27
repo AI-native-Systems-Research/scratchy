@@ -103,7 +103,8 @@ pub enum ExitSite {
 /// states.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DrainSite {
-    /// A knock: the executor's `drain_until`, sent by a deferred output's resolver.
+    /// A knock: the executor's `drain_ready` (fed first by `drain_knock`'s pump), sent
+    /// by a deferred output's resolver.
     Knock,
     /// A seating churn (a rung or seating change) draining the queue it replaces.
     Churn,

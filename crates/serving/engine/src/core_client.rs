@@ -185,7 +185,10 @@ enum PipelineMsg {
     ),
     /// ⭐ #32 (C) — A KNOCK: drain the worker's in-flight queue until the named
     /// cell is filled. Sent by a deferred output's resolver (another thread);
-    /// handled by [`executor_bg_loop`] through [`crate::executor::Executor::drain_until`].
+    /// handled by [`executor_bg_loop`] through [`crate::executor::drain_knock`]'s
+    /// pump, which feeds the executor every message that arrives while the
+    /// knock waits — a queued Step is submitted before the knock parks on a
+    /// step the card is still running.
     Knock(std::sync::Arc<crate::executor::DrainCell>),
     /// ⭐ #32 (C) — TEARDOWN. The worker holds a [`DrainDoor`] (a sender
     /// clone) for exactly this channel, so dropping the client's sender alone
@@ -284,7 +287,42 @@ fn executor_bg_loop(
                 let _ = reply.send(executor.embed(token_id_seqs));
             }
             PipelineMsg::Knock(cell) => {
-                executor.drain_until(&cell);
+                // ⭐ FEED BEFORE HARVEST ([`crate::executor::drain_knock`]): while
+                // this knock waits for its landing, every message that arrives runs
+                // first — the card is fed before it is harvested, so a queued Step's
+                // submit never waits behind the collect of a step already on the
+                // card. Without the pump, the knock for step N lands ahead of the
+                // pre-scheduled Step for N+1 (the resolver resolves before the next
+                // call pre-sends), the executor parks on N's landing, and decode
+                // serializes at depth 1 with the card idle behind every collect.
+                use crate::executor::{drain_knock, Pumped};
+                use std::sync::mpsc::TryRecvError;
+                let mut knocks = vec![cell];
+                let answered = drain_knock(&mut *executor, &mut knocks, |ex| match rx.try_recv() {
+                    Ok(PipelineMsg::Step(sched)) => {
+                        let result = ex.execute_model(&sched);
+                        if tx
+                            .send(PipelineResult::Step(sched, result))
+                            .is_err()
+                        {
+                            // The client is gone: the loop's own exit tail runs the
+                            // shutdown drain.
+                            return Pumped::Stop;
+                        }
+                        Pumped::Ran
+                    }
+                    Ok(PipelineMsg::Knock(cell)) => Pumped::Knock(cell),
+                    Ok(PipelineMsg::Embed(token_id_seqs, reply)) => {
+                        let _ = reply.send(ex.embed(token_id_seqs));
+                        Pumped::Ran
+                    }
+                    Ok(PipelineMsg::Shutdown) => Pumped::Stop,
+                    Err(TryRecvError::Empty) => Pumped::Idle,
+                    Err(TryRecvError::Disconnected) => Pumped::Stop,
+                });
+                if !answered {
+                    break;
+                }
             }
             PipelineMsg::Shutdown => break,
         }

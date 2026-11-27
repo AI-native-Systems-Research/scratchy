@@ -224,8 +224,14 @@ impl Executor for UniProcExecutor {
         self.worker.set_drain_door(door);
     }
 
-    fn drain_until(&mut self, cell: &std::sync::Arc<scratchy_serving_engine::executor::DrainCell>) {
-        self.worker.drain_until(cell);
+    /// ⭐ #32 (C) — straight through to the worker: it is the thing that owns
+    /// the in-flight queue a knock asks to drain, and only the steps of it that
+    /// have landed (the knock's pump feeds the executor while it waits).
+    fn drain_ready(
+        &mut self,
+        cell: &std::sync::Arc<scratchy_serving_engine::executor::DrainCell>,
+    ) -> bool {
+        self.worker.drain_ready(cell)
     }
 
     /// Straight through to the worker: it owns the devices the thread drives.

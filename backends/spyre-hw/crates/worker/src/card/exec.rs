@@ -20,7 +20,7 @@ use crate::spyre_worker::*;
 ///     block_table honored; rows don't cross-contaminate).
 impl SpyreWorker {
     /// ⭐ #32 (c4) — THE DRAIN'S ONE POP: collect one in-flight step and own its whole
-    /// bookkeeping. The same body runs for every caller — the knock (`drain_until`), the
+    /// bookkeeping. The same body runs for every caller — the knock (`drain_ready`), the
     /// in-call drain of a driver with no drain door, and the entry-drain that empties the
     /// queue before the next step builds its launch — so there is one collect path, not one
     /// per driver. The step's cell is filled here (with the step's own error if the collect
@@ -169,6 +169,19 @@ pub(crate) struct InFlightStep {
     pub(crate) seat: crate::card::types::StepSeat,
     /// What the step owes, and the bookkeeping the drain owns for it.
     pub(crate) owed: Owed,
+}
+
+impl InFlightStep {
+    /// ⭐ HAS THIS STEP'S CARD WORK LANDED — the non-blocking ask the knock's drain
+    /// makes before it collects. The park the drain would otherwise take lives in the
+    /// read's finish, so the read's own peek handle (which cannot wait, BY TYPE) is
+    /// exactly the fact "collecting this step now would not park": `fired` says the
+    /// card has retired the step and the D2H is complete. A step that has not landed
+    /// stays QUEUED — the knock's pump then feeds the card the Step arrived behind the
+    /// knock, and only a card that stays busy past this landing is harvested late.
+    pub(crate) fn landed(&self) -> bool {
+        self.sub.read.signal().fired()
+    }
 }
 
 /// ⭐ WHAT ONE SUBMITTED STEP OWES ITS CALLERS — the drain's bookkeeping, named by the

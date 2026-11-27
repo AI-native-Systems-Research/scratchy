@@ -931,19 +931,36 @@ impl Worker for SpyreWorker {
         self.drain_door = Some(door);
     }
 
-    /// ⭐ #32 (c4) — A KNOCK: drain in-flight steps until the named cell lands. The knock is a
-    /// deferred output's resolver asking — it runs on the engine thread while THIS thread owns
-    /// the queue, which is why the answer is a cell and not a return value.
+    /// ⭐ #32 (c4) — A KNOCK'S NON-BLOCKING HALF: drain the in-flight steps that have
+    /// already landed, in submission order, stopping at the first whose landing has not
+    /// fired, and say whether the named cell is filled. The knock is a deferred output's
+    /// resolver asking — it runs on the engine thread while THIS thread owns the queue,
+    /// which is why the answer is a cell and not a return value. The caller
+    /// (`drain_knock`'s pump) feeds this thread every Step that arrives while the knock
+    /// waits, so this drain never parks the executor behind a step the card is still
+    /// running — a queued Step's submit is what keeps the card busy past that landing.
     #[cfg(feature = "spyre-hw")]
-    fn drain_until(&mut self, cell: &std::sync::Arc<scratchy_serving_engine::executor::DrainCell>) {
+    fn drain_ready(
+        &mut self,
+        cell: &std::sync::Arc<scratchy_serving_engine::executor::DrainCell>,
+    ) -> bool {
         while !cell.is_filled() {
             let Some(infl) = self.in_flight.pop_front() else {
                 // A verdict computed over nothing must FAIL, never invent tokens.
                 cell.fill(Err(scratchy_serving_engine::error::EngineError::Executor(
                     "drain: the in-flight queue emptied before this step landed".into(),
                 )));
-                return;
+                return true;
             };
+            // FEED-FIRST: the first step whose landing has not fired stays queued — the
+            // pump runs the Step arrived behind this knock and feeds the card before
+            // this drain collects what it owes. The landed check is the read's own peek
+            // handle — it cannot wait, BY TYPE — so the park stays where it always was:
+            // in the caller's slices, never on this thread.
+            if !infl.landed() {
+                self.in_flight.push_front(infl);
+                return false;
+            }
             let Some(model) = self.model.as_mut() else {
                 let e = scratchy_serving_engine::error::EngineError::Executor(
                     "drain: the model is not loaded".into(),
@@ -953,7 +970,7 @@ impl Worker for SpyreWorker {
                         "drain: the model is not loaded".into(),
                     )));
                 cell.fill(Err(e));
-                return;
+                return true;
             };
             // (the knock's own drain — the site tag records before the collect runs)
             scratchy_serving_worker::step_segs::record_drain(
@@ -970,9 +987,10 @@ impl Worker for SpyreWorker {
                         format!("drain: an earlier in-flight step failed: {e}"),
                     )));
                 }
-                return;
+                return true;
             }
         }
+        true
     }
 
     fn rank(&self) -> usize {
