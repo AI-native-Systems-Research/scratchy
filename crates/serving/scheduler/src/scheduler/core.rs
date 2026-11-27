@@ -3025,6 +3025,17 @@ impl Scheduler {
                         .unwrap_or(0);
                     request.num_output_placeholders += 1 + cur_num_spec_tokens;
                 }
+                // SCHED TRACE: the update's own outcome — computed advanced, the
+                // is_prefill_chunk verdict, the placeholder it gated.
+                if std::env::var_os("SCRATCHY_SCHED_TRACE").is_some() {
+                    eprintln!(
+                        "[sched-trace]   update {} c={} ph={} prefill={}",
+                        req_id,
+                        request.num_computed_tokens,
+                        request.num_output_placeholders,
+                        request.is_prefill_chunk,
+                    );
+                }
             }
         }
 
@@ -3147,6 +3158,16 @@ impl Scheduler {
             request.num_output_placeholders = request
                 .num_output_placeholders
                 .saturating_sub(token_ids.len() as u32);
+            // SCHED TRACE: the finalize side — tokens landed, placeholders spent.
+            if std::env::var_os("SCRATCHY_SCHED_TRACE").is_some() {
+                eprintln!(
+                    "[sched-trace]   append {} +{} t={} ph={}",
+                    request_id,
+                    token_ids.len(),
+                    request.num_tokens(),
+                    request.num_output_placeholders,
+                );
+            }
         }
         // Also update the running list copy via O(1) index lookup.
         if let Some(&idx) = self.running_req_idx.get(request_id) {
@@ -3381,6 +3402,25 @@ impl SchedulerInterface for Scheduler {
                 .num_tokens_with_spec()
                 .saturating_add(request.num_output_placeholders as usize)
                 .saturating_sub(request.num_computed_tokens as usize);
+
+            // SCHED TRACE (SCRATCHY_SCHED_TRACE): the running loop's own arithmetic, verbatim —
+            // the raw new-token count with the counters that produced it. The decode
+            // pipelining question is exactly here: `new_raw=0` on a step whose predecessor is
+            // still unfinalized is the starved pipeline (no placeholder covers the in-flight
+            // step), and the t/c/ph triple says which counter moved wrong. Same diag-print
+            // practice as the engine's SCRATCHY_TTFT_PHASE: a read-only trace, never behavior.
+            if std::env::var_os("SCRATCHY_SCHED_TRACE").is_some() {
+                eprintln!(
+                    "[sched-trace] sched {} new_raw={} t={} c={} ph={} prefill={} budget={}",
+                    request.request_id,
+                    num_new_tokens_raw,
+                    request.num_tokens(),
+                    request.num_computed_tokens,
+                    request.num_output_placeholders,
+                    request.is_prefill_chunk,
+                    token_budget,
+                );
+            }
 
             let mut num_new_tokens = num_new_tokens_raw;
 
