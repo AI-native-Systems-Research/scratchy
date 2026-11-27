@@ -13,8 +13,6 @@ use scratchy_serving_worker::error::ExecutorResult;
 use scratchy_target_spyre::paged_step::{BatchSeq, StepRows};
 #[cfg(not(feature = "spyre-hw"))]
 use scratchy_target_spyre::runner::SpyreSession;
-#[cfg(feature = "spyre-hw")]
-use scratchy_target_spyre_card::sdsc_runner::StepLogits;
 
 /// The KTIR-emulator twin of [`forward_chunk`]: one fused forward through the resident session,
 /// with the prefix KV threaded from the host cache.

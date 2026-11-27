@@ -78,7 +78,12 @@ pub struct SubmitSegs {
 /// everything enqueued behind the read too, which is the pipeline's own cadence, not
 /// an artifact) and the pick decode. Recorded where the reads are fenced, which under
 /// deferral is a later drain, not the submitting step's own call.
+///
+/// `kind` routes the row: a DECODE step's collect lands in the decode table; a
+/// CHUNK's lands in its own kind's chunk table (the prompt-final pick's fence — the
+/// one host wait a prompt meets — files under `Chunk`, where its submit did).
 pub struct CollectSegs {
+    pub kind: StepKind,
     pub fence: Duration,
     pub pick: Duration,
 }
@@ -99,6 +104,21 @@ pub enum ChunkKind {
     Final,
     /// A wave of continuation tails on a packed rung: one launch, `s` windows.
     Packed,
+}
+
+/// ⭐ WHICH TABLE A SUBMITTED STEP'S SEGMENTS FILE UNDER — the routing fact the owed
+/// pick carries from its submit to its collect, so the two land in the same table:
+/// `Decode` is the decode table, `Chunk(k)` the chunk table's kind `k`. Keyed by the
+/// launch's own rows and end, never by a model or a geometry.
+///
+/// `pub` for the same reason [`SubmitSegs`] states: the only caller is a target's
+/// worker crate, which a build may not link.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StepKind {
+    /// A decode batch — the decode table's own population.
+    Decode,
+    /// A prompt chunk or a wave of tails — the chunk table's, at its kind.
+    Chunk(ChunkKind),
 }
 
 impl ChunkKind {
@@ -126,19 +146,17 @@ impl ChunkKind {
     }
 }
 
-/// One prompt-chunk launch's SUBMIT-half segments, clocked by the chunk's eager
-/// door and flushed here in one lock. The spans are the door's own coarse
-/// halves — the tree this was typed under runs a chunk through one eager door
-/// (`run_bound`: bind, submit and the wait, inseparable without changing when a
-/// step waits), so the table states what that door costs as it stands:
-/// `stage` (everything the host staged before the door), `door` (the whole
-/// eager call), and `fence` (the pick read after it — prompt-final chunks only;
-/// `None` for a middle chunk, absent from that segment's mean, never a recorded
-/// zero). `depth` counts CHUNK submissions outstanding, this launch included —
-/// its own population, never the decode table's. `busy` is the same prior-read
-/// latch the decode arm's busy row reads: the previous DECODE step's stick read
-/// had not yet landed when this chunk's door was called — the one cross-population
-/// card-owed fact a non-blocking peek can state.
+/// One prompt-chunk launch's SUBMIT-half segments, clocked by the chunk's submit
+/// and flushed here in one lock: `stage` (everything the host staged before the
+/// door), `door` (the submit — every card's binds, then its doorbell, no wait),
+/// and `fence` (the prompt-final pick's collect, recorded through
+/// [`record_collect`] where the one collect door runs it — `None` at the submit,
+/// absent from that segment's mean, never a recorded zero). `depth` counts the
+/// card's submissions outstanding at the submit, this launch included — the lead
+/// card's own step-queue depth, every step of the engine's alike (a chunk queued
+/// behind a decode owes that decode's work, and the reverse). `busy` is the
+/// last-armed landing's peek — the previous step's, whatever kind it was: not yet
+/// fired is the card owing work when this chunk queued.
 ///
 /// `pub` for the reason [`SubmitSegs`] states — the caller is a target's worker
 /// crate a build may not link.
@@ -311,11 +329,20 @@ pub fn record_submit(s: SubmitSegs) {
 }
 
 /// Flush one step's collect-half segments — the fence and the pick decode, recorded
-/// where the reads are fenced (the sync composition, or a drain under deferral).
+/// where the reads are fenced (the sync composition, or a drain under deferral). The
+/// step's kind routes the row: a decode step's into the decode table, a chunk's into
+/// its own kind's chunk table (the fence row its submit left for the collect to fill).
 pub fn record_collect(s: CollectSegs) {
     let mut t = stats();
-    t.fence.add(s.fence);
-    t.pick.add(s.pick);
+    match s.kind {
+        StepKind::Decode => {
+            t.fence.add(s.fence);
+            t.pick.add(s.pick);
+        }
+        StepKind::Chunk(k) => {
+            t.chunks[k.slot()].fence.add(s.fence);
+        }
+    }
 }
 
 /// Flush one prompt-chunk launch's segments (`pub` for the reason [`ChunkSegs`]'s
@@ -443,12 +470,12 @@ pub fn chunk_segment_table() -> Option<String> {
             ),
             (
                 "door",
-                "run_bound (bind + submit + the eager wait, inseparable today)",
+                "the submit (every card's binds, then its doorbell — no wait)",
                 &c.door,
             ),
             (
                 "fence",
-                "the pick read after the door (prompt-final chunks only)",
+                "the prompt-final pick's collect (the read's park, in the one collect door)",
                 &c.fence,
             ),
         ];

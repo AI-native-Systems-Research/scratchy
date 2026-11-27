@@ -147,6 +147,16 @@ pub struct StepLanding {
     pub forwards: Vec<ForwardLatch>,
 }
 
+impl StepLanding {
+    /// The lead card's (rank 0's) forward latch — a readless step's queue-arm form: the
+    /// landing the lead card's step queue takes when nobody reads this step's pick. The
+    /// forwards are in rank order by construction (one per card the step spans), so rank 0
+    /// is the front, never an index to agree on.
+    pub fn lead(&self) -> &ForwardLatch {
+        &self.forwards[0]
+    }
+}
+
 /// ⭐ WHAT ONE SUBMITTED STEP OWES ITS CALLER — the typed landing (design §3.2: a step is
 /// submitted, not run). The doorbells ring and the host returns; what the step owes rides this
 /// value to whoever drains it, in submission order:
@@ -805,20 +815,6 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> SuperDscSession<'a, 'c, T> {
         self.ranks.first().keyed_holds(id)
     }
 
-    /// ⭐ #32 (A) — ONE PIPELINED STEP'S SUBMIT HALF: [`Self::submit_bound`] with nothing to
-    /// bind — the shadow already holds every input. The doorbell is rung and the host returns;
-    /// nothing here waits (see `Executor::submit_step`). The step's landing is handed back for
-    /// the caller's cadence: the queue arm, the probes, the peers' settle at a collect.
-    pub fn submit_step(
-        &mut self,
-        n_new: usize,
-        seq_pos: usize,
-        suffix: SuffixLaunch,
-    ) -> Result<StepLanding> {
-        self.submit_bound(&StepBinds::NONE, n_new, seq_pos, suffix)
-            .map(|(_, landed)| landed)
-    }
-
     /// ⭐ BIND AND SUBMIT ONE PIPELINED STEP — every card's binds ([`Self::bind_all`]), then
     /// every card's doorbell in one parallel section, waiting on nothing. §3.5's protected
     /// shape, unchanged: ONE bind pass, ONE parallel submit — problem 1's measured work, byte
@@ -826,6 +822,8 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> SuperDscSession<'a, 'c, T> {
     /// landing: rank `r`'s [`ForwardLatch`] for the forward this step submitted on card `r`,
     /// armed on the forward's last submission, so the caller arms the lead card's step queue
     /// with it, probes what the card still owes, and settles every peer at a pick's collect.
+    /// Every launch binds — a step whose shadow already holds every input binds the empty
+    /// [`StepBinds::NONE`] — which is why there is no second, bindless submit door.
     pub fn submit_bound(
         &mut self,
         b: &StepBinds<'_, '_>,
@@ -861,6 +859,27 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> SuperDscSession<'a, 'c, T> {
     /// never a host count restated beside them.
     pub fn lead_steps(&mut self) -> &flex_rs::step::StepQueue<'a> {
         self.lead().steps()
+    }
+
+    /// ⭐ RETIRE THE LEAD'S LANDED STEPS THROUGH ONE — pop the lead card's queue oldest-first
+    /// until (and including) `through`, the landing the collected step armed. The launch
+    /// stream is in order, so a step whose read has landed has every older landing fired:
+    /// each pop's park returns immediately, and what the queue keeps is exactly the steps
+    /// still outstanding — the depth fact, returned to truth at every collect. Called by the
+    /// one collect door, with the collected step's own read as `through`.
+    pub fn drain_steps_through(
+        &mut self,
+        through: &std::sync::Arc<flex_rs::step::Landing>,
+    ) -> Result<()> {
+        loop {
+            let popped = self
+                .lead_steps()
+                .drain_oldest()
+                .map_err(|e| anyhow!("{e}"))?;
+            if std::sync::Arc::ptr_eq(&popped, through) {
+                return Ok(());
+            }
+        }
     }
 
     /// ⭐ #32 (A) — ENQUEUE THE STEP'S STICK READ, no drain: the D2H rides the

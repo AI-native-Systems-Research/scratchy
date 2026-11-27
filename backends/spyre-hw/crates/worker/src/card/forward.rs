@@ -14,16 +14,20 @@ use scratchy_serving_worker::error::ExecutorResult;
 use scratchy_target_spyre::paged_step::{BatchSeq, StepRows};
 #[cfg(not(feature = "spyre-hw"))]
 use scratchy_target_spyre::runner::SpyreSession;
-#[cfg(feature = "spyre-hw")]
-use scratchy_target_spyre_card::sdsc_runner::StepLogits;
 
-/// ⭐ #32 (c3) — A SUBMITTED DECODE STEP: the launch is on the card, the
+/// ⭐ #32 (c3) — A SUBMITTED LAUNCH THAT PICKS: the launch is on the card, the
 /// idx-stick read is enqueued, nothing collected. Everything the collect half
-/// needs to turn the ring slot back into tokens. The RUNG INDEX travels beside
+/// needs to turn the ring slot back into tokens — a decode step's picks, or a
+/// prompt-final chunk's first generated token. The RUNG INDEX travels beside
 /// it in the caller, because each rung owns its own session and only that
 /// session's executor can finish the read.
 pub(crate) struct SubmittedDecode {
+    /// What was submitted — the step-segment table's row the collect lands in.
+    pub(crate) kind: scratchy_serving_worker::step_segs::StepKind,
     pub(crate) read: scratchy_target_spyre_card::superdsc_exec::DeferredRead,
+    /// The step the pick belongs to, on every card it spans — its collect hands the step
+    /// back retired on every card ([`collect_decode_tokens`]).
+    pub(crate) step: scratchy_target_spyre_card::sdsc_runner::StepLanding,
     /// The launch's own typed width ([`SeatWidth`]) the submit half minted.
     pub(crate) rows: SeatWidth,
     /// The idx stick's own row size in i32 words — the seat's typed readback
@@ -47,56 +51,172 @@ pub(crate) struct SubmittedDecode {
     )>,
 }
 
-/// What `run_card_launch` hands back: a finished step's picks, or a
-/// submitted decode step whose read is deferred. A decode batch is ALWAYS the
-/// latter — one decode path — and a schedule that cannot defer collects it
-/// in-call through the same [`collect_decode_tokens`] door.
-pub(crate) enum BatchOut {
-    Done(Option<Vec<u32>>),
-    Deferred(SubmittedDecode),
+/// ⭐ WHAT A LAUNCH'S SUFFIX DOES, AS THE LAUNCH'S TYPE — whether it picks. A launch is staged and
+/// submitted the same way whatever its end ([`run_card_launch`] is one body); the end decides only
+/// whether the suffix runs and whether a pick's read is deferred behind it. So a decode step
+/// cannot come back without its pick, and a chunk that does not finish its prompt cannot come
+/// back with one: the caller names the end the request's own state gives it ([`Picks`] for a
+/// decode, a prompt-final chunk, a wave that finishes a prompt; [`Forwards`] otherwise).
+pub(crate) trait LaunchEnd {
+    /// The suffix this end launches.
+    const SUFFIX: scratchy_target_spyre_card::sdsc_runner::SuffixLaunch;
+    /// What this end's read needs of the launch's sampler seat — taken before anything stages.
+    type Seat<'s>;
+    /// What the launch hands back.
+    type Out;
+    /// The end's seat, from the launch's own `(seat, width)` pair: [`Picks`] refuses a bundle
+    /// that mints no draw — before anything stages.
+    fn seat<'s>(
+        seat: Option<(&'s scratchy_target_spyre::wiring::SampleSeat, SeatWidth)>,
+        b: &BundleMeta,
+    ) -> ExecutorResult<Self::Seat<'s>>;
+    /// After the doorbell: defer what this end owes, and ARM THE STEP'S LANDING on the lead
+    /// card's step queue — the read's own landing when this end picks (it fires behind the
+    /// forward on the FIFO, so waiting it proves the forward retired), the forward latch when
+    /// it does not — feeding the busy probe the same landing's peek. The duration returned is
+    /// the defer's own (the step-segment table's `defer` row), `None` when nothing was
+    /// deferred.
+    fn defer(
+        pf: &mut SuperDscSession,
+        seat: Self::Seat<'_>,
+        b: &BundleMeta,
+        vocab: usize,
+        kind: scratchy_serving_worker::step_segs::StepKind,
+        step: scratchy_target_spyre_card::sdsc_runner::StepLanding,
+    ) -> ExecutorResult<(Self::Out, Option<std::time::Duration>)>;
 }
 
-/// ⭐ #32 (E) — THE OVERLAP PROBE'S PROCESS-WIDE STATE, in the same idiom
-/// `step_segs` states the reason for: the submit half's borrows (the session,
-/// `Shared`, the launcher) cannot thread a worker field, and the lock is
-/// uncontended against a ~24 ms step. Holds the PREVIOUS decode step's stick
-/// read as its peek handle — `fired()` is the whole of its surface, so asking
-/// "is the card still busy" is a latch read, never a wait.
-static PRIOR_READ: std::sync::Mutex<Option<scratchy_target_spyre_card::runtime::ReadPeek>> =
-    std::sync::Mutex::new(None);
+/// A launch whose pick nobody reads — a prompt chunk that does not finish its prompt, a wave none
+/// of whose tails finishes. Its suffix never runs and nothing is read back: the launch is
+/// submitted and the host moves on.
+pub(crate) struct Forwards;
 
-/// ⭐ THE DEPTH ROW'S OWN COUNT: decode submissions outstanding, incremented at
-/// each deferred submit and decremented at each collect — the same population
-/// the worker's in-flight queue holds, stated once, process-wide, so the depth
-/// row counts exactly the submissions the pipeline has not yet collected.
-static OUTSTANDING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+impl LaunchEnd for Forwards {
+    const SUFFIX: scratchy_target_spyre_card::sdsc_runner::SuffixLaunch =
+        scratchy_target_spyre_card::sdsc_runner::SuffixLaunch::Skipped;
+    type Seat<'s> = ();
+    type Out = ();
 
-/// ⭐ THE CHUNK TABLE'S OWN DEPTH COUNT: prompt-chunk submissions outstanding,
-/// incremented at each recorded chunk door and decremented the moment the door
-/// returns — its own population, never the decode table's, so a chunk depth of
-/// 1 states "the host waited this chunk out before staging the next" without
-/// the decode pipeline's count ever diluting it.
-static CHUNKS_OUTSTANDING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    fn seat<'s>(
+        _seat: Option<(&'s scratchy_target_spyre::wiring::SampleSeat, SeatWidth)>,
+        _b: &BundleMeta,
+    ) -> ExecutorResult<Self::Seat<'s>> {
+        Ok(())
+    }
 
-/// ⭐ THE CHUNK TABLE'S KIND, keyed by the launch's own rows and want — never by
-/// a model or a geometry: a wave of tails is a packed launch whatever it wants;
-/// a sequence launch is a middle chunk when it wants nothing and the
-/// prompt-final chunk when it wants the last row. A decode batch (and a
-/// sequence the schedule deferred) is the DECODE table's own population —
-/// `None`, not recorded here, never a zero row.
-fn chunk_kind_of(
-    rows: &LaunchRows<'_>,
-    want: &LogitsWanted,
-) -> Option<scratchy_serving_worker::step_segs::ChunkKind> {
-    use scratchy_serving_worker::step_segs::ChunkKind;
-    match (rows, want) {
-        (LaunchRows::Packed { .. }, _) => Some(ChunkKind::Packed),
-        (LaunchRows::Sequence { .. }, LogitsWanted::None) => Some(ChunkKind::Middle),
-        (LaunchRows::Sequence { .. }, LogitsWanted::LastRow) => Some(ChunkKind::Final),
-        (LaunchRows::Batch { .. }, _)
-        | (LaunchRows::Sequence { .. }, LogitsWanted::PerRequestDeferred) => None,
+    fn defer(
+        pf: &mut SuperDscSession,
+        _seat: (),
+        _b: &BundleMeta,
+        _vocab: usize,
+        _kind: scratchy_serving_worker::step_segs::StepKind,
+        step: scratchy_target_spyre_card::sdsc_runner::StepLanding,
+    ) -> ExecutorResult<((), Option<std::time::Duration>)> {
+        // ⭐ READLESS: THE LANDING IS THE FORWARD'S OWN LATCH — the queue's depth counts this
+        // step until a later collect pops through its own landing behind it, and the busy
+        // probe holds its peek across the next submit.
+        if let scratchy_target_spyre_card::superdsc_exec::ForwardLatch::Queued(s) = step.lead() {
+            pf.lead_steps().arm(s.landing());
+            *PRIOR_LANDING.lock().expect("the busy probe's own lock") = Some(s.peek_handle());
+        }
+        Ok(((), None))
     }
 }
+
+/// A launch that picks — a decode step, a prompt's final chunk, a wave that finishes a prompt. Its
+/// suffix runs, the minted sampler consumes the `[rows, vocab]` result on the card and leaves the
+/// idx stick in its place, and the ONE raw D2H of that stick is deferred into its own ring slot —
+/// never a logits read, never a host argmax. The caller collects it through
+/// [`collect_decode_tokens`] where it needs the token: the drain, or in-call.
+pub(crate) struct Picks;
+
+impl LaunchEnd for Picks {
+    const SUFFIX: scratchy_target_spyre_card::sdsc_runner::SuffixLaunch =
+        scratchy_target_spyre_card::sdsc_runner::SuffixLaunch::Launched;
+    type Seat<'s> = (&'s scratchy_target_spyre::wiring::SampleSeat, SeatWidth);
+    type Out = SubmittedDecode;
+
+    fn seat<'s>(
+        seat: Option<(&'s scratchy_target_spyre::wiring::SampleSeat, SeatWidth)>,
+        b: &BundleMeta,
+    ) -> ExecutorResult<Self::Seat<'s>> {
+        seat.ok_or_else(|| {
+            werr(format!(
+                "bundle has no sampler seat (result t{}) — a launch cannot pick without the \
+                 minted draw",
+                b.result_id
+            ))
+        })
+    }
+
+    fn defer(
+        pf: &mut SuperDscSession,
+        (seat, seat_width): Self::Seat<'_>,
+        b: &BundleMeta,
+        vocab: usize,
+        kind: scratchy_serving_worker::step_segs::StepKind,
+        step: scratchy_target_spyre_card::sdsc_runner::StepLanding,
+    ) -> ExecutorResult<(SubmittedDecode, Option<std::time::Duration>)> {
+        let t_defer = std::time::Instant::now();
+        // The readback's own byte size — the seat's typed fact (the idx stick's placed row,
+        // minted once at the bake), never a recomputed `mq · 64 · 4`, at the launch's one typed
+        // width. The RING landing, never the shadow's: the pick is read after the doorbell, with
+        // this launch's own preamble H2D possibly still queued behind the card's earlier work, and
+        // a ring slot is the one landing no host write can move under that transfer.
+        let read = pf
+            .defer_read_tensor_ring(
+                scratchy_target_spyre::bundle_code::PlaceId::Act(b.result_id as u32),
+                seat_width.get() * seat.idx_row_words as usize * 4,
+            )
+            .map_err(|e| werr(format!("superdsc idx read (t{}): {e}", b.result_id)))?;
+        let deferred = t_defer.elapsed();
+        // ⭐ READ-BEARING: THE LANDING IS THE READ'S OWN (design §3.8.2 — the D2H already
+        // carries it), armed right behind the forward on the FIFO; the busy probe holds its
+        // peek across the next submit.
+        pf.lead_steps().arm(read.landing());
+        *PRIOR_LANDING.lock().expect("the busy probe's own lock") = Some(read.signal());
+        // ⭐ THE SEAT'S OWN LOGITS, DEFERRED BESIDE THE PICK (debug only): the
+        // ring grows a slot in place for the wider read, and the enqueue's
+        // stream order is the idx read's own — the next step on this rung
+        // cannot write the seat before this read has taken it.
+        let dbg_seat = if tracing::enabled!(tracing::Level::DEBUG) {
+            pf.defer_read_tensor_ring(
+                scratchy_target_spyre::bundle_code::PlaceId::Act(seat.row),
+                seat_width.get() * seat.pad_vocab as usize * 2,
+            )
+            .ok()
+            .map(|r| (r, seat.row, seat.pad_vocab as usize))
+        } else {
+            None
+        };
+        Ok((
+            SubmittedDecode {
+                kind,
+                read,
+                step,
+                rows: seat_width,
+                // The collect half's own typed readback fact — the idx
+                // stick's row size, carried beside the launch's typed width
+                // so the decode law never re-derives it.
+                idx_row_words: seat.idx_row_words,
+                result_id: b.result_id as u32,
+                vocab,
+                dbg_seat,
+            },
+            Some(deferred),
+        ))
+    }
+}
+
+/// ⭐ THE BUSY PROBE'S PROCESS-WIDE STATE, in the same idiom `step_segs` states
+/// the reason for: the submit half's borrows (the session, `Shared`, the
+/// launcher) cannot thread a worker field, and the lock is uncontended against
+/// a step. Holds the LAST-ARMED landing's peek handle — the previous step's,
+/// whatever kind it was (a decode's stick read, a chunk's forward latch) —
+/// `fired()` is the whole of its surface, so asking "is the card still busy"
+/// is a latch read, never a wait.
+static PRIOR_LANDING: std::sync::Mutex<Option<scratchy_target_spyre_card::runtime::ReadPeek>> =
+    std::sync::Mutex::new(None);
 
 /// ⭐ WHAT ONE CARD LAUNCH'S ROWS ARE, for the paged step: one sequence's rows — a prompt chunk, or
 /// the one-request decode — or one token of each of a decode batch's sequences. Each names its KV
@@ -220,9 +340,9 @@ impl SeatWidth {
     }
 }
 
-/// ⭐ THE SUFFIX'S MINTED SAMPLER, ONE BUNDLE: where the seeds come from, whether
-/// the lm-head tail runs, and the per-row seat laws — the three facts that
-/// describe the launch's sampling half rather than its forward body.
+/// ⭐ THE SUFFIX'S MINTED SAMPLER, ONE BUNDLE: where the seeds come from and the per-row
+/// seat laws — the facts that describe the launch's sampling half rather than its forward
+/// body. Whether the suffix runs at all is the launch's END, its type ([`LaunchEnd`]).
 pub(crate) struct SamplerLaws<'a> {
     // ⛔ THE SEED LAW, NOT A TOKEN LIST. The device writes a decode step's seeds itself (each
     // step's ChainStage decomposes its pick into the persistent sticks), so the host binds seeds
@@ -230,9 +350,8 @@ pub(crate) struct SamplerLaws<'a> {
     // rung switch. `SeedSource::OnCard` is that statement — a stable seating — and binds nothing.
     // A prompt chunk's rows are the prompt's own tokens, always `Host`.
     pub(crate) seeds: ktir_superdsc::sdsc_abstract::SeedSource<'a>,
-    pub(crate) want_logits: LogitsWanted,
     // ⭐ THE SEAT LAWS THIS LAUNCH'S ROWS RUN UNDER — one law per row the suffix's sampler picks
-    // for, staged before anything runs. A middle prompt chunk's suffix never runs, so the value it
+    // for, staged before anything runs. A [`Forwards`] launch's suffix never runs, so the value it
     // passes is inert — but it is still that request's own.
     pub(crate) laws: SeatLaws<'a>,
 }
@@ -249,17 +368,25 @@ pub(crate) struct SamplerLaws<'a> {
 /// `b` is the wiring the rung runs under — its own for a prompt chunk and the one-request decode,
 /// the one-request decode's for a decode batch rung (the same tape at `width` rows, addressed by
 /// fingerprint; `width` is the rung's own baked row count, which every extent here is sized by).
-pub(crate) fn run_card_launch(
+///
+/// ⭐⭐ EVERY LAUNCH IS SUBMITTED, NONE IS WAITED ON. A decode step, every chunk of a prompt and a
+/// wave of tails all take this one body: stage, submit on the card's launch stream
+/// (`SuperDscSession::submit_bound`), and — when the launch's END ([`LaunchEnd`]) picks — defer
+/// the pick's read and arm the step's landing on the lead card's queue. Nothing here waits on the
+/// card: a prompt's chunks queue back to back behind each other whichever rung's session each
+/// rides, and the host returns from a chunk that does not finish its prompt while the card is
+/// still running it. The one host wait a prompt ever meets is its first generated token's read,
+/// which the caller takes ([`collect_decode_tokens`]).
+pub(crate) fn run_card_launch<E: LaunchEnd>(
     rows_in: LaunchRows<'_>,
     sh: &Shared<'_>,
     pf: &mut SuperDscSession,
     b: &BundleMeta,
     width: ktir_superdsc::sdsc_abstract::RungWidth,
     sampler: SamplerLaws<'_>,
-) -> ExecutorResult<BatchOut> {
+) -> ExecutorResult<E::Out> {
     let SamplerLaws {
         seeds,
-        want_logits,
         laws: seat_laws,
     } = sampler;
     let (h, vocab) = (sh.hidden, sh.vocab);
@@ -443,23 +570,26 @@ pub(crate) fn run_card_launch(
     let mut acts_i32 = launcher.acts_i32;
     let seeds = launcher.seeds;
     // ⭐ EVERY LAUNCH OF A BUNDLE THAT MINTS THE DRAW BINDS ITS SAMPLER SEAT, every row of it,
-    // before anything runs — a MIDDLE prompt chunk included. Its suffix is skipped, but the
+    // before anything runs — a [`Forwards`] launch included. Its suffix is skipped, but the
     // seat's five sources are placed in this bundle all the same, and the launch's completeness
-    // check (`require_sources_filled`) refuses a placed source nobody wrote. The laws a middle
-    // chunk stages are this request's own, so nothing is invented.
+    // check (`require_sources_filled`) refuses a placed source nobody wrote. The laws such a
+    // launch stages are this request's own, so nothing is invented.
     //
     // ⭐ THE LAUNCH'S SEAT AND WIDTH, BOUND ONCE: the width is [`SeatWidth`]'s
-    // ONE mint for the whole launch — the staging block and both pick arms
-    // below read this one value, never a second mint — and the seat rides
-    // beside it so the pick match binds the pair as its own, never a second
-    // Option walk of the wiring.
+    // ONE mint for the whole launch — the staging block and the end's read
+    // below read this one value, never a second mint.
     let seat_launch = b
         .wiring
         .sample_seat
         .as_ref()
         .map(|seat| (seat, SeatWidth::of_launch(seat, &rows_in, mq)));
+    // ⭐ THE END'S SEAT, TAKEN BEFORE ANYTHING STAGES: a launch that picks takes the launch's own
+    // (seat, width) pair as its binding — never a second Option walk and never an unwrap over a
+    // guard established lines earlier — and a picking launch whose bundle mints no draw is refused
+    // here, before a byte reaches the card.
     // (the pair is `Copy` — a reference and a `Copy` width — so this binding
-    // copies it and the pick match below binds its own copy of the same one)
+    // copies it and the staging block below binds its own copy of the same one)
+    let end_seat = E::seat(seat_launch, b)?;
     if let Some((seat, seat_width)) = seat_launch {
         let laws: Vec<RowLaw<'_>> = match (seat_laws, &rows_in) {
             // A PROMPT CHUNK: one request, row `r` at its own position, a pad row clamped to the
@@ -512,7 +642,7 @@ pub(crate) fn run_card_launch(
     }
     log_binds(&format!("launch mq={mq} at={seq_pos}"), b.wiring, &acts);
     // ⭐ EVERY CHANNEL OF THE STEP, ONCE — every card binds them into its own shadow on its own
-    // thread, then every card rings its doorbell (`SuperDscSession::submit_bound` / `run_bound`).
+    // thread, then every card rings its doorbell (`SuperDscSession::submit_bound`).
     let binds = scratchy_target_spyre_card::sdsc_runner::StepBinds {
         tables: &tables,
         f32: &acts,
@@ -520,207 +650,86 @@ pub(crate) fn run_card_launch(
         i32: &acts_i32,
         seeds: &seeds,
     };
-    // ⭐ THE SEAT IS THE PICK'S OWN MATCH — every suffix arm takes the
-    // launch's own (seat, width) pair as the match's binding, never a second
-    // Option and never an unwrap over a guard established lines earlier: a
-    // launch whose suffix runs and whose bundle mints no draw is refused AT
-    // THE ARM, before anything stages.
-    // ⭐ THE CHUNK TABLE'S PROBE, taken once ahead of the arms: the launch's own
-    // kind (a decode batch answers `None` — the decode table's population, not
-    // recorded here), staged before any arm runs so the eager doors below clock
-    // what this tree's path costs as it stands. Measurement only: no arm's
-    // waits, submits or reads move.
-    let chunk_kind = chunk_kind_of(&rows_in, &want_logits);
-    let picked = match (want_logits, seat_launch) {
-        // ⭐ THE ONE DECODE PATH, SUBMITTED: stage, launch, enqueue the idx-stick read, return. The
-        // minted sampler consumes the `[rows, vocab]` result on the card and leaves the idx stick in
-        // its place; this arm defers the ONE raw D2H of that stick — never a logits read, never a
-        // host argmax — and the caller collects it through `collect_decode_tokens`.
-        (LogitsWanted::PerRequestDeferred, Some((seat, seat_width))) => {
-            // ⭐ #32 (E) — THE OVERLAP PROBE'S ASK: had the PREVIOUS step's stick read already
-            // landed? NOT-yet-landed is "card busy at submit".
-            let card_busy_at_submit = PRIOR_READ
-                .lock()
-                .expect("the overlap probe's own lock")
-                .as_ref()
-                .is_some_and(|s| !s.fired());
-            let t_submit = std::time::Instant::now();
-            let bind = pf.submit_bound(&binds, mq, seq_pos).map_err(|e| {
-                werr(format!(
-                    "superdsc decode bind+submit (mq={mq}, at={seq_pos}): {e}"
-                ))
-            })?;
-            let depth = OUTSTANDING.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-            let t_defer = std::time::Instant::now();
-            // The readback's own byte size — the seat's typed fact (the idx
-            // stick's placed row, minted once at the bake), never a
-            // recomputed `mq · 64 · 4`, at the launch's one typed width.
-            let read = pf
-                .defer_read_tensor_ring(
-                    scratchy_target_spyre::bundle_code::PlaceId::Act(b.result_id as u32),
-                    seat_width.get() * seat.idx_row_words as usize * 4,
-                )
-                .map_err(|e| {
-                    werr(format!(
-                        "superdsc decode idx read (mq={mq}, at={seq_pos}): {e}"
-                    ))
-                })?;
-            let t_stage = std::time::Instant::now();
-            *PRIOR_READ.lock().expect("the overlap probe's own lock") = Some(read.signal());
+    // What the step-segment table files this launch under — keyed by the launch's own rows
+    // and end, never by a model or a geometry: a decode batch is the decode table's
+    // population; a sequence is a middle chunk when its end forwards and the prompt-final
+    // chunk when it picks; a wave is the packed row whatever its end.
+    let kind = match &rows_in {
+        LaunchRows::Batch { .. } => scratchy_serving_worker::step_segs::StepKind::Decode,
+        LaunchRows::Packed { .. } => scratchy_serving_worker::step_segs::StepKind::Chunk(
+            scratchy_serving_worker::step_segs::ChunkKind::Packed,
+        ),
+        LaunchRows::Sequence { .. } => scratchy_serving_worker::step_segs::StepKind::Chunk(
+            if matches!(
+                E::SUFFIX,
+                scratchy_target_spyre_card::sdsc_runner::SuffixLaunch::Launched
+            ) {
+                scratchy_serving_worker::step_segs::ChunkKind::Final
+            } else {
+                scratchy_serving_worker::step_segs::ChunkKind::Middle
+            },
+        ),
+    };
+    // ⭐ THE ONE SUBMIT: stage, ring the doorbells, and hand the end its seat. Nothing below
+    // waits on the card. The stage's own quiet point is the shadow law's — it waits this
+    // session's last preamble H2D, which the card plays at the START of this session's
+    // previous step, so the card is still running that step when the stage returns.
+    //
+    // ⭐ DEPTH AND BUSY ARE READ BEFORE THE DOORBELLS, as the card's own latches state them:
+    // the lead card's step-queue depth is the submissions still outstanding (this launch
+    // included, +1), and the busy probe holds the LAST-ARMED landing's peek — the previous
+    // step's, whatever kind it was. Read here, not after the doorbells: a long chunk is more
+    // control blocks than the card's queue holds beside another, so its submit is fed as the
+    // card retires the chunk ahead of it, and by its last doorbell that chunk has retired —
+    // the card was never idle, and a read there would say it was.
+    let busy = PRIOR_LANDING
+        .lock()
+        .expect("the busy probe's own lock")
+        .as_ref()
+        .is_some_and(|s| !s.fired());
+    let depth = pf.lead_steps().depth() + 1;
+    let stage = t_stage.elapsed();
+    let t_submit = std::time::Instant::now();
+    let (bind, step) = pf
+        .submit_bound(&binds, mq, seq_pos, E::SUFFIX)
+        .map_err(|e| werr(format!("superdsc submit (mq={mq}, at={seq_pos}): {e}")))?;
+    let t_doorbell = std::time::Instant::now();
+    let door = t_doorbell.duration_since(t_submit);
+    let (out, defer) = E::defer(pf, end_seat, b, vocab, kind, step)?;
+    match kind {
+        scratchy_serving_worker::step_segs::StepKind::Decode => {
             scratchy_serving_worker::step_segs::record_submit(
                 scratchy_serving_worker::step_segs::SubmitSegs {
                     // The cards' binds run inside `submit_bound`, ahead of its doorbells: the
                     // slowest card's is the bind row, and the rest of the span is the submit.
                     bind,
-                    submit: t_defer.duration_since(t_submit).saturating_sub(bind),
-                    defer: t_stage.duration_since(t_defer),
+                    submit: door.saturating_sub(bind),
+                    defer: defer.unwrap_or_default(),
                     stage: None,
                     total: t_submit.elapsed(),
                     depth,
-                    busy: card_busy_at_submit,
+                    busy,
                 },
             );
-            // ⭐ THE SEAT'S OWN LOGITS, DEFERRED BESIDE THE PICK (debug only): the
-            // ring grows a slot in place for the wider read, and the enqueue's
-            // stream order is the idx read's own — the next step on this rung
-            // cannot write the seat before this read has taken it.
-            let dbg_seat = if tracing::enabled!(tracing::Level::DEBUG) {
-                pf.defer_read_tensor_ring(
-                    scratchy_target_spyre::bundle_code::PlaceId::Act(seat.row),
-                    seat_width.get() * seat.pad_vocab as usize * 2,
-                )
-                .ok()
-                .map(|r| (r, seat.row, seat.pad_vocab as usize))
-            } else {
-                None
-            };
-            return Ok(BatchOut::Deferred(SubmittedDecode {
-                read,
-                rows: seat_width,
-                // The collect half's own typed readback fact — the idx
-                // stick's row size, carried beside the launch's typed width
-                // so the decode law never re-derives it.
-                idx_row_words: seat.idx_row_words,
-                result_id: b.result_id as u32,
-                vocab,
-                dbg_seat,
-            }));
         }
-        // A deferred decode whose bundle mints no draw — refused at the arm,
-        // before anything stages (the match's own binding, no second Option).
-        (LogitsWanted::PerRequestDeferred, None) => {
-            return Err(werr(format!(
-                "bundle has no sampler seat (result t{}) — a deferred decode cannot pick \
-                 without the minted draw",
-                b.result_id
-            )));
-        }
-        // A middle prompt chunk: no suffix runs and nothing is read back.
-        (LogitsWanted::None, _) => {
-            // ⭐ THE CHUNK TABLE'S ROW, measurement only: stage (everything the
-            // host staged before the door), the door itself, the depth of chunk
-            // submissions outstanding, and the card-busy peek — the same latch
-            // the decode arm's busy row reads. The counter is released the
-            // moment the door returns, before `?`, so an error leaves it
-            // balanced.
-            let probe = chunk_kind.map(|kind| {
-                let busy = PRIOR_READ
-                    .lock()
-                    .expect("the overlap probe's own lock")
-                    .as_ref()
-                    .is_some_and(|s| !s.fired());
-                let depth =
-                    CHUNKS_OUTSTANDING.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                (kind, t_stage.elapsed(), busy, depth)
-            });
-            let t_door = std::time::Instant::now();
-            let run = pf.run_bound(&binds, mq, seq_pos, StepLogits::Discarded);
-            CHUNKS_OUTSTANDING.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-            run.map_err(|e| {
-                werr(format!(
-                    "superdsc prefill run_step (mq={mq}, at={seq_pos}): {e}"
-                ))
-            })?;
-            if let Some((kind, stage, busy, depth)) = probe {
-                scratchy_serving_worker::step_segs::record_chunk(
-                    scratchy_serving_worker::step_segs::ChunkSegs {
-                        kind,
-                        stage,
-                        door: t_door.elapsed(),
-                        fence: None,
-                        depth,
-                        busy,
-                    },
-                );
-            }
-            None
-        }
-        // ⭐ THE PROMPT-FINAL CHUNK'S PICK — on the card, through the prefill rung's own minted
-        // sampler: the suffix runs, the sampler consumes the folded lm-head row there, and the idx
-        // stick comes back raw, exactly like a decode's.
-        (LogitsWanted::LastRow, Some((seat, seat_width))) => {
-            // ⭐ THE CHUNK TABLE'S ROW, the middle arm's own probe verbatim, plus
-            // the fence: the pick read this arm alone performs, clocked apart
-            // from the door. The counter is released the moment the door
-            // returns, before `?`, so an error — the door's or the read's —
-            // leaves it balanced.
-            let probe = chunk_kind.map(|kind| {
-                let busy = PRIOR_READ
-                    .lock()
-                    .expect("the overlap probe's own lock")
-                    .as_ref()
-                    .is_some_and(|s| !s.fired());
-                let depth =
-                    CHUNKS_OUTSTANDING.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                (kind, t_stage.elapsed(), busy, depth)
-            });
-            let t_door = std::time::Instant::now();
-            let run = pf.run_bound(&binds, mq, seq_pos, StepLogits::LeftOnDevice);
-            CHUNKS_OUTSTANDING.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-            run.map_err(|e| {
-                werr(format!(
-                    "superdsc prefill run_step (mq={mq}, at={seq_pos}): {e}"
-                ))
-            })?;
-            let door = t_door.elapsed();
-            let t_fence = std::time::Instant::now();
-            // The prompt-final width is the launch's one typed width — the
-            // mint's verbatim prompt case, the same value the staging block
-            // bound the seat's rows at.
-            let picked = read_sampled_tokens(pf, seat, seat_width, b.result_id as u32, vocab)?;
-            let fence = t_fence.elapsed();
-            log_seat_readback(
-                pf,
-                seat,
-                b.wiring.load_consts,
-                &picked,
-                &format!("prefill-final mq={mq} at={seq_pos}"),
+        scratchy_serving_worker::step_segs::StepKind::Chunk(kind) => {
+            scratchy_serving_worker::step_segs::record_chunk(
+                scratchy_serving_worker::step_segs::ChunkSegs {
+                    kind,
+                    stage,
+                    door,
+                    // The prompt-final pick's fence is recorded at its collect
+                    // (`record_collect`), where the one collect door runs it.
+                    fence: None,
+                    depth,
+                    busy,
+                },
             );
-            if let Some((kind, stage, busy, depth)) = probe {
-                scratchy_serving_worker::step_segs::record_chunk(
-                    scratchy_serving_worker::step_segs::ChunkSegs {
-                        kind,
-                        stage,
-                        door,
-                        fence: Some(fence),
-                        depth,
-                        busy,
-                    },
-                );
-            }
-            Some(picked)
         }
-        // A prompt-final pick whose bundle mints no draw — refused at the arm.
-        (LogitsWanted::LastRow, None) => {
-            return Err(werr(format!(
-                "bundle has no sampler seat (result t{}) — a prompt-final pick cannot run \
-                 without the minted draw",
-                b.result_id
-            )));
-        }
-    };
-    Ok(BatchOut::Done(picked))
+    }
+    Ok(out)
 }
+
 /// Every activation a forward binds, against what the BAKE says that tensor is — one line, at
 /// `debug`, per launch.
 ///
@@ -1115,79 +1124,47 @@ fn sample_binds(
     Ok(binds)
 }
 
-/// Read the minted sampler's idx stick back and decode it: one i32 per row at
-/// lane 0 of a 64-lane padded row. Any word at or past `vocab` is the sampler's
-/// sentinel — refuse it, never sample it.
-///
-/// ⭐ THE STICK IS SCATTERED, NOT ROW-MAJOR. A `[rows, W]` SENUINT32 placement
-/// (W the seat's minted `idx_row_words`) stores rows INTERLEAVED at the
-/// format's own 32-element stick — `dev_off_stk`
-/// with `SenUint32::ELEMS_PER_STICK` — so row r's lane 0 is word `r·32`, NOT
-/// `r·W`: measured on the card (probe, 2-row rung: each 64-word physical block
-/// held `32×row0's idx` then `32×row1's idx`, both blocks identical), where the
-/// row-major stride handed EVERY row row 0's pick. At `rows = 1` the scattered
-/// offset is 0 and the solo readback is byte-identical.
-fn read_sampled_tokens(
-    session: &mut SuperDscSession,
-    seat: &scratchy_target_spyre::wiring::SampleSeat,
-    width: SeatWidth,
-    result_id: u32,
-    vocab: usize,
-) -> ExecutorResult<Vec<u32>> {
-    // The one-shot door's own pair — defer, then decode ON the landed window
-    // through the visitor (no owned copy): the same zero-alloc stick law the
-    // deferred collect obeys, composed inline because this pick runs in-call.
-    let read = session
-        .defer_read_tensor_raw(
-            scratchy_target_spyre::bundle_code::PlaceId::Act(result_id),
-            width.get() * seat.idx_row_words as usize * 4,
-        )
-        .map_err(|e| werr(format!("sampler idx readback (t{result_id}): {e}")))?;
-    session
-        .finish_deferred_read_with(&read, |bytes| {
-            decode_idx_stick(bytes, width.get(), seat.idx_row_words as usize, vocab)
-        })
-        .map_err(|e| werr(format!("sampler idx readback (t{result_id}): {e}")))?
-}
-
-/// ⭐ #32 (c3) — THE COLLECT HALF of a submitted decode step: park on the idx
-/// read's own completion (the loop's ONE fence — this read's D2H, then the
-/// shadow's quiet point, never a whole-stream sync), then apply the exact
-/// [`read_sampled_tokens`] decode law to the bytes the ring slot holds. The
-/// SAME door whether the caller collects in-call (a schedule that cannot
-/// defer) or from the drain — the only difference is when, never what.
+/// ⭐ #32 (c3) — THE COLLECT HALF of every launch that picks: park on the idx
+/// read's own completion (this read's D2H, then the shadow's quiet point,
+/// never a whole-stream sync), then decode the bytes the ring slot holds. The
+/// SAME door for a decode step (from the drain, or in-call when the schedule
+/// cannot defer) and for a prompt's final chunk (in-call: its first generated
+/// token, the one wait a prompt meets) — the only difference is when, never
+/// what.
 pub(crate) fn collect_decode_tokens(
     session: &mut SuperDscSession,
     sub: &SubmittedDecode,
 ) -> ExecutorResult<Vec<u32>> {
     // The probe's collect-half clocks: the fence is the wait (at depth ≥ 2 it waits
     // everything enqueued behind the read too, which is the pipeline's own cadence,
-    // not an artifact), the pick is the decode. And this collect is the outstanding
-    // count's other half — the submit incremented it, this decrements it, so the
-    // depth row counts exactly the submissions still uncollected.
+    // not an artifact), the pick is the decode, and the row lands in the table the
+    // submit filed the launch under — the decode table's collect row, or the chunk
+    // table's prompt-final fence.
     // The on-card alloc-census window steps here, before the fence, so the window
     // spans the whole steady step (instrumentation only; the card crate's `census`).
     #[cfg(feature = "alloc-census")]
-    scratchy_target_spyre_card::census::collect_step();
+    if sub.kind == scratchy_serving_worker::step_segs::StepKind::Decode {
+        scratchy_target_spyre_card::census::collect_step();
+    }
     let t_fence = std::time::Instant::now();
     // ⭐ ZERO-ALLOC COLLECT: the decode runs ON the ring slot's landed bytes,
     // through the visitor door — no copy into a fresh Vec, no intermediate
     // word buffer. The pick is the only thing this step allocates, and it is
     // the step's own output crossing the engine's API, not a seam buffer.
-    // The two `?`s keep the original's ORDER: a read error returns before the
-    // outstanding decrement (the submission is still uncollected on a dead
-    // read), a decode refusal decrements first — the step was collected; its
-    // pick is refused.
     let toks = session
-        .finish_deferred_read_with(&sub.read, |bytes| {
+        .finish_deferred_read_with(&sub.read, &sub.step, |bytes| {
             decode_idx_stick(bytes, sub.rows.get(), sub.idx_row_words as usize, sub.vocab)
         })
-        .map_err(|e| werr(format!("sampler idx readback (t{}): {e}", sub.result_id)))?;
+        .map_err(|e| werr(format!("sampler idx readback (t{}): {e}", sub.result_id)))??;
     let t_pick = std::time::Instant::now();
-    OUTSTANDING.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-    let toks = toks?;
+    // ⭐ THE LEAD QUEUE'S OWN DRAIN, oldest-first through this step's read
+    // landing: the arm order IS the submission order, and the FIFO guarantees
+    // every older landing has fired once this read has landed — so the pops
+    // are free, and the depth row returns to truth at every collect.
+    session.drain_steps_through(&sub.read.landing())?;
     scratchy_serving_worker::step_segs::record_collect(
         scratchy_serving_worker::step_segs::CollectSegs {
+            kind: sub.kind,
             fence: t_pick.duration_since(t_fence),
             pick: t_pick.elapsed(),
         },
@@ -1200,7 +1177,7 @@ pub(crate) fn collect_decode_tokens(
     // rungs' fp drift is a near-tie either order may take, a pick won wide and
     // still differing is a row computed wrong.
     if let Some((hread, row_tid, pad_vocab)) = &sub.dbg_seat {
-        match session.finish_deferred_read_raw(hread) {
+        match session.finish_deferred_read_raw(hread, &sub.step) {
             Ok(b) => log_decode_top2(&b, sub.rows.get(), *pad_vocab, sub.vocab, &toks, *row_tid),
             Err(e) => {
                 tracing::debug!("DECODE_READBACK t{row_tid}: the seat read failed: {e}")
@@ -1580,40 +1557,44 @@ pub(crate) fn superdsc_forward_chunk(
         let finishes = last && end >= tokens.prompt_len(id);
         let rung = ktir_superdsc::sdsc_abstract::RungWidth::of_baked_rows(width as u32)
             .ok_or_else(|| werr("superdsc prefill: the selected rung has zero rows".to_string()))?;
-        let out = run_card_launch(
-            LaunchRows::Sequence {
-                blocks: &blocks,
-                rows: StepRows::new(pos, real).ok_or_else(|| {
-                    werr(
-                        "superdsc prefill: a chunk of zero real rows — the chunker staged no chunk"
-                            .to_string(),
-                    )
-                })?,
+        // ⭐ THE CHUNK'S END IS ITS OWN: a chunk that does not finish the prompt only
+        // forwards ([`Forwards`] — its suffix never runs, nothing is read back, the host
+        // returns while the card is still running it), and the chunk that finishes it picks
+        // ([`Picks`] — the rung's minted sampler picks the first generated token on the
+        // card, and the loop collects it IN-CALL through the one collect door: §3.2's one
+        // host wait a prompt meets). The laws are stated once, before the end is chosen —
+        // they are this chunk's own either way.
+        let laws = SamplerLaws {
+            seeds: ktir_superdsc::sdsc_abstract::SeedSource::Host(&chunk_toks),
+            laws: SeatLaws::Prompt {
+                draw: req.draw.as_ref(),
             },
-            sh,
-            sess,
-            pmeta,
-            rung,
-            SamplerLaws {
-                seeds: ktir_superdsc::sdsc_abstract::SeedSource::Host(&chunk_toks),
-                want_logits: if finishes {
-                    LogitsWanted::LastRow
-                } else {
-                    LogitsWanted::None
-                },
-                laws: SeatLaws::Prompt {
-                    draw: req.draw.as_ref(),
-                },
-            },
-        )?;
-        pick = match out {
-            BatchOut::Done(p) => p,
-            BatchOut::Deferred(_) => {
-                return Err(werr(
-                    "a prompt chunk deferred its read — only a decode can".to_string(),
-                ));
-            }
         };
+        let rows_in = LaunchRows::Sequence {
+            blocks: &blocks,
+            rows: StepRows::new(pos, real).ok_or_else(|| {
+                werr(
+                    "superdsc prefill: a chunk of zero real rows — the chunker staged no chunk"
+                        .to_string(),
+                )
+            })?,
+        };
+        if finishes {
+            let sub = run_card_launch::<Picks>(rows_in, sh, sess, pmeta, rung, laws)?;
+            let picked = collect_decode_tokens(sess, &sub)?;
+            if let Some(seat) = pmeta.wiring.sample_seat.as_ref() {
+                log_seat_readback(
+                    sess,
+                    seat,
+                    pmeta.wiring.load_consts,
+                    &picked,
+                    &format!("prefill-final mq={width} at={}", end - 1),
+                );
+            }
+            pick = Some(picked);
+        } else {
+            run_card_launch::<Forwards>(rows_in, sh, sess, pmeta, rung, laws)?;
+        }
         tracing::debug!(
             "PREFILL_PATH=batched rung={width} rows={real} pos={pos} end={end} top_m={top_m} \
              prefix={}",
@@ -1685,57 +1666,79 @@ pub(crate) fn superdsc_forward_packed(
     let draws: Vec<Option<&SampledDraw>> = tails.iter().map(|t| t.draw.as_ref()).collect();
     let width = ktir_superdsc::sdsc_abstract::RungWidth::of_baked_rows((w * s) as u32)
         .ok_or_else(|| werr("the packed rung bakes zero rows".to_string()))?;
-    let picked = match run_card_launch(
-        LaunchRows::Packed {
-            steps: &steps,
-            width: w,
-        },
-        sh,
-        sess,
-        meta,
-        width,
-        SamplerLaws {
-            seeds: ktir_superdsc::sdsc_abstract::SeedSource::Host(&seeds),
-            want_logits: LogitsWanted::LastRow,
-            laws: SeatLaws::Packed { draws: &draws },
-        },
-    )? {
-        BatchOut::Done(picked) => picked.ok_or_else(|| {
-            werr(
-                "the packed launch picked no tokens — its minted draw never ran, and every \
-                 window's answer is the readback's to carry"
-                    .to_string(),
-            )
-        })?,
-        BatchOut::Deferred(_) => {
-            return Err(werr(
-                "a packed prefill deferred its read — only a decode can".to_string(),
-            ));
+    // ⭐ THE WAVE'S END IS WHETHER ANY TAIL FINISHES — the suffix runs for every window of
+    // the one tape either way, so a wave whose every tail is mid-prompt only forwards
+    // ([`Forwards`] — no read, no wait, the host returns while the card runs the wave), and
+    // a wave with a finishing tail picks ([`Picks`] — the readback carries `s` picks, one
+    // per window, collected in-call through the one collect door).
+    let picked = if tails.iter().any(|t| t.finishes) {
+        let sub = run_card_launch::<Picks>(
+            LaunchRows::Packed {
+                steps: &steps,
+                width: w,
+            },
+            sh,
+            sess,
+            meta,
+            width,
+            SamplerLaws {
+                seeds: ktir_superdsc::sdsc_abstract::SeedSource::Host(&seeds),
+                laws: SeatLaws::Packed { draws: &draws },
+            },
+        )?;
+        let picked = collect_decode_tokens(sess, &sub)?;
+        if let Some(seat) = meta.wiring.sample_seat.as_ref() {
+            log_seat_readback(
+                sess,
+                seat,
+                meta.wiring.load_consts,
+                &picked,
+                &format!("packed wave w={w} s={s}"),
+            );
         }
+        if picked.len() != s {
+            return Err(werr(format!(
+                "the packed rung (w={w}, s={s}) picked {} token(s) — one per window, never another \
+                 count",
+                picked.len()
+            )));
+        }
+        Some(picked)
+    } else {
+        run_card_launch::<Forwards>(
+            LaunchRows::Packed {
+                steps: &steps,
+                width: w,
+            },
+            sh,
+            sess,
+            meta,
+            width,
+            SamplerLaws {
+                seeds: ktir_superdsc::sdsc_abstract::SeedSource::Host(&seeds),
+                laws: SeatLaws::Packed { draws: &draws },
+            },
+        )?;
+        None
     };
-    if picked.len() != s {
-        return Err(werr(format!(
-            "the packed rung (w={w}, s={s}) picked {} token(s) — one per window, never another \
-             count",
-            picked.len()
-        )));
-    }
     tracing::debug!(
         "PREFILL_PATH=packed rung_w={w} rung_s={s} tails={} rows={}",
         tails.len(),
         seeds.len()
     );
     // ⭐ THE BOOKKEEPING, PER REQUEST — its pool count always, its pick iff this step
-    // finished its prompt (the pick is request `r`'s own: seat row `r`, window `r`).
+    // finished its prompt (the pick is request `r`'s own: seat row `r`, window `r`). A wave
+    // that forwarded finished no prompt, so every tail's answer is `None`.
     let mut out = Vec::with_capacity(tails.len());
     for (r, t) in tails.iter().enumerate() {
         tokens.set_tokens_in_pool(&t.id, t.start + t.toks.len());
-        if t.finishes {
-            let tok = picked[r];
-            tokens.push_generated(&t.id, tok);
-            out.push(Some(tok));
-        } else {
-            out.push(None);
+        match &picked {
+            Some(p) if t.finishes => {
+                let tok = p[r];
+                tokens.push_generated(&t.id, tok);
+                out.push(Some(tok));
+            }
+            _ => out.push(None),
         }
     }
     Ok(out)
