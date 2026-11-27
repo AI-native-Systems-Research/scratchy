@@ -935,7 +935,7 @@ impl std::error::Error for AllocError {}
 /// by a comment: a handle with no `wait` method cannot break the ring law,
 /// so the signal itself is not `Clone`.
 pub struct ReadSignal {
-    landing: flex_rs::step::Landing,
+    landing: std::sync::Arc<flex_rs::step::Landing>,
 }
 
 /// ⭐ #32 (E) — THE PEEK HANDLE: a read-only view of one transfer's
@@ -961,8 +961,17 @@ impl ReadPeek {
 impl ReadSignal {
     pub fn new() -> Self {
         Self {
-            landing: flex_rs::step::Landing::new(),
+            landing: std::sync::Arc::new(flex_rs::step::Landing::new()),
         }
+    }
+
+    /// ⭐ THE QUEUE-ARM FORM — the landing's own `Arc`, for arming a card's step queue
+    /// ([`CardRuntime::steps`]). The queue holds landings by `Arc` and parks the oldest at its
+    /// drain; this is the SAME latch the finish half parks, handed to the one cadence that
+    /// drains landings in submission order — not a second completion form, and not a waiter:
+    /// the queue's drain and the read's finish are the same thread, one after the other.
+    pub fn landing(&self) -> std::sync::Arc<flex_rs::step::Landing> {
+        self.landing.clone()
     }
 
     /// The latch handed to `launch_d2h`/`launch_h2d` as the op's user

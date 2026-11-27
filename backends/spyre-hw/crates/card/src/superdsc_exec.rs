@@ -1550,6 +1550,14 @@ impl DeferredRead {
     pub fn signal(&self) -> crate::runtime::ReadPeek {
         self.done.peek_handle()
     }
+
+    /// ⭐ THE QUEUE-ARM FORM — the read's own landing, as the step door's `Arc`, for arming the
+    /// lead card's step queue. A read-bearing step's landing IS its D2H's latch (design §3.8.2:
+    /// it needs nothing new — the crossing already carries it), so the queue's depth and busy
+    /// facts read this latch exactly as a readless step's read their forward's.
+    pub fn landing(&self) -> std::sync::Arc<flex_rs::step::Landing> {
+        self.done.landing()
+    }
 }
 
 /// The timers and H2D accounting of a step's FORWARD HALF — everything upstream of the
@@ -3410,6 +3418,13 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> Executor<'a, 'c, T> {
     /// and every door it opens after prepare, rides it.
     fn launches(&self) -> &Stream<'a> {
         self.card.launches()
+    }
+
+    /// The card's step queue ([`CardRuntime::steps`]) — the launch stream's landings, in
+    /// submission order. The submitting thread arms it with each step's landing right after
+    /// the submit that carries it; the drain pops the oldest.
+    pub(crate) fn steps(&self) -> &flex_rs::step::StepQueue<'a> {
+        self.card.steps()
     }
 
     /// Give every op in one list its own Program-segment allocation and upload its device binary

@@ -2,9 +2,9 @@
 //! Execute an emitted **SuperDSC** bundle on the real IBM Spyre AIU — the `--target sendnn` silicon
 //! run path, as the worker sees it.
 //!
-//! This is the worker-facing wrapper: f32 host buffers in, f32 logits out, names as `t{id}` (the
-//! SubtileIR tensor id). The work is [`crate::superdsc_exec`]'s, which drives the card through the
-//! typed flex-rs surface in [`crate::runtime`].
+//! This is the worker-facing wrapper: f32 host buffers in, a submitted step's landing out, names
+//! as `t{id}` (the SubtileIR tensor id). The work is [`crate::superdsc_exec`]'s, which drives the
+//! card through the typed flex-rs surface in [`crate::runtime`].
 //!
 //! ⛔ THE SENGRAPH PATH IS GONE. The offline_decoder `GraphLoader`/`Predict` families (`SpyreSession`
 //! / `GroupedSession` and their C++ shim) were the pre-SuperDSC bring-up path and had no live
@@ -12,7 +12,8 @@
 //! runs is the dxp-compiled SuperDSC bundle.
 
 use crate::superdsc_exec::{
-    DeferredRead, Executor, KvDim, Logits, LogitsRead, NewTokens, PoolPages, SegIdx, SeqPos, Vocab,
+    DeferredRead, Executor, ForwardLatch, KvDim, NewTokens, PoolPages, SegIdx, SeqPos,
+    SuffixLaunch, Vocab,
 };
 use anyhow::{Result, anyhow};
 use scratchy_tensors::DType as SDType;
@@ -66,7 +67,7 @@ fn bind_rank<T: ktir_superdsc::collective::Tp>(
     b: &StepBinds<'_, '_>,
 ) -> Result<()> {
     // BIND-LOOP TIMING (SCRATCHY_SDSC_PHASE_TIME, the executor's phase-breakdown flag): the binds
-    // run BEFORE predict, so the preamble_h2d/compute/logits_d2h split cannot see them.
+    // run BEFORE the forward's doorbells, so the preamble_h2d/compute/read split cannot see them.
     let t_bind = std::time::Instant::now();
     // ⭐ A HOST KERNEL'S TABLE IS WRITTEN IN THE CARD'S OWN FORMAT, at its own slot — no f32 table,
     // no clone of it, no per-card convert of one.
@@ -135,16 +136,29 @@ fn bind_rank<T: ktir_superdsc::collective::Tp>(
     Ok(())
 }
 
-/// What a step's caller does with its logits — the session-level spelling of [`Logits`], minus the
-/// buffer the session owns. See [`Logits`] for why this is three states and not a `bool`.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum StepLogits {
-    /// Convert the `[1, vocab]` row and return it.
-    ReadBack,
-    /// Run the suffix and leave its output on the device; the caller reads the tensor itself.
-    LeftOnDevice,
-    /// Nobody reads them: the suffix does not run.
-    Discarded,
+/// ⭐ ONE SUBMITTED STEP'S LANDING, PER CARD — rank `r`'s [`ForwardLatch`] for the forward that
+/// step submitted on card `r`, in rank order. The lead's (rank 0's) is the step's own landing
+/// when nobody reads a pick: the launch stream retires the forward in order, so its latch firing
+/// IS the step having landed. Every peer's is consumed at a pick's collect
+/// ([`SuperDscSession::finish_deferred_read_with`]) — each peer parks its OWN forward of the
+/// step and takes its shadow's quiet point, never a whole-stream drain behind it.
+pub struct StepLanding {
+    /// In rank order: `forwards[r]` is rank `r`'s.
+    pub forwards: Vec<ForwardLatch>,
+}
+
+/// ⭐ WHAT ONE SUBMITTED STEP OWES ITS CALLER — the typed landing (design §3.2: a step is
+/// submitted, not run). The doorbells ring and the host returns; what the step owes rides this
+/// value to whoever drains it, in submission order:
+/// * `Nothing` — nobody reads this step's pick (a prompt's middle chunk, a discarded tail): the
+///   step owes NOTHING. A VALUE, not the refusal the chunk loop used to raise on the chunk that
+///   did not finish its prompt — the type states the case, so the refusal cannot exist.
+/// * `Picks` — the step's pick is read (a prompt's final chunk, a decode step): the idx-stick
+///   read is already deferred onto the ring exactly like a decode's, and the step owes that
+///   pick, collected through the one collect door whenever its caller drains.
+pub enum ForwardLanding {
+    Nothing,
+    Picks(DeferredRead),
 }
 
 /// The three model extents every constructor here forwards unchanged — one value because they are
@@ -171,7 +185,8 @@ fn f16_le_to_f32(bytes: &[u8]) -> Vec<f32> {
 
 /// A resident SUPERDSC session: the dxp-compiled bundle loaded from its AoT cache directory and run
 /// through the flex runtime. Weights pack into resident device segments and the KV grows in a
-/// resident pool; `run_step` appends `n_new` NEW positions at `[seq_pos..seq_pos+n_new)` and returns
+/// resident pool; a submitted step ([`SuperDscSession::submit_bound`]) appends `n_new` NEW
+/// positions at `[seq_pos..seq_pos+n_new)` and hands back its landing — what the card owes, not
 /// the last new position's logits.
 pub struct SuperDscSession<'a, 'c, T: ktir_superdsc::collective::Tp> {
     /// ⭐ ONE EXECUTOR PER CARD THE FORWARD SPANS, in rank order — one for a world of one, `W` for a
@@ -759,7 +774,7 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> SuperDscSession<'a, 'c, T> {
     /// [`superdsc_exec::StepBody`]. The host asks this BEFORE it stages anything, because both the
     /// gather's index table and the prefix mask's block form are decisions about the selected body.
     ///
-    /// ⛔ `start` IS THE SAME `start` THE HOST PASSES TO `run_step`, and the selection is derived from it
+    /// ⛔ `start` IS THE SAME `seq_pos` THE HOST PASSES TO `submit_bound`, and the selection is derived from it
     /// alone — so the body staged for and the body launched are the same body by construction, not by two
     /// call sites agreeing.
     ///
@@ -779,114 +794,6 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> SuperDscSession<'a, 'c, T> {
             .step_body(crate::superdsc_exec::SeqPos(start as i64))
     }
 
-    /// Run ONE INCREMENTAL forward over `n_new` NEW positions at `[seq_pos..seq_pos+n_new)`.
-    /// `activations[i] = (name, f32 data)` are this step's NEW-token sources bound by NAME
-    /// (`t{id}` embed + cos/sin), narrowed to f16 at the boundary. The resident pool holds
-    /// `[0..seq_pos)`; this writes only the new K/V and attends `[0..seq_pos+i]` causally. Returns
-    /// the logits `[vocab]` of the LAST NEW position.
-    pub fn run_step(
-        &mut self,
-        n_new: usize,
-        seq_pos: usize,
-        activations: &[scratchy_target_spyre::wiring::Bind],
-    ) -> Result<Vec<f32>> {
-        Ok(self
-            .run_step_inner(n_new, seq_pos, activations, &[], &[], StepLogits::ReadBack)?
-            .unwrap_or_default())
-    }
-
-    /// [`run_step`](Self::run_step) for a forward whose logits stay on the device — skips the logits
-    /// D2H and the sen→IEEE convert, and still runs the suffix ([`StepLogits::LeftOnDevice`]).
-    pub fn run_step_no_logits(
-        &mut self,
-        n_new: usize,
-        seq_pos: usize,
-        activations: &[scratchy_target_spyre::wiring::Bind],
-    ) -> Result<()> {
-        self.run_step_inner(
-            n_new,
-            seq_pos,
-            activations,
-            &[],
-            &[],
-            StepLogits::LeftOnDevice,
-        )?;
-        Ok(())
-    }
-
-    /// [`run_step_no_logits`](Self::run_step_no_logits) plus activations the caller ALREADY holds as
-    /// LE f16 bytes.
-    ///
-    /// An activation staged as f32 is paid for three times: the host builds it, the bind loop
-    /// converts it element by element into a fresh Vec, and only then does it reach the card. For a
-    /// decode batch's prefix mask that is the dominant per-step host cost — 93% of every element
-    /// bound (2.26 M of 2.42 M at 16 requests, measured), and 0.124·mq² of it a single repeated
-    /// constant, because a fold pass masks off every row that is not its own request. The f32 round
-    /// trip buys nothing there: the value is `-inf` or `0.0`, both exactly representable, so the
-    /// caller can write the f16 bit pattern directly and the card receives the SAME BYTES.
-    pub fn run_step_no_logits_f16(
-        &mut self,
-        n_new: usize,
-        seq_pos: usize,
-        activations: &[scratchy_target_spyre::wiring::Bind],
-        activations_f16: &[(scratchy_target_spyre::bundle_code::PlaceId, Vec<u8>)],
-    ) -> Result<()> {
-        self.run_step_inner(
-            n_new,
-            seq_pos,
-            activations,
-            activations_f16,
-            &[],
-            StepLogits::LeftOnDevice,
-        )?;
-        Ok(())
-    }
-
-    /// [`run_step`](Self::run_step) with a pre-narrowed f16 channel.
-    pub fn run_step_f16(
-        &mut self,
-        n_new: usize,
-        seq_pos: usize,
-        activations: &[scratchy_target_spyre::wiring::Bind],
-        activations_f16: &[(scratchy_target_spyre::bundle_code::PlaceId, Vec<u8>)],
-    ) -> Result<Vec<f32>> {
-        Ok(self
-            .run_step_inner(
-                n_new,
-                seq_pos,
-                activations,
-                activations_f16,
-                &[],
-                StepLogits::ReadBack,
-            )?
-            .unwrap_or_default())
-    }
-
-    /// ⭐⭐⭐ [`run_step_f16`](Self::run_step_f16) plus the INT32 channel — a gather's index table.
-    ///
-    /// ⛔ A THIRD LIST, NOT A THIRD ENTRY IN THE f16 ONE. `activations_f16` means "bytes that are
-    /// already fp16", and every one of them still passes through `ieee_to_sen_bytes` in the shadow
-    /// write; int32 entries must NOT (see `Executor::raw_ids`). Two lists that both mean "device
-    /// bytes" but need different shadow writes is exactly the collapse this keeps apart.
-    pub fn run_step_i32(
-        &mut self,
-        n_new: usize,
-        seq_pos: usize,
-        activations: &[scratchy_target_spyre::wiring::Bind],
-        activations_f16: &[(scratchy_target_spyre::bundle_code::PlaceId, Vec<u8>)],
-        activations_i32: &[(scratchy_target_spyre::bundle_code::PlaceId, Vec<u8>)],
-        logits: StepLogits,
-    ) -> Result<Option<Vec<f32>>> {
-        self.run_step_inner(
-            n_new,
-            seq_pos,
-            activations,
-            activations_f16,
-            activations_i32,
-            logits,
-        )
-    }
-
     /// The [`CausalKey`] this session's staged activation `id` was last bound under, if it was
     /// bound keyed. A forward whose key equals it has nothing to bind for `id`.
     ///
@@ -898,41 +805,62 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> SuperDscSession<'a, 'c, T> {
         self.ranks.first().keyed_holds(id)
     }
 
-    /// ⭐ #32 (A) — ONE PIPELINED STEP'S SUBMIT HALF: the same private forward
-    /// body `run_step_inner` reaches through `predict` for
-    /// `StepLogits::LeftOnDevice`, with NO trailing drain — the doorbell is rung
-    /// and the host returns (see `Executor::submit_step`). The loop's ONE fence —
-    /// the finish half of the stick read, `finish_deferred_read_raw` below — is
-    /// what waits this submission out; `predict`'s tail sync is the drain this
-    /// door exists to not run. Call `stage_step_acts` first: this door submits
-    /// whatever the shadow holds.
-    pub fn submit_step(&mut self, n_new: usize, seq_pos: usize) -> Result<()> {
-        // Nothing to bind: the shadow already holds every input.
-        self.submit_bound(&StepBinds::NONE, n_new, seq_pos)
-            .map(drop)
+    /// ⭐ #32 (A) — ONE PIPELINED STEP'S SUBMIT HALF: [`Self::submit_bound`] with nothing to
+    /// bind — the shadow already holds every input. The doorbell is rung and the host returns;
+    /// nothing here waits (see `Executor::submit_step`). The step's landing is handed back for
+    /// the caller's cadence: the queue arm, the probes, the peers' settle at a collect.
+    pub fn submit_step(
+        &mut self,
+        n_new: usize,
+        seq_pos: usize,
+        suffix: SuffixLaunch,
+    ) -> Result<StepLanding> {
+        self.submit_bound(&StepBinds::NONE, n_new, seq_pos, suffix)
+            .map(|(_, landed)| landed)
     }
 
-    /// ⭐ BIND AND SUBMIT ONE PIPELINED STEP — every card's binds ([`Self::bind_all`]), then every
-    /// card's doorbell in one parallel section. Waits on nothing, as [`Self::submit_step`]. Returns
-    /// the binds' time — the bind's share of the submit span.
+    /// ⭐ BIND AND SUBMIT ONE PIPELINED STEP — every card's binds ([`Self::bind_all`]), then
+    /// every card's doorbell in one parallel section, waiting on nothing. §3.5's protected
+    /// shape, unchanged: ONE bind pass, ONE parallel submit — problem 1's measured work, byte
+    /// for byte. Returns the binds' time (the bind row of the step segments) and the step's
+    /// landing: rank `r`'s [`ForwardLatch`] for the forward this step submitted on card `r`,
+    /// armed on the forward's last submission, so the caller arms the lead card's step queue
+    /// with it, probes what the card still owes, and settles every peer at a pick's collect.
     pub fn submit_bound(
         &mut self,
         b: &StepBinds<'_, '_>,
         n_new: usize,
         seq_pos: usize,
-    ) -> Result<std::time::Duration> {
+        suffix: SuffixLaunch,
+    ) -> Result<(std::time::Duration, StepLanding)> {
         let bind = self.bind_all(b)?;
         // ⭐ EVERY CARD'S DOORBELL BEFORE ANY WAIT — this door waits on nothing, so the ranks' steps
         // are all in flight together and their collectives meet on the cards.
         let t0 = std::time::Instant::now();
-        let at = self.each_parallel("Submit", |e| {
-            e.submit_step(NewTokens(n_new as i64), SeqPos(seq_pos as i64))?;
-            Ok(t0.elapsed().as_secs_f64() * 1e3)
+        let landed = self.each_parallel("Submit", |e| {
+            let landed = e.submit_step(NewTokens(n_new as i64), SeqPos(seq_pos as i64), suffix)?;
+            Ok((landed, t0.elapsed().as_secs_f64() * 1e3))
         })?;
         if std::env::var_os("SCRATCHY_SDSC_RB_TIME").is_some() {
+            let at = landed.iter().map(|(_, ms)| *ms).collect::<Vec<_>>();
             eprintln!("[sdsc-submit] step {seq_pos}: rank submits done at {at:.2?} ms");
         }
-        Ok(bind)
+        Ok((
+            bind,
+            StepLanding {
+                forwards: landed.into_iter().map(|(l, _)| l).collect(),
+            },
+        ))
+    }
+
+    /// ⭐ THE LEAD CARD'S STEP QUEUE — the submission-order cadence over the launch stream's
+    /// landings. The single submitting thread arms it with each step's landing right after the
+    /// submit that carries it (a readless step's forward latch, a read-bearing step's read —
+    /// design §3.8.2), and the drain pops the oldest. The depth and busy facts the step
+    /// segments read are THE QUEUE'S OWN (`depth`, and the peek of the last-armed landing) —
+    /// never a host count restated beside them.
+    pub fn lead_steps(&mut self) -> &flex_rs::step::StepQueue<'a> {
+        self.lead().steps()
     }
 
     /// ⭐ #32 (A) — ENQUEUE THE STEP'S STICK READ, no drain: the D2H rides the
@@ -962,20 +890,26 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> SuperDscSession<'a, 'c, T> {
     /// ⭐ #32 (A) — THE LOOP'S ONE FENCE, ZERO-ALLOC: park on this read's own
     /// completion (and the shadow's quiet point), then hand the landed window
     /// to `f` BY BORROW — no copy, no fresh Vec per step (the runner spelling
-    /// of `Executor::finish_deferred_read_with`).
+    /// of `Executor::finish_deferred_read_with`). `step` is the landing the
+    /// step that deferred this read handed back: every PEER settles on its own
+    /// forward of that step here — the collect is where a sharded world
+    /// retires the step on every card.
     pub fn finish_deferred_read_with<R>(
         &mut self,
         read: &DeferredRead,
+        step: &StepLanding,
         f: impl FnOnce(&[u8]) -> R,
     ) -> Result<R> {
-        // Rank 0's read lands behind its step. Every other rank takes only its shadow's quiet point
-        // — NEVER a whole-stream drain: each peer's stream already holds the NEXT step the pipelined
-        // loop submitted, and draining it would wait that step out too, so the card would idle
-        // through every submit (measured at tp/8: busy at 1% of submits, against tp/1's 99%).
+        // Rank 0's read lands behind its step. Every other rank settles on its OWN forward of
+        // that step — NEVER a whole-stream drain: each peer's stream already holds the NEXT step
+        // the pipelined loop submitted, and draining it would wait that step out too, so the card
+        // would idle through every submit (measured at tp/8: busy at 1% of submits, against
+        // tp/1's 99%). The forwards are zipped rank-to-rank — both are in rank order by
+        // construction, so no index can disagree.
         let out = self.lead().finish_deferred_read_with(read, f)?;
-        for (r, e) in self.ranks.iter_mut() {
+        for ((r, e), l) in self.ranks.iter_mut().zip(&step.forwards) {
             if r.get() != 0 {
-                e.settle_peer_step()?;
+                e.settle_peer_pick(l)?;
             }
         }
         Ok(out)
@@ -984,8 +918,12 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> SuperDscSession<'a, 'c, T> {
     /// The same fence COMPOSED WITH A COPY — the one-shot owned contract over
     /// [`Self::finish_deferred_read_with`] (the runner spelling of
     /// `Executor::finish_deferred_read_raw`).
-    pub fn finish_deferred_read_raw(&mut self, read: &DeferredRead) -> Result<Vec<u8>> {
-        self.finish_deferred_read_with(read, |bytes| bytes.to_vec())
+    pub fn finish_deferred_read_raw(
+        &mut self,
+        read: &DeferredRead,
+        step: &StepLanding,
+    ) -> Result<Vec<u8>> {
+        self.finish_deferred_read_with(read, step, |bytes| bytes.to_vec())
     }
 
     /// Bind `id` as a function of `key` alone, narrowed to f16 here. The next step uploads it, and
@@ -1026,86 +964,6 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> SuperDscSession<'a, 'c, T> {
         }
     }
 
-    /// ⭐ #32 (A) — THE BIND LOOP A STEP RUNS BEFORE ITS FORWARD ([`Self::bind_all`], the one bind
-    /// body every door runs). The one-shot `run_step_inner` path stages through it; a launch binds
-    /// and submits through [`Self::submit_bound`] / [`Self::run_bound`].
-    pub fn stage_step_acts(
-        &mut self,
-        activations: &[scratchy_target_spyre::wiring::Bind],
-        activations_f16: &[(scratchy_target_spyre::bundle_code::PlaceId, Vec<u8>)],
-        activations_i32: &[(scratchy_target_spyre::bundle_code::PlaceId, Vec<u8>)],
-    ) -> Result<()> {
-        let b = StepBinds {
-            f32: activations,
-            f16: activations_f16,
-            i32: activations_i32,
-            ..StepBinds::NONE
-        };
-        self.bind_all(&b).map(drop)
-    }
-
-    fn run_step_inner(
-        &mut self,
-        n_new: usize,
-        seq_pos: usize,
-        activations: &[scratchy_target_spyre::wiring::Bind],
-        // Already in the device's format — bound as-is, never re-narrowed.
-        activations_f16: &[(scratchy_target_spyre::bundle_code::PlaceId, Vec<u8>)],
-        // ⭐ RAW LE int32 bytes — bound through `bind_input_raw`, so the shadow write COPIES them
-        // instead of re-encoding them as fp16. A gather's index table, and nothing else today.
-        activations_i32: &[(scratchy_target_spyre::bundle_code::PlaceId, Vec<u8>)],
-        logits: StepLogits,
-    ) -> Result<Option<Vec<f32>>> {
-        self.stage_step_acts(activations, activations_f16, activations_i32)?;
-        self.run_staged_step(n_new, seq_pos, logits)
-    }
-
-    /// Run the step whatever the shadow holds — every input already staged
-    /// ([`Self::stage_step_acts`]).
-    pub fn run_staged_step(
-        &mut self,
-        n_new: usize,
-        seq_pos: usize,
-        logits: StepLogits,
-    ) -> Result<Option<Vec<f32>>> {
-        self.run_bound(&StepBinds::NONE, n_new, seq_pos, logits)
-    }
-
-    /// ⭐ BIND AND RUN ONE STEP — every card's binds ([`Self::bind_all`]; a prompt chunk's tables
-    /// are [`scratchy_target_spyre::forward_tape::CardTable`]s), then every card submits in one
-    /// parallel section, then every card's forward is finished, rank 0 reading the row back when
-    /// the step asks for it.
-    pub fn run_bound(
-        &mut self,
-        b: &StepBinds<'_, '_>,
-        n_new: usize,
-        seq_pos: usize,
-        logits: StepLogits,
-    ) -> Result<Option<Vec<f32>>> {
-        let (n_new, seq_pos) = (NewTokens(n_new as i64), SeqPos(seq_pos as i64));
-        let want = match logits {
-            StepLogits::ReadBack => LogitsRead::ReadBack,
-            StepLogits::LeftOnDevice => LogitsRead::LeftOnDevice,
-            StepLogits::Discarded => LogitsRead::Discarded,
-        };
-        // ⭐ EVERY CARD SUBMITS BEFORE ANY CARD IS WAITED ON — a rank's collective waits on its
-        // peers' sends, so the forward is in flight on all of them before the host drains one.
-        self.bind_all(b)?;
-        let submitted = self.each_parallel("Submit", |e| e.predict_submit(n_new, seq_pos, want))?;
-        let mut row = vec![0u8; self.vocab * 2];
-        for ((r, e), s) in self.ranks.iter_mut().zip(submitted) {
-            // Rank 0 reads the row back; every other rank's forward is drained, its read the same
-            // replicated row, left on its card.
-            let l = match want {
-                LogitsRead::ReadBack if r.get() == 0 => Logits::ReadBack(&mut row[..]),
-                LogitsRead::ReadBack | LogitsRead::LeftOnDevice => Logits::LeftOnDevice,
-                LogitsRead::Discarded => Logits::Discarded,
-            };
-            e.predict_finish(s, l)?;
-        }
-        Ok((want == LogitsRead::ReadBack).then(|| f16_le_to_f32(&row)))
-    }
-
     // ── DEBUG numeric bisection (SPYRE_SUPERDSC_SELFTEST). NOT a serving path. ──
 
     /// Bind an activation source (f32 → f16) before a prefix run.
@@ -1144,9 +1002,9 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> SuperDscSession<'a, 'c, T> {
 
     /// ⭐ THE GENERIC RAW-READ VARIANT of [`Self::read_tensor`] — the tensor's
     /// own bytes, VERBATIM, no f16 decode. A step whose rung's result is not
-    /// the f16 row runs `StepLogits::LeftOnDevice` and reads the result here:
-    /// the CALLER decodes at the dtype the wiring's `result_dtype` states (an
-    /// index stick's raw LE int32 words), because only the wiring knows it.
+    /// the f16 row reads the result here: the CALLER decodes at the dtype the
+    /// wiring's `result_dtype` states (an index stick's raw LE int32 words),
+    /// because only the wiring knows it.
     pub fn read_tensor_raw(
         &mut self,
         id: scratchy_target_spyre::bundle_code::PlaceId,
