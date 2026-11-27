@@ -330,7 +330,7 @@ template <typename T>
 // Dispatch: threadgroups (ceil(rows * HEADS / (BLOCK_ROWS * BLOCKS)), 1, seqs), threads
 // (32 * BLOCKS * LATENT / WARP_LANES, 1, 1); threadgroups past a sequence's
 // queries return.
-// The tile's shape is `MlaAttendTiles`' (the lowering's `mla_attend_tiles`), its numbers these
+// The tile's shape is `MlaAttendTiles::new`'s, its numbers these
 // slots. Unset (another kernel's compile of this file): one fragment each, never dispatched.
 constant constexpr uint MLA_TILE_FRAG = MLA_FRAGMENT_SET ? MLA_FRAGMENT : 8u;
 constant constexpr uint MLA_TILE_ROWS = MLA_BLOCK_ROWS_SET ? MLA_BLOCK_ROWS : MLA_TILE_FRAG;

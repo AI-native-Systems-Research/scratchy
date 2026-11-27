@@ -16,8 +16,7 @@
 // registers. Every op reads its operands from device memory itself.
 //
 // Bindings and dispatch as `mla_attend_tiles`'.
-// Constants: `mla.h`'s; the tile's shape is `MlaAttendTiles`' (the lowering's
-// `mla_attend_tiles`), its numbers slots 16 to 22.
+// Constants: `mla.h`'s; the tile's shape is `MlaAttendTiles::new`'s, its numbers slots 16 to 22.
 
 #include <metal_stdlib>
 #include "baked.h"

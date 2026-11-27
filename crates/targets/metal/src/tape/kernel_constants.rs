@@ -1406,9 +1406,12 @@ impl MlaTileUnit {
     }
 
     /// The queries of a block (slot 20): two fragments' rows on a simdgroup MMA, one on the matrix
-    /// unit.
+    /// unit (whose ops' destinations lie as a row of fragments).
     const fn block_rows(self) -> u32 {
-        16
+        match self {
+            Self::Simdgroup => 2 * self.fragment(),
+            Self::Matrix => self.fragment(),
+        }
     }
 
     /// The query blocks of a threadgroup (slot 18).
