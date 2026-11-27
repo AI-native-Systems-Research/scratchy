@@ -1525,14 +1525,21 @@ pub(crate) fn superdsc_forward_chunk(
     let top_m = rungs.last().map(|(m, _)| *m).unwrap_or(0);
     let end = start + n;
     let mut pos = start;
-    let mut pick: Option<Vec<u32>> = None;
+    // ⭐ THE PROMPT'S OWED PICK — the prompt-final chunk's piece, riding the executor's
+    // step queue to whoever drains it. Nothing this loop does waits on the card: the
+    // chunks submit back to back, and the ONE host wait a prompt meets is the drain that
+    // owes this piece.
+    let mut owed: Option<crate::card::exec::InFlightStep> = None;
     while pos < end {
         let left = end - pos;
-        let (width, sess) = if pos == 0 {
+        // ⭐ THE SEAT THE CHUNK RAN ON — carried beside the session it names, so the
+        // prompt-final chunk's piece can state which session owes its read (the drain
+        // resolves it back through `SuperDscBundle::step_session`).
+        let (width, sess, seat) = if pos == 0 {
             let ri = prefill_rung_for(rungs, left.min(top_m))
                 .ok_or_else(|| werr("superdsc prefill: no prompt chunk rung baked".to_string()))?;
             let (m, sess) = &mut rungs[ri];
-            (*m, sess)
+            (*m, sess, crate::card::types::StepSeat::Prefill(ri))
         } else {
             let r = prefix.rung_for(left).ok_or_else(|| {
                 werr(format!(
@@ -1540,7 +1547,11 @@ pub(crate) fn superdsc_forward_chunk(
                      keys before it, and none is baked"
                 ))
             })?;
-            (r.width(), prefix.session(r))
+            (
+                r.width(),
+                prefix.session(r),
+                crate::card::types::StepSeat::Prefix(r),
+            )
         };
         let real = left.min(width);
         let chunk_toks: Vec<usize> = (pos..pos + real)
@@ -1561,9 +1572,9 @@ pub(crate) fn superdsc_forward_chunk(
         // forwards ([`Forwards`] — its suffix never runs, nothing is read back, the host
         // returns while the card is still running it), and the chunk that finishes it picks
         // ([`Picks`] — the rung's minted sampler picks the first generated token on the
-        // card, and the loop collects it IN-CALL through the one collect door: §3.2's one
-        // host wait a prompt meets). The laws are stated once, before the end is chosen —
-        // they are this chunk's own either way.
+        // card, and its read is DEFERRED: the piece rides the executor's step queue, and
+        // the loop keeps nothing of it here). The laws are stated once, before the end is
+        // chosen — they are this chunk's own either way.
         let laws = SamplerLaws {
             seeds: ktir_superdsc::sdsc_abstract::SeedSource::Host(&chunk_toks),
             laws: SeatLaws::Prompt {
@@ -1580,18 +1591,19 @@ pub(crate) fn superdsc_forward_chunk(
             })?,
         };
         if finishes {
+            // ⭐ THE PROMPT-FINAL PICK IS OWED, NOT COLLECTED: the piece carries the step's
+            // landing, the seat it ran on, and this request — the executor's queue pops it
+            // in submission order and the drain owns the pick's bookkeeping. (The chunk's
+            // `dbg_seat` logits readback rides the piece's `sub` and prints at the drain;
+            // the staged-bytes seat readback was an in-call instrument and has no deferred
+            // home — the card-crate readback door is the piece's own.)
             let sub = run_card_launch::<Picks>(rows_in, sh, sess, pmeta, rung, laws)?;
-            let picked = collect_decode_tokens(sess, &sub)?;
-            if let Some(seat) = pmeta.wiring.sample_seat.as_ref() {
-                log_seat_readback(
-                    sess,
-                    seat,
-                    pmeta.wiring.load_consts,
-                    &picked,
-                    &format!("prefill-final mq={width} at={}", end - 1),
-                );
-            }
-            pick = Some(picked);
+            owed = Some(crate::card::exec::InFlightStep {
+                cell: std::sync::Arc::new(scratchy_serving_engine::executor::DrainCell::new()),
+                sub,
+                seat,
+                owed: crate::card::exec::Owed::Prompt { id: id.to_string() },
+            });
         } else {
             run_card_launch::<Forwards>(rows_in, sh, sess, pmeta, rung, laws)?;
         }
@@ -1602,9 +1614,11 @@ pub(crate) fn superdsc_forward_chunk(
         );
         pos += real;
     }
+    // ⭐ THE KV HISTORY AT SUBMIT (c4b) — the write slot is a position fact the host knew
+    // when it launched, and the next chunk's geometry reads it before any drain.
     tokens.set_tokens_in_pool(id, end);
-    Ok(match pick {
-        Some(ts) => ChunkOut::Tokens(ts),
+    Ok(match owed {
+        Some(piece) => ChunkOut::Owed(piece),
         None => ChunkOut::Prompt,
     })
 }
@@ -1638,13 +1652,17 @@ pub(crate) struct PackedTail {
 /// request's pick is computed and never read. The caller's selection (a rung that holds the
 /// widest tail and the live count, or none) is a SELECTION, never a refusal: a wave no rung
 /// holds runs the solo path.
+///
+/// ⭐ THE WAVE'S PICKS ARE OWED, NOT COLLECTED: a wave with a finishing tail hands back its
+/// piece — the step's landing, the rung it ran on, and every tail's bookkeeping — and the
+/// executor's queue pops it in submission order; the drain owns each tail's pool count and
+/// each finishing tail's pick. `None` is a wave that only forwarded.
 pub(crate) fn superdsc_forward_packed(
     sh: &Shared<'_>,
     prefix: &mut PrefixLadder,
     rung: PrefixRung,
     tails: &[PackedTail],
-    tokens: &mut scratchy_serving_engine::input_batch::InputBatch,
-) -> ExecutorResult<Vec<Option<u32>>> {
+) -> ExecutorResult<Option<crate::card::exec::InFlightStep>> {
     let (meta, sess) = prefix.packed_parts(rung);
     let (w, s) = (rung.width(), rung.seqs());
     // ⭐ REQUEST `r`'S OWN STEP — its tail's rows from its own start, at most the window's
@@ -1670,8 +1688,8 @@ pub(crate) fn superdsc_forward_packed(
     // the one tape either way, so a wave whose every tail is mid-prompt only forwards
     // ([`Forwards`] — no read, no wait, the host returns while the card runs the wave), and
     // a wave with a finishing tail picks ([`Picks`] — the readback carries `s` picks, one
-    // per window, collected in-call through the one collect door).
-    let picked = if tails.iter().any(|t| t.finishes) {
+    // per window, and they are owed through the piece).
+    let piece = if tails.iter().any(|t| t.finishes) {
         let sub = run_card_launch::<Picks>(
             LaunchRows::Packed {
                 steps: &steps,
@@ -1686,24 +1704,24 @@ pub(crate) fn superdsc_forward_packed(
                 laws: SeatLaws::Packed { draws: &draws },
             },
         )?;
-        let picked = collect_decode_tokens(sess, &sub)?;
-        if let Some(seat) = meta.wiring.sample_seat.as_ref() {
-            log_seat_readback(
-                sess,
-                seat,
-                meta.wiring.load_consts,
-                &picked,
-                &format!("packed wave w={w} s={s}"),
-            );
-        }
-        if picked.len() != s {
-            return Err(werr(format!(
-                "the packed rung (w={w}, s={s}) picked {} token(s) — one per window, never another \
-                 count",
-                picked.len()
-            )));
-        }
-        Some(picked)
+        Some(crate::card::exec::InFlightStep {
+            cell: std::sync::Arc::new(scratchy_serving_engine::executor::DrainCell::new()),
+            sub,
+            seat: crate::card::types::StepSeat::Prefix(rung),
+            owed: crate::card::exec::Owed::Wave {
+                rows: tails
+                    .iter()
+                    .enumerate()
+                    .map(|(r, t)| crate::card::exec::OwedTail {
+                        id: t.id.clone(),
+                        end: t.start + t.toks.len(),
+                        // A mid-prompt tail's pick is computed and never read — the
+                        // wave's own law.
+                        pick: t.finishes.then_some(r),
+                    })
+                    .collect(),
+            },
+        })
     } else {
         run_card_launch::<Forwards>(
             LaunchRows::Packed {
@@ -1726,22 +1744,7 @@ pub(crate) fn superdsc_forward_packed(
         tails.len(),
         seeds.len()
     );
-    // ⭐ THE BOOKKEEPING, PER REQUEST — its pool count always, its pick iff this step
-    // finished its prompt (the pick is request `r`'s own: seat row `r`, window `r`). A wave
-    // that forwarded finished no prompt, so every tail's answer is `None`.
-    let mut out = Vec::with_capacity(tails.len());
-    for (r, t) in tails.iter().enumerate() {
-        tokens.set_tokens_in_pool(&t.id, t.start + t.toks.len());
-        match &picked {
-            Some(p) if t.finishes => {
-                let tok = p[r];
-                tokens.push_generated(&t.id, tok);
-                out.push(Some(tok));
-            }
-            _ => out.push(None),
-        }
-    }
-    Ok(out)
+    Ok(piece)
 }
 
 /// Run the prompt tokens `toks` at absolute positions `start..start+toks.len()` on the card's

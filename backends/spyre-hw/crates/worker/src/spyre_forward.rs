@@ -34,6 +34,12 @@ pub(crate) enum ChunkOut {
     /// both tiers' bundles). The shared readers go through
     /// [`ChunkOut::minted_pick`], so no reader names the variant.
     Tokens(Vec<u32>),
+    /// ⭐ THE CHUNK'S PICK IS OWED (card only): the prompt-final launch's read is
+    /// deferred and its piece rides the executor's step queue — the caller's output
+    /// defers on the piece's cell. The card tier collects nothing in-call; the
+    /// emulator's twin has no queue and keeps its synchronous [`ChunkOut::Tokens`].
+    #[cfg(feature = "spyre-hw")]
+    Owed(crate::card::exec::InFlightStep),
 }
 
 impl ChunkOut {
@@ -41,13 +47,32 @@ impl ChunkOut {
     /// single door both shared pick readers go through. `None` is every chunk
     /// that picked nothing: a mid-prompt chunk (its suffix never runs), or any
     /// chunk of a build with no minted sampler, where the pick step's own
-    /// refusal — not a silent `Prompt` match — is what the caller meets.
+    /// refusal — not a silent `Prompt` match — is what the caller meets. On the
+    /// card tier an owed chunk answers `None` — its pick is not IN HAND, and the
+    /// chunk loop takes the piece before this door.
     pub(crate) fn minted_pick(&self) -> Option<&[u32]> {
         match self {
             ChunkOut::Tokens(ts) => Some(ts),
             ChunkOut::Prompt => None,
+            #[cfg(feature = "spyre-hw")]
+            ChunkOut::Owed(_) => None,
         }
     }
+}
+
+/// ⭐ WHAT A STEP'S PROMPT-FINAL PICK IS when the step returns — the shared door's own
+/// answer shape. The emulator tier collected its pick synchronously and answers
+/// [`StepPick::Token`]; the card tier owes it: the prompt-final launch's read is
+/// deferred, its piece rides the executor's step queue, and the caller's output defers
+/// on the piece's cell.
+pub(crate) enum StepPick {
+    /// The step owes no token: a mid-prompt chunk.
+    None,
+    /// The step's token, collected — the step waited its own pick.
+    Token(u32),
+    /// The step's token is OWED: the piece rides the executor's queue.
+    #[cfg(feature = "spyre-hw")]
+    Owed(crate::card::exec::InFlightStep),
 }
 
 /// ⭐ ONE ROW'S LAW FOR THE SEAT — what the launch's row `r` draws. `None` is
@@ -135,6 +160,11 @@ pub(crate) fn select_decode(buckets: &[BundleMeta], need: usize) -> &BundleMeta 
 /// the prompt or is a decode step. n==1 (generation) uses the cheap m=1 DECODE
 /// bundle; n>1 (prompt) uses the batched m=M PREFILL bundle (chunked by m_cap),
 /// falling back to the decode bundle if no prefill bundle was emitted.
+///
+/// ⭐ The answer is a [`StepPick`]: the emulator tier collected its pick and answers
+/// the token; the card tier owes it — the prompt-final launch's read is deferred, its
+/// piece rides the executor's step queue, and the caller's output defers on the
+/// piece's cell. Nothing in this call waits on the card.
 pub(crate) fn run_request_step(
     model: &mut Loaded,
     req: &mut ReqState,
@@ -146,9 +176,9 @@ pub(crate) fn run_request_step(
     tokens: &mut scratchy_serving_engine::input_batch::InputBatch,
     start: usize,
     n: usize,
-) -> ExecutorResult<Option<u32>> {
+) -> ExecutorResult<StepPick> {
     if n == 0 {
-        return Ok(None);
+        return Ok(StepPick::None);
     }
     let toks: Vec<usize> = (start..start + n)
         .map(|p| {
@@ -202,7 +232,10 @@ pub(crate) fn run_request_step(
         n
     };
     let mut pos = start;
+    #[cfg(not(feature = "spyre-hw"))]
     let mut prompt_pick: Option<u32> = None;
+    #[cfg(feature = "spyre-hw")]
+    let mut prompt_owed: Option<crate::card::exec::InFlightStep> = None;
     for chunk in toks[..prefill_n].chunks(chunk_w) {
         // ⭐ A PROMPT CHUNK RUNS ON THE SMALLEST PREFILL RUNG THAT REACHES IT. A rung's
         // attention walks the request's pages through the page table and the step's mask
@@ -242,7 +275,7 @@ pub(crate) fn run_request_step(
         }
         #[cfg(not(feature = "spyre-hw"))]
         let b = rung.unwrap_or(b);
-        if let Some(ts) = forward_chunk(
+        let out = forward_chunk(
             &sh,
             &mut model.session,
             b,
@@ -254,23 +287,55 @@ pub(crate) fn run_request_step(
                 start: pos,
                 toks: chunk,
             },
-        )?
-        .minted_pick()
-        {
+        )?;
+        // ⭐ THE CARD'S CHUNK OWES ITS PICK (the emulator's collected it): the piece
+        // rides the executor's step queue and this loop keeps staging the prompt's
+        // next chunk behind it — nothing here waits on the card.
+        #[cfg(feature = "spyre-hw")]
+        match out {
+            ChunkOut::Owed(piece) => prompt_owed = Some(piece),
+            // A mid-prompt chunk forwarded; the card tier never collects in-call, so
+            // `Tokens` is not a case it can meet.
+            _ => {}
+        }
+        #[cfg(not(feature = "spyre-hw"))]
+        if let Some(ts) = out.minted_pick() {
             prompt_pick = ts.last().copied();
         }
         pos += chunk.len();
     }
     if !finishes {
-        return Ok(None);
+        return Ok(StepPick::None);
     }
     let tok = if n > 1 {
         // The prompt-final chunk's on-card pick — the prefill rung's own minted
-        // sampler, read back as its idx stick. A `None` here means the final
-        // chunk never asked for its draw — a wiring bug, never a silent skip.
-        prompt_pick.ok_or_else(|| {
-            werr("the prompt-final chunk picked no token — its minted draw never ran".to_string())
-        })?
+        // sampler, read back as its idx stick.
+        #[cfg(feature = "spyre-hw")]
+        {
+            // ⭐ THE PICK IS OWED: the prompt-final launch's read is deferred and its
+            // piece rides the executor's step queue; the drain owns the pick's
+            // bookkeeping. The prompt's pool count was set at submit (the chunk loop's
+            // KV-history law). This block diverges — the card tier's `tok` is the
+            // queue's to answer, never this call's.
+            let piece = prompt_owed.ok_or_else(|| {
+                werr(
+                    "the prompt-final chunk picked no token — its minted draw never ran"
+                        .to_string(),
+                )
+            })?;
+            return Ok(StepPick::Owed(piece));
+        }
+        #[cfg(not(feature = "spyre-hw"))]
+        {
+            // A `None` here means the final chunk never asked for its draw — a wiring
+            // bug, never a silent skip.
+            prompt_pick.ok_or_else(|| {
+                werr(
+                    "the prompt-final chunk picked no token — its minted draw never ran"
+                        .to_string(),
+                )
+            })?
+        }
     } else {
         // THE PICK — on the card, through the decode bundle's sampler. No host
         // logits, no host argmax, anywhere: the idx stick is the only answer that
@@ -303,7 +368,7 @@ pub(crate) fn run_request_step(
         }
     };
     tokens.push_generated(id, tok);
-    Ok(Some(tok))
+    Ok(StepPick::Token(tok))
 }
 
 /// The idx stick's own decode law, shared by the sync readback and the deferred

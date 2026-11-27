@@ -234,6 +234,12 @@ impl Worker for SpyreWorker {
 
         let mut order: Vec<String> = Vec::new();
         let mut sampled: Vec<Option<u32>> = Vec::new();
+        // ⭐ §3.3 — THE STEP'S OWED ANSWERS: one row per request this schedule owes a token
+        // (a prompt's final pick, a wave's finishing tail, a decode batch's rows — mixed
+        // steps alike). Each names its piece's cell and its pick of it; the step's exit —
+        // the deferred output, or the in-call drain through the same pop — fills them.
+        #[cfg(feature = "spyre-hw")]
+        let mut owed_rows: Vec<OwedRow> = Vec::new();
 
         // New requests = (chunked) prefill: register the prompt + empty KV cache.
         //
@@ -335,7 +341,18 @@ impl Worker for SpyreWorker {
             let req = requests.get_mut(&nr.req_id).expect("just inserted");
             let s = run_request_step(model, req, &nr.req_id, input_batch, start, n)?;
             order.push(nr.req_id.clone());
-            sampled.push(s);
+            match s {
+                StepPick::None => sampled.push(None),
+                StepPick::Token(tok) => sampled.push(Some(tok)),
+                #[cfg(feature = "spyre-hw")]
+                StepPick::Owed(piece) => crate::card::exec::owe_prompt(
+                    &mut self.in_flight,
+                    &mut owed_rows,
+                    &mut sampled,
+                    piece,
+                    &nr.req_id,
+                ),
+            }
         }
 
         // Cached requests = decode (n=1) or a prefill-continuation chunk.
@@ -445,11 +462,30 @@ impl Worker for SpyreWorker {
                 };
                 let SendnnSession::SuperDsc(sb) = &mut model.session;
                 let (group, tail) = rest.split_at(seats);
-                let picks =
-                    superdsc_forward_packed(&sh, &mut sb.prefill_prefix, rung, group, input_batch)?;
-                for (t, pick) in group.iter().zip(picks) {
-                    order.push(t.id.clone());
-                    sampled.push(pick);
+                let piece = superdsc_forward_packed(&sh, &mut sb.prefill_prefix, rung, group)?;
+                if let Some(piece) = piece {
+                    // ⭐ THE WAVE'S PICKS ARE OWED: the piece rides the queue and each
+                    // finishing tail's row names its window's pick of the piece's cell.
+                    // A mid-prompt tail owes nothing — its answer stays `None`.
+                    let cell = piece.cell.clone();
+                    self.in_flight.push_back(piece);
+                    for (r, t) in group.iter().enumerate() {
+                        order.push(t.id.clone());
+                        sampled.push(None);
+                        if t.finishes {
+                            owed_rows.push(OwedRow {
+                                index: sampled.len() - 1,
+                                id: t.id.clone(),
+                                cell: cell.clone(),
+                                pick: OwedPick::Slot(r),
+                            });
+                        }
+                    }
+                } else {
+                    for t in group {
+                        order.push(t.id.clone());
+                        sampled.push(None);
+                    }
                 }
                 rest = tail;
             }
@@ -461,7 +497,18 @@ impl Worker for SpyreWorker {
                     .ok_or_else(|| werr(format!("unknown wave req {}", t.id)))?;
                 let s = run_request_step(model, req, &t.id, input_batch, t.start, t.toks.len())?;
                 order.push(t.id.clone());
-                sampled.push(s);
+                match s {
+                    StepPick::None => sampled.push(None),
+                    StepPick::Token(tok) => sampled.push(Some(tok)),
+                    #[cfg(feature = "spyre-hw")]
+                    StepPick::Owed(piece) => crate::card::exec::owe_prompt(
+                        &mut self.in_flight,
+                        &mut owed_rows,
+                        &mut sampled,
+                        piece,
+                        &t.id,
+                    ),
+                }
             }
             // ⛔ `waved` STAYS SET: every gathered tail ran above — packed or solo — and the
             // per-request loop below must not run the cached ones a second time.
@@ -687,71 +734,36 @@ impl Worker for SpyreWorker {
                     },
                 )?;
                 // ⭐ #32 (c4) — THE STEP IS SUBMITTED; its collect is QUEUED, not run. Everything
-                // the drain needs rides in `InFlightDecode` — per live row, in `decode_ids` order,
-                // the request, its position and the launch slot its token lands in.
+                // the drain needs rides in `InFlightStep` — the seat it was submitted on, and per
+                // live row, in `decode_ids` order, the request, its position and the launch slot
+                // its token lands in.
                 let laid: Vec<(String, usize, usize)> = decode_ids
                     .iter()
                     .enumerate()
                     .map(|(slot, (id, start))| (id.clone(), *start, slot))
                     .collect();
-                // A step defers only when it is THE WHOLE STEP — a pure decode, on a driver whose
-                // engine can drain it. A mixed schedule (a prefill chunk ran, or a per-request
-                // forward will run after this) collects in-call through the SAME pop, because its
-                // output has to carry the other rows' tokens with it.
-                let pure = scheduler_output.scheduled_new_reqs.is_empty()
-                    && cr
-                        .req_ids
-                        .iter()
-                        .all(|id| decode_ids.iter().any(|(d, _)| d == id));
                 let cell = std::sync::Arc::new(scratchy_serving_engine::executor::DrainCell::new());
-                self.in_flight.push_back(InFlightDecode {
+                self.in_flight.push_back(InFlightStep {
                     cell: cell.clone(),
                     sub,
-                    rung: ri,
-                    rows: laid,
+                    seat: crate::card::types::StepSeat::Decode(ri),
+                    owed: crate::card::exec::Owed::Decode { rows: laid },
                 });
-                if pure && self.drain_door.is_some() {
-                    // THE DEFERRED OUTPUT: knock, THEN wait — in that order, because a resolver
-                    // that waited first would block the one thread that can fill the cell.
-                    let door = self.drain_door.clone().expect("checked above");
-                    let waiting = cell.clone();
-                    let resolver = move || -> Result<Vec<u32>, String> {
-                        door.knock(waiting.clone()).map_err(|e| e.to_string())?;
-                        waiting.wait().map_err(|e| e.to_string())
-                    };
-                    let req_ids: Vec<String> =
-                        decode_ids.iter().map(|(id, _)| id.clone()).collect();
-                    return Ok(ModelRunnerOutput::deferred(req_ids, Box::new(resolver)));
-                }
-                // NOT DEFERRABLE — drain it right here, through the same pop the knock takes.
-                //
-                // ⛔ IN SUBMISSION ORDER. The step before this one may still be in flight (a stable
-                // seating submits at depth 2), and each drain appends its pick to the request's
-                // history. Draining this step first appended the two picks swapped, so the next
-                // churn re-seeded the request from the OLDER pick and it decoded that token twice
-                // (granite-3.1-2b: "Title: A A …" at a second request's join). The older steps
-                // drain first; this step is the queue's last.
-                while self.in_flight.len() > 1 {
-                    let older = self.in_flight.pop_front().expect("len > 1");
-                    Self::drain_one(older, model, requests, input_batch)?;
-                }
-                let infl = self.in_flight.pop_front().expect("queued just above");
-                let rows = Self::drain_one(infl, model, requests, input_batch)?;
                 // A REQUEST'S TOKEN COMES BACK IN THE SLOT THE LAUNCH PUT IT IN — live `i` in slot
-                // `i`. The pool bookkeeping (push_generated, set_tokens_in_pool) already ran in the
-                // drain; this loop only carries the step's answer into the output.
+                // `i`. The row is OWED: its pick parks on the piece's cell until a drain fills it,
+                // and the step's exit — the deferred output, or the in-call drain through the same
+                // pop — carries it into the output. The pool bookkeeping (push_generated,
+                // set_tokens_in_pool) runs at that drain; this loop only lays the rows.
                 for (slot, (id, _start)) in decode_ids.iter().enumerate() {
-                    let tok = rows.get(slot).copied().ok_or_else(|| {
-                        werr(format!(
-                            "decode: {} token(s) for {} request(s) — the rung's sampler did not \
-                             pick one per launch slot",
-                            rows.len(),
-                            decode_ids.len()
-                        ))
-                    })?;
                     order.push(id.clone());
-                    sampled.push(Some(tok));
+                    sampled.push(None);
                     batched.insert(id.clone());
+                    owed_rows.push(OwedRow {
+                        index: sampled.len() - 1,
+                        id: id.clone(),
+                        cell: cell.clone(),
+                        pick: OwedPick::Slot(slot),
+                    });
                 }
             }
         }
@@ -784,7 +796,55 @@ impl Worker for SpyreWorker {
                 .ok_or_else(|| werr(format!("unknown cached req {req_id}")))?;
             let s = run_request_step(model, req, req_id, input_batch, start, n)?;
             order.push(req_id.clone());
-            sampled.push(s);
+            match s {
+                StepPick::None => sampled.push(None),
+                StepPick::Token(tok) => sampled.push(Some(tok)),
+                #[cfg(feature = "spyre-hw")]
+                StepPick::Owed(piece) => crate::card::exec::owe_prompt(
+                    &mut self.in_flight,
+                    &mut owed_rows,
+                    &mut sampled,
+                    piece,
+                    req_id,
+                ),
+            }
+        }
+        // ⭐ #32 (c5) — THE EXIT IS THE ONE PLACE THAT DECIDES WHERE THE DRAIN RUNS. Every
+        // submitted step of this schedule is queued — a decode batch, a prompt's final chunk,
+        // a wave, ANY MIX, in submission order — each with its owed rows laid above. A driver
+        // whose engine handed down a drain door gives the whole queue to it: the output
+        // defers, carrying only the owing requests (the resolver answers row by row), and its
+        // resolver knocks, THEN waits — in that order, because a resolver that waited first
+        // would block the one thread that can fill the cells.
+        #[cfg(feature = "spyre-hw")]
+        if !owed_rows.is_empty() {
+            if let Some(door) = self.drain_door.clone() {
+                // The knock names the LAST row's cell, so the drain pops every older piece on
+                // the way to it — submission order, one pop, one path.
+                let last = owed_rows.last().expect("checked non-empty").cell.clone();
+                let req_ids: Vec<String> = owed_rows.iter().map(|r| r.id.clone()).collect();
+                let rows = owed_rows;
+                let resolver = move || -> Result<Vec<u32>, String> {
+                    door.knock(last.clone()).map_err(|e| e.to_string())?;
+                    rows.iter().map(|r| r.token()).collect()
+                };
+                return Ok(ModelRunnerOutput::deferred(req_ids, Box::new(resolver)));
+            }
+            // NO DRAIN DOOR — a synchronous driver: drain the queue right here, through the
+            // SAME pop the knock takes, then read the cells.
+            //
+            // ⛔ IN SUBMISSION ORDER. The step before this one may still be in flight (a stable
+            // seating submits at depth 2), and each drain appends its pick to the request's
+            // history. Draining the newest first appended the two picks swapped, so the next
+            // churn re-seeded the request from the OLDER pick and it decoded that token twice
+            // (granite-3.1-2b: "Title: A A …" at a second request's join). The older steps
+            // drain first; the queue's order is the submission order.
+            while let Some(infl) = self.in_flight.pop_front() {
+                Self::drain_one(infl, model, requests, input_batch)?;
+            }
+            for row in &owed_rows {
+                sampled[row.index] = Some(row.token().map_err(werr)?);
+            }
         }
 
         // One sampled token per request, in processing order; intermediate
