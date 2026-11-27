@@ -23,7 +23,7 @@ use tracing::debug;
 
 use scratchy_target_spyre::manifest::bytes_to_f32;
 
-use ktir_superdsc::collective::PerRank;
+use ktir_superdsc::collective::{PerRank, Rank};
 use scratchy_target_spyre::sen_convert::f32_to_f16_le;
 
 /// ⭐ ONE STEP'S HOST INPUTS — every channel a launch writes into each card's shadow, borrowed for
@@ -139,23 +139,48 @@ fn bind_rank<T: ktir_superdsc::collective::Tp>(
 }
 
 /// ⭐ ONE SUBMITTED STEP'S LANDING, PER CARD — rank `r`'s [`ForwardLatch`] for the forward that
-/// step submitted on card `r`, in rank order. The lead's (rank 0's) is the step's own landing
-/// when nobody reads a pick: the launch stream retires the forward in order, so its latch firing
-/// IS the step having landed. Every peer's is consumed at a pick's collect
+/// step submitted on card `r`. The lead's (rank 0's) is the step's own landing when nobody reads
+/// a pick: the launch stream retires the forward in order, so its latch firing IS the step having
+/// landed. Every peer's is consumed at a pick's collect
 /// ([`SuperDscSession::finish_deferred_read_with`]) — each peer parks its OWN forward of the
 /// step and takes its shadow's quiet point, never a whole-stream drain behind it.
-pub struct StepLanding {
-    /// In rank order: `forwards[r]` is rank `r`'s.
-    pub forwards: Vec<ForwardLatch>,
+///
+/// A [`PerRank`] behind a private field: minted only over the world's ranks (one latch per card
+/// the step spans, by type — no length to check, no index to agree on), so [`Self::lead`] is
+/// total and the peer settle is rank-to-rank by [`PerRank::get`], never a zip of two lists that
+/// could disagree.
+pub struct StepLanding<T: ktir_superdsc::collective::World> {
+    forwards: PerRank<T, ForwardLatch>,
 }
 
-impl StepLanding {
+impl<T: ktir_superdsc::collective::World> StepLanding<T> {
+    /// Mint from the parallel submits — one latch per rank, in rank order
+    /// (`each_parallel` spawns over the ranks and joins in that order); the mint
+    /// walks the ranks taking each one's own submit, so the landing is
+    /// one-per-card BY TYPE and no caller can build it of the wrong length or
+    /// order.
+    fn mint(landed: Vec<(ForwardLatch, f64)>) -> Self {
+        let mut submits = landed.into_iter();
+        Self {
+            forwards: PerRank::from_fn(|_| {
+                submits
+                    .next()
+                    .expect("each_parallel answers one submit per rank")
+                    .0
+            }),
+        }
+    }
+
     /// The lead card's (rank 0's) forward latch — a readless step's queue-arm form: the
-    /// landing the lead card's step queue takes when nobody reads this step's pick. The
-    /// forwards are in rank order by construction (one per card the step spans), so rank 0
-    /// is the front, never an index to agree on.
+    /// landing the lead card's step queue takes when nobody reads this step's pick.
+    /// Total: rank 0 is below every world, by type.
     pub fn lead(&self) -> &ForwardLatch {
-        &self.forwards[0]
+        self.forwards.get(Rank::<T>::of::<0>())
+    }
+
+    /// Rank `r`'s forward latch — total by [`PerRank`]'s own law.
+    pub fn get(&self, r: Rank<T>) -> &ForwardLatch {
+        self.forwards.get(r)
     }
 }
 
@@ -163,8 +188,8 @@ impl StepLanding {
 /// submitted, not run). The doorbells ring and the host returns; what the step owes rides this
 /// value to whoever drains it, in submission order:
 /// * `Nothing` — nobody reads this step's pick (a prompt's middle chunk, a discarded tail): the
-///   step owes NOTHING. A VALUE, not the refusal the chunk loop used to raise on the chunk that
-///   did not finish its prompt — the type states the case, so the refusal cannot exist.
+///   step owes NOTHING. A VALUE, not a refusal — the type states the case, so no reader can
+///   fail a step for owing nothing.
 /// * `Picks` — the step's pick is read (a prompt's final chunk, a decode step): the idx-stick
 ///   read is already deferred onto the ring exactly like a decode's, and the step owes that
 ///   pick, collected through the one collect door whenever its caller drains.
@@ -832,7 +857,7 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> SuperDscSession<'a, 'c, T> {
         n_new: usize,
         seq_pos: usize,
         suffix: SuffixLaunch,
-    ) -> Result<(std::time::Duration, StepLanding)> {
+    ) -> Result<(std::time::Duration, StepLanding<T>)> {
         let bind = self.bind_all(b)?;
         // ⭐ EVERY CARD'S DOORBELL BEFORE ANY WAIT — this door waits on nothing, so the ranks' steps
         // are all in flight together and their collectives meet on the cards.
@@ -845,12 +870,7 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> SuperDscSession<'a, 'c, T> {
             let at = landed.iter().map(|(_, ms)| *ms).collect::<Vec<_>>();
             eprintln!("[sdsc-submit] step {seq_pos}: rank submits done at {at:.2?} ms");
         }
-        Ok((
-            bind,
-            StepLanding {
-                forwards: landed.into_iter().map(|(l, _)| l).collect(),
-            },
-        ))
+        Ok((bind, StepLanding::mint(landed)))
     }
 
     /// ⭐ THE LEAD CARD'S STEP QUEUE — the submission-order cadence over the launch stream's
@@ -918,19 +938,19 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> SuperDscSession<'a, 'c, T> {
     pub fn finish_deferred_read_with<R>(
         &mut self,
         read: &DeferredRead,
-        step: &StepLanding,
+        step: &StepLanding<T>,
         f: impl FnOnce(&[u8]) -> R,
     ) -> Result<R> {
         // Rank 0's read lands behind its step. Every other rank settles on its OWN forward of
         // that step — NEVER a whole-stream drain: each peer's stream already holds the NEXT step
         // the pipelined loop submitted, and draining it would wait that step out too, so the card
         // would idle through every submit (measured at tp/8: busy at 1% of submits, against
-        // tp/1's 99%). The forwards are zipped rank-to-rank — both are in rank order by
-        // construction, so no index can disagree.
+        // tp/1's 99%). The settle is rank-to-rank BY TYPE (the landing is one-per-card by
+        // construction), so no index can disagree.
         let out = self.lead().finish_deferred_read_with(read, f)?;
-        for ((r, e), l) in self.ranks.iter_mut().zip(&step.forwards) {
+        for (r, e) in self.ranks.iter_mut() {
             if r.get() != 0 {
-                e.settle_peer_pick(l)?;
+                e.settle_peer_pick(step.get(r))?;
             }
         }
         Ok(out)
@@ -942,7 +962,7 @@ impl<'a, 'c, T: ktir_superdsc::collective::Tp> SuperDscSession<'a, 'c, T> {
     pub fn finish_deferred_read_raw(
         &mut self,
         read: &DeferredRead,
-        step: &StepLanding,
+        step: &StepLanding<T>,
     ) -> Result<Vec<u8>> {
         self.finish_deferred_read_with(read, step, |bytes| bytes.to_vec())
     }

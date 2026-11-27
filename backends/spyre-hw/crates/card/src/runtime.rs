@@ -96,10 +96,9 @@ pub struct CardRuntime<'a, T: ktir_superdsc::collective::Tp> {
     memory: CardMemory,
     rt: Arc<RuntimeContext<'a>>,
     /// ⭐ THE CARD'S ONE LAUNCH STREAM — minted once here, at bring-up, and
-    /// BORROWED by every executor that launches on this card. Before the
-    /// pipelining front each `Executor::prepare` minted (and dropped) its own
-    /// stream, so a card's sessions serialized on per-session streams and no
-    /// host side could state what the card still owed. One stream per card is
+    /// BORROWED by every executor that launches on this card; never a
+    /// per-session stream, whose serialization would hide what the card
+    /// still owed from every host side. One stream per card is
     /// the law the step cadence rides: its FIFO is the submission order the
     /// [`steps`](Self::steps) queue's landings are drained in, and its
     /// teardown drain (this runtime's [`shutdown`](Self::shutdown), plus the
@@ -923,9 +922,7 @@ impl std::error::Error for AllocError {}
 /// error and goes sticky-shutdown instead — so a waiter with no tick would
 /// hang on a dead device) are stated ONCE, in `flex_rs::step`; this type names
 /// that latch as a read's own landing and adds nothing the latch does not
-/// already carry. Before the step door existed this file carried its own copy
-/// of the pair, the tick, and the park loop — the same law stated twice, which
-/// is the defect the refounding deletes.
+/// already carry.
 ///
 /// One signal names one transfer, and the finish half that parks on it is
 /// its only WAITER (the ring law — a slot's bytes are read exactly once, by
