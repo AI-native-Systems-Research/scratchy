@@ -24,9 +24,10 @@ use scratchy_serving_worker::error::ExecutorResult;
 /// reads. One enum (not a bare `Vec<Vec<f32>>`) because the shape is a fact of the
 /// step the caller must not be able to confuse with the model's other outs.
 pub(crate) enum ChunkOut {
-    /// A prompt-only forward: no launch in it picked, nothing to sample. The first
-    /// generated token is picked by the DECODE launch that runs the prompt's last
-    /// token — never by a host readback.
+    /// A forward that picked nothing: a chunk that does not finish its prompt (its
+    /// suffix never runs — the finish law stated once inside each tier's forward).
+    /// A chunk that DOES finish and minted no draw is the tier forward's own
+    /// refusal, never this variant.
     Prompt,
     /// TOKENS THE DEVICE PICKED, one per launch this chunk ran that drew, in step
     /// order. The minted sampler's idx stick, read back raw — the only pick that
@@ -48,11 +49,12 @@ pub(crate) enum ChunkOut {
 impl ChunkOut {
     /// ⭐ THE CHUNK'S OWN MINTED PICKS, one per launch that ran a sampler — the
     /// single door both shared pick readers go through. `None` is every chunk
-    /// that picked nothing: a mid-prompt chunk (its suffix never runs), or any
-    /// chunk of a build with no minted sampler, where the pick step's own
-    /// refusal — not a silent `Prompt` match — is what the caller meets. On the
-    /// card tier an owed chunk answers `None` — its pick is not IN HAND, and the
-    /// chunk loop takes the piece before this door.
+    /// that picked nothing: a mid-prompt chunk (its suffix never runs — each
+    /// tier's forward states the finish law once). On the card tier an owed
+    /// chunk answers `None` — its pick is not IN HAND, and the chunk loop takes
+    /// the piece before this door. Emulator only: the card tier's outcomes are
+    /// `Prompt` and `Owed`, so nothing on it reads a collected pick here.
+    #[cfg(not(feature = "spyre-hw"))]
     pub(crate) fn minted_pick(&self) -> Option<&[u32]> {
         match self {
             #[cfg(not(feature = "spyre-hw"))]
@@ -72,7 +74,9 @@ impl ChunkOut {
 pub(crate) enum StepPick {
     /// The step owes no token: a mid-prompt chunk.
     None,
-    /// The step's token, collected — the step waited its own pick.
+    /// The step's token, collected — the step waited its own pick. Emulator
+    /// only: the card tier never waits a pick (it owes the piece).
+    #[cfg(not(feature = "spyre-hw"))]
     Token(u32),
     /// The step's token is OWED: the piece rides the executor's queue. Boxed — the piece
     /// is the enum's whole weight, paid once per step, never per token.
@@ -218,30 +222,55 @@ pub(crate) fn run_request_step(
     let chunk_w = n.max(1);
     #[cfg(not(feature = "spyre-hw"))]
     let chunk_w = b.m_cap;
-    // ⭐ THE PROMPT'S LAST TOKEN RUNS THROUGH PREFILL, exactly as on main. The
-    // prompt-final chunk's own minted sampler (the general mint — every prefill
-    // rung carries the draw) picks the first generated token ON THE CARD from
-    // the folded lm-head row, and the idx stick is read back exactly like a
-    // decode launch's. No decode launch runs a prompt step, so the last prompt
-    // position's KV is prefill-written, as main writes it. A generation step
-    // (n==1) prefills nothing and takes the DECODE pick launch below — every
-    // generated token past the first is the decode bundle's own draw. A
-    // mid-prompt wave (start+n still inside the prompt) forwards every token it
-    // was given and picks nothing: its chunks' suffixes never run.
-    let finishes = start + n >= tokens.prompt_len(id);
-    let prefill_n = if finishes && n > 1 {
-        n
-    } else if finishes {
-        0
-    } else {
-        n
-    };
+    // ⭐ A LONE TOKEN IS THE DECODE BUNDLE'S STEP — main's law. The card's executor routes one
+    // to the batched decode arm before this call (`solo_step_is_decode`), so on the card this
+    // arm meets only a lone MID-PROMPT tail (forwarded, nothing owed); the emulator's
+    // synchronous tier runs the transition token on the m=1 decode bundle and collects its
+    // pick. The chunk's own outcome states whether it picked ([`ChunkOut`]) — nothing here
+    // derives where the prompt ends.
+    if n == 1 {
+        let out = forward_chunk(
+            &sh,
+            &mut model.session,
+            b,
+            model.batched_prefill.as_ref(),
+            Chunk {
+                state: req,
+                id,
+                tokens,
+                start,
+                toks: &toks[..1],
+            },
+        )?;
+        return Ok(match out {
+            #[cfg(feature = "spyre-hw")]
+            ChunkOut::Owed(piece) => StepPick::Owed(piece),
+            #[cfg(not(feature = "spyre-hw"))]
+            ChunkOut::Tokens(ts) => {
+                let tok = *ts
+                    .last()
+                    .ok_or_else(|| werr("the pick step's decode launch picked no token".to_string()))?;
+                tokens.push_generated(id, tok);
+                StepPick::Token(tok)
+            }
+            ChunkOut::Prompt => StepPick::None,
+        });
+    }
+    // ⭐ THE PROMPT'S CHUNKS, AND THE CHUNK'S OWN OUTCOME IS THE FINISH LAW — the one statement
+    // of it. A chunk that finishes the prompt returns its owed pick ([`ChunkOut::Owed`]: the
+    // prompt-final chunk's minted sampler — the general mint, every prefill rung carries the
+    // draw — picks the first generated token ON THE CARD from the folded lm-head row, and the
+    // idx stick is read back exactly like a decode launch's, deferred onto the executor's
+    // queue); a mid-prompt chunk forwards every token it was given and picks nothing (its
+    // suffix never runs). This loop derives nothing about where the prompt ends — the chunk
+    // that ran to it says so, so there is nothing to reconcile and no refusal to raise when
+    // two derivations disagree.
     let mut pos = start;
     #[cfg(not(feature = "spyre-hw"))]
     let mut prompt_pick: Option<u32> = None;
     #[cfg(feature = "spyre-hw")]
     let mut prompt_owed: Option<Box<crate::card::exec::InFlightStep>> = None;
-    for chunk in toks[..prefill_n].chunks(chunk_w) {
+    for chunk in toks.chunks(chunk_w) {
         // ⭐ A PROMPT CHUNK RUNS ON THE SMALLEST PREFILL RUNG THAT REACHES IT. A rung's
         // attention walks the request's pages through the page table and the step's mask
         // stack says which keys each row attends, so a chunk over a cached prefix attends
@@ -308,71 +337,30 @@ pub(crate) fn run_request_step(
         }
         pos += chunk.len();
     }
-    if !finishes {
-        return Ok(StepPick::None);
+    // ⭐ THE CHUNK'S OUTCOME IS THE STEP'S — the piece is the prompt-final pick, owed through
+    // the executor's queue; no piece means every chunk forwarded: a mid-prompt wave, picking
+    // nothing. The card tier's answer is the queue's to give, never this call's.
+    #[cfg(feature = "spyre-hw")]
+    {
+        Ok(match prompt_owed {
+            Some(piece) => StepPick::Owed(piece),
+            None => StepPick::None,
+        })
     }
-    let tok = if n > 1 {
-        // The prompt-final chunk's on-card pick — the prefill rung's own minted
-        // sampler, read back as its idx stick.
-        #[cfg(feature = "spyre-hw")]
-        {
-            // ⭐ THE PICK IS OWED: the prompt-final launch's read is deferred and its
-            // piece rides the executor's step queue; the drain owns the pick's
-            // bookkeeping. The prompt's pool count was set at submit (the chunk loop's
-            // KV-history law). This block diverges — the card tier's `tok` is the
-            // queue's to answer, never this call's.
-            let piece = prompt_owed.ok_or_else(|| {
-                werr(
-                    "the prompt-final chunk picked no token — its minted draw never ran"
-                        .to_string(),
-                )
-            })?;
-            return Ok(StepPick::Owed(piece));
-        }
-        #[cfg(not(feature = "spyre-hw"))]
-        {
-            // A `None` here means the final chunk never asked for its draw — a wiring
-            // bug, never a silent skip.
-            prompt_pick.ok_or_else(|| {
-                werr(
-                    "the prompt-final chunk picked no token — its minted draw never ran"
-                        .to_string(),
-                )
-            })?
-        }
-    } else {
-        // THE PICK — on the card, through the decode bundle's sampler. No host
-        // logits, no host argmax, anywhere: the idx stick is the only answer that
-        // comes back.
-        let db = select_decode(&model.decode, start + n);
-        match forward_chunk(
-            &sh,
-            &mut model.session,
-            db,
-            model.batched_prefill.as_ref(),
-            Chunk {
-                state: req,
-                id,
-                tokens,
-                start: start + n - 1,
-                toks: &toks[n - 1..n],
-            },
-        )?
-        .minted_pick()
-        {
-            Some(ts) => *ts
-                .last()
-                .ok_or_else(|| werr("the pick step's decode launch picked no token".to_string()))?,
-            None => {
-                return Err(werr(
-                    "the pick step ran no decode launch — this build has no device sampler"
-                        .to_string(),
-                ));
+    #[cfg(not(feature = "spyre-hw"))]
+    {
+        // The prompt-final chunk's collected pick — `None` is every chunk of a mid-prompt
+        // step (the tier's forward answers `Prompt` for a chunk that does not finish, its
+        // one statement of the finish law); a finishing chunk that minted no draw is the
+        // FORWARD's own refusal, never a silent skip here.
+        match prompt_pick {
+            Some(tok) => {
+                tokens.push_generated(id, tok);
+                Ok(StepPick::Token(tok))
             }
+            None => Ok(StepPick::None),
         }
-    };
-    tokens.push_generated(id, tok);
-    Ok(StepPick::Token(tok))
+    }
 }
 
 /// The idx stick's own decode law, shared by the sync readback and the deferred

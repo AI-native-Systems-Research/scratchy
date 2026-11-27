@@ -349,6 +349,7 @@ impl Worker for SpyreWorker {
             order.push(nr.req_id.clone());
             match s {
                 StepPick::None => sampled.push(None),
+                #[cfg(not(feature = "spyre-hw"))]
                 StepPick::Token(tok) => sampled.push(Some(tok)),
                 #[cfg(feature = "spyre-hw")]
                 StepPick::Owed(piece) => crate::card::exec::owe_prompt(
@@ -469,10 +470,18 @@ impl Worker for SpyreWorker {
                 let SendnnSession::SuperDsc(sb) = &mut model.session;
                 let (group, tail) = rest.split_at(seats);
                 let piece = superdsc_forward_packed(&sh, &mut sb.prefill_prefix, rung, group)?;
+                // ⭐ THE KV HISTORY AT SUBMIT (c4b) — one rule for every kind of step: each
+                // tail's forward reaches `start + toks.len()` positions, written here for
+                // the whole group whether the wave picks or only forwards (a readless wave
+                // has no piece, so its count could never be the drain's to write).
+                for t in group {
+                    input_batch.set_tokens_in_pool(&t.id, t.start + t.toks.len());
+                }
                 if let Some(piece) = piece {
                     // ⭐ THE WAVE'S PICKS ARE OWED: the piece rides the queue and each
-                    // finishing tail's row names its window's pick of the piece's cell.
-                    // A mid-prompt tail owes nothing — its answer stays `None`.
+                    // finishing tail's row names its window's pick of the piece's cell,
+                    // minted against the group's window count. A mid-prompt tail owes
+                    // nothing — its answer stays `None`.
                     let cell = piece.cell.clone();
                     self.in_flight.push_back(piece);
                     for (r, t) in group.iter().enumerate() {
@@ -483,7 +492,10 @@ impl Worker for SpyreWorker {
                                 index: sampled.len() - 1,
                                 id: t.id.clone(),
                                 cell: cell.clone(),
-                                pick: OwedPick::Slot(r),
+                                pick: OwedPick::Slot(
+                                    crate::card::exec::SeatSlot::mint(r, group.len())
+                                        .expect("the wave seats one window per tail"),
+                                ),
                             });
                         }
                     }
@@ -505,6 +517,7 @@ impl Worker for SpyreWorker {
                 order.push(t.id.clone());
                 match s {
                     StepPick::None => sampled.push(None),
+                    #[cfg(not(feature = "spyre-hw"))]
                     StepPick::Token(tok) => sampled.push(Some(tok)),
                     #[cfg(feature = "spyre-hw")]
                     StepPick::Owed(piece) => crate::card::exec::owe_prompt(
@@ -747,13 +760,26 @@ impl Worker for SpyreWorker {
                 )?;
                 // ⭐ #32 (c4) — THE STEP IS SUBMITTED; its collect is QUEUED, not run. Everything
                 // the drain needs rides in `InFlightStep` — the seat it was submitted on, and per
-                // live row, in `decode_ids` order, the request, its position and the launch slot
-                // its token lands in.
-                let laid: Vec<(String, usize, usize)> = decode_ids
+                // live row, in `decode_ids` order, the request and the launch slot its token
+                // lands in, minted against the launch's width (one row per request).
+                let laid: Vec<(String, crate::card::exec::SeatSlot)> = decode_ids
                     .iter()
                     .enumerate()
-                    .map(|(slot, (id, start))| (id.clone(), *start, slot))
+                    .map(|(slot, (id, _start))| {
+                        (
+                            id.clone(),
+                            crate::card::exec::SeatSlot::mint(slot, decode_ids.len())
+                                .expect("the decode launch lays one row per request"),
+                        )
+                    })
                     .collect();
+                // ⭐ THE KV HISTORY AT SUBMIT (c4b) — ONE RULE FOR EVERY KIND OF STEP: the
+                // pool count a step reached is a position fact the host knew when it
+                // launched, written here, read by the next step's geometry before any
+                // drain on a stable seating. The drain owns PICKS, never history.
+                for (id, start) in decode_ids.iter() {
+                    input_batch.set_tokens_in_pool(id, start + 1);
+                }
                 let cell = std::sync::Arc::new(scratchy_serving_engine::executor::DrainCell::new());
                 self.in_flight.push_back(InFlightStep {
                     cell: cell.clone(),
@@ -762,10 +788,11 @@ impl Worker for SpyreWorker {
                     owed: crate::card::exec::Owed::Decode { rows: laid },
                 });
                 // A REQUEST'S TOKEN COMES BACK IN THE SLOT THE LAUNCH PUT IT IN — live `i` in slot
-                // `i`. The row is OWED: its pick parks on the piece's cell until a drain fills it,
-                // and the step's exit — the deferred output, or the in-call drain through the same
-                // pop — carries it into the output. The pool bookkeeping (push_generated,
-                // set_tokens_in_pool) runs at that drain; this loop only lays the rows.
+                // `i`, minted against the launch's width. The row is OWED: its pick parks on the
+                // piece's cell until a drain fills it, and the step's exit — the deferred output,
+                // or the in-call drain through the same pop — carries it into the output. The
+                // pick's bookkeeping (push_generated) runs at that drain; this loop only lays the
+                // rows.
                 for (slot, (id, _start)) in decode_ids.iter().enumerate() {
                     order.push(id.clone());
                     sampled.push(None);
@@ -774,7 +801,10 @@ impl Worker for SpyreWorker {
                         index: sampled.len() - 1,
                         id: id.clone(),
                         cell: cell.clone(),
-                        pick: OwedPick::Slot(slot),
+                        pick: OwedPick::Slot(
+                            crate::card::exec::SeatSlot::mint(slot, decode_ids.len())
+                                .expect("the decode launch lays one row per request"),
+                        ),
                     });
                 }
             }
@@ -810,6 +840,7 @@ impl Worker for SpyreWorker {
             order.push(req_id.clone());
             match s {
                 StepPick::None => sampled.push(None),
+                #[cfg(not(feature = "spyre-hw"))]
                 StepPick::Token(tok) => sampled.push(Some(tok)),
                 #[cfg(feature = "spyre-hw")]
                 StepPick::Owed(piece) => crate::card::exec::owe_prompt(

@@ -64,6 +64,12 @@ impl SpyreWorker {
     /// step `j+1` in flight; the next schedule names it in `finished_req_ids`, and
     /// `execute_model` drops it before that step is drained. The engine discards the overshoot
     /// token of a finished request, so the drain skips its bookkeeping rather than failing the step.
+    ///
+    /// ⭐ THE KV HISTORY IS NEVER THE DRAIN'S FACT — every submit writes the pool count its step
+    /// reached (the c4b law: a position fact the host knew when it launched, read by the next
+    /// step's geometry before any drain, on a stable seating). The drain owns PICKS: the
+    /// launch's typed [`LaunchPicks`] (one per slot, the bounds law stated once at the mint)
+    /// and each row's bookkeeping write.
     pub(crate) fn collect_rows(
         sess: &mut SuperDscSession,
         sub: &crate::spyre_forward::SubmittedDecode,
@@ -71,54 +77,37 @@ impl SpyreWorker {
         requests: &mut HashMap<String, ReqState>,
         input_batch: &mut scratchy_serving_engine::input_batch::InputBatch,
     ) -> ExecutorResult<Vec<u32>> {
-        let toks = collect_decode_tokens(sess, sub)?;
+        let picks = collect_decode_tokens(sess, sub)?;
         match owed {
             Owed::Decode { rows } => {
-                // A REQUEST'S TOKEN COMES BACK IN THE SLOT THE LAUNCH PUT IT IN — the slot was resolved
-                // at submit and rides in `rows`, so the drain cannot re-derive (and mis-derive) it.
-                // The sentinel check already happened at the decode law (`collect_decode_tokens`);
-                // this guard is the slice's own bound.
+                // A REQUEST'S TOKEN COMES BACK IN THE SLOT THE LAUNCH PUT IT IN — the slot was
+                // minted at submit against the launch's width and rides in `rows`, so the
+                // drain cannot re-derive (and mis-derive) it, and the pick is total.
                 let n_req = rows.len();
                 let mut out = Vec::with_capacity(n_req);
-                for (id, start, slot) in rows {
-                    let tok = toks.get(slot).copied().ok_or_else(|| {
-                        werr(format!(
-                            "decode batch: {} token(s) for {n_req} request(s) — the rung's sampler did \
-                             not pick one per launch slot",
-                            toks.len()
-                        ))
-                    })?;
+                for (id, slot) in rows {
+                    let tok = picks.pick(slot);
                     // The token stays in its slot either way: the deferred output maps answer `i` to its
                     // `req_ids[i]` and the in-call drain reads slot `i`, so a dropped row would hand every
                     // later row its neighbour's token. A gone request's overshoot pick is discarded by the
                     // engine; it only skips the pool bookkeeping of a request that no longer exists.
-                    // Every pick the drain owns, one line each: request, the position the row
-                    // computed, the token id. The stream a request's reply is made of, stated as
-                    // the fact the numerics bar argues over — WHERE a reply diverges between two
-                    // cells names the step, and the step names the rung.
-                    tracing::debug!("[spyre-worker] pick {id} at {start} = {tok}");
+                    // Every pick the drain owns, one line each: request, the token id. The stream a
+                    // request's reply is made of, stated as the fact the numerics bar argues over —
+                    // WHERE a reply diverges between two cells names the step, and the step names the rung.
+                    tracing::debug!("[spyre-worker] pick {id} = {tok}");
                     if requests.contains_key(&id) {
                         input_batch.push_generated(&id, tok);
-                        input_batch.set_tokens_in_pool(&id, start + 1);
                     }
-                    // ⭐ THE KV HISTORY WAS RECORDED AT SUBMIT (c4b) — the write slot is a position fact
-                    // the host knew when it launched, and the next step's geometry reads it before this
-                    // drain on a stable seating. The drain owns the PICK; the history was never its fact.
                     out.push(tok);
                 }
                 Ok(out)
             }
             Owed::Prompt { id } => {
-                // ⭐ A PROMPT'S FIRST GENERATED TOKEN — the mint's consumed pick is the LAST baked
-                // row's (the pad clamp makes the pad rows' picks the last real row's own). The
-                // prompt's pool count was set at submit (the chunk loop's own KV-history law);
-                // the drain owns only the pick.
-                let tok = *toks.last().ok_or_else(|| {
-                    werr(
-                        "the prompt-final chunk picked no token — its minted draw never ran"
-                            .to_string(),
-                    )
-                })?;
+                // ⭐ A PROMPT'S FIRST GENERATED TOKEN — the mint's consumed pick is the last
+                // baked row's ([`prompt_final_pick`], the one rule). The prompt's pool count
+                // was set at submit (the chunk loop's own KV-history law); the drain owns
+                // only the pick.
+                let tok = picks.prompt_final();
                 tracing::debug!("[spyre-worker] pick {id} (prompt-final) = {tok}");
                 if requests.contains_key(&id) {
                     input_batch.push_generated(&id, tok);
@@ -126,29 +115,20 @@ impl SpyreWorker {
                 Ok(vec![tok])
             }
             Owed::Wave { rows } => {
-                // ⭐ A WAVE'S PICKS, one per window — request `r`'s own answer from seat row `r`.
-                // Every tail's pool count is the drain's (the wave stated it at its collect before
-                // steps deferred; it drains through the same door now). A mid-prompt tail's pick
-                // is computed and never read — the wave's own law.
+                // ⭐ A WAVE'S PICKS, one per window — request `r`'s own answer from its
+                // window's slot, minted at submit against the wave's window count. Every
+                // tail's pool count was set at submit, with the wave's; a mid-prompt tail's
+                // pick is computed and never read — the wave's own law.
                 for t in rows {
-                    input_batch.set_tokens_in_pool(&t.id, t.end);
                     if let Some(slot) = t.pick {
-                        let tok = toks.get(slot).copied().ok_or_else(|| {
-                            werr(format!(
-                                "the packed wave picked {} token(s) — tail {}'s window {} has none, \
-                                 and every window's answer is the readback's to carry",
-                                toks.len(),
-                                t.id,
-                                slot
-                            ))
-                        })?;
+                        let tok = picks.pick(slot);
                         tracing::debug!("[spyre-worker] pick {} (wave) = {tok}", t.id);
                         if requests.contains_key(&t.id) {
                             input_batch.push_generated(&t.id, tok);
                         }
                     }
                 }
-                Ok(toks)
+                Ok(picks.into_tokens())
             }
         }
     }
@@ -184,27 +164,99 @@ impl InFlightStep {
     }
 }
 
+/// ⭐ THE LAUNCH'S OWN TYPED PICKS — the readback decoded once, ONE TOKEN PER
+/// SLOT of the launch's seat width. `decode_idx_stick` states that law
+/// structurally (it answers exactly one token per row it is given, and the row
+/// count is the launch's own `SeatWidth`), so a [`SeatSlot`] minted against the
+/// width picks TOTAL: no reader of a pick re-checks the sampler's law, and the
+/// prompt-final rule lives here as the one function every prompt-final reader
+/// calls.
+pub(crate) struct LaunchPicks {
+    toks: Vec<u32>,
+}
+
+/// A slot of a launch's seat — minted only against the width that laid it
+/// ([`SeatSlot::mint`], called by the submit as it lays each row and names each
+/// window), so the pick against it is total and a slot of one launch cannot be
+/// spent against another's count by accident.
+#[derive(Clone, Copy)]
+pub(crate) struct SeatSlot {
+    slot: usize,
+}
+
+impl SeatSlot {
+    /// Mint against the launch's width — the ONE statement of the bounds law.
+    /// `None` names a wiring bug at the caller that laid the rows.
+    pub(crate) fn mint(i: usize, width: usize) -> Option<Self> {
+        (i < width).then_some(Self { slot: i })
+    }
+}
+
+/// ⭐ THE PROMPT-FINAL PICK IS THE LAST BAKED ROW'S — the pad clamp makes the pad
+/// rows' picks the last real row's own, so the consumed pick is the last slot's.
+/// ONE function: the drain's bookkeeping and the owed row's output both call it,
+/// never restate it.
+pub(crate) fn prompt_final_pick(toks: &[u32]) -> u32 {
+    *toks
+        .last()
+        .expect("the prompt-final launch answered no pick — its minted draw never ran")
+}
+
+impl LaunchPicks {
+    /// Mint the readback against the launch's width — `decode_idx_stick` answers
+    /// one token per row it is given, and `rows` is that count (the submitted
+    /// step's own [`crate::spyre_forward::SeatWidth`]), so the width is the
+    /// readback's own law, never a second check.
+    pub(crate) fn mint(toks: Vec<u32>, rows: usize) -> Self {
+        debug_assert_eq!(
+            toks.len(),
+            rows,
+            "decode_idx_stick answers one token per launch row"
+        );
+        Self { toks }
+    }
+
+    /// The slot's token — TOTAL: the slot was minted against this launch's width
+    /// and the readback answered one token per row of it. The two mints are the
+    /// whole law; this index cannot be out of bounds unless they disagree.
+    pub(crate) fn pick(&self, s: SeatSlot) -> u32 {
+        self.toks[s.slot]
+    }
+
+    /// The prompt-final pick — [`prompt_final_pick`], the one rule.
+    pub(crate) fn prompt_final(&self) -> u32 {
+        prompt_final_pick(&self.toks)
+    }
+
+    /// The picks as the piece's cell answer — one token per slot, in the
+    /// launch's own order, so an owed row's minted slot picks its own.
+    pub(crate) fn into_tokens(self) -> Vec<u32> {
+        self.toks
+    }
+}
+
 /// ⭐ WHAT ONE SUBMITTED STEP OWES ITS CALLERS — the drain's bookkeeping, named by the
 /// kind of step that submitted. The pieces ride [`InFlightStep`] in submission order.
+/// The KV history is NOT the drain's fact for any kind: every submit writes the pool
+/// count it reached (the c4b law), so the drain owns only picks.
 pub(crate) enum Owed {
-    /// A DECODE BATCH: per live row, in submit order, `(request id, position, launch
-    /// slot)` — the drain owns each row's pick and pool bookkeeping.
-    Decode { rows: Vec<(String, usize, usize)> },
+    /// A DECODE BATCH: per live row, in submit order, `(request id, launch slot)`
+    /// — the drain owns each row's pick.
+    Decode { rows: Vec<(String, SeatSlot)> },
     /// A PROMPT-FINAL PICK: one request's first generated token. The prompt's pool count
     /// was set at submit (the chunk loop's KV-history law); the drain owns only the pick.
     Prompt { id: String },
-    /// A WAVE'S TAILS: per tail, its request, its pool end, and its window's pick (a
-    /// mid-prompt tail's is computed and never read — `None`).
+    /// A WAVE'S TAILS: per tail, its request and its window's pick (a mid-prompt
+    /// tail's is computed and never read — `None`). The tail's pool count was set
+    /// at submit, with the wave's.
     Wave { rows: Vec<OwedTail> },
 }
 
 /// One tail of an owed wave — the drain's per-request bookkeeping for it.
 pub(crate) struct OwedTail {
     pub(crate) id: String,
-    /// The pool count the tail's forward reached (set at the drain, the wave's own law).
-    pub(crate) end: usize,
     /// The window whose pick is this tail's — `None` for a mid-prompt tail.
-    pub(crate) pick: Option<usize>,
+    pub(crate) pick: Option<SeatSlot>,
 }
 
 /// ⭐ ONE REQUEST'S OWED ANSWER within a step's output — where its token lands and how to
@@ -224,10 +276,25 @@ pub(crate) struct OwedRow {
 
 /// Which pick of a piece's landed answer is a row's own token.
 pub(crate) enum OwedPick {
-    /// A decode batch's row: the launch slot the request's token comes back in.
-    Slot(usize),
+    /// A launch slot the request's token comes back in — minted at submit against
+    /// the launch's width (a decode batch's row, a wave's window).
+    Slot(SeatSlot),
     /// A piece that answers ONE token (a prompt-final pick): the piece's own answer.
     One,
+}
+
+impl OwedPick {
+    /// The row's token out of its piece's landed answer — TOTAL, the same two mints
+    /// the drain's [`LaunchPicks`] rests on: the slot was minted at submit against
+    /// the piece's unit count, and the drain minted the answer one token per unit
+    /// of the same count. The prompt-final rule is [`prompt_final_pick`], the one
+    /// function — never restated here.
+    pub(crate) fn pick(&self, answer: &[u32]) -> u32 {
+        match self {
+            OwedPick::Slot(s) => answer[s.slot],
+            OwedPick::One => prompt_final_pick(answer),
+        }
+    }
 }
 
 impl OwedRow {
@@ -241,19 +308,7 @@ impl OwedRow {
             Ok(toks) => toks,
             Err(e) => return Err(e.to_string()),
         };
-        match self.pick {
-            OwedPick::Slot(slot) => toks.get(slot).copied().ok_or_else(|| {
-                format!(
-                    "the step picked {} token(s) — request {}'s launch slot {slot} has none",
-                    toks.len(),
-                    self.id
-                )
-            }),
-            OwedPick::One => toks
-                .last()
-                .copied()
-                .ok_or_else(|| format!("the step owed {} a token and picked none", self.id)),
-        }
+        Ok(self.pick.pick(toks))
     }
 }
 

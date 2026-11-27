@@ -332,8 +332,16 @@ pub(crate) fn forward_chunk(
         // emulator's readback is memref-faithful, row `r`'s lane 0 is element `r·width`, and each
         // word passes the same token law the card's decode applies (`token_of_idx_word`). The
         // caller consumes the LAST row's pick, the folded tail's: the last real token's forward.
-        match b.sample_seat {
-            Some(seat) => {
+        //
+        // ⭐ THE CHUNK'S OWN OUTCOME IS THE FINISH LAW — this tier's ONE statement of it (the
+        // card's twin lives in `superdsc_forward_chunk`, each tier's forward inside that tier):
+        // a chunk that does not finish its prompt PICKS NOTHING, whatever its bundle minted —
+        // its answer is [`ChunkOut::Prompt`], and the step that ran it owes no token. The chunk
+        // that finishes the prompt answers its minted picks, and a finishing chunk whose bundle
+        // minted no draw is refused HERE — where both facts live — never silently answered.
+        let finishes = start + n >= tokens.prompt_len(id);
+        match (b.sample_seat, finishes) {
+            (Some(seat), true) => {
                 let idx = out.get(&(b.result_id as u64)).ok_or_else(|| {
                     werr(format!(
                         "the minted draw's idx stick t{} came back unread",
@@ -353,7 +361,11 @@ pub(crate) fn forward_chunk(
                     .collect::<ExecutorResult<Vec<u32>>>()?;
                 Ok(ChunkOut::Tokens(picks))
             }
-            None => Ok(ChunkOut::Prompt),
+            (None, true) => Err(werr(
+                "the prompt-final chunk's bundle minted no draw — this build has no device sampler"
+                    .to_string(),
+            )),
+            (_, false) => Ok(ChunkOut::Prompt),
         }
     }
 }

@@ -27,7 +27,7 @@ pub(crate) struct SubmittedDecode {
     pub(crate) read: scratchy_target_spyre_card::superdsc_exec::DeferredRead,
     /// The step the pick belongs to, on every card it spans — its collect hands the step
     /// back retired on every card ([`collect_decode_tokens`]).
-    pub(crate) step: scratchy_target_spyre_card::sdsc_runner::StepLanding,
+    pub(crate) step: crate::card::types::StepLanding,
     /// The launch's own typed width ([`SeatWidth`]) the submit half minted.
     pub(crate) rows: SeatWidth,
     /// The idx stick's own row size in i32 words — the seat's typed readback
@@ -49,6 +49,158 @@ pub(crate) struct SubmittedDecode {
         u32,
         usize,
     )>,
+    /// ⭐ THE SEAT'S OWN STAGED TABLES, DEFERRED BESIDE THE PICK — armed only
+    /// at `debug`: the greedy-draw localization's staged byte-groups (auditor
+    /// order 2026-10-27), each read through the same ring door and the same
+    /// stream order as the pick, and stated at the drain by
+    /// [`log_seat_tables`] — the readback runs where the collect runs and
+    /// never blocks a submit. See [`SeatTables`].
+    pub(crate) dbg_tables: Option<SeatTables>,
+}
+
+/// ⭐ THE SEAT'S OWN STAGED TABLES, DEFERRED BESIDE THE PICK — the greedy-draw
+/// localization's staged byte-groups (auditor order 2026-10-27), read back as
+/// facts, never as gates:
+///   * THE SEAT — the four seed-word tables and `inv_t`, each row's word at
+///     its stick head through the same scatter law [`sample_binds`] staged
+///     (zeros or a greedy quadruple on a sampled row ⇒ the seat path: the
+///     worker binds greedy whatever the params);
+///   * THE HASH CHAIN'S UNIFORM TABLES — hc1/hc2/hc3/c256 and the lane
+///     table, staged at load. A noise CONSTANT across lanes is exactly the
+///     greedy signature — a per-lane constant added to every score cannot
+///     move the argmax — and the hash is the only lane-varying term in the
+///     noise. Row 1's head reading 0 where row 0's holds the constant is the
+///     DENSE-STAGING signature: the table was staged `rows` words dense
+///     instead of one word at every row's stick head.
+///
+/// The order's third byte-group — the logits row's argmax beside the pick —
+/// is the same collect's `DECODE_READBACK` line ([`log_decode_top2`]): one
+/// fact, one line, never restated here.
+pub(crate) struct SeatTables {
+    /// One read per seed-word table of the quadruple `(seed_lo, seed_hi,
+    /// step, greedy_gate)`, the seat's own order — `(read, tid, row stride in
+    /// words)`. The gate table's stride is its own (the β reservation is
+    /// twice the others'), so each row's word is read at the head the
+    /// staging wrote, never at a re-derived stride.
+    seeds: Vec<(
+        scratchy_target_spyre_card::superdsc_exec::DeferredRead,
+        u32,
+        u32,
+    )>,
+    /// The temperature reciprocal's read — `(read, tid, row stride)`; an f32
+    /// word at the same stick geometry the seed tables stage.
+    invt: (
+        scratchy_target_spyre_card::superdsc_exec::DeferredRead,
+        u32,
+        u32,
+    ),
+    /// hc1/hc2/hc3/c256 in order — `(read, tid)`; `None` when the bake placed
+    /// that table for nobody (itself a finding: NOT-IN-CONSTS).
+    hash: [Option<(
+        scratchy_target_spyre_card::superdsc_exec::DeferredRead,
+        u32,
+    )>; 4],
+    /// The lane table's first words — `None` when not placed.
+    lane: Option<(
+        scratchy_target_spyre_card::superdsc_exec::DeferredRead,
+        u32,
+    )>,
+    /// The launch's own typed width — the row count the seat was staged at
+    /// and every table is read back at.
+    rows: usize,
+}
+
+/// Defer the seat readback's reads — one ring slot per byte-group, enqueued
+/// behind the launch's forward in the pick's own stream order, so the bytes
+/// the drain reads are THIS launch's seat (the tables staged at load read the
+/// same every time; the seat's own words change every step, and the read
+/// lands behind the preamble H2D that staged them). A SEAT read the door
+/// refuses drops the whole readback (it never gates the run); a uniform table
+/// the bake placed for nobody is carried as `None` and stated as the finding
+/// it is.
+fn defer_seat_tables(
+    pf: &mut SuperDscSession,
+    seat: &scratchy_target_spyre::wiring::SampleSeat,
+    width: SeatWidth,
+    b: &BundleMeta,
+) -> Option<SeatTables> {
+    // A placement's first `words` words, deferred — `None` names a read the
+    // door refused.
+    fn defer_words(
+        pf: &mut SuperDscSession,
+        tid: u32,
+        words: usize,
+    ) -> Option<scratchy_target_spyre_card::superdsc_exec::DeferredRead> {
+        pf.defer_read_tensor_ring(
+            scratchy_target_spyre::bundle_code::PlaceId::Act(tid),
+            words * 4,
+        )
+        .ok()
+    }
+    // A staged table's `(tid, rows)` by its kernel operand number (the doc
+    // order in `sample_staged_tables`).
+    fn uniform(
+        consts: &'static [(u32, scratchy_target_spyre::wiring::LoadConst)],
+        operand: u8,
+    ) -> Option<(u32, usize)> {
+        consts.iter().find_map(|&(tid, k)| match k {
+            scratchy_target_spyre::wiring::LoadConst::SampleTable {
+                operand: o, rows, ..
+            } if o == operand => Some((tid, rows as usize)),
+            _ => None,
+        })
+    }
+    let rows = width.get();
+    let mut seeds = Vec::with_capacity(seat.seed_words.len());
+    for (k, &tid) in seat.seed_words.iter().enumerate() {
+        // The gate table alone reserves the β sweep — twice the stride — so
+        // the read takes the table's OWN row stride ([`sample_binds`]'s law,
+        // never re-derived here).
+        let stride = if k == 3 {
+            seat.gate_row_words
+        } else {
+            seat.seed_row_words
+        };
+        seeds.push((defer_words(pf, tid, rows * stride as usize)?, tid, stride));
+    }
+    let invt_stride = seat.seed_row_words;
+    let invt = (
+        defer_words(pf, seat.invt, rows * invt_stride as usize)?,
+        seat.invt,
+        invt_stride,
+    );
+    // The u32 stick width — the uniform tables' own readback stride, the
+    // staging's `stage_col_stick_heads` law derived from the format once
+    // (the ladder's one derivation). The seat's word tables do NOT share it
+    // by accident: their strides are the seat's own typed facts, carried per
+    // read above.
+    const U32_ELEMS_PER_STICK: usize =
+        <ktir_superdsc::superdsc_opspec::SenUint32 as ktir_superdsc::superdsc_opspec::DataFormat>::ELEMS_PER_STICK
+            as usize;
+    // ⭐ THE PLACEMENT IS THE LAUNCH'S ROWS on a batched rung: the wiring's
+    // kind carries the single-request meta while the rung's graph mints the
+    // table at the baked width, so reading the LAUNCH's width (max'd with the
+    // table's own) is what measures whether every stick head the launch
+    // addresses actually holds the constant — a staged one-word stream
+    // leaves rows past 0 reading ZERO.
+    let mut hash: [Option<(
+        scratchy_target_spyre_card::superdsc_exec::DeferredRead,
+        u32,
+    )>; 4] = [None, None, None, None];
+    for (h, operand) in [(0usize, 10u8), (1, 11), (2, 12), (3, 13)] {
+        hash[h] = uniform(b.wiring.load_consts, operand).and_then(|(tid, trows)| {
+            defer_words(pf, tid, trows.max(rows) * U32_ELEMS_PER_STICK).map(|r| (r, tid))
+        });
+    }
+    let lane = uniform(b.wiring.load_consts, 14)
+        .and_then(|(tid, _)| defer_words(pf, tid, 4).map(|r| (r, tid)));
+    Some(SeatTables {
+        seeds,
+        invt,
+        hash,
+        lane,
+        rows,
+    })
 }
 
 /// ⭐ WHAT A LAUNCH'S SUFFIX DOES, AS THE LAUNCH'S TYPE — whether it picks. A launch is staged and
@@ -82,7 +234,7 @@ pub(crate) trait LaunchEnd {
         b: &BundleMeta,
         vocab: usize,
         kind: scratchy_serving_worker::step_segs::StepKind,
-        step: scratchy_target_spyre_card::sdsc_runner::StepLanding,
+        step: crate::card::types::StepLanding,
     ) -> ExecutorResult<(Self::Out, Option<std::time::Duration>)>;
 }
 
@@ -110,7 +262,7 @@ impl LaunchEnd for Forwards {
         _b: &BundleMeta,
         _vocab: usize,
         _kind: scratchy_serving_worker::step_segs::StepKind,
-        step: scratchy_target_spyre_card::sdsc_runner::StepLanding,
+        step: crate::card::types::StepLanding,
     ) -> ExecutorResult<((), Option<std::time::Duration>)> {
         // ⭐ READLESS: THE LANDING IS THE FORWARD'S OWN LATCH — the queue's depth counts this
         // step until a later collect pops through its own landing behind it, and the busy
@@ -155,7 +307,7 @@ impl LaunchEnd for Picks {
         b: &BundleMeta,
         vocab: usize,
         kind: scratchy_serving_worker::step_segs::StepKind,
-        step: scratchy_target_spyre_card::sdsc_runner::StepLanding,
+        step: crate::card::types::StepLanding,
     ) -> ExecutorResult<(SubmittedDecode, Option<std::time::Duration>)> {
         let t_defer = std::time::Instant::now();
         // The readback's own byte size — the seat's typed fact (the idx stick's placed row,
@@ -189,6 +341,16 @@ impl LaunchEnd for Picks {
         } else {
             None
         };
+        // ⭐ THE SEAT'S OWN STAGED TABLES, DEFERRED BESIDE THE PICK (debug
+        // only): the greedy-draw localization's byte-groups, each through the
+        // same ring door and the same stream order — stated at the drain by
+        // [`log_seat_tables`], never blocking this submit.
+        let dbg_tables =
+            if tracing::enabled!(tracing::Level::DEBUG) {
+                defer_seat_tables(pf, seat, seat_width, b)
+            } else {
+                None
+            };
         Ok((
             SubmittedDecode {
                 kind,
@@ -202,6 +364,7 @@ impl LaunchEnd for Picks {
                 result_id: b.result_id as u32,
                 vocab,
                 dbg_seat,
+                dbg_tables,
             },
             Some(deferred),
         ))
@@ -1134,7 +1297,7 @@ fn sample_binds(
 pub(crate) fn collect_decode_tokens(
     session: &mut SuperDscSession,
     sub: &SubmittedDecode,
-) -> ExecutorResult<Vec<u32>> {
+) -> ExecutorResult<crate::card::exec::LaunchPicks> {
     // The probe's collect-half clocks: the fence is the wait (at depth ≥ 2 it waits
     // everything enqueued behind the read too, which is the pipeline's own cadence,
     // not an artifact), the pick is the decode, and the row lands in the table the
@@ -1190,7 +1353,16 @@ pub(crate) fn collect_decode_tokens(
             }
         }
     }
-    Ok(toks)
+    // ⭐ THE SEAT TABLES' OWN LINE (debug only): the greedy-draw
+    // localization's staged byte-groups, stated from the same collect the
+    // pick came back at — the deferred home the readback always had.
+    if let Some(tables) = &sub.dbg_tables {
+        log_seat_tables(session, sub, &toks, tables);
+    }
+    // ⭐ THE LAUNCH'S OWN TYPED PICKS — minted against the launch's width (the
+    // row count the stick was decoded at), so every pick reader downstream is
+    // total; the bounds law is stated here, once.
+    Ok(crate::card::exec::LaunchPicks::mint(toks, sub.rows.get()))
 }
 
 /// ⭐ THE DECODE SEAT'S OWN READBACK — the collect half of the debug seat read:
@@ -1242,6 +1414,130 @@ fn log_decode_top2(
             best.1 - second
         );
     }
+}
+
+/// ⭐ THE SEAT TABLES' OWN READBACK — the collect half of [`SeatTables`]:
+/// each deferred group's landed bytes stated in ONE debug line per launch
+/// (the greedy-draw localization, auditor order 2026-10-27): every report
+/// row's seed quadruple, `inv_t` and pick; the hash chain's uniform tables
+/// at row 0's and row 1's stick heads; the lane table's first words. The
+/// order's argmax-vs-pick group is the same collect's `DECODE_READBACK` line
+/// ([`log_decode_top2`]) — one fact, one line, never restated. A failed
+/// finish names its tid and the line stops — the readback never gates the
+/// collect.
+fn log_seat_tables(
+    session: &mut SuperDscSession,
+    sub: &SubmittedDecode,
+    toks: &[u32],
+    tables: &SeatTables,
+) {
+    // LE i32 words out of a landed read.
+    fn le_words(b: &[u8]) -> Vec<i32> {
+        b.as_chunks::<4>()
+            .0
+            .iter()
+            .map(|w| i32::from_le_bytes([w[0], w[1], w[2], w[3]]))
+            .collect()
+    }
+    // The u32 stick width — the uniform tables' readback stride, the same
+    // one derivation [`defer_seat_tables`] reads the tables at.
+    const U32_ELEMS_PER_STICK: usize =
+        <ktir_superdsc::superdsc_opspec::SenUint32 as ktir_superdsc::superdsc_opspec::DataFormat>::ELEMS_PER_STICK
+            as usize;
+    let rows = tables.rows;
+    // The four word tables — each row's quadruple at its table's OWN stride
+    // (the gate's β reservation is twice the others'), the head the staging
+    // wrote.
+    let mut words: Vec<[i32; 4]> = vec![[0; 4]; rows];
+    for (k, (read, tid, stride)) in tables.seeds.iter().enumerate() {
+        match session.finish_deferred_read_raw(read, &sub.step) {
+            Ok(b) => {
+                let ws = le_words(&b);
+                for (r, row) in words.iter_mut().enumerate() {
+                    row[k] = ws.get(r * *stride as usize).copied().unwrap_or(-1);
+                }
+            }
+            Err(e) => {
+                tracing::debug!("SEAT_READBACK {:?}: seat word table t{tid} read failed ({e})", sub.kind);
+                return;
+            }
+        }
+    }
+    let (iread, itid, istride) = &tables.invt;
+    let invt: Vec<f32> = match session.finish_deferred_read_raw(iread, &sub.step) {
+        Ok(b) => {
+            let ws = le_words(&b);
+            (0..rows)
+                .map(|r| ws.get(r * *istride as usize).copied().unwrap_or(0))
+                .map(|w| f32::from_bits(w as u32))
+                .collect()
+        }
+        Err(e) => {
+            tracing::debug!("SEAT_READBACK {:?}: inv_t t{itid} read failed ({e})", sub.kind);
+            return;
+        }
+    };
+    // The hash chain's uniform tables at row 0's and row 1's stick heads —
+    // DISTINCT values across lanes prove the hash's one per-lane input lives;
+    // row 1 reading 0 where row 0 holds the constant is the dense-staging
+    // signature.
+    let mut hash = String::new();
+    for (name, group) in [("hc1", 0usize), ("hc2", 1), ("hc3", 2), ("c256", 3)] {
+        match &tables.hash[group] {
+            Some((read, tid)) => match session.finish_deferred_read_raw(read, &sub.step) {
+                Ok(b) => {
+                    let ws = le_words(&b);
+                    let w0 = ws.first().copied().unwrap_or(-1);
+                    let r1 = if ws.len() > U32_ELEMS_PER_STICK {
+                        format!(
+                            "/r1=0x{:08X}",
+                            ws.get(U32_ELEMS_PER_STICK).copied().unwrap_or(-1)
+                        )
+                    } else {
+                        String::new()
+                    };
+                    hash.push_str(&format!("{name}(t{tid})=0x{w0:08X}{r1} "));
+                }
+                Err(e) => hash.push_str(&format!("{name}: READ-FAIL({e}) ")),
+            },
+            None => hash.push_str(&format!("{name}: NOT-IN-CONSTS ")),
+        }
+    }
+    // The lane table's first words — a zero or constant table flattens the
+    // noise.
+    let lane = match &tables.lane {
+        Some((read, tid)) => match session.finish_deferred_read_raw(read, &sub.step) {
+            Ok(b) => format!("lane(t{tid})={:?}", le_words(&b)),
+            Err(e) => format!("lane: READ-FAIL({e})"),
+        },
+        None => "lane: NOT-IN-CONSTS".to_string(),
+    };
+    // The REPORT rows only — every row of a wide prefill rung would be
+    // minutes of nothing.
+    let report: Vec<usize> = if rows > 5 {
+        (0..4).chain([rows - 1]).collect()
+    } else {
+        (0..rows).collect()
+    };
+    let per_row: Vec<String> = report
+        .iter()
+        .map(|&r| {
+            format!(
+                "r{r}:words={:?}:invt={}:pick={:?}",
+                words[r],
+                invt[r],
+                toks.get(r).copied()
+            )
+        })
+        .collect();
+    tracing::debug!(
+        "SEAT_READBACK {:?} rows={} {} {} {}",
+        sub.kind,
+        rows,
+        hash,
+        lane,
+        per_row.join(" ")
+    );
 }
 
 /// ⭐ THE PREFILL LADDERS THE CHUNK LOOP CLIMBS, ONE BUNDLE: the ladder a prompt's first chunk picks
@@ -1365,10 +1661,9 @@ pub(crate) fn superdsc_forward_chunk(
         if finishes {
             // ⭐ THE PROMPT-FINAL PICK IS OWED, NOT COLLECTED: the piece carries the step's
             // landing, the seat it ran on, and this request — the executor's queue pops it
-            // in submission order and the drain owns the pick's bookkeeping. (The chunk's
-            // `dbg_seat` logits readback rides the piece's `sub` and prints at the drain;
-            // the staged-bytes seat readback was an in-call instrument and has no deferred
-            // home — the card-crate readback door is the piece's own.)
+            // in submission order and the drain owns the pick's bookkeeping. The chunk's
+            // debug readbacks — the `dbg_seat` logits line and the `dbg_tables` seat
+            // readback — ride the piece's `sub` and print at the drain.
             let sub = run_card_launch::<Picks>(rows_in, sh, sess, pmeta, rung, laws)?;
             owed = Some(crate::card::exec::InFlightStep {
                 cell: std::sync::Arc::new(scratchy_serving_engine::executor::DrainCell::new()),
@@ -1486,10 +1781,13 @@ pub(crate) fn superdsc_forward_packed(
                     .enumerate()
                     .map(|(r, t)| crate::card::exec::OwedTail {
                         id: t.id.clone(),
-                        end: t.start + t.toks.len(),
                         // A mid-prompt tail's pick is computed and never read — the
-                        // wave's own law.
-                        pick: t.finishes.then_some(r),
+                        // wave's own law. The slot is minted against the wave's
+                        // window count (one window per tail the rung seats).
+                        pick: t.finishes.then(|| {
+                            crate::card::exec::SeatSlot::mint(r, tails.len())
+                                .expect("the wave seats one window per tail")
+                        }),
                     })
                     .collect(),
             },

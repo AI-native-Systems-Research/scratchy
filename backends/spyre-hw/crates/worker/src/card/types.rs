@@ -13,6 +13,10 @@ pub(crate) type World = scratchy_target_spyre::bundle_code::collective::Build;
 pub(crate) type SuperDscSession =
     scratchy_target_spyre_card::sdsc_runner::SuperDscSession<'static, 'static, World>;
 
+/// A submitted step's landing over the build's world — rank `r`'s forward latch,
+/// one per card the step spans BY TYPE ([`PerRank`] behind a private field).
+pub(crate) type StepLanding = scratchy_target_spyre_card::sdsc_runner::StepLanding<World>;
+
 /// The world's OPENED CARDS — phase 1's product, leaked once for the process at the load site, so
 /// every runtime phase 2 builds over them borrows a card for `'static`.
 pub(crate) type OpenedCards = scratchy_target_spyre::bundle_code::collective::PerRank<
