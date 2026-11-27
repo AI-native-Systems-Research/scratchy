@@ -5762,7 +5762,7 @@ fn lower_one(
                 ]),
             }
         }
-        I::HeadMatmul(hm) => lower_head_matmul(p, hm, w, eff_m, bucket_m, layer_offset)?,
+        I::HeadMatmul(hm) => lower_head_matmul(p, profile, hm, w, eff_m, bucket_m, layer_offset)?,
         I::MlaRopeQ(Slot(q), Slot(out), mla) => {
             let threads = mla_row_threads(mla.q_head());
             LoweredCommand {
@@ -5864,14 +5864,86 @@ fn lower_one(
                 kind,
                 binding_index,
             };
+            let cache = mla_cache(p, attention_blocks_per_chunk(chunked))?;
+            let attend_bindings = || {
+                [
+                    Binding::ArenaSlot {
+                        slot: *q_latent,
+                        binding_index: 1,
+                    },
+                    Binding::ArenaSlot {
+                        slot: *q,
+                        binding_index: 2,
+                    },
+                    runtime(RuntimeBindingKind::SeqUsedK, 3),
+                    runtime(RuntimeBindingKind::BlockTable { layer: kv_layer }, 4),
+                    runtime(RuntimeBindingKind::KvCacheK { layer: kv_layer }, 5),
+                    runtime(RuntimeBindingKind::KvCacheV { layer: kv_layer }, 6),
+                    runtime(RuntimeBindingKind::CuSeqlensQ, 7),
+                ]
+            };
+            // A prefill-shaped bucket's queries tile: a threadgroup takes a block of a sequence's
+            // queries (its rows' heads, which share every cached row) on the matrix unit where the
+            // chip has one and its kernel takes the shape, else on the simdgroup MMA.
+            let tiles = (bucket_m > crate::op_abi::METAL_VERIFY_ROWS)
+                .then(|| {
+                    use super::kernel_constants::MlaTileUnit as U;
+                    let nax = profile.is_some_and(|p| crate::targets::is_nax_capable(p.generation));
+                    let units = [U::Matrix, U::Simdgroup];
+                    (units.into_iter())
+                        .filter(|u| nax || *u == U::Simdgroup)
+                        .find_map(|u| {
+                            mla_attend_tiles(
+                                u,
+                                mla.latent().get(),
+                                mla.rope().get(),
+                                cache.block_size.get(),
+                                cache.half_row.get(),
+                            )
+                        })
+                })
+                .flatten();
+            if let Some(tiles) = tiles {
+                let queries = tiles.queries();
+                let (library, function) = tiles.kernel(p.act_dtype());
+                let mut bindings = vec![Binding::ArenaSlot {
+                    slot: *out,
+                    binding_index: 0,
+                }];
+                bindings.extend(attend_bindings());
+                return dispatched(vec![LoweredCommand {
+                    kernel: KernelId::MlaAttend,
+                    library,
+                    function,
+                    constants: super::kernel_constants::MlaConstants {
+                        mla: *mla,
+                        cache: Some(cache),
+                        attend: Some(super::kernel_constants::MlaAttendKernel::Tiles(tiles)),
+                        row: None,
+                    }
+                    .into_baked(),
+                    // One grid-Z layer a sequence: a threadgroup's queries never straddle two.
+                    dispatch: DispatchShape {
+                        threadgroups: ((bucket_m * mla.heads().get()).div_ceil(queries), 1, 1),
+                        threads_per_threadgroup: (tiles.threads(), 1, 1),
+                        m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
+                            set_axis: Some(crate::tape::lowered::SetAxis::Seqs(
+                                crate::interpreter::metal::lowered::MScaleAxis::Z,
+                            )),
+                            axis: crate::tape::lowered::MScaleAxis::X,
+                            bucket_m: super::ids::BucketM(bucket_m),
+                        }),
+                    },
+                    bindings: baked(bindings),
+                }]);
+            }
             let tiling = mla_attend_tiling(mla.heads().get(), mla.latent().get(), bucket_m)?;
             let parts = tiling.parts.get();
-            let cache = mla_cache(p, attention_blocks_per_chunk(chunked))?;
             let constants = || {
                 super::kernel_constants::MlaConstants {
                     mla: *mla,
                     cache: Some(cache),
-                    attend: Some(tiling),
+                    attend: Some(super::kernel_constants::MlaAttendKernel::Rows(tiling)),
                     row: None,
                 }
                 .into_baked()
@@ -5907,22 +5979,7 @@ fn lower_one(
                     threads_per_threadgroup: (32 * tiling.simdgroups.get(), 1, 1),
                     m_scaling,
                 },
-                bindings: baked(vec![
-                    written,
-                    Binding::ArenaSlot {
-                        slot: *q_latent,
-                        binding_index: 1,
-                    },
-                    Binding::ArenaSlot {
-                        slot: *q,
-                        binding_index: 2,
-                    },
-                    runtime(RuntimeBindingKind::SeqUsedK, 3),
-                    runtime(RuntimeBindingKind::BlockTable { layer: kv_layer }, 4),
-                    runtime(RuntimeBindingKind::KvCacheK { layer: kv_layer }, 5),
-                    runtime(RuntimeBindingKind::KvCacheV { layer: kv_layer }, 6),
-                    runtime(RuntimeBindingKind::CuSeqlensQ, 7),
-                ]),
+                bindings: baked(std::iter::once(written).chain(attend_bindings()).collect()),
             };
             let Some(bytes) = partials else {
                 return dispatched(vec![attend]);
@@ -7043,6 +7100,50 @@ pub fn mla_attend_tiling(
     })
 }
 
+/// The tile of a tiled MLA attention on `unit` over `block_size`-row pages whose rows the pool's
+/// K and V stores hold `half_row` lanes each: a warp's slice of the output's `latent` lanes (the
+/// simdgroup MMA's [`MLA_TILE_WARP_LANES`], all of a narrower latent's; the matrix unit's four
+/// 32-lane ops), a step's page group of up to 32 rows a warp.
+/// `None` where the unit's kernel does not take the shape: a latent not of whole warp slices, a
+/// row's halves not of whole operands (MMA fragments; the matrix unit's 32-lane P @ V ops), a
+/// page its page groups do not tile, more warps than a threadgroup holds.
+pub fn mla_attend_tiles(
+    unit: super::kernel_constants::MlaTileUnit,
+    latent: u32,
+    rope: u32,
+    block_size: u32,
+    half_row: u32,
+) -> Option<super::kernel_constants::MlaAttendTiles> {
+    use super::kernel_constants::{MlaAttendTiles, MlaTileUnit};
+    // The edge of a fragment (keys, query parts), the lanes of a warp's slices of the output,
+    // and a warp's lanes: the matrix unit's warp holds four 32-lane slices' ops (`mla_nax.metal`).
+    let (fragment, slice, warp_lanes) = match unit {
+        MlaTileUnit::Simdgroup => (8, 8, latent.min(MLA_TILE_WARP_LANES)),
+        MlaTileUnit::Matrix => (16, 32, 4 * 32),
+    };
+    let keys = block_size.min(32);
+    let warps = MlaAttendTiles::blocks_of(unit) * latent / warp_lanes.max(1);
+    let shaped = warp_lanes.is_multiple_of(slice)
+        && latent.is_multiple_of(warp_lanes)
+        && half_row.is_multiple_of(slice)
+        && rope.is_multiple_of(fragment)
+        && keys.is_multiple_of(fragment)
+        && block_size.is_multiple_of(keys)
+        && warps <= 32;
+    shaped.then_some(MlaAttendTiles {
+        unit,
+        warp_lanes: super::ids::WarpLanes(warp_lanes),
+        keys: super::ids::KeysPerStep(keys),
+        warps: super::ids::SimdgroupCount(warps),
+    })
+}
+
+/// The latent lanes of a simdgroup-MMA tiled MLA attention's output one warp accumulates (16
+/// queries' worth: a thread's `lanes / 2` f32 registers). Hand-tuned: measured on GLM-4.7-Flash's
+/// geometry on a base M5, 2048 queries' rows over as many cached, 32-row page groups: 64 lanes
+/// 37.4 ms a layer, 128 lanes 40.8.
+const MLA_TILE_WARP_LANES: u32 = 64;
+
 /// The threads an MLA row kernel (the query rotation, the cache write) runs a threadgroup: a lane
 /// each of a `lanes`-wide row, rounded to a power of two, up to [`MLA_ROW_THREADS`]; past it each
 /// thread takes several.
@@ -7091,9 +7192,13 @@ const _: () = assert!(
 const HEAD_MATMUL_SIMDGROUPS: u32 = 8;
 const HEAD_MATMUL_ROWS_PER_SG: u32 = 4;
 
-/// A per-head matmul's command: the affine kernel over packed blocks, or the dense one.
+/// A per-head matmul's command: the affine kernel over packed blocks, or the dense one. From an
+/// affine weight's matvec/matmul boundary on, the matmul: `qmm_t`'s tile a head (grid z) — the
+/// matrix unit's where the chip has one —, its weight block read once a row tile rather than once
+/// a row.
 fn lower_head_matmul(
     p: &ModelFacts,
+    profile: Option<&crate::targets::MetalTargetProfile>,
     hm: &crate::tape::step::HeadMatmul,
     w: RowSources<'_>,
     eff_m: u32,
@@ -7105,8 +7210,77 @@ fn lower_head_matmul(
     let ix = w.of(WeightKind::Linear, 0)?;
     let heads = hm.heads.get();
     let n = hm.n.get();
+    let n_head = n / heads;
+    let k = hm.lanes.k().get();
+    if let HeadWeight::Affine {
+        group_size,
+        bits,
+        vector_limit: QmvBatchLimit(vector_limit),
+    } = hm.weight
+        // The standard tile's K loop takes whole 32-lane steps.
+        && bucket_m >= vector_limit
+        && k.is_multiple_of(32)
+    {
+        // The matrix unit's tile where the chip has one and it takes the shape, else the standard
+        // one (a head is a batch: never split-K).
+        let is_nax = profile.is_some_and(|p| crate::targets::is_nax_capable(p.generation));
+        let kernel = pick_qmm_t_kernel(bucket_m, n_head, k, heads, group_size, bits, is_nax);
+        let dtype = dequant_dtype_for(p);
+        // M1's bf16 MMA is emulation: its int4 matmuls compute in f16, as a GEMM's do.
+        let compute_dtype = match profile
+            .is_some_and(|p| crate::targets::bf16_simdgroup_is_slow_path(p.generation))
+            && dtype == DequantDtype::Bf16
+            && bits == AffineBits::B4
+            && kernel == QmmTKernel::Standard
+        {
+            true => DequantDtype::F16,
+            false => dtype,
+        };
+        let (tg, tpg) = qmm_t_dispatch_shape(kernel, bucket_m, n_head, heads);
+        let (library, tile) = match kernel {
+            QmmTKernel::Nax(_) => ("quantized_qmm_nax", 64),
+            _ => ("quantized_qmm", 32),
+        };
+        return Ok(LoweredCommand {
+            // The head matmul's command: its weight is read as written, the matvec's way.
+            kernel: KernelId::HeadMatmul,
+            library,
+            function: qmm_t_kernel_static_name_with_compute(
+                kernel,
+                dtype,
+                compute_dtype,
+                scale_dtype_for(p),
+                bits,
+                group_size,
+                n_head.is_multiple_of(tile),
+            ),
+            constants: super::kernel_constants::AffineHeadQmmTConstants {
+                qmm: super::kernel_constants::AffineQmmTConstants {
+                    k: super::ids::KDimI32(k as i32),
+                    n: super::ids::NDimI32(n_head as i32),
+                    m: super::ids::MDimI32(bucket_m as i32),
+                    codes: super::kernel_constants::AffineCodes::AsWritten,
+                },
+                heads: super::ids::NumQHeads(heads),
+                in_stride: hm.lanes.stride(),
+            }
+            .into_baked(),
+            dispatch: DispatchShape {
+                threadgroups: tg,
+                threads_per_threadgroup: tpg,
+                m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
+                    set_axis: None,
+                    axis: crate::tape::lowered::MScaleAxis::Y,
+                    bucket_m: super::ids::BucketM(bucket_m),
+                }),
+            },
+            bindings: baked(affine_qmm_bindings(hm.input.0, hm.output.0, layer, ix)),
+        });
+    }
     let (function, affine, mut bindings) = match hm.weight {
-        HeadWeight::Affine { group_size, bits } => (
+        HeadWeight::Affine {
+            group_size, bits, ..
+        } => (
             head_qmv_static_name(p.act_dtype(), scale_dtype_for(p)),
             Some((group_size, bits)),
             affine_weight_bindings(ix, layer).to_vec(),

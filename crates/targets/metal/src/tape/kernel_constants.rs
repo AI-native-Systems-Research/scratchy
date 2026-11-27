@@ -1210,6 +1210,25 @@ impl From<AffineQmmTConstants> for Vec<ConstantValue> {
     }
 }
 
+/// `KernelId::HeadMatmul` from its matvec/matmul boundary on: `affine_qmm_t` a head
+/// (`quantized_qmm.metal`'s QMM_HEADS mode), each
+/// head's `k`-lane part of a `heads * in_stride`-wide input row times its `n`-row weight block
+/// (slots 6 and 8 beside the matmul's; the matrix unit's `affine_qmm_t_nax` takes them alike).
+pub struct AffineHeadQmmTConstants {
+    pub qmm: AffineQmmTConstants,
+    pub heads: NumQHeads,
+    pub in_stride: crate::tape::ids::RowStride,
+}
+
+impl From<AffineHeadQmmTConstants> for Vec<ConstantValue> {
+    fn from(c: AffineHeadQmmTConstants) -> Self {
+        let mut v: Vec<ConstantValue> = c.qmm.into();
+        v.push(ConstantValue::int(ConstSlot(6), c.heads.get() as i32));
+        v.push(ConstantValue::int(ConstSlot(8), c.in_stride.get() as i32));
+        v
+    }
+}
+
 // ── MLX-affine QMM_T SplitK ───────────────────────────────────────
 
 /// `KernelId::AffineQmmTSplitK`. The `k_partition_size` slot was the
@@ -1350,13 +1369,78 @@ pub struct MlaAttendTiling {
     pub merge_threads: crate::tape::ids::ThreadCount,
 }
 
+/// The unit a tiled MLA attention's products run on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MlaTileUnit {
+    /// Simdgroup MMA (`mla.metal`'s `mla_attend_tiles`).
+    Simdgroup,
+    /// The matrix unit, M5+ (`mla_nax.metal`'s `mla_attend_tiles_nax`).
+    Matrix,
+}
+
+/// How a tiled MLA attention (a prefill-shaped bucket's) spreads a threadgroup's queries over its
+/// warps: [`Self::blocks`] blocks of 16 queries, each `latent / warp_lanes` warps, a warp the
+/// output's `warp_lanes` latent lanes and a step's `keys` cached rows (one page group).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MlaAttendTiles {
+    pub unit: MlaTileUnit,
+    pub warp_lanes: crate::tape::ids::WarpLanes,
+    pub keys: crate::tape::ids::KeysPerStep,
+    pub warps: crate::tape::ids::SimdgroupCount,
+}
+
+impl MlaAttendTiles {
+    /// The 16-query blocks of a threadgroup (`mla.metal` slot 18).
+    pub const fn blocks(self) -> u32 {
+        Self::blocks_of(self.unit)
+    }
+
+    /// The 16-query blocks of a threadgroup of `unit`'s kernel.
+    pub const fn blocks_of(unit: MlaTileUnit) -> u32 {
+        match unit {
+            MlaTileUnit::Simdgroup => 2,
+            MlaTileUnit::Matrix => 4,
+        }
+    }
+
+    /// The queries a threadgroup takes.
+    pub const fn queries(self) -> u32 {
+        16 * self.blocks()
+    }
+
+    /// A threadgroup's threads.
+    pub fn threads(self) -> u32 {
+        32 * self.warps.get()
+    }
+
+    /// The kernel's library and symbol at activation dtype `act`.
+    pub fn kernel(self, act: crate::tape::lowered::MetalDtype) -> (&'static str, &'static str) {
+        use crate::tape::lowered::MetalDtype::Bf16;
+        match (self.unit, act) {
+            (MlaTileUnit::Simdgroup, Bf16) => ("mla", "mla_attend_tiles_bf16"),
+            (MlaTileUnit::Simdgroup, _) => ("mla", "mla_attend_tiles_f16"),
+            (MlaTileUnit::Matrix, Bf16) => ("mla_nax", "mla_attend_tiles_nax_bf16"),
+            (MlaTileUnit::Matrix, _) => ("mla_nax", "mla_attend_tiles_nax_f16"),
+        }
+    }
+}
+
+/// How an MLA attention's kernel spreads its work: a row-parallel one's (a decode-shaped bucket's,
+/// and its merge's), or a tiled one's.
+#[derive(Clone, Copy)]
+pub enum MlaAttendKernel {
+    Rows(MlaAttendTiling),
+    Tiles(MlaAttendTiles),
+}
+
 /// `KernelId::MlaRopeQ` / `MlaAppend` / `MlaAttend` (`mla.metal`): the geometry (slots 0 to 3),
 /// the cache (4 to 6, the writer's and the attention's), and the attention's and its merge's: the
-/// softmax scale (7) and the tiling (8 to 12); a row kernel's, its threads and pairing (13, 15).
+/// softmax scale (7) and its kernel's tiling (8 to 12 a row-parallel one's, 16 to 18 a tiled
+/// one's); a row kernel's, its threads and pairing (13, 15).
 pub struct MlaConstants {
     pub mla: crate::tape::step::Mla,
     pub cache: Option<MlaCacheConstants>,
-    pub attend: Option<MlaAttendTiling>,
+    pub attend: Option<MlaAttendKernel>,
     /// A row kernel's: the query rotation's and the cache write's.
     pub row: Option<MlaRowConstants>,
 }
@@ -1415,13 +1499,22 @@ impl From<MlaConstants> for Vec<ConstantValue> {
             ));
             v.push(ConstantValue::uint(ConstSlot(14), cache.half_row.get()));
         }
-        if let Some(t) = c.attend {
+        if let Some(kernel) = c.attend {
             v.push(ConstantValue::float(ConstSlot(7), m.scale().get()));
-            v.push(ConstantValue::uint(ConstSlot(8), t.heads_per_tg.get()));
-            v.push(ConstantValue::uint(ConstSlot(9), t.simdgroups.get()));
-            v.push(ConstantValue::uint(ConstSlot(10), t.parts.get()));
-            v.push(ConstantValue::uint(ConstSlot(11), t.partial.get()));
-            v.push(ConstantValue::uint(ConstSlot(12), t.merge_threads.get()));
+            match kernel {
+                MlaAttendKernel::Rows(t) => {
+                    v.push(ConstantValue::uint(ConstSlot(8), t.heads_per_tg.get()));
+                    v.push(ConstantValue::uint(ConstSlot(9), t.simdgroups.get()));
+                    v.push(ConstantValue::uint(ConstSlot(10), t.parts.get()));
+                    v.push(ConstantValue::uint(ConstSlot(11), t.partial.get()));
+                    v.push(ConstantValue::uint(ConstSlot(12), t.merge_threads.get()));
+                }
+                MlaAttendKernel::Tiles(t) => {
+                    v.push(ConstantValue::uint(ConstSlot(16), t.warp_lanes.get()));
+                    v.push(ConstantValue::uint(ConstSlot(17), t.keys.get()));
+                    v.push(ConstantValue::uint(ConstSlot(18), t.blocks()));
+                }
+            }
         }
         if let Some(row) = c.row {
             v.push(ConstantValue::uint(ConstSlot(13), row.threads.get()));

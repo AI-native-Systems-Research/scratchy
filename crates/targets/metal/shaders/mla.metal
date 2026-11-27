@@ -37,32 +37,18 @@
 //                   the V store's
 //  15 = PAIRING     the rope's lane pairing: 0 adjacent `(2i, 2i + 1)`, 1 the
 //                   halves `(i, i + ROPE / 2)` (NeoX)
+//  16 = WARP_LANES  the tiled attention's: the latent lanes of a warp's output
+//  17 = KEYS        the tiled attention's: the cached rows a warp scores a step
+//  18 = BLOCKS      the tiled attention's: the 16-query blocks of a threadgroup
 
 #include <metal_stdlib>
 #include "baked.h"
+#include "mla.h"
+#include "mlx_steel_attn/attn.h"
+#include "mlx_steel_attn/attn_ops.h"
 
 using namespace metal;
 
-SCRATCHY_CONSTANT(uint, MLA_HEADS, 0);
-SCRATCHY_CONSTANT(uint, MLA_LATENT, 1);
-SCRATCHY_CONSTANT(uint, MLA_NOPE, 2);
-SCRATCHY_CONSTANT(uint, MLA_ROPE, 3);
-SCRATCHY_CONSTANT_OPTIONAL(uint, MLA_BLOCK_SIZE, 4);
-SCRATCHY_CONSTANT_OPTIONAL(uint, MLA_MAX_BLOCKS, 5);
-SCRATCHY_CONSTANT_OPTIONAL(uint, MLA_BLOCKS_PER_CHUNK, 6);
-SCRATCHY_CONSTANT_OPTIONAL(float, MLA_SCALE, 7);
-SCRATCHY_CONSTANT_OPTIONAL(uint, MLA_HEADS_PER_TG, 8);
-SCRATCHY_CONSTANT_OPTIONAL(uint, MLA_SIMDGROUPS, 9);
-SCRATCHY_CONSTANT_OPTIONAL(uint, MLA_PARTS, 10);
-SCRATCHY_CONSTANT_OPTIONAL(uint, MLA_PARTIAL_STRIDE, 11);
-SCRATCHY_CONSTANT_OPTIONAL(uint, MLA_MERGE_THREADS, 12);
-SCRATCHY_CONSTANT_OPTIONAL(uint, MLA_ROW_THREADS, 13);
-SCRATCHY_CONSTANT_OPTIONAL(uint, MLA_HALF_ROW, 14);
-SCRATCHY_CONSTANT_OPTIONAL(uint, MLA_PAIRING, 15);
-
-constant constexpr uint MLA_Q_HEAD = MLA_NOPE + MLA_ROPE;
-constant constexpr uint MLA_ROW = MLA_LATENT + MLA_ROPE;
-constant constexpr uint MLA_HALF = MLA_HALF_ROW;
 constant constexpr uint MLA_HALF_ROPE = MLA_ROPE / 2u;
 
 // Lane `d` of a rope part `x` (ROPE lanes) rotated at `pos`. Interleaved
@@ -318,6 +304,295 @@ template <typename T>
     }
 }
 
+// ── Tiled absorbed attention (a matmul-band bucket) ─────────────────────────
+// The absorbed attention is one key head every query head shares: over a
+// sequence's `rows x HEADS` queries (row-major, a row's heads consecutive —
+// exactly `q_latent`'s and `out`'s rows), each a LATENT + ROPE query (its
+// latent query, then its rotated rope part) against the cached rows, its
+// output the softmax-weighted latent lanes of the rows. This kernel is the
+// steel wide paged attention's FA-2 (`attention_steel_paged_wide`) over those
+// queries: a threadgroup takes BLOCKS blocks of 16 of them, a block LATENT /
+// WARP_LANES warps; warp `wn` of a block scores page group `wn` of a step (KEYS cached
+// rows) over the whole query, the block's scores cross its warps through
+// threadgroup memory once a step, and each warp applies the online softmax
+// and accumulates its WARP_LANES-lane slice of the output. Every fragment
+// loads straight from device memory: a query fragment from `q_latent` or
+// `q`, a cached row's from the K or V store (HALF is whole fragments, so no
+// fragment straddles the two). The heads of a row share its keys and its
+// causal limit; a query attends to the cached rows up to its row's position.
+//
+// Bindings as `mla_attend`'s, less the partials (buffer(8)).
+// Dispatch: threadgroups (ceil(rows * HEADS / (16 * BLOCKS)), 1, seqs), threads
+// (32 * BLOCKS * LATENT / WARP_LANES, 1, 1); threadgroups past a sequence's
+// queries return.
+// Unset (another kernel's compile of this file): one fragment each, never dispatched.
+constant constexpr uint MLA_TILE_LANES = MLA_WARP_LANES_SET ? MLA_WARP_LANES : 8u;
+constant constexpr uint MLA_TILE_KEYS = MLA_KEYS_SET ? MLA_KEYS : 8u;
+static_assert(!MLA_WARP_LANES_SET || (MLA_LATENT % MLA_WARP_LANES == 0 && MLA_WARP_LANES % 8u == 0),
+              "whole fragments a warp");
+static_assert(!MLA_WARP_LANES_SET || (MLA_ROPE % 8u == 0 && MLA_HALF % 8u == 0),
+              "a fragment never straddles the query's parts or the row's stores");
+static_assert(!MLA_KEYS_SET || (MLA_KEYS % 8u == 0 && MLA_BLOCK_SIZE % MLA_KEYS == 0),
+              "whole page groups a step");
+
+template <typename T>
+[[kernel, max_total_threads_per_threadgroup(MLA_TILE_THREADS)]]
+void mla_attend_tiles(
+    device       T*        out          [[buffer(0)]],
+    device const T*        q_latent     [[buffer(1)]],
+    device const T*        q            [[buffer(2)]],
+    device const uint*     seq_used_k   [[buffer(3)]],
+    device const uint*     block_table  [[buffer(4)]],
+    device const uint64_t* k_cache      [[buffer(5)]],
+    device const uint64_t* v_cache      [[buffer(6)]],
+    device const uint*     cu_seqlens_q [[buffer(7)]],
+    uint  simd_lane_id  [[thread_index_in_simdgroup]],
+    uint  simd_group_id [[simdgroup_index_in_threadgroup]],
+    uint3 tid           [[threadgroup_position_in_grid]])
+{
+    using namespace mlx::steel;
+    typedef float AccumType;
+    constexpr short kU = 8;                    // a fragment's edge
+    constexpr short ROWS = 16;                 // queries a warp's block
+    constexpr int TQ = ROWS / kU;
+    constexpr int WM = int(MLA_TILE_BLOCKS);
+    constexpr int BQ = WM * ROWS;
+    constexpr int WN = int(MLA_TILE_WN);
+    constexpr int DW = int(MLA_TILE_LANES);
+    constexpr int TDW = DW / kU;
+    constexpr int KQ = int(MLA_TILE_KEYS);     // a step's page group a warp, and a K-tile
+    constexpr short TK = KQ / kU;
+    constexpr int QK_FRAGS = int(MLA_ROW) / kU;
+    constexpr int LATENT_FRAGS = int(MLA_LATENT) / kU;
+    constexpr int HALF_FRAGS = int(MLA_HALF) / kU;
+    constexpr int ld_lat = int(MLA_LATENT);
+    constexpr int ld_q = int(MLA_Q_HEAD);
+    constexpr int ld_row = int(MLA_HALF);
+
+    const uint seq = tid.z;
+    const uint seq_start = cu_seqlens_q[seq];
+    const uint new_q = cu_seqlens_q[seq + 1u] - seq_start;
+    const uint kv_len = seq_used_k[seq];
+    const uint prefix = kv_len - new_q;
+    const uint queries = new_q * MLA_HEADS;
+    const uint item0 = tid.x * uint(BQ);
+    if (item0 >= queries) {
+        return;
+    }
+    const uint tile_items = min(uint(BQ), queries - item0);
+
+    using MMAFrag_acc_t = BaseMMAFrag<AccumType, kU, kU>;
+    using otile_t = MMATile<AccumType, TQ, TDW, MMAFrag_acc_t>;
+    using stile_t = MMATile<AccumType, TQ, TK, MMAFrag_acc_t>;
+
+    const short rb = short(simd_group_id / uint(WN));
+    const short wn = short(simd_group_id % uint(WN));
+    const short tm = ROWS * rb;
+    const short lim_rows = short(int(tile_items) - int(tm));
+    // A block past the tile's queries still meets every step: it reads the tile's first queries
+    // and stores nothing.
+    const uint load_item = seq_start * MLA_HEADS + item0 + (lim_rows > 0 ? uint(tm) : 0u);
+    device const T* ql = q_latent + load_item * MLA_LATENT;
+    device const T* qr = q + load_item * MLA_Q_HEAD + MLA_NOPE;
+
+    const short2 simd_coord = MMAFrag_acc_t::get_coord(simd_lane_id);
+    const short sm = simd_coord.y;
+    const short sn = simd_coord.x;
+
+    constexpr short kRowsPT = otile_t::kRowsPerThread;
+    AccumType max_score[kRowsPT];
+    AccumType sum_score[kRowsPT] = {0};
+    for (short i = 0; i < kRowsPT; ++i) {
+        max_score[i] = Limits<AccumType>::finite_min;
+    }
+    otile_t Otile;
+    Otile.clear();
+
+    // Positions: a query's is its row's, `prefix + item / HEADS`.
+    const int pos_block = int(prefix + (item0 + uint(tm)) / MLA_HEADS);
+    const int pos_last = int(prefix + (item0 + tile_items - 1u) / MLA_HEADS);
+    const int kv_tiles = int((kv_len + uint(KQ) - 1u) / uint(KQ));
+    const int kb_lim = min((pos_last + KQ) / KQ, kv_tiles);
+    const int num_pages = int((kv_len + MLA_BLOCK_SIZE - 1u) / MLA_BLOCK_SIZE);
+    device const uint* blocks = block_table + seq * MLA_MAX_BLOCKS;
+    const AccumType scale2 = AccumType(MLA_SCALE) * AccumType(M_LOG2E_F);
+
+    auto rows_at = [&](device const uint64_t* store, int key) -> device const T* {
+        return mla_rows_at<T>(store, blocks, num_pages, key);
+    };
+
+    // S = Q K^T of page group `g` over the whole query: its latent lanes then its rope lanes,
+    // against the rows' lanes in the K store then the V store.
+    auto do_qk_group = [&](int g, thread stile_t& Sg) {
+        const short klim = short(clamp(int(kv_len) - g * KQ, 0, KQ));
+        const short rows = max(min(lim_rows, ROWS), short(1));
+        device const T* kg = rows_at(k_cache, g * KQ);
+        device const T* vg = rows_at(v_cache, g * KQ);
+        STEEL_PRAGMA_UNROLL
+        for (short dd = 0; dd < QK_FRAGS; dd++) {
+            MMATile<AccumType, TQ, 1> Qt;
+            MMATile<AccumType, 1, TK> Kt;
+            const bool latent = dd < LATENT_FRAGS;
+            const int ld = latent ? ld_lat : ld_q;
+            device const T* qsrc = (latent ? ql + dd * kU : qr + (dd - LATENT_FRAGS) * kU)
+                + int(sm) * ld + int(sn);
+            if (rows == ROWS) {
+                Qt.template load<T, 1, 1>(qsrc, ld);
+            } else {
+                Qt.template load_safe<T, 1, 1>(qsrc, ld, short2(kU, short(rows - sm)));
+            }
+            device const T* ksrc = (dd < HALF_FRAGS ? kg + dd * kU : vg + (dd - HALF_FRAGS) * kU)
+                + int(sm);
+            STEEL_PRAGMA_UNROLL
+            for (short j = 0; j < TK; j++) {
+                const short k0 = j * kU;
+                device const T* src = ksrc + int(k0 + sn) * ld_row;
+                if (k0 + kU <= klim) {
+                    MMAFrag_acc_t::load(Kt.frag_at(0, j), src, Int<1>{}, ld_row);
+                } else {
+                    MMAFrag_acc_t::load_safe(
+                        Kt.frag_at(0, j), src, Int<1>{}, ld_row, short(kU),
+                        short(klim - k0 - sn), 0, 0);
+                }
+            }
+            tile_matmad(Sg, Qt, Kt, Sg);
+        }
+    };
+
+    auto scale_and_mask = [&](int kb, thread stile_t& S) {
+        STEEL_PRAGMA_UNROLL
+        for (short i = 0; i < stile_t::kElemsPerTile; i++) {
+            S.elems()[i] *= scale2;
+        }
+        const int key0 = kb * KQ;
+        if (key0 + KQ > int(kv_len) || key0 + KQ - 1 > pos_block) {
+            constexpr auto neg_inf = Limits<AccumType>::finite_min;
+            STEEL_PRAGMA_UNROLL
+            for (short iq = 0; iq < TQ; iq++) {
+                const int pos = int(prefix + (item0 + uint(tm + sm + iq * kU)) / MLA_HEADS);
+                STEEL_PRAGMA_UNROLL
+                for (short ik = 0; ik < TK; ik++) {
+                    thread auto& fg = S.frag_at(iq, ik);
+                    STEEL_PRAGMA_UNROLL
+                    for (short jj = 0; jj < stile_t::MMAFrag_t::kElemCols; jj++) {
+                        const int c = key0 + ik * kU + sn + jj;
+                        fg[jj] = (c >= int(kv_len) || c > pos) ? neg_inf : fg[jj];
+                    }
+                }
+            }
+        }
+    };
+
+    auto softmax_update = [&](thread stile_t& S) {
+        AccumType new_max[kRowsPT];
+        AccumType factor[kRowsPT];
+        for (short i = 0; i < kRowsPT; ++i) {
+            new_max[i] = max_score[i];
+        }
+        S.template row_reduce<MaxOp>(new_max);
+        S.template row_bin_op<ExpSubOp>(new_max);
+        for (short i = 0; i < kRowsPT; ++i) {
+            factor[i] = fast::exp2(max_score[i] - new_max[i]);
+            max_score[i] = new_max[i];
+            sum_score[i] = sum_score[i] * factor[i];
+        }
+        S.template row_reduce<SumOp>(sum_score);
+        Otile.template row_bin_op<MulOp>(factor);
+    };
+
+    // O += P V over K-tile `kb`: this warp's latent lanes of its rows, from the K store below
+    // HALF, the V store past it.
+    auto do_pv = [&](int kb, thread stile_t& S) {
+        const int key0 = kb * KQ;
+        device const T* kg = rows_at(k_cache, key0);
+        device const T* vg = rows_at(v_cache, key0);
+        STEEL_PRAGMA_UNROLL
+        for (short id = 0; id < TDW; id++) {
+            const int lane = int(wn) * DW + id * kU;
+            device const T* vp = (lane < int(MLA_HALF) ? kg + lane : vg + (lane - int(MLA_HALF)))
+                + int(sn);
+            STEEL_PRAGMA_UNROLL
+            for (short ik = 0; ik < TK; ik++) {
+                const int k_abs = key0 + ik * kU;
+                typename MMAFrag_acc_t::frag_type Vf;
+                device const T* vsrc = vp + int(ik * kU + sm) * ld_row;
+                if (k_abs + kU <= int(kv_len)) {
+                    MMAFrag_acc_t::load(Vf, vsrc, ld_row, Int<1>{});
+                } else {
+                    MMAFrag_acc_t::load_safe(
+                        Vf, vsrc, ld_row, Int<1>{},
+                        short(clamp(int(kv_len) - k_abs - sm, 0, int(kU))), short(kU), 0, 0);
+                }
+                STEEL_PRAGMA_UNROLL
+                for (short iq = 0; iq < TQ; iq++) {
+                    MMAFrag_acc_t::mma(
+                        Otile.frag_at(iq, id), S.frag_at(iq, ik), Vf, Otile.frag_at(iq, id));
+                }
+            }
+        }
+    };
+
+    // A block's scores of a step, lane by lane (lane-preserving, as the wide kernel's), a buffer
+    // a step parity where two fit.
+    constexpr int kSPerLane = stile_t::kElemsPerTile;
+    constexpr int kPart = 32 * kSPerLane;
+    constexpr int kBufs = 2 * WM * WN * kPart * int(sizeof(AccumType)) <= 32768 ? 2 : 1;
+    threadgroup AccumType sx[kBufs * WM * WN * kPart];
+
+    for (int kb0 = 0; kb0 < kb_lim; kb0 += WN) {
+        const int g = kb0 + wn;
+        stile_t Sg;
+        Sg.clear();
+        if (g < kb_lim) {
+            do_qk_group(g, Sg);
+        }
+        threadgroup AccumType* part = sx + (kb0 / WN % kBufs) * (WM * WN * kPart);
+        STEEL_PRAGMA_UNROLL
+        for (short i = 0; i < kSPerLane; i++) {
+            part[(simd_group_id * kSPerLane + i) * 32 + simd_lane_id] = Sg.elems()[i];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        STEEL_PRAGMA_UNROLL
+        for (short t = 0; t < WN; t++) {
+            const int kb = kb0 + t;
+            if (kb >= kb_lim) {
+                break;
+            }
+            stile_t S;
+            STEEL_PRAGMA_UNROLL
+            for (short i = 0; i < kSPerLane; i++) {
+                S.elems()[i] = part[((rb * WN + t) * kSPerLane + i) * 32 + simd_lane_id];
+            }
+            scale_and_mask(kb, S);
+            softmax_update(S);
+            do_pv(kb, S);
+        }
+        if (kBufs == 1) {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    AccumType rcp[kRowsPT];
+    for (short i = 0; i < kRowsPT; ++i) {
+        rcp[i] = 1.f / sum_score[i];
+    }
+    Otile.template row_bin_op<MulOp>(rcp);
+    if (lim_rows <= 0) {
+        return;
+    }
+    device T* o = out + (seq_start * MLA_HEADS + item0 + uint(tm)) * MLA_LATENT
+        + uint(wn) * uint(DW) + uint(sm) * MLA_LATENT + uint(sn);
+    if (lim_rows < ROWS) {
+        const short2 dims = short2(short(DW) - sn, lim_rows - sm);
+        if (dims.x <= 0 || dims.y <= 0) {
+            return;
+        }
+        Otile.template store_safe<T, 1, 1>(o, ld_lat, dims);
+    } else {
+        Otile.template store<T, 1, 1>(o, ld_lat);
+    }
+}
+
 // ── The partitions' merge ───────────────────────────────────────────────────
 // buffer(0) = out [rows, HEADS * LATENT], buffer(1) = the partials
 // `mla_attend` wrote. Each head's lanes: the PARTS partials' weighted lanes,
@@ -359,5 +634,7 @@ SCRATCHY_KERNEL(mla_append_f16, mla_append<half>)
 SCRATCHY_KERNEL(mla_append_bf16, mla_append<bfloat>)
 SCRATCHY_KERNEL(mla_attend_f16, mla_attend<half>)
 SCRATCHY_KERNEL(mla_attend_bf16, mla_attend<bfloat>)
+SCRATCHY_KERNEL(mla_attend_tiles_f16, mla_attend_tiles<half>)
+SCRATCHY_KERNEL(mla_attend_tiles_bf16, mla_attend_tiles<bfloat>)
 SCRATCHY_KERNEL(mla_attend_merge_f16, mla_attend_merge<half>)
 SCRATCHY_KERNEL(mla_attend_merge_bf16, mla_attend_merge<bfloat>)

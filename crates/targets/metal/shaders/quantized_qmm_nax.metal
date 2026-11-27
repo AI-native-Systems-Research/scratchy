@@ -80,6 +80,16 @@ SCRATCHY_CONSTANT_OPTIONAL(int, QMM_NUM_EXPERTS, 4);
 // codes directly as signed int4 (q - 8) and fold the 8 into the bias.
 // Kernel entries branch on it once, into a loader instantiated for it.
 SCRATCHY_CONSTANT_OPTIONAL(bool, AFFINE_CODES_OFFSET8, 5);
+// 6 / 8: a matmul per head (`affine_qmm_t_nax_kernel` only), as `quantized_qmm.metal`'s
+// `affine_qmm_t_kernel` takes it: QMM_HEADS heads, grid z one each, head `h` the first QMM_K
+// lanes of its QMM_IN_STRIDE-wide part of each input row times its QMM_N-row weight block, into
+// its QMM_N lanes of the output row.
+SCRATCHY_CONSTANT_OPTIONAL(int, QMM_HEADS, 6);
+SCRATCHY_CONSTANT_OPTIONAL(int, QMM_IN_STRIDE, 8);
+static_assert(QMM_HEADS_SET == QMM_IN_STRIDE_SET, "a per-head matmul states its heads and stride");
+static_assert(!QMM_HEADS_SET || QMM_K <= QMM_IN_STRIDE, "a head's dot stays inside its part");
+constant constexpr int QMM_LDX = QMM_HEADS_SET ? QMM_HEADS * QMM_IN_STRIDE : QMM_K;
+constant constexpr int QMM_LDY = QMM_HEADS_SET ? QMM_HEADS * QMM_N : QMM_N;
 // The fused act+quant (`affine_gather_w4a8_quant_<act>_*`) only: gpt-oss's grouped
 // bake — the pair's expert adds its gate and up LINEAR biases before the activation
 // ([E, 2·K], buffer(4)), the same switch `silu_mul.metal`'s `SILU_MUL_LINEAR_BIAS`
@@ -154,6 +164,10 @@ METAL_FUNC void qmm_t_nax_impl(
     const int K,
     const int N,
     const int M,
+    // The row strides of `x` and `y`: K and N for a dense matrix, wider for a per-head matmul's
+    // head (`affine_qmm_t_nax_kernel` under QMM_HEADS).
+    const int ldx,
+    const int ldy,
     uint  simd_gid,
     uint  simd_lid,
     uint3 tgid)
@@ -257,11 +271,11 @@ METAL_FUNC void qmm_t_nax_impl(
     const int K_g = K / group_size;                    // scale groups per W row
 
     const device uint8_t* wl_base = (const device uint8_t*)w;
-    const device T_act* x_block   = x + int64_t(y_row) * K;
+    const device T_act* x_block   = x + int64_t(y_row) * ldx;
     const device uint8_t* w_block = wl_base + y_col * K_w;
     const device T_scale* s_block = scales  + y_col * K_g;
     const device T_scale* b_block = biases  + y_col * K_g;
-    device T_act* y_block         = y + int64_t(y_row) * N + y_col;
+    device T_act* y_block         = y + int64_t(y_row) * ldy + y_col;
 
     // ── Per-thread W destination in Ws, source in device W ─────────
     threadgroup T_act* Ws_dst = Ws + bi_w * BK_padded + bj_w * pack_factor;
@@ -270,7 +284,7 @@ METAL_FUNC void qmm_t_nax_impl(
 
     // Per-simdgroup X pointer: x_block points to top of the M-tile;
     // shift by tm rows for this simdgroup.
-    const device T_act* x_ptr = x_block + int64_t(tm) * K;
+    const device T_act* x_ptr = x_block + int64_t(tm) * ldx;
 
     // ── Float accumulator (NAX register tiles) ──────────────────────
     NAXTile<float, TM, TN> Dtile;
@@ -299,9 +313,9 @@ METAL_FUNC void qmm_t_nax_impl(
                   volatile int compiler_barrier;
 
                   if constexpr (kAlignedM.value) {
-                      Atile.load(x_ptr + kk1, K);
+                      Atile.load(x_ptr + kk1, ldx);
                   } else {
-                      Atile.load_safe(x_ptr + kk1, K, short2(SK, sgp_sm));
+                      Atile.load_safe(x_ptr + kk1, ldx, short2(SK, sgp_sm));
                   }
                   Btile.template load<T_act, BK_padded, 1>(
                       tile + tn * BK_padded + kk1);
@@ -481,11 +495,11 @@ METAL_FUNC void qmm_t_nax_impl(
             }
 
             if constexpr (kAlignedM.value && kAlignedN.value) {
-                Dtile.store(y_block + tm * N + tn, N);
+                Dtile.store(y_block + tm * ldy + tn, ldy);
             } else if (kAlignedM.value && sgp_sn == short(SN)) {
-                Dtile.store(y_block + tm * N + tn, N);
+                Dtile.store(y_block + tm * ldy + tn, ldy);
             } else {
-                Dtile.store_safe(y_block + tm * N + tn, N, short2(sgp_sn, sgp_sm));
+                Dtile.store_safe(y_block + tm * ldy + tn, ldy, short2(sgp_sn, sgp_sm));
             }
 
         });
@@ -515,10 +529,24 @@ template <typename T_act, typename T_scale, int group_size, int bits, bool align
     constexpr int BK_padded = BK + 16 / int(sizeof(T_act));  // 72
     // 64 × 72 = 4608 elements; the producer schedule double-buffers it.
     threadgroup T_act Ws[(producer ? 2 : 1) * BN * BK_padded];
+    // A per-head matmul's head (QMM_HEADS): its weight block, scales and biases, its part of the
+    // input rows and of the output rows (`affine_qmm_t_kernel`'s). Planes regroup a whole
+    // matrix's codes, never a head's block.
+    static_assert(!QMM_HEADS_SET || !(AFFINE_CODES_PLANES && bits == 4),
+                  "a per-head matmul's codes are row-major");
+    constexpr int pack_factor = (bits == 3) ? 8 : ((bits == 4) ? 2 : ((bits == 2) ? 4 : 1));
+    constexpr int bytes_per_pack = (bits == 3) ? 3 : 1;
+    const uint head = QMM_HEADS_SET ? tgid.z : 0u;
+    const size_t w_head =
+        size_t(head) * size_t(QMM_N) * size_t(QMM_K * bytes_per_pack / pack_factor);
+    const size_t s_head = size_t(head) * size_t(QMM_N) * size_t(QMM_K / group_size);
+    const device uint32_t* w_h = (const device uint32_t*)((const device uint8_t*)w + w_head);
+    const device T_act* x_h = x + size_t(head) * size_t(QMM_HEADS_SET ? QMM_IN_STRIDE : 0);
+    device T_act* y_h = y + size_t(head) * size_t(QMM_N);
     dispatch_bool(bits == 4 && AFFINE_CODES_OFFSET8, [&](auto kOffset8) {
     qmm_t_nax_impl<T_act, T_scale, group_size, bits, aligned_N, false, kOffset8.value, producer>(
-        w, scales, biases, x, y, Ws,
-        QMM_K, QMM_N, QMM_M,
+        w_h, scales + s_head, biases + s_head, x_h, y_h, Ws,
+        QMM_K, QMM_N, QMM_M, QMM_LDX, QMM_LDY,
         simd_gid, simd_lid, tgid);
     });
 }
@@ -569,7 +597,7 @@ template <typename T_act, typename T_scale, int group_size, int bits, bool align
     dispatch_bool(bits == 4 && AFFINE_CODES_OFFSET8, [&](auto kOffset8) {
     qmm_t_nax_impl<T_act, T_scale, group_size, bits, aligned_N, false, kOffset8.value, producer>(
         w_e, s_e, b_e, x, y, Ws,
-        QMM_K, QMM_N, QMM_M,
+        QMM_K, QMM_N, QMM_M, QMM_K, QMM_N,
         simd_gid, simd_lid, tgid);
     });
 }
@@ -731,7 +759,7 @@ template <typename T_act, typename T_scale, int group_size, int bits, bool align
     dispatch_bool(bits == 4 && AFFINE_CODES_OFFSET8, [&](auto kOffset8) {
     qmm_t_nax_impl<T_act, T_scale, group_size, bits, aligned_N, false, kOffset8.value>(
         w, scales, biases, x, y, Ws,
-        K, N, M,
+        K, N, M, K, N,
         simd_gid, simd_lid, tgid);
     });
 }
@@ -771,7 +799,7 @@ template <typename T_act, typename T_scale, int group_size, int bits, bool align
     threadgroup T_act Ws[BN * BK_padded];
     qmm_t_nax_impl<T_act, T_scale, group_size, bits, aligned_N, /*nvfp4=*/true>(
         w, scales, biases, x, y, Ws,
-        QMM_K, QMM_N, QMM_M,
+        QMM_K, QMM_N, QMM_M, QMM_K, QMM_N,
         simd_gid, simd_lid, tgid);
 }
 

@@ -20,7 +20,10 @@ use scratchy_target_metal::detect_device;
 use scratchy_target_metal::specialized_pipeline_cache::{
     ConstantValue, PipelineKey, SpecializedPipelineCache,
 };
-use scratchy_target_metal::tape::lowering::mla_attend_tiling;
+use scratchy_target_metal::tape::kernel_constants::MlaTileUnit;
+use scratchy_target_metal::tape::lowered::MetalDtype;
+use scratchy_target_metal::tape::lowering::{mla_attend_tiles, mla_attend_tiling};
+use scratchy_target_metal::targets::is_nax_capable;
 
 type Device = objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLDevice>>;
 type Buffer = objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn MTLBuffer>>;
@@ -183,6 +186,57 @@ fn head_dispatch(
     ran.then(|| BF16.decode(&y, c.rows * n))
 }
 
+/// A per-head matmul's MLX-affine weight: every head's block of rows, `bits`-wide codes packed
+/// eight a pack, `bits` bytes a pack, little-endian, one bf16 scale and bias a group.
+struct AffineBlocks {
+    codes: Vec<u8>,
+    code: Vec<u32>,
+    scales: Vec<f32>,
+    biases: Vec<f32>,
+    k: usize,
+    group: usize,
+}
+
+impl AffineBlocks {
+    fn new(c: &HeadCase, bits: usize, group: usize) -> Self {
+        let n = c.heads * c.n_head;
+        let groups = c.k / group;
+        let row_bytes = 4 * (c.k * bits).div_ceil(32);
+        let mut codes = vec![0u8; n * row_bytes];
+        let mut code = vec![0u32; n * c.k];
+        let raw = fill(n * c.k, 7 + bits as u32);
+        for row in 0..n {
+            for i in 0..c.k {
+                let q = ((raw[row * c.k + i] + 0.5) * (1 << bits) as f32) as u32 % (1 << bits);
+                code[row * c.k + i] = q;
+                let bit = i * bits;
+                let at = row * row_bytes + bit / 8;
+                let v = (q as u64) << (bit % 8);
+                for b in 0..2 {
+                    let byte = (v >> (8 * b)) as u8;
+                    if byte != 0 {
+                        codes[at + b] |= byte;
+                    }
+                }
+            }
+        }
+        Self {
+            codes,
+            code,
+            scales: fill(n * groups, 11),
+            biases: fill(n * groups, 13),
+            k: c.k,
+            group,
+        }
+    }
+
+    /// Weight row `row`'s element `i`, dequantized.
+    fn weight(&self, row: usize, i: usize) -> f32 {
+        let g = row * (self.k / self.group) + i / self.group;
+        self.scales[g] * self.code[row * self.k + i] as f32 + self.biases[g]
+    }
+}
+
 /// MLX-affine rows at each code width MLX writes: eight codes a pack, `bits` bytes a pack,
 /// little-endian (the 2-, 4- and 8-bit word paths and the byte path of 3, 5 and 6), one bf16
 /// scale and bias a group.
@@ -219,39 +273,14 @@ fn head_qmv_matches_reference_at_every_code_width() {
             (6, 64),
             (8, 32),
         ] {
-            let n = c.heads * c.n_head;
-            let groups = c.k / group;
-            let row_bytes = 4 * (c.k * bits).div_ceil(32);
-            let mut codes = vec![0u8; n * row_bytes];
-            let mut code = vec![0u32; n * c.k];
-            let raw = fill(n * c.k, 7 + bits as u32);
-            for row in 0..n {
-                for i in 0..c.k {
-                    let q = ((raw[row * c.k + i] + 0.5) * (1 << bits) as f32) as u32 % (1 << bits);
-                    code[row * c.k + i] = q;
-                    let bit = i * bits;
-                    let at = row * row_bytes + bit / 8;
-                    let v = (q as u64) << (bit % 8);
-                    for b in 0..2 {
-                        let byte = (v >> (8 * b)) as u8;
-                        if byte != 0 {
-                            codes[at + b] |= byte;
-                        }
-                    }
-                }
-            }
-            let scales = fill(n * groups, 11);
-            let biases = fill(n * groups, 13);
+            let blocks = AffineBlocks::new(c, bits, group);
             let x = fill(c.rows * c.heads * c.stride, 17);
-            let w = |row: usize, i: usize| {
-                let g = row * groups + i / group;
-                scales[g] * code[row * c.k + i] as f32 + biases[g]
-            };
+            let w = |row: usize, i: usize| blocks.weight(row, i);
             let want = head_reference(c, &x, &w);
             let bufs = [
-                &common::shared_bytes(&device, &codes),
-                &bf16_buf(&device, &scales),
-                &bf16_buf(&device, &biases),
+                &common::shared_bytes(&device, &blocks.codes),
+                &bf16_buf(&device, &blocks.scales),
+                &bf16_buf(&device, &blocks.biases),
                 &bf16_buf(&device, &x),
             ];
             let Some(got) = head_dispatch(
@@ -267,6 +296,110 @@ fn head_qmv_matches_reference_at_every_code_width() {
             assert_close(
                 &format!("head_qmv bits={bits} group={group} k={}", c.k),
                 &got,
+                &want,
+            );
+        }
+    }
+}
+
+/// The matmul a per-head matmul runs from its matvec/matmul boundary on: `qmm_t`'s standard
+/// tile a head (QMM_HEADS), at each width it is instantiated for, over rows of whole and partial
+/// 32-row tiles and heads of whole and partial 32-column ones.
+#[test]
+fn head_qmm_matches_reference() {
+    let Some((device, cache)) = setup() else {
+        return;
+    };
+    let cases = [
+        // GLM-4.7-Flash's query absorption: each head's first 192 of its 256 lanes, into 512.
+        HeadCase {
+            rows: 37,
+            heads: 20,
+            k: 192,
+            stride: 256,
+            n_head: 512,
+        },
+        // A value decompression whose heads are partial column tiles.
+        HeadCase {
+            rows: 70,
+            heads: 3,
+            k: 128,
+            stride: 128,
+            n_head: 40,
+        },
+    ];
+    // The standard tile everywhere; the matrix unit's (64-lane K steps, groups of 64 or more)
+    // where the chip has one.
+    let nax = detect_device().is_some_and(|di| is_nax_capable(di.profile.generation));
+    // (library, symbol stem, rows and columns a tile, threads, the matrix unit's)
+    let tiles = [
+        ("quantized_qmm", "qmm_t", 32, size(32, 2, 2), false),
+        ("quantized_qmm_nax", "qmm_t_nax", 64, size(32, 2, 2), true),
+        (
+            "quantized_qmm_nax",
+            "qmm_t_nax_producer",
+            64,
+            size(32, 5, 1),
+            true,
+        ),
+    ];
+    let tiles = tiles.into_iter().filter(|t| !t.4 || nax);
+    let runs = tiles.flat_map(|t| {
+        [
+            (4usize, 64usize),
+            (4, 32),
+            (4, 128),
+            (3, 64),
+            (2, 64),
+            (8, 64),
+        ]
+        .map(|w| (t, w))
+    });
+    for ((library, stem, tile, threads, matrix), (bits, group)) in runs {
+        for c in &cases {
+            if c.k % group != 0 || (matrix && (c.k % 64 != 0 || group < 64)) {
+                continue;
+            }
+            let blocks = AffineBlocks::new(c, bits, group);
+            let x = fill(c.rows * c.heads * c.stride, 17);
+            // The tile dequantizes each weight into threadgroup memory in the activation dtype.
+            let want = head_reference(c, &x, &|row, i| BF16.round(blocks.weight(row, i)));
+            let aligned = c.n_head % tile == 0;
+            let symbol =
+                format!("affine_{stem}_bf16_s_bf16_gs_{group}_b_{bits}_alN_{aligned}_batch_0");
+            let constants = vec![
+                ConstantValue::int(0, c.k as i32),
+                ConstantValue::int(1, c.n_head as i32),
+                ConstantValue::int(2, c.rows as i32),
+                ConstantValue::int(6, c.heads as i32),
+                ConstantValue::int(8, c.stride as i32),
+            ];
+            let symbol: &'static str = Box::leak(symbol.into_boxed_str());
+            let key = PipelineKey::new(library, symbol, constants);
+            let pso = baked_build(&cache, &key).expect("per-head qmm_t pipeline");
+            let n = c.heads * c.n_head;
+            let y = common::shared_zeroed(&device, c.rows * n * 2);
+            if !common::dispatch_threadgroups(
+                &device,
+                &pso,
+                &[
+                    &common::shared_bytes(&device, &blocks.codes),
+                    &bf16_buf(&device, &blocks.scales),
+                    &bf16_buf(&device, &blocks.biases),
+                    &bf16_buf(&device, &x),
+                    &y,
+                ],
+                size(c.n_head.div_ceil(tile), c.rows.div_ceil(tile), c.heads),
+                threads,
+            ) {
+                return;
+            }
+            assert_close(
+                &format!(
+                    "head {stem} bits={bits} group={group} k={} n_head={}",
+                    c.k, c.n_head
+                ),
+                &BF16.decode(&y, c.rows * n),
                 &want,
             );
         }
@@ -669,52 +802,18 @@ fn mla_attend_matches_reference() {
         (glm, 4, 8, 16),
         (glm, 2, 4, 1),
     ]) {
-        let (block_size, bpc, blocks, max_blocks) = (4usize, 2usize, 10usize, 6usize);
-        let pool = Pool::new(&device, g, blocks, block_size, bpc, 0.0);
         // Sequence 0: 9 cached rows, its last 3 this step's; sequence 1: 6, its last 2.
-        let seq_used: Vec<u32> = vec![9, 6];
-        let cu: Vec<u32> = vec![0, 3, 5];
-        let tables: [Vec<u32>; 2] = [vec![7, 2, 9], vec![4, 0]];
-        let mut block_table = vec![0u32; 2 * max_blocks];
-        for (s, t) in tables.iter().enumerate() {
-            block_table[s * max_blocks..s * max_blocks + t.len()].copy_from_slice(t);
-        }
-        // Each sequence's cached rows, written through its block table.
-        let cached: Vec<Vec<f32>> = (0..2)
-            .map(|s| fill(seq_used[s] as usize * g.row(), 41 + s as u32))
-            .collect();
-        let (mut k, mut v) = pool.read(g);
-        for s in 0..2 {
-            for pos in 0..seq_used[s] as usize {
-                let slot = tables[s][pos / block_size] as usize * block_size + pos % block_size;
-                for e in 0..g.row() {
-                    let (in_v, at) = pool.at(g, slot, e);
-                    let val = cached[s][pos * g.row() + e];
-                    match in_v {
-                        true => v[at] = val,
-                        false => k[at] = val,
-                    }
-                }
-            }
-        }
-        let pool_k = bf16_buf(&device, &k);
-        let pool_v = bf16_buf(&device, &v);
-        let (k_table, v_table) = {
-            let block_bytes = (block_size * g.half() * 2) as u64;
-            let table = |store: &Buffer| {
-                let chunks: Vec<u64> = (0..blocks.div_ceil(bpc))
-                    .map(|ch| store.gpuAddress() + ch as u64 * bpc as u64 * block_bytes)
-                    .collect();
-                common::shared_slice(&device, &chunks)
-            };
-            (table(&pool_k), table(&pool_v))
-        };
-        let rows = *cu.last().unwrap() as usize;
-        let q_latent = fill(rows * g.heads * g.latent, 43);
-        let q = fill(rows * g.heads * g.q_head(), 47);
-        let scale = 1.0 / (g.q_head() as f32).sqrt();
+        let case = AttendCase::new(
+            &device,
+            g,
+            (4, 2, 10, 6),
+            &[9, 6],
+            &[0, 3, 5],
+            &[vec![7, 2, 9], vec![4, 0]],
+        );
+        let (rows, scale, max_blocks) = (case.rows, case.scale, case.max_blocks);
         let mut constants = g.constants();
-        constants.extend(pool.cache_constants(g, max_blocks));
+        constants.extend(case.pool.cache_constants(g, max_blocks));
         constants.extend([
             ConstantValue::float(7, scale),
             uint(8, heads_per_tg),
@@ -732,16 +831,16 @@ fn mla_attend_matches_reference() {
             &pso,
             &[
                 &out,
-                &bf16_buf(&device, &q_latent),
-                &bf16_buf(&device, &q),
-                &common::shared_slice(&device, &seq_used),
-                &common::shared_slice(&device, &block_table),
-                &k_table,
-                &v_table,
-                &common::shared_slice(&device, &cu),
+                &case.q_latent,
+                &case.q,
+                &case.seq_used,
+                &case.block_table,
+                &case.k_table,
+                &case.v_table,
+                &case.cu,
                 &partials,
-                &pool_k,
-                &pool_v,
+                &case.k,
+                &case.v,
             ],
             size(rows, g.heads / heads_per_tg, parts),
             size(32 * simdgroups, 1, 1),
@@ -761,9 +860,89 @@ fn mla_attend_matches_reference() {
                 return;
             }
         }
+        assert_close(
+            &format!(
+                "mla_attend heads={} per_tg={heads_per_tg} simdgroups={simdgroups} parts={parts}",
+                g.heads
+            ),
+            &BF16.decode(&out, case.want.len()),
+            &case.want,
+        );
+    }
+}
+
+/// An absorbed attention's inputs, each sequence's cached rows written through its block table
+/// into a paged pool, and the reference output: every row of each sequence over its sequence's
+/// cached rows up to its own position.
+struct AttendCase {
+    pool: Pool,
+    k: Buffer,
+    v: Buffer,
+    k_table: Buffer,
+    v_table: Buffer,
+    seq_used: Buffer,
+    cu: Buffer,
+    block_table: Buffer,
+    q_latent: Buffer,
+    q: Buffer,
+    rows: usize,
+    max_blocks: usize,
+    scale: f32,
+    want: Vec<f32>,
+}
+
+impl AttendCase {
+    /// `pages` = (rows a block, blocks a chunk, blocks in the pool, the block table's stride);
+    /// sequence `s` holds `seq_used[s]` cached rows in blocks `tables[s]`, its last
+    /// `cu[s + 1] - cu[s]` this step's.
+    fn new(
+        device: &Device,
+        g: Geom,
+        pages: (usize, usize, usize, usize),
+        seq_used: &[u32],
+        cu: &[u32],
+        tables: &[Vec<u32>],
+    ) -> Self {
+        let (block_size, bpc, blocks, max_blocks) = pages;
+        let seqs = seq_used.len();
+        let pool = Pool::new(device, g, blocks, block_size, bpc, 0.0);
+        let mut block_table = vec![0u32; seqs * max_blocks];
+        for (s, t) in tables.iter().enumerate() {
+            block_table[s * max_blocks..s * max_blocks + t.len()].copy_from_slice(t);
+        }
+        let cached: Vec<Vec<f32>> = (0..seqs)
+            .map(|s| fill(seq_used[s] as usize * g.row(), 41 + s as u32))
+            .collect();
+        let (mut k, mut v) = pool.read(g);
+        for s in 0..seqs {
+            for pos in 0..seq_used[s] as usize {
+                let slot = tables[s][pos / block_size] as usize * block_size + pos % block_size;
+                for e in 0..g.row() {
+                    let (in_v, at) = pool.at(g, slot, e);
+                    let val = cached[s][pos * g.row() + e];
+                    match in_v {
+                        true => v[at] = val,
+                        false => k[at] = val,
+                    }
+                }
+            }
+        }
+        let (pool_k, pool_v) = (bf16_buf(device, &k), bf16_buf(device, &v));
+        let block_bytes = (block_size * g.half() * 2) as u64;
+        let table = |store: &Buffer| {
+            let chunks: Vec<u64> = (0..blocks.div_ceil(bpc))
+                .map(|ch| store.gpuAddress() + ch as u64 * bpc as u64 * block_bytes)
+                .collect();
+            common::shared_slice(device, &chunks)
+        };
+        let (k_table, v_table) = (table(&pool_k), table(&pool_v));
+        let rows = *cu.last().unwrap() as usize;
+        let q_latent = fill(rows * g.heads * g.latent, 43);
+        let q = fill(rows * g.heads * g.q_head(), 47);
+        let scale = 1.0 / (g.q_head() as f32).sqrt();
         let mut want = vec![0.0f32; rows * g.heads * g.latent];
         for row in 0..rows {
-            let s = (cu[1] as usize <= row) as usize;
+            let s = (1..=seqs).find(|&s| row < cu[s] as usize).unwrap() - 1;
             let kv_len = seq_used[s] as usize - (cu[s + 1] as usize - 1 - row);
             for h in 0..g.heads {
                 let ql = &q_latent[(row * g.heads + h) * g.latent..][..g.latent];
@@ -787,13 +966,153 @@ fn mla_attend_matches_reference() {
                 }
             }
         }
+        Self {
+            pool,
+            k: pool_k,
+            v: pool_v,
+            k_table,
+            v_table,
+            seq_used: common::shared_slice(device, seq_used),
+            cu: common::shared_slice(device, cu),
+            block_table: common::shared_slice(device, &block_table),
+            q_latent: bf16_buf(device, &q_latent),
+            q: bf16_buf(device, &q),
+            rows,
+            max_blocks,
+            scale,
+            want,
+        }
+    }
+}
+
+/// The tiled attention a matmul-band bucket runs, at the tile the lowering ships for each
+/// geometry and page: three sequences — a fresh prompt of several query tiles, a chunk after a
+/// cached prefix whose last tile is partial, and one decode row — their blocks scattered across
+/// chunks, every causal boundary inside a tile.
+#[test]
+fn mla_attend_tiles_matches_reference() {
+    let Some((device, cache)) = setup() else {
+        return;
+    };
+    let small = Geom {
+        heads: 4,
+        latent: 64,
+        nope: 16,
+        rope: 16,
+    };
+    let glm = Geom {
+        heads: 20,
+        latent: 512,
+        nope: 192,
+        rope: 64,
+    };
+    let nax = detect_device().is_some_and(|di| is_nax_capable(di.profile.generation));
+    let units = [MlaTileUnit::Simdgroup, MlaTileUnit::Matrix];
+    let units = units
+        .into_iter()
+        .filter(|u| nax || *u == MlaTileUnit::Simdgroup);
+    let shapes = units.flat_map(|u| {
+        [(small, 16usize), (small, 32), (glm, 16), (glm, 32)].map(|(g, page)| (u, g, page))
+    });
+    for (unit, g, block_size) in shapes {
+        let half = (g.latent + g.rope) as u32 / 2;
+        let tile = mla_attend_tiles(
+            unit,
+            g.latent as u32,
+            g.rope as u32,
+            block_size as u32,
+            half,
+        );
+        let Some(tile) = tile else {
+            // The matrix unit's 32-lane slices: the small row's 40-lane halves are none.
+            assert!(unit == MlaTileUnit::Matrix && g.latent == small.latent);
+            continue;
+        };
+        let (warp_lanes, keys) = (tile.warp_lanes.get() as usize, tile.keys.get() as usize);
+        // Sequence 0: a fresh 45-row prompt; 1: 70 cached rows, the last 21 this step's; 2: one
+        // decode row over 37.
+        let seq_used = [45u32, 70, 37];
+        let cu = [0u32, 45, 66, 67];
+        let pages_of = |rows: u32| (rows as usize).div_ceil(block_size);
+        let total_pages: usize = seq_used.iter().map(|&n| pages_of(n)).sum();
+        // Each sequence's pages, scattered: a stride coprime to the pool's size, so no two pages
+        // share a block.
+        let blocks = total_pages + 3;
+        let gcd = |mut a: usize, mut b: usize| {
+            while b != 0 {
+                (a, b) = (b, a % b);
+            }
+            a
+        };
+        let stride = (5..).find(|&s| gcd(s, blocks) == 1).unwrap();
+        let mut next = 0usize;
+        let tables: Vec<Vec<u32>> = seq_used
+            .iter()
+            .map(|&n| {
+                (0..pages_of(n))
+                    .map(|_| {
+                        next += 1;
+                        ((next * stride) % blocks) as u32
+                    })
+                    .collect()
+            })
+            .collect();
+        let max_blocks = tables.iter().map(Vec::len).max().unwrap() + 1;
+        let case = AttendCase::new(
+            &device,
+            g,
+            (block_size, 2, blocks, max_blocks),
+            &seq_used,
+            &cu,
+            &tables,
+        );
+        let mut constants = g.constants();
+        constants.extend(case.pool.cache_constants(g, max_blocks));
+        constants.extend([
+            ConstantValue::float(7, case.scale),
+            uint(16, warp_lanes),
+            uint(17, keys),
+            uint(18, tile.blocks() as usize),
+        ]);
+        let (library, function) = tile.kernel(MetalDtype::Bf16);
+        let key = PipelineKey::new(library, function, constants);
+        let pso = baked_build(&cache, &key).expect("mla_attend_tiles pipeline");
+        let out = common::shared_zeroed(&device, case.rows * g.heads * g.latent * 2);
+        let most = (0..seq_used.len())
+            .map(|s| (cu[s + 1] - cu[s]) as usize)
+            .max()
+            .unwrap();
+        if !common::dispatch_threadgroups(
+            &device,
+            &pso,
+            &[
+                &out,
+                &case.q_latent,
+                &case.q,
+                &case.seq_used,
+                &case.block_table,
+                &case.k_table,
+                &case.v_table,
+                &case.cu,
+                &case.k,
+                &case.v,
+            ],
+            size(
+                (most * g.heads).div_ceil(tile.queries() as usize),
+                1,
+                seq_used.len(),
+            ),
+            size(tile.threads() as usize, 1, 1),
+        ) {
+            return;
+        }
         assert_close(
             &format!(
-                "mla_attend heads={} per_tg={heads_per_tg} simdgroups={simdgroups} parts={parts}",
-                g.heads
+                "mla_attend_tiles {unit:?} heads={} latent={} page={block_size}",
+                g.heads, g.latent
             ),
-            &BF16.decode(&out, want.len()),
-            &want,
+            &BF16.decode(&out, case.want.len()),
+            &case.want,
         );
     }
 }
