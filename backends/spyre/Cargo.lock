@@ -2302,6 +2302,8 @@ dependencies = [
 name = "triton-frontend"
 version = "0.1.0"
 dependencies = [
+ "ktir-superdsc",
+ "scratchy-triton-splice",
  "triton-ktir",
 ]
 
@@ -2330,6 +2332,8 @@ version = "0.1.0"
 dependencies = [
  "ktir-core",
  "ktir-emulator",
+ "ktir-superdsc",
+ "scratchy-triton-splice",
  "serde_json",
  "triton-frontend",
  "triton-ktir",
