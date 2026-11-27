@@ -589,6 +589,13 @@ pub enum Pumped {
 /// churn drain fills cells through the same pop the knock takes — the pop in the
 /// worker's drain is the single authority over which drain owns a step.
 ///
+/// ⭐ THE KNOCK'S PARK SLICE — the one latency constant of the feed-before-harvest
+/// loop. Long enough that an idle pump's wakeups stay off the profile (4 kHz per
+/// knocked step at most), short enough that a landing between slices costs well
+/// under a step's own host time; the park never holds the executor's thread, so
+/// the slice only paces how often the channel and the landings are re-checked.
+const KNOCK_PARK_SLICE: std::time::Duration = std::time::Duration::from_micros(250);
+
 /// Returns `true` when every knocked cell is filled, `false` when the teardown
 /// arrived (the caller breaks to its own shutdown tail).
 pub fn drain_knock(
@@ -618,7 +625,7 @@ pub fn drain_knock(
         // PARK A SLICE: nothing landed, nothing queued — the device is still
         // running the knocked step. The next round feeds the channel first: the
         // Step that arrives is what keeps the device busy past this landing.
-        std::thread::sleep(std::time::Duration::from_micros(250));
+        std::thread::sleep(KNOCK_PARK_SLICE);
     }
 }
 

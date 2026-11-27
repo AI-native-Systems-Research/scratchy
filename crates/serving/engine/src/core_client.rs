@@ -15,7 +15,7 @@ use tracing::info;
 
 use crate::engine_core::{EngineCore, EngineCoreConfig, StepOutcome, StepOutputs};
 use crate::error::{EngineError, EngineResult};
-use crate::executor::{Executor, ModelRunnerOutput};
+use crate::executor::{drain_knock, Executor, ModelRunnerOutput, Pumped};
 
 // ---------------------------------------------------------------------------
 // EngineCoreClient trait
@@ -261,6 +261,37 @@ enum PipelineResult {
     Step(Box<SchedulerOutput>, EngineResult<ModelRunnerOutput>),
 }
 
+/// ⭐ ONE DISPATCH, BOTH CALLERS OF IT. Every `PipelineMsg` this channel can
+/// carry is handled here, once — the loop's own `recv` and the knock's pump
+/// ([`crate::executor::drain_knock`]) both route through this statement, so a
+/// new variant is written in exactly one place per channel, never once per
+/// caller. The verdict is the pump's own vocabulary: a message ran, a knock
+/// joins the pending set, or the loop must stop (the teardown arrived, or the
+/// client is gone — the caller breaks to its own shutdown tail).
+fn dispatch_pipeline_msg(
+    executor: &mut dyn Executor,
+    tx: &std::sync::mpsc::SyncSender<PipelineResult>,
+    msg: PipelineMsg,
+) -> Pumped {
+    match msg {
+        PipelineMsg::Step(sched) => {
+            let result = executor.execute_model(&sched);
+            if tx.send(PipelineResult::Step(sched, result)).is_err() {
+                // The client is gone: the loop's own exit tail runs the
+                // shutdown drain.
+                return Pumped::Stop;
+            }
+            Pumped::Ran
+        }
+        PipelineMsg::Embed(token_id_seqs, reply) => {
+            let _ = reply.send(executor.embed(token_id_seqs));
+            Pumped::Ran
+        }
+        PipelineMsg::Knock(cell) => Pumped::Knock(cell),
+        PipelineMsg::Shutdown => Pumped::Stop,
+    }
+}
+
 /// Background executor thread loop: receives scheduler outputs, runs
 /// `execute_model`, and sends back results.
 fn executor_bg_loop(
@@ -268,6 +299,7 @@ fn executor_bg_loop(
     rx: std::sync::mpsc::Receiver<PipelineMsg>,
     tx: std::sync::mpsc::SyncSender<PipelineResult>,
 ) {
+    use std::sync::mpsc::TryRecvError;
     // First act: run where the executor's devices want their driver. A refusal ends the thread
     // by name; the client's next receive reports the thread gone.
     if let Err(e) = executor.pin_driving_thread() {
@@ -276,47 +308,20 @@ fn executor_bg_loop(
         return;
     }
     while let Ok(msg) = rx.recv() {
-        match msg {
-            PipelineMsg::Step(sched) => {
-                let result = executor.execute_model(&sched);
-                if tx.send(PipelineResult::Step(sched, result)).is_err() {
-                    break;
-                }
-            }
-            PipelineMsg::Embed(token_id_seqs, reply) => {
-                let _ = reply.send(executor.embed(token_id_seqs));
-            }
-            PipelineMsg::Knock(cell) => {
-                // ⭐ FEED BEFORE HARVEST ([`crate::executor::drain_knock`]): while
-                // this knock waits for its landing, every message that arrives runs
-                // first — the card is fed before it is harvested, so a queued Step's
-                // submit never waits behind the collect of a step already on the
-                // card. Without the pump, the knock for step N lands ahead of the
-                // pre-scheduled Step for N+1 (the resolver resolves before the next
-                // call pre-sends), the executor parks on N's landing, and decode
-                // serializes at depth 1 with the card idle behind every collect.
-                use crate::executor::{drain_knock, Pumped};
-                use std::sync::mpsc::TryRecvError;
+        match dispatch_pipeline_msg(&mut *executor, &tx, msg) {
+            Pumped::Ran => {}
+            // ⭐ FEED BEFORE HARVEST ([`drain_knock`]): while this knock waits
+            // for its landing, every message that arrives runs first — the
+            // card is fed before it is harvested, so a queued Step's submit
+            // never waits behind the collect of a step already on the card.
+            // Without the pump, the knock for step N lands ahead of the
+            // pre-scheduled Step for N+1 (the resolver resolves before the next
+            // call pre-sends), the executor parks on N's landing, and decode
+            // serializes at depth 1 with the card idle behind every collect.
+            Pumped::Knock(cell) => {
                 let mut knocks = vec![cell];
                 let answered = drain_knock(&mut *executor, &mut knocks, |ex| match rx.try_recv() {
-                    Ok(PipelineMsg::Step(sched)) => {
-                        let result = ex.execute_model(&sched);
-                        if tx
-                            .send(PipelineResult::Step(sched, result))
-                            .is_err()
-                        {
-                            // The client is gone: the loop's own exit tail runs the
-                            // shutdown drain.
-                            return Pumped::Stop;
-                        }
-                        Pumped::Ran
-                    }
-                    Ok(PipelineMsg::Knock(cell)) => Pumped::Knock(cell),
-                    Ok(PipelineMsg::Embed(token_id_seqs, reply)) => {
-                        let _ = reply.send(ex.embed(token_id_seqs));
-                        Pumped::Ran
-                    }
-                    Ok(PipelineMsg::Shutdown) => Pumped::Stop,
+                    Ok(msg) => dispatch_pipeline_msg(ex, &tx, msg),
                     Err(TryRecvError::Empty) => Pumped::Idle,
                     Err(TryRecvError::Disconnected) => Pumped::Stop,
                 });
@@ -324,7 +329,10 @@ fn executor_bg_loop(
                     break;
                 }
             }
-            PipelineMsg::Shutdown => break,
+            Pumped::Stop => break,
+            // Only the pump's channel-empty arm produces this; a dispatched
+            // message never does.
+            Pumped::Idle => {}
         }
     }
     executor.shutdown();
