@@ -120,9 +120,13 @@ rand = "0.9"
 # Tokenizer. default-features=false drops the training-only defaults, since we
 # only ever infer: `progressbar` (training progress bars) and `esaxx_fast` (the
 # C++ suffix array the Unigram *trainer* uses — encode/decode never reach it).
-# onig is kept to preserve exact tokenization behavior: it is the pre-tokenizer
-# regex engine.
-tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
+# fancy-regex is the pre-tokenizer regex engine: the pure-Rust SysRegex backend
+# (tokenizers src/utils/{mod,fancy}.rs), so the tree carries no C regex dep.
+# Parity with the onig backend was verified token-for-token: every cached
+# tokenizer.json (17, all arch families) over a corner-case corpus, per line
+# and whole-corpus, with and without special tokens — identical ids
+# (.claude/scratch/onig-parity in the lead session's tree).
+tokenizers = { version = "0.23", default-features = false, features = ["fancy-regex"] }
 
 # Template engine (for HuggingFace chat templates)
 # `preserve_order`: template maps keep insertion order like the Python dicts
