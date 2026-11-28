@@ -21,7 +21,7 @@ use ktir_superdsc::emit::EmittedOp;
 use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::{
     StickPermute, StickPermuteSpec, assemble_stick_permute,
 };
-use ktir_superdsc::superdsc_opspec::{DataFormat, Df, Fp16, Fp8, OpFunc};
+use ktir_superdsc::superdsc_opspec::{DataFormat, Df, Fp8, Fp16, OpFunc};
 
 /// One permute of `rows` rows of `sticks` sticks at `df`, stick-major to row-major, emitted.
 fn permute(rows: u32, sticks: u32, df: Df) -> Result<EmittedOp<TpWorld<1>>, String> {
@@ -45,8 +45,7 @@ fn permute(rows: u32, sticks: u32, df: Df) -> Result<EmittedOp<TpWorld<1>>, Stri
 
 /// The op's one dsc, as JSON.
 fn dsc(op: &EmittedOp<TpWorld<1>>) -> serde_json::Value {
-    serde_json::to_value(op.op.as_ref().expect("a descriptor"))
-        .expect("json")["dscs_"][0]
+    serde_json::to_value(op.op.as_ref().expect("a descriptor")).expect("json")["dscs_"][0]
         .as_object()
         .and_then(|m| m.values().next())
         .expect("one dsc")

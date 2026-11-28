@@ -537,11 +537,11 @@ fn emit_superdsc_wiring(
                 scratchy_target_spyre::paged_step::PagedRows::Batch => {
                     vec![p.chunk_masks]
                 }
-                scratchy_target_spyre::paged_step::PagedRows::Sequence => (0
-                    ..p.extent.requests().get())
-                    .map(|r| {
-                        scratchy_triton_splice::paged_window_of_class(p.class as usize, r, 2)
-                    })
+                scratchy_target_spyre::paged_step::PagedRows::Sequence => (0..p
+                    .extent
+                    .requests()
+                    .get())
+                    .map(|r| scratchy_triton_splice::paged_window_of_class(p.class as usize, r, 2))
                     .collect(),
             })
             .collect();
@@ -2643,18 +2643,19 @@ impl<T: ktir_superdsc::collective::Tp> PooledSession for Declared<T> {
         for step in &mut self.gk.paged {
             *step = step.over_pool(pool);
         }
-        let placed = match &mut self.walked {
-            Ok((rolled, rungs)) => std::iter::once(rolled)
-                .chain(rungs.iter_mut().map(|(_, _, rung)| rung))
-                .try_for_each(|walk| {
-                    self.gk.paged.iter().try_for_each(|step| {
+        let placed =
+            match &mut self.walked {
+                Ok((rolled, rungs)) => std::iter::once(rolled)
+                    .chain(rungs.iter_mut().map(|(_, _, rung)| rung))
+                    .try_for_each(|walk| {
+                        self.gk.paged.iter().try_for_each(|step| {
                         scratchy_target_spyre::lower_subtile_tape_to_superdsc::place_kv_pools_at(
                             walk, Some(*step), pool,
                         )
                     })
-                }),
-            Err(_) => Ok(()),
-        };
+                    }),
+                Err(_) => Ok(()),
+            };
         if let Err(e) = placed {
             self.walked = Err(e);
         }

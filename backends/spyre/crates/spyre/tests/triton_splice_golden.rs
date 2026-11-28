@@ -2607,8 +2607,14 @@ fn a_sliding_window_attention_lowers_on_the_mask_stack() {
     // staged page table names and what the mask tiles hold, never the splice's own shape.
     assert_eq!(c.len(), w.len(), "one window a request, windowed or causal");
     assert_eq!(
-        c[0].ktir.as_ref().expect("a spliced op carries its ktir node").bindings,
-        w[0].ktir.as_ref().expect("a spliced op carries its ktir node").bindings
+        c[0].ktir
+            .as_ref()
+            .expect("a spliced op carries its ktir node")
+            .bindings,
+        w[0].ktir
+            .as_ref()
+            .expect("a spliced op carries its ktir node")
+            .bindings
     );
     // And the step's walk is the window's own bound, capped by the causal sweep the rung states.
     let step_of = |ir: &scratchy_subtile::subtile_ir::SubtileIR| {

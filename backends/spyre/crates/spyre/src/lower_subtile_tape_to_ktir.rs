@@ -1661,8 +1661,10 @@ pub fn paged_step_of_ir<F: RopeForm>(
                 continue;
             };
             let g = attention.class(mask.class());
-            if (mask.window().map(|w| w.get()).unwrap_or(0), g.kv_heads().get())
-                != (*window, *nkvh)
+            if (
+                mask.window().map(|w| w.get()).unwrap_or(0),
+                g.kv_heads().get(),
+            ) != (*window, *nkvh)
             {
                 continue;
             }
@@ -1961,15 +1963,9 @@ pub fn graph_wiring<T: ktir_superdsc::collective::Tp, F: RopeForm>(
                 if batch {
                     expected.insert(step.chunk_masks);
                 } else {
-                    expected.extend(
-                        (0..windows).map(|r| {
-                            scratchy_triton_splice::paged_window_of_class(
-                                step.class as usize,
-                                r,
-                                2,
-                            )
-                        }),
-                    );
+                    expected.extend((0..windows).map(|r| {
+                        scratchy_triton_splice::paged_window_of_class(step.class as usize, r, 2)
+                    }));
                 }
             }
             let bound: std::collections::BTreeSet<u32> =

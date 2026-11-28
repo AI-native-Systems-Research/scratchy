@@ -1231,8 +1231,7 @@ pub fn assemble_expand_blocks<T: crate::collective::Tp>(
                                 src_pitch: block_sticks,
                                 dst_pitch: group * block_sticks,
                                 src_elems: first * block_sticks * stick as u32,
-                                dst_elems: dst_kernel
-                                    .dev_off((first * group + g) as usize, 0)
+                                dst_elems: dst_kernel.dev_off((first * group + g) as usize, 0)
                                     as u32,
                                 df,
                             },
@@ -1262,10 +1261,8 @@ pub fn assemble_expand_blocks<T: crate::collective::Tp>(
             // `record.dev_off(b·rows + r, j·lanes)`, and destination block `b·group + g` holds the
             // same column as `rows` consecutive sticks at `dst_block.dev_off(r, j·lanes)` past the
             // block's base. Both pitches are one stick. One run a stick, at most one run a core.
-            let dst_block = crate::sdsc_abstract::StickLayout::row_blocked(
-                rows as usize,
-                cols as usize,
-            );
+            let dst_block =
+                crate::sdsc_abstract::StickLayout::row_blocked(rows as usize, cols as usize);
             let block_elems = rows as usize * cols as usize;
             let columns = cols as usize / stick;
             let chunks = stick_runs_chunks(rows);
@@ -1299,9 +1296,7 @@ pub fn assemble_expand_blocks<T: crate::collective::Tp>(
                                     sym_id_base,
                                     layout,
                                 )
-                                .map_err(|e| {
-                                    format!("assemble_expand_blocks {op_name}: {e}")
-                                })?,
+                                .map_err(|e| format!("assemble_expand_blocks {op_name}: {e}"))?,
                             );
                         }
                     }
@@ -2929,10 +2924,16 @@ mod expand_blocks_tests {
     fn a_source_that_is_not_the_stated_blocks_refuses() {
         let err = ExpandedBlocks::of(8, 2, 29, 256, 841, 256)
             .expect_err("841 rows is not 8 blocks of 29 rows");
-        assert!(err.contains("disagree"), "the refusal names the disagreement: {err}");
+        assert!(
+            err.contains("disagree"),
+            "the refusal names the disagreement: {err}"
+        );
         let err = ExpandedBlocks::of(8, 2, 29, 256, 232, 2048)
             .expect_err("the cols disagree with the source frame");
-        assert!(err.contains("disagree"), "the refusal names the disagreement: {err}");
+        assert!(
+            err.contains("disagree"),
+            "the refusal names the disagreement: {err}"
+        );
     }
 
     /// ⭐ THE RUNG-27 GOLDEN GEOMETRY (gemma-4-12b's good rung — the card verified the attention
@@ -3129,7 +3130,12 @@ mod expand_blocks_tests {
                 .expect("per-core starts")
                 .iter()
                 .filter_map(|(k, val)| {
-                    let c = k.strip_prefix('[')?.split(',').next()?.parse::<u64>().ok()?;
+                    let c = k
+                        .strip_prefix('[')?
+                        .split(',')
+                        .next()?
+                        .parse::<u64>()
+                        .ok()?;
                     let s = val.as_str()?.parse::<u64>().ok()?;
                     Some((c, s))
                 })
@@ -3137,10 +3143,7 @@ mod expand_blocks_tests {
             assert!(!starts.is_empty(), "the copy has cores");
             starts.sort();
             let base = starts[0].1;
-            (
-                starts.iter().map(|(_, s)| s - base).collect(),
-                base,
-            )
+            (starts.iter().map(|(_, s)| s - base).collect(), base)
         };
         (starts(0), starts(1))
     }
@@ -3237,11 +3240,8 @@ mod expand_blocks_tests {
         let (rows, cols, group) = (128u32, 512u32, 16u32);
         let l = declared(rows, cols, rows * group, cols);
         let (src, dst) = (crate::place::act_name(1), crate::place::act_name(2));
-        l.declare_arrangement(
-            &src,
-            StickLayout::row_blocked(rows as usize, cols as usize),
-        )
-        .expect("the one-block page landing, stick-major [128, 512]");
+        l.declare_arrangement(&src, StickLayout::row_blocked(rows as usize, cols as usize))
+            .expect("the one-block page landing, stick-major [128, 512]");
         let mut sym = 0i64;
         let ops = assemble_expand_blocks::<crate::collective::TpWorld<1>>(
             "expand_o2",
@@ -3302,7 +3302,8 @@ mod expand_blocks_tests {
             for (&in_rel, &out_rel) in input.iter().zip(&output) {
                 let (b, within) = (in_rel / block, in_rel % block);
                 assert_eq!(
-                    out_rel, b * 2 * block + within,
+                    out_rel,
+                    b * 2 * block + within,
                     "run {b}'s stick writes at query head {}'s block — the golden law",
                     b * 2 + g as u64
                 );

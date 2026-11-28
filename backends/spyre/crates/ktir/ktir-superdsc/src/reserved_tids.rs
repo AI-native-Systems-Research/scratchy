@@ -716,7 +716,10 @@ pub const fn paged_step_class_tid(idx: u32) -> u32 {
 pub const fn paged_step_class_window_tid(class: u32, window: u32, table: u32) -> u32 {
     assert!(class >= 1, "class 0's windows are the paged_window family");
     assert!(window >= 1, "window 0 is the class's own step tables");
-    assert!(window < PAGED_MAX_WINDOWS, "a packed rung asked for a window past PAGED_MAX_WINDOWS");
+    assert!(
+        window < PAGED_MAX_WINDOWS,
+        "a packed rung asked for a window past PAGED_MAX_WINDOWS"
+    );
     assert!(
         table == 1 || table == 2,
         "a window past the first owns the page table and the mask stack, in paged_window_tid's \

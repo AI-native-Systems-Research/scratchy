@@ -364,7 +364,12 @@ impl Wiring {
         rows: StagedRows,
         n_consts: usize,
     ) -> crate::forward_tape::ForwardShape {
-        self.forward_shape_within(self.baked_row_capacity(), rows, self.paged.to_vec(), n_consts)
+        self.forward_shape_within(
+            self.baked_row_capacity(),
+            rows,
+            self.paged.to_vec(),
+            n_consts,
+        )
     }
 
     /// [`Self::forward_shape`] with the capacity and the paged step supplied by the CALLER rather
@@ -894,7 +899,11 @@ impl PagedStep {
                 let w = u64::from(self.extent.per_request().get());
                 let windows = u64::from(self.extent.requests().get());
                 let window_tid = |r: u64, table: u32| {
-                    scratchy_triton_splice::paged_window_of_class(self.class as usize, r as u32, table)
+                    scratchy_triton_splice::paged_window_of_class(
+                        self.class as usize,
+                        r as u32,
+                        table,
+                    )
                 };
                 for r in 0..windows {
                     v.extend([

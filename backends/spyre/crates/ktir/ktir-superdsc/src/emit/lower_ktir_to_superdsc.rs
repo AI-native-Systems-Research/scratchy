@@ -58,7 +58,7 @@ use crate::reserved_tids::{LAST_HIDDEN_TID, scalarmul_scale_tid};
 use crate::sdsc_abstract::{KernelTag, Stk};
 use crate::sdsc_abstract::{MatK, MatM, MatN};
 use crate::superdsc_opspec::{
-    DataFormat, Df, Fp16, Fp32, Fp8, ItDim, SdscFoldSet, SenUint32, StickExtent,
+    DataFormat, Df, Fp8, Fp16, Fp32, ItDim, SdscFoldSet, SenUint32, StickExtent,
 };
 use crate::work::{CoreSplit, DeviceWidth, EwDivision, FP16_ELEMS_PER_STICK};
 use ktir_core::affine::AffineExpr;

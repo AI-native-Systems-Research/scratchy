@@ -228,7 +228,9 @@ pub(crate) fn forward_chunk(
     // so a tid already staged is not staged again.
     {
         if b.paged.is_empty() {
-            return Err(werr("this bundle states no paged step — its attention has no pools"));
+            return Err(werr(
+                "this bundle states no paged step — its attention has no pools",
+            ));
         }
         let rows = scratchy_target_spyre::paged_step::StepRows::new(start, n).ok_or_else(|| {
             werr(format!(
@@ -241,12 +243,7 @@ pub(crate) fn forward_chunk(
                 .map_err(|e| werr(format!("request {id}: paged step: {e}")))?;
             for (tid, bytes, shape) in srcs.int32 {
                 if !int32.iter().any(|(t, ..)| *t == tid as usize) {
-                    int32.push((
-                        tid as usize,
-                        bytes,
-                        scratchy_tensors::DType::I32,
-                        shape,
-                    ));
+                    int32.push((tid as usize, bytes, scratchy_tensors::DType::I32, shape));
                 }
             }
             let (mask_tid, mask, mask_shape) = srcs.mask;

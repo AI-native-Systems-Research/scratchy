@@ -7805,8 +7805,7 @@ fn tiled_trips_alias<T: ktir_superdsc::collective::Tp>(e: &EmittedOp<T>) -> bool
             for dsc in dsc_map.values() {
                 for node in &dsc.scheduleTree_ {
                     if node.component_ != "hbm"
-                        || e
-                            .arg_bindings
+                        || e.arg_bindings
                             .get(node.ldsIdx_ as usize)
                             .is_some_and(|b| b.is_input)
                     {

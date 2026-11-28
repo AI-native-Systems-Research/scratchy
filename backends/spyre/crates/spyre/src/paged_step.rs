@@ -38,8 +38,7 @@ use crate::wiring::PagedStep;
 /// The page walk's laws, where the bake and the worker that state a bundle's walk reach them: the
 /// page size, a rung's walk ([`walk_pages`]) and the rungs a pool is walked by ([`walk_buckets`]).
 pub use scratchy_triton_splice::{
-    BatchChunking, PagedRows, SchedulerBlockTokens, walk_buckets, walk_pages,
-    window_walk_blocks,
+    BatchChunking, PagedRows, SchedulerBlockTokens, walk_buckets, walk_pages, window_walk_blocks,
 };
 
 /// `finfo(float16).min` — spyre-inference's masked additive value: finite, so a fully-masked tile's
@@ -598,11 +597,8 @@ pub fn batch_sources(
             pages[i * b + s] = q.blocks[anchor + i] as i32;
             for col in 0..slots {
                 let kv = (anchor + i) * slots + col;
-                mask_bs[(s * padded + i) * slots + col] = if kv <= q.pos && kv >= lo {
-                    0.0
-                } else {
-                    MASKED
-                };
+                mask_bs[(s * padded + i) * slots + col] =
+                    if kv <= q.pos && kv >= lo { 0.0 } else { MASKED };
             }
         }
     }
@@ -822,13 +818,7 @@ pub fn card_step_sources(
             // The window's table stages the walk's own blocks — from the window's anchor
             // ([`first_active`]), whose trips the mask stack below cuts at each row's reach.
             let anchor = first_active(step, &req.rows);
-            for (i, &page) in req
-                .blocks
-                .iter()
-                .skip(anchor)
-                .take(walk)
-                .enumerate()
-            {
+            for (i, &page) in req.blocks.iter().skip(anchor).take(walk).enumerate() {
                 let at = i * trip;
                 table[at..at + 4].copy_from_slice(&(page as i32).to_le_bytes());
             }
@@ -1417,7 +1407,11 @@ mod tests {
         };
         let rows = StepRows::new(9, 3).unwrap();
         let blocks = [0u32, 1, 2, 3];
-        assert_eq!(first_active(&s, &rows), 1, "the earliest query reaches from 4");
+        assert_eq!(
+            first_active(&s, &rows),
+            1,
+            "the earliest query reaches from 4"
+        );
         assert_eq!(s.span(&rows), 8, "end 12 less the anchor's 4 positions");
         // The table names the walk's own blocks — 1, 2, 3 — then the block table's zero past
         // the request's four.
@@ -1429,8 +1423,16 @@ mod tests {
         let m = mask_stack(&s, &rows);
         assert_eq!(&m[0..4], &[0.0; 4], "trip 0 row 0: positions 4..=7");
         assert_eq!(&m[4..8], &[MASKED, 0.0, 0.0, 0.0], "trip 0 row 1: from 5");
-        assert_eq!(&m[8..12], &[MASKED, MASKED, 0.0, 0.0], "trip 0 row 2: from 6");
-        assert_eq!(&m[12..16], &[0.0, 0.0, MASKED, MASKED], "trip 1 row 0: to 9");
+        assert_eq!(
+            &m[8..12],
+            &[MASKED, MASKED, 0.0, 0.0],
+            "trip 0 row 2: from 6"
+        );
+        assert_eq!(
+            &m[12..16],
+            &[0.0, 0.0, MASKED, MASKED],
+            "trip 1 row 0: to 9"
+        );
         assert_eq!(&m[16..20], &[0.0, 0.0, 0.0, MASKED], "trip 1 row 1: to 10");
         assert_eq!(&m[20..24], &[0.0; 4], "trip 1 row 2: to 11");
         assert!(
@@ -1479,10 +1481,7 @@ mod tests {
         assert!(step_sources(&causal, &blocks, &rows).is_err());
         assert!(step_sources(&base, &blocks, &rows).is_ok());
         // The same windowed step on a 2-block walk (8 positions) refuses: its span does not fit.
-        let narrow = PagedStep {
-            walk: 2,
-            ..base
-        };
+        let narrow = PagedStep { walk: 2, ..base };
         assert!(step_sources(&narrow, &blocks, &rows).is_err());
     }
 
@@ -1560,9 +1559,7 @@ mod tests {
         );
         let (mask, shape) = (&src.mask.1, &src.mask.2);
         assert_eq!(shape, &vec![8usize, 4]);
-        let tile = |i: usize, s: usize| -> &[f32] {
-            &mask[(i * 4 + s) * 4..(i * 4 + s + 1) * 4]
-        };
+        let tile = |i: usize, s: usize| -> &[f32] { &mask[(i * 4 + s) * 4..(i * 4 + s + 1) * 4] };
         // A (position 9, reach [4, 9]): slot 0 covers 4..=7 whole, slot 1 (8..=11) to 9.
         assert_eq!(tile(0, 0), &[0.0; 4]);
         assert_eq!(tile(1, 0), &[0.0, 0.0, MASKED, MASKED]);
@@ -1571,7 +1568,16 @@ mod tests {
         assert_eq!(tile(0, 1), &[0.0, 0.0, 0.0, MASKED]);
         assert_eq!(tile(1, 1), &[f32::NEG_INFINITY; 4]);
         // A sequence whose span is past the walk refuses: position 12 touches 3 blocks.
-        assert!(batch_sources(&s, &[BatchSeq { blocks: &a, pos: 12 }]).is_err());
+        assert!(
+            batch_sources(
+                &s,
+                &[BatchSeq {
+                    blocks: &a,
+                    pos: 12
+                }]
+            )
+            .is_err()
+        );
     }
 
     /// spyre-inference's dispatch: the decode kernel, at one query row, is the one that reads

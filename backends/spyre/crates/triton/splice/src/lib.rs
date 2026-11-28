@@ -1950,8 +1950,7 @@ impl PagedStepTids {
         // region's BASE slot (class 0 lives on the sentinels, so no slot is wasted).
         let slot = |table: usize| {
             ktir_superdsc::reserved_tids::paged_step_class_tid(
-                (class as u32 - 1)
-                    * ktir_superdsc::reserved_tids::PAGED_STEP_CLASS_STRIDE
+                (class as u32 - 1) * ktir_superdsc::reserved_tids::PAGED_STEP_CLASS_STRIDE
                     + table as u32,
             )
         };
@@ -2016,7 +2015,11 @@ pub fn paged_window_of_class(class: usize, window: u32, table: u32) -> u32 {
         1 | 2 => {
             if window == 0 {
                 let tids = PagedStepTids::of_class(class);
-                if table == 1 { tids.page_table } else { tids.mask }
+                if table == 1 {
+                    tids.page_table
+                } else {
+                    tids.mask
+                }
             } else {
                 ktir_superdsc::reserved_tids::paged_step_class_window_tid(
                     class as u32,
@@ -2942,9 +2945,10 @@ pub fn lower_kv_write<
                         ..
                     },
                 ..
-            } if *producer_node_idx == idx => {
-                Some((mask.window(), attention.class(mask.class()).kv_heads().get()))
-            }
+            } if *producer_node_idx == idx => Some((
+                mask.window(),
+                attention.class(mask.class()).kv_heads().get(),
+            )),
             _ => None,
         })
         .next()

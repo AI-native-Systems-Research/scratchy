@@ -3079,14 +3079,14 @@ impl SpyreWorker {
                     for p in meta.paged.iter_mut() {
                         let swept = (r / page_slots) as u32;
                         p.walk = match p.window {
-                            Some(w) => swept.min(
-                                scratchy_target_spyre::paged_step::window_walk_blocks(
+                            Some(w) => {
+                                swept.min(scratchy_target_spyre::paged_step::window_walk_blocks(
                                     p.pages,
                                     w,
                                     p.extent.per_request().get(),
                                     p.page_slots,
-                                ),
-                            ),
+                                ))
+                            }
                             None => swept,
                         };
                     }

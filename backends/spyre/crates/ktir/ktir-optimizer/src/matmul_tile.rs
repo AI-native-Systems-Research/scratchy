@@ -954,19 +954,35 @@ mod tests {
         let (val, tile) = (stores[0].operands[0], stores[0].operands[1]);
         let tile = def(tile).expect("the store's tile is constructed here");
         assert_eq!(tile.op_type, OpKind::KtdpConstructAccessTile);
-        assert_eq!(tile.attr(AttrKey::Shape), Some(&row_dims), "a [1, n] store tile");
-        assert_eq!(tile.operands[1], pid, "its row corner is the program's own row");
+        assert_eq!(
+            tile.attr(AttrKey::Shape),
+            Some(&row_dims),
+            "a [1, n] store tile"
+        );
+        assert_eq!(
+            tile.operands[1], pid,
+            "its row corner is the program's own row"
+        );
         let mulf = def(val).expect("the store drains a value defined here");
-        assert_eq!(mulf.op_type, OpKind::ArithMulf, "the store drains the dequant");
-        assert_eq!(mulf.attr(AttrKey::Shape), Some(&row_dims), "a [1, n] dequant");
+        assert_eq!(
+            mulf.op_type,
+            OpKind::ArithMulf,
+            "the store drains the dequant"
+        );
+        assert_eq!(
+            mulf.attr(AttrKey::Shape),
+            Some(&row_dims),
+            "a [1, n] dequant"
+        );
         let [prod, scale] = [mulf.operands[0], mulf.operands[1]];
         assert!(
             def(prod).is_some_and(|o| o.op_type == OpKind::ScfFor),
             "the dequant scales the nest's own result"
         );
         assert!(
-            def(scale).is_some_and(|o| o.op_type == OpKind::KtdpLoad
-                && o.attr(AttrKey::Shape) == Some(&row_dims)),
+            def(scale).is_some_and(
+                |o| o.op_type == OpKind::KtdpLoad && o.attr(AttrKey::Shape) == Some(&row_dims)
+            ),
             "by the loaded [1, n] scale row"
         );
         let whole = Attr::IntList(Arena::global().ints(vec![m, n]));
