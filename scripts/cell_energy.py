@@ -16,6 +16,7 @@ GPU (a counter step is about 2 mJ), 100 ms never does.
 
 import csv
 import json
+import math
 import sys
 
 # How much of a window the log may miss and still be read: the larger of a fixed slack, a
@@ -138,6 +139,20 @@ def per_request(cell, rows):
     return shares(rows, start, end, [(span[0], span[2]) if span else None for span in spans])
 
 
+def on_grid(span):
+    """A request's span on the millisecond grid its timestamps claim: start and first token
+    rounded up to a millisecond, end rounded down, so a rounding sliver where consecutive
+    requests of a closed-loop cell touch — the client sends the next the moment the last lands,
+    and each timestamp is rounded to its unit — belongs to no request. An overlap left after
+    that is past a millisecond: two requests really in flight, and [`per_phase`] refuses the
+    cell on it."""
+    s, f, e = span
+    s = math.ceil(s * 1000) / 1000
+    e = math.floor(e * 1000) / 1000
+    f = min(max(math.ceil(f * 1000) / 1000, s), e) if f is not None else None
+    return (s, f, e)
+
+
 def per_phase(cell, rows):
     """Each request's prefill and decode joules, in the order sent (`task_prefill_joules`,
     `task_decode_joules`): its joules up to its first token, and after it ([`shares`] over the two
@@ -149,6 +164,7 @@ def per_phase(cell, rows):
     start, end, spans = cell.get("started_unix_s"), cell.get("ended_unix_s"), request_spans(cell)
     if start is None or end is None or spans is None:
         return None
+    spans = [on_grid(span) if span else None for span in spans]
     open_ = sorted((s, e) for span in spans if span for s, _, e in [span])
     if any(b[0] < a[1] for a, b in zip(open_, open_[1:])):
         return None
