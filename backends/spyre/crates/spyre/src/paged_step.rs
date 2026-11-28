@@ -906,17 +906,18 @@ pub fn request_sources(
 ) -> Result<StepSources, PagedStepError> {
     match step.paged_rows {
         PagedRows::Sequence => step_sources(step, blocks, rows),
-        PagedRows::Batch if rows.real.get() == 1 => batch_sources(
-            step,
-            &[BatchSeq {
-                blocks,
-                pos: rows.start,
-            }],
-        ),
-        PagedRows::Batch => Err(PagedStepError(format!(
-            "a decode bundle runs one row of a request, and this step asks for {} rows from {}",
-            rows.real, rows.start
-        ))),
+        // A decode batch's rows are one token of EACH of its requests: request `r` at the
+        // step's own position for row `r` ([`StepRows::pos`]) over the shared `blocks` — at one
+        // row, the one request it always was.
+        PagedRows::Batch => {
+            let seqs: Vec<BatchSeq<'_>> = (0..rows.real.get())
+                .map(|r| BatchSeq {
+                    blocks,
+                    pos: rows.pos(r),
+                })
+                .collect();
+            batch_sources(step, &seqs)
+        }
     }
 }
 
@@ -1336,6 +1337,37 @@ mod tests {
             step_sources(&prompt, &blocks, &rows).unwrap().int32
         );
         assert!(request_sources(&decode, &blocks, &rows).is_err());
+    }
+
+    /// ⭐ A DECODE BATCH'S ROWS ARE ONE TOKEN OF EACH REQUEST — `request_sources` stages row `r`
+    /// as its own request at the step's position for it (`StepRows::pos`), over the shared
+    /// blocks: the batch law the card stager calls, and the golden's `own_pos` for a chunk of the
+    /// same rows. One request padded to the rung's rows only agreed with that under a causal mask.
+    #[test]
+    fn a_decode_batch_stages_each_row_as_its_own_request() {
+        let b = batch();
+        let blocks = [2u32, 3];
+        let rows = StepRows {
+            start: 5,
+            real: nz(2),
+        };
+        let got = request_sources(&b, &blocks, &rows).unwrap();
+        let want = batch_sources(
+            &b,
+            &[
+                BatchSeq {
+                    blocks: &blocks,
+                    pos: 5,
+                },
+                BatchSeq {
+                    blocks: &blocks,
+                    pos: 6,
+                },
+            ],
+        )
+        .unwrap();
+        assert_eq!(got.int32, want.int32);
+        assert_eq!(got.mask, want.mask);
     }
 
     /// A sequence whose position is past the rung's walk cannot run on it.

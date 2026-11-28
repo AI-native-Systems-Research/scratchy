@@ -4207,7 +4207,15 @@ fn stage_gate_probe<T: ktir_superdsc::collective::Tp, F: RopeForm>(
                 })
                 .max()
                 .unwrap_or(0);
-            crate::paged_step::StepRows::one_at(cached.min(p.capacity().saturating_sub(1)))
+            // ⭐ THE RUNG'S OWN ROWS, NOT ONE — a decode rung's step carries every row the rung
+            // bakes: the solo rung's one row (`one_at`, byte for byte) and a batch rung's one
+            // token of EACH of its requests. Row `r` at `start + r` is the golden's own
+            // `own_pos = seq_len − mq + qi` over the same region, so every request's window
+            // reads the very keys the reference's does — the law a windowed class needs, which
+            // one request padded to the rung's rows only matched under a causal mask.
+            let rows = rung.query_rows.graph_rows().get() as usize;
+            crate::paged_step::StepRows::new(cached.min(p.capacity().saturating_sub(1)), rows)
+                .expect("the rung's query rows are its step's — a zero-row rung cannot bake")
         }
         (None, None) => crate::paged_step::StepRows::one_at(0),
     };
