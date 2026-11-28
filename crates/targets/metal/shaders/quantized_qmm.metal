@@ -127,6 +127,17 @@ SCRATCHY_CONSTANT_OPTIONAL(int, QMM_NUM_EXPERTS, 4);
 // tapes); XOR-ing each loaded byte restores them. Unset: as written.
 // Kernel entries branch on it once, into a loader instantiated for it.
 SCRATCHY_CONSTANT_OPTIONAL(bool, AFFINE_CODES_OFFSET8, 5);
+// 6 / 8: a matmul per head (`affine_qmm_t_kernel` only; MLA's `embed_q` / `unembed_out` at a
+// matmul-band bucket): QMM_HEADS heads, grid z one each. Head `h` multiplies the first QMM_K
+// lanes of its QMM_IN_STRIDE-wide part of each input row by its block of the weight (rows
+// `[h N, (h + 1) N)`, MLX's `MultiLinear` `[heads, out, in]`) into its N lanes of the output
+// row: an input row is QMM_HEADS * QMM_IN_STRIDE wide, an output row QMM_HEADS * QMM_N.
+SCRATCHY_CONSTANT_OPTIONAL(int, QMM_HEADS, 6);
+SCRATCHY_CONSTANT_OPTIONAL(int, QMM_IN_STRIDE, 8);
+static_assert(QMM_HEADS_SET == QMM_IN_STRIDE_SET, "a per-head matmul states its heads and stride");
+static_assert(!QMM_HEADS_SET || QMM_K <= QMM_IN_STRIDE, "a head's dot stays inside its part");
+constant constexpr int QMM_LDX = QMM_HEADS_SET ? QMM_HEADS * QMM_IN_STRIDE : QMM_K;
+constant constexpr int QMM_LDY = QMM_HEADS_SET ? QMM_HEADS * QMM_N : QMM_N;
 
 // ─────────────────────────────────────────────────────────────────
 // Pack helpers — quantized.h:17-26 (same constants as
@@ -207,6 +218,10 @@ METAL_FUNC void qmm_t_impl_inline(
     const int              N,
     const int              M,
     const int              K_eff,
+    // The row strides of `x` and `y`: K and N for a dense matrix, wider for a per-head matmul's
+    // head (`affine_qmm_t_kernel` under QMM_HEADS).
+    const int              ldx,
+    const int              ldy,
     uint  simd_group_id,
     uint  simd_lane_id,
     uint3 tgid,
@@ -283,17 +298,17 @@ METAL_FUNC void qmm_t_impl_inline(
   const int K_w = K * bytes_per_pack / pack_factor;       // packed bytes per row of W
   const int K_g = K / group_size;                         // groups per row of W
   const device uint8_t* wl_base = (const device uint8_t*)w;
-  const device T_act* x_block    = x + int64_t(c_row) * K;
+  const device T_act* x_block    = x + int64_t(c_row) * ldx;
   const device uint8_t* w_block  = wl_base + c_col * K_w;
   const device T_scale* s_block  = scales + c_col * K_g;
   const device T_scale* b_block  = biases + c_col * K_g;
-  device T_act* y_block          = y + int64_t(c_row) * N + c_col;
+  device T_act* y_block          = y + int64_t(c_row) * ldy + c_col;
 
   // ── X loader: per-thread source/dest pointers. The X path stays
   // inline because `BlockLoader<T, ...>` requires `T_act == T_compute`
   // (single-T template); we need a bf16→half cast on the way into Xs.
   threadgroup T_compute* Xs_dst = Xs + bi_x * BK_padded + bj_x;
-  const device T_act* X_src = x_block + bi_x * K + bj_x;
+  const device T_act* X_src = x_block + bi_x * ldx + bj_x;
 
   // ── W loader. When `T_compute == T_scale` (M1 fast-path with
   //    T_compute = half = T_scale), delegate to MLX's
@@ -562,9 +577,9 @@ METAL_FUNC void qmm_t_impl_inline(
   // accumulator to device memory cast to U=T_act. The safe variant
   // bounds-checks against `(num_outs, num_els)` for the M/N tail.
   if (m_full && n_full) {
-    mma_op.store_result(y_block, N);
+    mma_op.store_result(y_block, ldy);
   } else {
-    mma_op.store_result_safe(y_block, N, short2(int(n_tile), int(m_tile)));
+    mma_op.store_result_safe(y_block, ldy, short2(int(n_tile), int(m_tile)));
   }
   (void)out_scratch;
 }
@@ -593,20 +608,34 @@ template <typename T_act, typename T_compute, typename T_scale,
 {
   constexpr int BM = 32, BN = 32, BK = 32;
   constexpr int BK_padded = BK + 16 / int(sizeof(T_compute));
+  // A per-head matmul's head (QMM_HEADS): its weight block, scales and biases, as the MoE
+  // gather's expert slab; its part of the input rows and of the output rows. Planes regroup a
+  // whole matrix's codes, never a head's block.
+  static_assert(!QMM_HEADS_SET || !(AFFINE_CODES_PLANES && bits == 4),
+                "a per-head matmul's codes are row-major");
+  const uint head = QMM_HEADS_SET ? tgid.z : 0u;
+  const size_t w_head = size_t(head) * size_t(QMM_N)
+      * size_t(QMM_K * get_bytes_per_pack<bits>() / get_pack_factor<bits, 8>());
+  const size_t s_head = size_t(head) * size_t(QMM_N) * size_t(QMM_K / group_size);
+  const device uint32_t* w_h = (const device uint32_t*)((const device uint8_t*)w + w_head);
+  const device T_scale* s_h = scales + s_head;
+  const device T_scale* b_h = biases + s_head;
+  const device T_act* x_h = x + size_t(head) * size_t(QMM_HEADS_SET ? QMM_IN_STRIDE : 0);
+  device T_act* y_h = y + size_t(head) * size_t(QMM_N);
   threadgroup T_compute Xs[BM * BK_padded];
   threadgroup T_compute Ws[BN * BK_padded];
   threadgroup float out_scratch[BM * BN];
   if (bits == 4 && AFFINE_CODES_OFFSET8) {
   qmm_t_impl_inline<T_act, T_compute, T_scale, group_size, bits, aligned_N, false, true>(
-      w, scales, biases, x, y,
+      w_h, s_h, b_h, x_h, y_h,
       Xs, Ws, out_scratch,
-      QMM_K, QMM_N, QMM_M, /*K_eff=*/QMM_K,
+      QMM_K, QMM_N, QMM_M, /*K_eff=*/QMM_K, QMM_LDX, QMM_LDY,
       simd_group_id, simd_lane_id, tgid);
   } else {
   qmm_t_impl_inline<T_act, T_compute, T_scale, group_size, bits, aligned_N>(
-      w, scales, biases, x, y,
+      w_h, s_h, b_h, x_h, y_h,
       Xs, Ws, out_scratch,
-      QMM_K, QMM_N, QMM_M, /*K_eff=*/QMM_K,
+      QMM_K, QMM_N, QMM_M, /*K_eff=*/QMM_K, QMM_LDX, QMM_LDY,
       simd_group_id, simd_lane_id, tgid);
   }
 }
@@ -667,13 +696,13 @@ template <typename T_act, typename T_compute, typename T_scale,
   qmm_t_impl_inline<T_act, T_compute, T_scale, group_size, bits, aligned_N, false, true>(
       w_e, s_e, b_e, x, y,
       Xs, Ws, out_scratch,
-      QMM_K, QMM_N, QMM_M, /*K_eff=*/QMM_K,
+      QMM_K, QMM_N, QMM_M, /*K_eff=*/QMM_K, QMM_K, QMM_N,
       simd_group_id, simd_lane_id, tgid);
   } else {
   qmm_t_impl_inline<T_act, T_compute, T_scale, group_size, bits, aligned_N>(
       w_e, s_e, b_e, x, y,
       Xs, Ws, out_scratch,
-      QMM_K, QMM_N, QMM_M, /*K_eff=*/QMM_K,
+      QMM_K, QMM_N, QMM_M, /*K_eff=*/QMM_K, QMM_K, QMM_N,
       simd_group_id, simd_lane_id, tgid);
   }
 }
@@ -735,7 +764,7 @@ template <typename T_act, typename T_compute, typename T_scale,
       y_shift,
       Xs, Ws, out_scratch,
       QMM_K, QMM_N, QMM_M,
-      /*K_eff=*/QMM_K_PARTITION_SIZE,
+      /*K_eff=*/QMM_K_PARTITION_SIZE, QMM_K, QMM_N,
       simd_group_id, simd_lane_id, tgid, planes ? k_start : 0);
   } else {
   qmm_t_impl_inline<T_act, T_compute, T_scale, group_size, bits, aligned_N>(
@@ -746,7 +775,7 @@ template <typename T_act, typename T_compute, typename T_scale,
       y_shift,
       Xs, Ws, out_scratch,
       QMM_K, QMM_N, QMM_M,
-      /*K_eff=*/QMM_K_PARTITION_SIZE,
+      /*K_eff=*/QMM_K_PARTITION_SIZE, QMM_K, QMM_N,
       simd_group_id, simd_lane_id, tgid, planes ? k_start : 0);
   }
 }
@@ -1352,7 +1381,7 @@ template <typename T_act, typename T_compute, typename T_scale,
                     /*nvfp4=*/true>(
       w, scales, biases, x, y,
       Xs, Ws, out_scratch,
-      QMM_K, QMM_N, QMM_M, /*K_eff=*/QMM_K,
+      QMM_K, QMM_N, QMM_M, /*K_eff=*/QMM_K, QMM_K, QMM_N,
       simd_group_id, simd_lane_id, tgid);
 }
 

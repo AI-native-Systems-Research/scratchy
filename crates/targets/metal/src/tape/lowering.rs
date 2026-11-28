@@ -50,11 +50,11 @@ use crate::op_abi::GuardRun;
 use crate::quantized::{
     DequantDtype, NaxDequant, QmmTKernel, QmvKernel, SMALL_M_TILE_COLS, ScaleDtype, SmallMTile,
     W4A8_GROUPED_TILE, W4A8_SMALL_M_ROWS, W4A8_TILE_ROWS, W4a8Act, W4a8Gemm, W4a8Rows, W4a8Tile,
-    narrow_matvec, pick_qmm_t_kernel, pick_qmv_kernel, pick_qmv_kernel_wide, qmm_t_dispatch_shape,
-    qmm_t_kernel_static_name, qmm_t_kernel_static_name_with_compute, qmm_w4a8_static_name,
-    qmv_dispatch_shape, qmv_kernel_static_name, small_m_kernel_static_name,
-    splitk_reduce_kernel_static_name, w4a8_act_quant_static_name, w4a8_quant_static_name,
-    w4a8_scratch_bytes,
+    get_qmv_batch_limit, narrow_matvec, pick_qmm_t_batch_kernel, pick_qmm_t_kernel,
+    pick_qmv_kernel, pick_qmv_kernel_wide, qmm_t_dispatch_shape,
+    qmm_t_kernel_static_name_with_compute, qmm_w4a8_static_name, qmv_dispatch_shape,
+    qmv_kernel_static_name, small_m_kernel_static_name, splitk_reduce_kernel_static_name,
+    w4a8_act_quant_static_name, w4a8_quant_static_name, w4a8_scratch_bytes,
 };
 use crate::specialized_pipeline_cache::ConstantValue;
 
@@ -3371,37 +3371,7 @@ fn lower_one(
                 // SplitK stays b4-only: the picker takes it only for an int4 width.
                 let kernel =
                     pick_qmm_t_kernel(bucket_m, n_v, k_v, /*B=*/ 1, group, width_bits, is_nax);
-                // NAX tile is 64×64 so align check uses 64; Standard/SplitK use 32.
-                let aligned_n = match kernel {
-                    QmmTKernel::Nax(_) => n_v.is_multiple_of(64),
-                    _ => n_v.is_multiple_of(32),
-                };
-                // M1 fast-path: bf16 simdgroup MMA is software emulation
-                // (~1.7× slower than f16). Pick T_compute=F16 for the
-                // qmm_t kernel — kernel reads bf16 from device memory,
-                // casts to f16 on threadgroup-tile populate, runs MMA
-                // in f16, casts back to bf16 on store. Output is bf16
-                // so the residual stream is unchanged. M2+ has
-                // hardware bf16 so we keep T_compute=T_act there.
-                use crate::targets::bf16_simdgroup_is_slow_path;
-                let f16_compute_eligible = profile
-                    .map(|p| bf16_simdgroup_is_slow_path(p.generation))
-                    .unwrap_or(false)
-                    && matches!(dtype, DequantDtype::Bf16)
-                    && !matches!(kernel, QmmTKernel::Nax(_))
-                    // The mixed-compute (`_c_f16_`) qmm_t kernels (INST_QMM_T_C)
-                    // are instantiated for bits=4 ONLY. Applying the M1 f16
-                    // flip to an 8-bit weight would mis-resolve to a b4 symbol
-                    // (the with-compute name builder omits `bits`) and decode
-                    // 8-bit as 4-bit → silent garbage (OptiQ on M1). 8-bit
-                    // keeps same-compute bf16 → the existing b8 kernel; 3-bit
-                    // and 2-bit likewise have no `_c_f16_` instantiation.
-                    && bits_v == 4;
-                let compute_dtype = if f16_compute_eligible {
-                    DequantDtype::F16
-                } else {
-                    dtype
-                };
+                let (library, function) = qmm_t_symbol(p, profile, kernel, width_bits, group, n_v);
                 // W4A8 on the matrix unit's int8 lane: a pre-pass quantizes
                 // the activations per (row, 64-chunk) into the shared scratch,
                 // then the GEMM multiplies them against the offset-8 codes.
@@ -3502,15 +3472,8 @@ fn lower_one(
                         let (tg, tpg) = qmm_t_dispatch_shape(kernel, bucket_m, n_v, /*B=*/ 1);
                         LoweredCommand {
                             kernel: KernelId::AffineQmmTNax,
-                            library: "quantized_qmm_nax",
-                            function: qmm_t_kernel_static_name(
-                                kernel,
-                                dtype,
-                                scale_dtype,
-                                width_bits,
-                                group,
-                                aligned_n,
-                            ),
+                            library,
+                            function,
                             constants: super::kernel_constants::AffineQmmTConstants {
                                 k: super::ids::KDimI32(k_v as i32),
                                 n: super::ids::NDimI32(n_v as i32),
@@ -3542,16 +3505,8 @@ fn lower_one(
                         let (tg, tpg) = qmm_t_dispatch_shape(kernel, bucket_m, n_v, /*B=*/ 1);
                         LoweredCommand {
                             kernel: KernelId::AffineQmmT,
-                            library: "quantized_qmm",
-                            function: qmm_t_kernel_static_name_with_compute(
-                                kernel,
-                                dtype,
-                                compute_dtype,
-                                scale_dtype,
-                                width_bits,
-                                group,
-                                aligned_n,
-                            ),
+                            library,
+                            function,
                             constants: super::kernel_constants::AffineQmmTConstants {
                                 k: super::ids::KDimI32(k_v as i32),
                                 n: super::ids::NDimI32(n_v as i32),
@@ -3600,16 +3555,8 @@ fn lower_one(
                         let (tg, tpg) = qmm_t_dispatch_shape(kernel, bucket_m, n_v, /*B=*/ 1);
                         let qmm_t_cmd = LoweredCommand {
                             kernel: KernelId::AffineQmmTSplitK,
-                            library: "quantized_qmm",
-                            function: qmm_t_kernel_static_name_with_compute(
-                                kernel,
-                                dtype,
-                                compute_dtype,
-                                scale_dtype,
-                                width_bits,
-                                group,
-                                aligned_n,
-                            ),
+                            library,
+                            function,
                             // SplitK needs FOUR function constants:
                             // (0=K, 1=N, 2=M, 3=k_partition_size) per
                             // `quantized_qmm.metal:80-83`. The
@@ -5762,7 +5709,7 @@ fn lower_one(
                 ]),
             }
         }
-        I::HeadMatmul(hm) => lower_head_matmul(p, hm, w, eff_m, bucket_m, layer_offset)?,
+        I::HeadMatmul(hm) => lower_head_matmul(p, profile, hm, w, eff_m, bucket_m, layer_offset)?,
         I::MlaRopeQ(Slot(q), Slot(out), mla) => {
             let threads = mla_row_threads(mla.q_head());
             LoweredCommand {
@@ -5864,14 +5811,78 @@ fn lower_one(
                 kind,
                 binding_index,
             };
+            let cache = mla_cache(p, attention_blocks_per_chunk(chunked))?;
+            let attend_bindings = || {
+                [
+                    Binding::ArenaSlot {
+                        slot: *q_latent,
+                        binding_index: 1,
+                    },
+                    Binding::ArenaSlot {
+                        slot: *q,
+                        binding_index: 2,
+                    },
+                    runtime(RuntimeBindingKind::SeqUsedK, 3),
+                    runtime(RuntimeBindingKind::BlockTable { layer: kv_layer }, 4),
+                    runtime(RuntimeBindingKind::KvCacheK { layer: kv_layer }, 5),
+                    runtime(RuntimeBindingKind::KvCacheV { layer: kv_layer }, 6),
+                    runtime(RuntimeBindingKind::CuSeqlensQ, 7),
+                ]
+            };
+            // A prefill-shaped bucket's queries tile: a threadgroup takes a block of a sequence's
+            // queries (its rows' heads, which share every cached row) on the matrix unit where the
+            // chip has one and its kernel takes the shape, else on the simdgroup MMA.
+            let tiles = (bucket_m > crate::op_abi::METAL_VERIFY_ROWS)
+                .then(|| {
+                    use super::kernel_constants::MlaTileUnit as U;
+                    let nax = profile.is_some_and(|p| crate::targets::is_nax_capable(p.generation));
+                    let units = [U::Matrix, U::Simdgroup];
+                    (units.into_iter())
+                        .filter(|u| nax || *u == U::Simdgroup)
+                        .find_map(|u| super::kernel_constants::MlaAttendTiles::new(u, mla, &cache))
+                })
+                .flatten();
+            if let Some(tiles) = tiles {
+                let queries = tiles.queries().get();
+                let (library, function) = tiles.kernel(p.act_dtype());
+                let mut bindings = vec![Binding::ArenaSlot {
+                    slot: *out,
+                    binding_index: 0,
+                }];
+                bindings.extend(attend_bindings());
+                return dispatched(vec![LoweredCommand {
+                    kernel: KernelId::MlaAttend,
+                    library,
+                    function,
+                    constants: super::kernel_constants::MlaConstants {
+                        mla: *mla,
+                        cache: Some(cache),
+                        attend: Some(super::kernel_constants::MlaAttendKernel::Tiles(tiles)),
+                        row: None,
+                    }
+                    .into_baked(),
+                    // One grid-Z layer a sequence: a threadgroup's queries never straddle two.
+                    dispatch: DispatchShape {
+                        threadgroups: ((bucket_m * mla.heads().get()).div_ceil(queries), 1, 1),
+                        threads_per_threadgroup: (tiles.threads().get(), 1, 1),
+                        m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
+                            set_axis: Some(crate::tape::lowered::SetAxis::Seqs(
+                                crate::interpreter::metal::lowered::MScaleAxis::Z,
+                            )),
+                            axis: crate::tape::lowered::MScaleAxis::X,
+                            bucket_m: super::ids::BucketM(bucket_m),
+                        }),
+                    },
+                    bindings: baked(bindings),
+                }]);
+            }
             let tiling = mla_attend_tiling(mla.heads().get(), mla.latent().get(), bucket_m)?;
             let parts = tiling.parts.get();
-            let cache = mla_cache(p, attention_blocks_per_chunk(chunked))?;
             let constants = || {
                 super::kernel_constants::MlaConstants {
                     mla: *mla,
                     cache: Some(cache),
-                    attend: Some(tiling),
+                    attend: Some(super::kernel_constants::MlaAttendKernel::Rows(tiling)),
                     row: None,
                 }
                 .into_baked()
@@ -5907,22 +5918,7 @@ fn lower_one(
                     threads_per_threadgroup: (32 * tiling.simdgroups.get(), 1, 1),
                     m_scaling,
                 },
-                bindings: baked(vec![
-                    written,
-                    Binding::ArenaSlot {
-                        slot: *q_latent,
-                        binding_index: 1,
-                    },
-                    Binding::ArenaSlot {
-                        slot: *q,
-                        binding_index: 2,
-                    },
-                    runtime(RuntimeBindingKind::SeqUsedK, 3),
-                    runtime(RuntimeBindingKind::BlockTable { layer: kv_layer }, 4),
-                    runtime(RuntimeBindingKind::KvCacheK { layer: kv_layer }, 5),
-                    runtime(RuntimeBindingKind::KvCacheV { layer: kv_layer }, 6),
-                    runtime(RuntimeBindingKind::CuSeqlensQ, 7),
-                ]),
+                bindings: baked(std::iter::once(written).chain(attend_bindings()).collect()),
             };
             let Some(bytes) = partials else {
                 return dispatched(vec![attend]);
@@ -7076,7 +7072,7 @@ const MLA_MAX_SIMDGROUPS: u32 = 32;
 
 /// The threadgroup memory every Metal target holds (`threadgroup_memory_bytes` in
 /// [`crate::tape::targets`]).
-const METAL_THREADGROUP_BYTES: u32 = 32768;
+pub(crate) const METAL_THREADGROUP_BYTES: u32 = 32768;
 
 // The attention's threadgroup memory: its simdgroups' latent partials (`tg_o`, within
 // MLA_MERGE_BYTES by the tiling) and each served head's softmax max and sum per simdgroup (`tg_m`,
@@ -7091,9 +7087,53 @@ const _: () = assert!(
 const HEAD_MATMUL_SIMDGROUPS: u32 = 8;
 const HEAD_MATMUL_ROWS_PER_SG: u32 = 4;
 
-/// A per-head matmul's command: the affine kernel over packed blocks, or the dense one.
+/// A picked qmm_t kernel's library and symbol at `p`'s activations and an affine weight's codes
+/// (`bits` in groups of `group`) over `n` output columns. The matrix unit's tile aligns N to 64
+/// columns, the others to 32. On M1, whose bf16 simdgroup MMA is emulation (~1.7× slower than
+/// f16), a bf16 model's int4 standard and split-K matmuls compute in f16: they read bf16, cast on
+/// the tile populate and store bf16, so the residual stream is unchanged. The mixed-compute
+/// (`_c_f16_`) kernels are instantiated for int4 alone, and the matrix unit has hardware bf16.
+fn qmm_t_symbol(
+    p: &ModelFacts,
+    profile: Option<&crate::targets::MetalTargetProfile>,
+    kernel: QmmTKernel,
+    bits: AffineBits,
+    group: AffineGroupSize,
+    n: u32,
+) -> (&'static str, &'static str) {
+    let dtype = dequant_dtype_for(p);
+    let (library, tile) = match kernel {
+        QmmTKernel::Nax(_) => ("quantized_qmm_nax", 64),
+        QmmTKernel::Standard | QmmTKernel::SplitK { .. } => ("quantized_qmm", 32),
+    };
+    let f16_compute = profile
+        .is_some_and(|p| crate::targets::bf16_simdgroup_is_slow_path(p.generation))
+        && dtype == DequantDtype::Bf16
+        && !matches!(kernel, QmmTKernel::Nax(_))
+        && bits == AffineBits::B4;
+    let compute = match f16_compute {
+        true => DequantDtype::F16,
+        false => dtype,
+    };
+    let function = qmm_t_kernel_static_name_with_compute(
+        kernel,
+        dtype,
+        compute,
+        scale_dtype_for(p),
+        bits,
+        group,
+        n.is_multiple_of(tile),
+    );
+    (library, function)
+}
+
+/// A per-head matmul's command: the affine kernel over packed blocks, or the dense one. From an
+/// affine weight's matvec/matmul boundary on (the device's `get_qmv_batch_limit` at a head's
+/// shape), the matmul: `qmm_t`'s tile a head (grid z) — the matrix unit's where the chip has one —,
+/// its weight block read once a row tile rather than once a row.
 fn lower_head_matmul(
     p: &ModelFacts,
+    profile: Option<&crate::targets::MetalTargetProfile>,
     hm: &crate::tape::step::HeadMatmul,
     w: RowSources<'_>,
     eff_m: u32,
@@ -7105,6 +7145,50 @@ fn lower_head_matmul(
     let ix = w.of(WeightKind::Linear, 0)?;
     let heads = hm.heads.get();
     let n = hm.n.get();
+    let n_head = n / heads;
+    let k = hm.lanes.k().get();
+    if let HeadWeight::Affine { group_size, bits } = hm.weight
+        && let Some(profile) = profile
+        && bucket_m >= get_qmv_batch_limit(k, n_head, profile.generation)
+        // The standard tile's K loop takes whole 32-lane steps.
+        && k.is_multiple_of(32)
+    {
+        // The matrix unit's tile where the chip has one and it takes the shape, else the standard
+        // one.
+        let is_nax = crate::targets::is_nax_capable(profile.generation);
+        let kernel = QmmTKernel::from(pick_qmm_t_batch_kernel(
+            bucket_m, n_head, k, group_size, is_nax,
+        ));
+        let (tg, tpg) = qmm_t_dispatch_shape(kernel, bucket_m, n_head, heads);
+        let (library, function) = qmm_t_symbol(p, Some(profile), kernel, bits, group_size, n_head);
+        return Ok(LoweredCommand {
+            // The head matmul's command: its weight is read as written, the matvec's way.
+            kernel: KernelId::HeadMatmul,
+            library,
+            function,
+            constants: super::kernel_constants::AffineHeadQmmTConstants {
+                qmm: super::kernel_constants::AffineQmmTConstants {
+                    k: super::ids::KDimI32(k as i32),
+                    n: super::ids::NDimI32(n_head as i32),
+                    m: super::ids::MDimI32(bucket_m as i32),
+                    codes: super::kernel_constants::AffineCodes::AsWritten,
+                },
+                heads: super::ids::NumQHeads(heads),
+                in_stride: hm.lanes.stride(),
+            }
+            .into_baked(),
+            dispatch: DispatchShape {
+                threadgroups: tg,
+                threads_per_threadgroup: tpg,
+                m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
+                    set_axis: None,
+                    axis: crate::tape::lowered::MScaleAxis::Y,
+                    bucket_m: super::ids::BucketM(bucket_m),
+                }),
+            },
+            bindings: baked(affine_qmm_bindings(hm.input.0, hm.output.0, layer, ix)),
+        });
+    }
     let (function, affine, mut bindings) = match hm.weight {
         HeadWeight::Affine { group_size, bits } => (
             head_qmv_static_name(p.act_dtype(), scale_dtype_for(p)),

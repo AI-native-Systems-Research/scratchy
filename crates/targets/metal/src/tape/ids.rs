@@ -552,6 +552,12 @@ u32_newtype!(
     /// The lanes of a latent attention's cached row one of the paged pool's K and V stores
     /// holds.
     HalfRow,
+    /// The latent lanes of a tiled latent attention's output one warp accumulates.
+    WarpLanes,
+    /// The cached rows one warp of a tiled latent attention scores a step: a page group.
+    KeysPerStep,
+    /// The queries one threadgroup of a tiled latent attention takes.
+    TileQueries,
     /// A reshape's row divisor (`num_tokens / d` rows — the vision merger's factor).
     RowsDivisor,
     /// Iterations of a rolled loop.
