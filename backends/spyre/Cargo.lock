@@ -2103,7 +2103,6 @@ dependencies = [
  "fs2",
  "indicatif",
  "inventory",
- "scratchy-core-common",
  "scratchy-hf-hub-downloader",
  "serde",
  "serde_json",
@@ -2142,7 +2141,6 @@ version = "0.1.0"
 dependencies = [
  "proc-macro2",
  "quote",
- "rayon",
  "scratchy-forward-compiler",
  "scratchy-forward-compiler-frontend",
  "scratchy-ir",
@@ -2315,7 +2313,6 @@ dependencies = [
  "scratchy-triton-splice",
  "serde_json",
  "syn 3.0.9",
- "tracing",
  "zstd",
 ]
 

@@ -15,7 +15,6 @@ datasets = ["dep:arrow", "dep:parquet"]
 
 [dependencies]
 scratchy-core-common = { workspace = true }
-scratchy-core-config = { workspace = true }
 scratchy-serving-api = { workspace = true }
 scratchy-serving-engine = { workspace = true }
 clap = { workspace = true }

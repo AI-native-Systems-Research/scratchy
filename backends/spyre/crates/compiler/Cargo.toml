@@ -52,7 +52,6 @@ proc-macro2 = "1"
 quote = "1"
 syn = { version = "3", features = ["full"] }
 rayon = { workspace = true }
-tracing = { workspace = true }
 serde_json = { workspace = true }
 # The bake's device images are packed as zstd frames against one dictionary trained on the whole
 # build — the metal AOT precedent (`crates/targets/metal/src/aot.rs`, `pack`). Compression runs HERE,
