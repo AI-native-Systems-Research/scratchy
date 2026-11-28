@@ -89,7 +89,9 @@ opentelemetry = "0.33"
 opentelemetry_sdk = { version = "0.33", features = ["rt-tokio"] }
 # No default features: the exporter is gRPC only (`telemetry.rs` builds it `.with_tonic()`), so
 # the defaults' HTTP exporter (reqwest, url and its ICU stack) would be compiled and never called.
-opentelemetry-otlp = { version = "0.33", default-features = false, features = ["grpc-tonic", "trace"] }
+# `internal-logs` stays: it is what emits the exporter's own warnings (a collector's partial
+# rejection, an ignored `OTEL_EXPORTER_OTLP_*` value, export retries) through `tracing`.
+opentelemetry-otlp = { version = "0.33", default-features = false, features = ["grpc-tonic", "trace", "internal-logs"] }
 tracing-opentelemetry = "0.34"
 
 # Metrics. default-features=false drops the default `protobuf` feature: /metrics
