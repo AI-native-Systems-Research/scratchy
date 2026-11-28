@@ -9,9 +9,9 @@ description = "Benchmarking tools for vLLM Rust inference engine"
 [features]
 default = []
 # Parquet-backed RAG accuracy datasets (hotpotqa / multihop / msmarco).
-# Off by default so the ~18-crate arrow/parquet columnar subtree only
-# compiles when those three `scr bench` subcommands are needed.
-datasets = ["dep:arrow", "dep:parquet"]
+# Off by default so the parquet subtree only compiles when those three
+# `scr bench` subcommands are needed.
+datasets = ["dep:parquet"]
 
 [dependencies]
 scratchy-core-common = { workspace = true }
@@ -38,8 +38,12 @@ libc = { workspace = true }
 shell-words = "1"
 csv = "1"
 dirs = { workspace = true }
-parquet = { version = "60", default-features = false, features = ["arrow", "snap"], optional = true }
-arrow = { version = "60", default-features = false, features = ["json"], optional = true }
+# Rows as JSON through parquet's own record reader (`json`: `Row::to_json_value`), so no arrow.
+parquet = { version = "60", default-features = false, features = ["snap", "json"], optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# The test fixtures write their parquet files with arrow's writer: rows the reader under test
+# did not produce.
+parquet = { version = "60", default-features = false, features = ["arrow", "snap", "json"] }
+arrow = { version = "60", default-features = false, features = ["json"] }
