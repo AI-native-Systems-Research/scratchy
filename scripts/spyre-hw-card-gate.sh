@@ -61,16 +61,17 @@ SCRATCHY_SKIP_SENDNN_CXX=1 cargo clippy -p scratchy-target-spyre-cli \
 # The card crate's compile_fail doctests (the nightly job's leg).
 SCRATCHY_SKIP_SENDNN_CXX=1 cargo +nightly test --doc -p scratchy-target-spyre-card --features snt1p0
 
-# ⭐ THE COUNT LAW, LIVE ON THE CARDS (#1429): the wdone counter bumps once per run,
-# on the last message, on the sid that message carries — so every message of a
-# multi-message send must be its own complete send (`RunPlace::ALONE`). `alone2` is
-# the 8-MiB two-message all-gather through the production CB path (per-message
-# F-sends, one wdone wait per slot) and must pass byte-exact; the run-flags shape it
-# replaces wedges the card — zero completions, no error — which is the defect this
-# leg exists to keep out. The one leg here that links and runs: it takes the oco
+# ⭐ THE COUNT LAW, LIVE ON THE CARDS (#1429 — the law is stated once, on
+# ktir-superdsc's `Message`): one wdone bump per run, on the last message, so every
+# message of a multi-message send must be its own complete send (`RunPlace::ALONE`).
+# `alone2` is the 8-MiB two-message all-gather through the production CB path
+# (per-message F-sends, one wdone wait per slot) and must pass byte-exact; the
+# run-flags shape it replaces wedges the card — zero completions, no error — which is
+# the defect this leg exists to keep out. The host's whole card table — no N passed —
+# so any card host runs it. The one leg here that links and runs: it takes the oco
 # route, like every link-bearing build.
 SCRATCHY_SKIP_SENDNN_CXX=1 cargo --config patches/oco.toml build --release \
     --example cards_all_gather -p scratchy-target-spyre-card --features snt1p0
 DEEPTOOLS_PATH=/opt/ibm/spyre/deeptools/share \
 LD_LIBRARY_PATH="/opt/ibm/spyre/senlib/lib:/opt/ibm/spyre/runtime/lib:/opt/ibm/spyre/deeptools/lib:/opt/ibm/spyre/spyre-comms/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
-    target/release/examples/cards_all_gather 4 alone2
+    target/release/examples/cards_all_gather alone2

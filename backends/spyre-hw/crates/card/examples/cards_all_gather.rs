@@ -38,9 +38,10 @@
 //! consumed — which is the drop-vs-wait split, read while the card is stuck.
 //!
 //! ```text
-//! cargo run --release -p scratchy-target-spyre-card --features snt1p0 --example cards_all_gather -- <N> [vendor|run2|alone2|split2]
+//! cargo run --release -p scratchy-target-spyre-card --features snt1p0 --example cards_all_gather -- [[N]] [vendor|run2|alone2|split2]
 //! ```
-//! N cards: the first N of this host's card table (`CardTable`), opened by PCI address.
+//! N defaults to every card this host's card table (`CardTable`) enumerates, opened by PCI
+//! address.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -212,7 +213,7 @@ enum Mode {
     /// The production CB shape: per-message F-sends through ONE `submit_batch`, each message its
     /// own sid and landing slot, the run's `first`/`last` flags, one wdone wait per message slot.
     Run,
-    /// The fix candidate: the same, every message `RunPlace::ALONE` — each its own complete send.
+    /// The fix: the same, every message `RunPlace::ALONE` — each its own complete send.
     Alone,
     /// The production shape split across two doorbells: the sends synchronized on their own
     /// first, then the waits — deciding whether the stuck CB is the message-1 SEND (the sends
@@ -226,26 +227,40 @@ impl Mode {
     fn sid(i: usize, m: u64) -> u8 {
         (2 * i as u64 + m) as u8
     }
+
+    fn of(arg: &str) -> Result<Self> {
+        Ok(match arg {
+            "vendor" => Mode::Vendor,
+            "run2" => Mode::Run,
+            "alone2" => Mode::Alone,
+            "split2" => Mode::Split,
+            other => bail!("unknown mode {other:?}: vendor | run2 | alone2 | split2"),
+        })
+    }
 }
 
 fn main() -> Result<()> {
-    let n: usize = std::env::args()
-        .nth(1)
-        .context("usage: cards_all_gather <N> [vendor|run2|alone2|split2]")?
-        .parse()
-        .context("N is a card count")?;
-    let mode = match std::env::args().nth(2).as_deref() {
-        None | Some("vendor") => Mode::Vendor,
-        Some("run2") => Mode::Run,
-        Some("alone2") => Mode::Alone,
-        Some("split2") => Mode::Split,
-        Some(other) => bail!("unknown mode {other:?}: vendor | run2 | alone2 | split2"),
-    };
-    // ── The cards: the first N of this host's card table, each a world of one (this probe drives
-    //    its own link and sends, not a tensor-parallel world). ──
+    // ── The cards: this host's whole card table by default — the card gate passes no N, so a
+    //    host of any count runs its own exchange — each a world of one (this probe drives its own
+    //    link and sends, not a tensor-parallel world). ──
     let table =
         scratchy_target_spyre_card::runtime::CardTable::enumerate().map_err(|e| anyhow!("{e}"))?;
     let have = table.cards().len();
+    // `[N] mode`: N defaults to every card the host has, the mode to `vendor`.
+    let mut args = std::env::args().skip(1);
+    let (n, mode) = match args.next().as_deref() {
+        None => (have, Mode::Vendor),
+        Some(first) => match first.parse::<usize>() {
+            Ok(n) => (
+                n,
+                match args.next().as_deref() {
+                    None => Mode::Vendor,
+                    Some(arg) => Mode::of(arg)?,
+                },
+            ),
+            Err(_) => (have, Mode::of(first)?),
+        },
+    };
     ensure!(
         n >= 2 && n <= have,
         "N={n}: needs 2..={have} cards (senlib enumerates {have})"

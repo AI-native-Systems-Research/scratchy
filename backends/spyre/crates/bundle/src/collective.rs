@@ -234,9 +234,9 @@ impl<T: Tp> TpSend<T> {
     }
 }
 
-/// ONE F-SEND of a [`TpSend`]: one message of its payload, at the matching offset on both ends — a
-/// complete send in itself, carrying none of a run's protocol bits (#1429: the wdone counter bumps
-/// once per run, on the last message, so a flagged run cannot be waited on).
+/// ONE F-SEND of a [`TpSend`]: one message of its payload, at the matching offset on both ends —
+/// a complete send in itself, carrying none of a run's protocol bits (the count law on
+/// [`Message`], #1429).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TpMessage<T: Tp> {
     pub source_offset: u64,
@@ -249,10 +249,9 @@ pub struct TpMessage<T: Tp> {
 impl<T: Tp> TpSend<T> {
     /// ⭐ THE CUT: the send as one F-send per message ([`Payload::messages`]), each advancing the
     /// source and the landing together, and each in a landing slot of its own
-    /// ([`CutPayload::landings`]). Every message is a complete send — the wdone counter bumps once
-    /// per run, on the last message, on the sid that message carries (measured on the card, #1429),
-    /// so this is the only shape that raises every slot's count; a wait consumes exactly one count,
-    /// once per slot, so a send of N messages is waited for N times.
+    /// ([`CutPayload::landings`]). Every message is a complete send (the count law on
+    /// [`Message`]) — the only shape that raises every slot's count, so a send of N messages is
+    /// waited for N times, once per slot.
     pub fn messages(self) -> impl Iterator<Item = TpMessage<T>> {
         self.bytes
             .landings(self.cut)

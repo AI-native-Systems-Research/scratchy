@@ -147,9 +147,8 @@ pub struct WireBytes(u64);
 
 /// WHAT ONE SEND MOVES: a whole, non-zero number of flits, of any width. On the wire it is a
 /// sequence of [`Message`]s — one F-send per [`RDMA_MESSAGE_CAP_BYTES`] chunk, each its own
-/// complete send ([`Payload::messages`]): the wdone counter bumps once per run, on the last
-/// message, on the sid that message carries (measured on the card, #1429), so a run spanning
-/// messages leaves every non-last message's wait unconsumable — the chunks share nothing.
+/// complete send ([`Payload::messages`]), per the count law on [`Message`]: the chunks share
+/// nothing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Payload(u64);
 
@@ -191,9 +190,14 @@ impl From<WireBytes> for Payload {
 }
 
 /// One message of a [`Payload`]: where it starts inside the payload and how much it carries. It is
-/// a complete send in itself, carrying none of a run's protocol bits — the wdone counter bumps once
-/// per run, on the last message (#1429), so a flagged run of messages is a shape that cannot be
-/// waited on; a message never knows its siblings.
+/// a complete send in itself, carrying none of a run's protocol bits — a message never knows its
+/// siblings.
+///
+/// THE COUNT LAW (measured on four cards, #1429), stated here once — every other mention links
+/// to this one: the wdone counter bumps ONCE PER RUN, ON THE LAST MESSAGE, on the sid that
+/// message carries, and a wait consumes exactly one count. A run spanning messages therefore
+/// leaves every non-last message's landing slot uncounted and its wait unsatisfiable — the
+/// 1024-row prefill wedge — so every message is emitted as its own run.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Message {
     pub offset: u64,
