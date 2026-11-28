@@ -417,9 +417,10 @@ fn program_kind_tokens(
         Program::PagedKvWrite => quote! { __KProgram::PagedKvWrite },
         Program::KvQuantize => quote! { __KProgram::KvQuantize },
         Program::Transpose => quote! { __KProgram::Transpose },
-        Program::EmbedRowGather { k } => {
+        Program::EmbedRowGather { k, hidden } => {
             let k = proc_macro2::Literal::u32_unsuffixed(*k);
-            quote! { __KProgram::EmbedRowGather { k: #k } }
+            let hidden = proc_macro2::Literal::u32_unsuffixed(*hidden);
+            quote! { __KProgram::EmbedRowGather { k: #k, hidden: #hidden } }
         }
         Program::ChainStage {
             pad_vocab,

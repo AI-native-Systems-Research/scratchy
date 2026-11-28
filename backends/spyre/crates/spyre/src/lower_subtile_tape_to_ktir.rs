@@ -521,11 +521,14 @@ fn chain_skeleton<F: RopeForm>(
     })
 }
 
-/// The gathered row's program — `Program::EmbedRowGather { k }`, `[s_stick, l_stick, weight]`
-/// in and the `[1, hidden]` row out, hand-minted over the node's own regions. `k` is the
+/// The gathered row's program — `Program::EmbedRowGather { k, hidden }`, `[s_stick, l_stick,
+/// weight]` in and the `[1, hidden]` row out, hand-minted over the node's own regions. `k` is the
 /// ONE SPELLING'S spyre-side call: this node carries no k of its own (the ChainStage's
 /// payload does), so the emitter asks [`chain_slab_entries`] at THIS node's own `hidden`
 /// — the same pure fn the mint stated, called on the same hidden, the ruled third site.
+/// `hidden` is the node's own payload statement carried verbatim, so the door reads the
+/// LOGICAL hidden from the payload, never from the row out's stated shape (whose cols are the
+/// widest ALLOCATION view — a pointwise consumer's device-width restatement).
 fn embed_row_gather_emitted<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     node: &SubtileNode<F>,
     ir: &SubtileIR<F>,
@@ -547,7 +550,7 @@ fn embed_row_gather_emitted<T: ktir_superdsc::collective::Tp, F: RopeForm>(
         "embed_row_gather",
         node,
         ir,
-        ktir_superdsc::ktir_node::Program::EmbedRowGather { k: entries },
+        ktir_superdsc::ktir_node::Program::EmbedRowGather { k: entries, hidden },
     )?;
     Ok(ktir_only(k))
 }
