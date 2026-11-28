@@ -266,8 +266,8 @@ pub(crate) fn site_cbs<T: ktir_superdsc::collective::Tp>(
     let mut first_send = true;
     for step in group_steps(index, consume) {
         match step {
-            // ⭐ THE CUT: a send is its run of messages (`TpSend::messages`, the vendor's windowed
-            // loop), one F-send each, to peer `to`, signalling this rank's sid for each slot.
+            // ⭐ THE CUT: a send is its messages (`TpSend::messages`), one F-send each, to peer
+            // `to`, signalling this rank's sid for each slot.
             CbStep::Send { to, .. } => {
                 let (Some(BoundCollective { send, me }), Some(l)) = (bound, launch.as_ref()) else {
                     bail!("group {index} sends with no binding or after its launch");
@@ -279,19 +279,23 @@ pub(crate) fn site_cbs<T: ktir_superdsc::collective::Tp>(
                         bytes: m.bytes,
                         source: end(l, send.source_segment, m.source_offset)?,
                         window: end(l, WINDOW_SEGMENT as u8, m.window_offset)?,
-                        place: RunPlace {
-                            first: m.first,
-                            last: m.last,
-                        },
+                        // ⭐ EVERY MESSAGE IS ITS OWN COMPLETE SEND, per the count law on `Message`
+                        // (#1429, measured on the card: the run-flags shape wedges at exactly that
+                        // wait, zero completions, no error; the ALONE shape serves byte-exact,
+                        // same batch, same cards). The receiver already treats each message
+                        // independently — its own sid, its own XSEG entry, its own wait — so the
+                        // run exists only in these flags; never emit them.
+                        place: RunPlace::ALONE,
                         barrier: std::mem::replace(&mut first_send, false),
                     }));
                 }
             }
-            // ⭐ AND THE PAIRING: every one of peer `from`'s messages increments its slot's counter
-            // on `from`'s sid once and a wait consumes exactly one count, so `from`'s run of N
-            // messages is waited for N times, once per slot. Every rank's run is this rank's own —
-            // the forward is SPMD and the fragment is the payload's — so this rank's messages name
-            // `from`'s slots too.
+            // ⭐ AND THE PAIRING: every one of peer `from`'s messages bumps its slot's counter on
+            // `from`'s sid exactly once — because each is its own run's last (`RunPlace::ALONE`
+            // above, per the count law on `Message`) — and a wait consumes exactly one count, so
+            // `from`'s N messages are waited for N times, once per slot. Every rank's send is
+            // this rank's own — the forward is SPMD and the fragment is the payload's — so this
+            // rank's messages name `from`'s slots too.
             // ⭐ ONE WAIT CB PER MESSAGE SLOT, OVER EVERY PEER OF THE EXCHANGE AT ONCE. The wdone
             // barrier waits on a SET of sids (its list bitmask) and consumes one count from each —
             // measured on four cards (`cards_all_gather`, `ONE_WAIT=1`: byte-exact, every wdone
@@ -651,7 +655,7 @@ mod tests {
                 .iter()
                 .map(|c| match c {
                     BatchedCb::Send(s) => s,
-                    _ => panic!("the runs' sends lead"),
+                    _ => panic!("the sends lead"),
                 })
                 .collect();
             assert_eq!(
@@ -666,16 +670,9 @@ mod tests {
             );
             assert_eq!(
                 sends.iter().map(|s| s.place).collect::<Vec<_>>(),
-                [
-                    RunPlace {
-                        first: true,
-                        last: false
-                    },
-                    RunPlace {
-                        first: false,
-                        last: true
-                    }
-                ]
+                [RunPlace::ALONE, RunPlace::ALONE],
+                "every message is its own complete send — the count law on Message (#1429): \
+                 a non-last message's sid can never satisfy its wait"
             );
             assert_eq!(
                 sends.iter().map(|s| s.sid).collect::<Vec<_>>(),

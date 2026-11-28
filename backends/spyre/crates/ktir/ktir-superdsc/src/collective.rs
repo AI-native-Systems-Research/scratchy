@@ -145,9 +145,10 @@ impl<T: World> Tp for T {}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct WireBytes(u64);
 
-/// WHAT ONE SEND MOVES: a whole, non-zero number of flits, of any width. On the wire it is a run of
-/// [`Message`]s — the vendor's windowed P2P loop: one F-send per [`RDMA_MESSAGE_CAP_BYTES`] chunk,
-/// `first` on the first, `last` on the last ([`Payload::messages`]).
+/// WHAT ONE SEND MOVES: a whole, non-zero number of flits, of any width. On the wire it is a
+/// sequence of [`Message`]s — one F-send per [`RDMA_MESSAGE_CAP_BYTES`] chunk, each its own
+/// complete send ([`Payload::messages`]), per the count law on [`Message`]: the chunks share
+/// nothing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Payload(u64);
 
@@ -177,12 +178,7 @@ impl Payload {
             let Some(bytes) = WireBytes::new((self.0 - offset).min(RDMA_MESSAGE_CAP_BYTES)) else {
                 unreachable!("a flit-multiple remainder within the cap is one message")
             };
-            Message {
-                offset,
-                bytes,
-                first: i == 0,
-                last: i + 1 == n,
-            }
+            Message { offset, bytes }
         })
     }
 }
@@ -193,14 +189,19 @@ impl From<WireBytes> for Payload {
     }
 }
 
-/// One message of a [`Payload`]: where it starts inside the payload, how much it carries, and its
-/// place in the run (`first` / `last`, the send section's own protocol bits).
+/// One message of a [`Payload`]: where it starts inside the payload and how much it carries. It is
+/// a complete send in itself, carrying none of a run's protocol bits — a message never knows its
+/// siblings.
+///
+/// THE COUNT LAW (measured on four cards, #1429), stated here once — every other mention links
+/// to this one: the wdone counter bumps ONCE PER RUN, ON THE LAST MESSAGE, on the sid that
+/// message carries, and a wait consumes exactly one count. A run spanning messages therefore
+/// leaves every non-last message's landing slot uncounted and its wait unsatisfiable — the
+/// 1024-row prefill wedge — so every message is emitted as its own run.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Message {
     pub offset: u64,
     pub bytes: WireBytes,
-    pub first: bool,
-    pub last: bool,
 }
 
 impl WireBytes {
@@ -779,8 +780,8 @@ mod tests {
         assert_eq!(WireBytes::CAP.get(), RDMA_MESSAGE_CAP_BYTES);
     }
 
-    /// A payload is cut into the vendor loop's messages: whole caps then the remainder, tiling it
-    /// exactly, `first` on the first alone and `last` on the last alone — one message is both.
+    /// A payload is cut into messages: whole caps then the remainder, tiling it exactly — each a
+    /// complete send, carrying no run bits.
     #[test]
     fn a_payload_goes_out_as_messages_within_the_cap() {
         assert!(Payload::new(0).is_none());
@@ -797,15 +798,16 @@ mod tests {
         );
         assert!(m[..3].iter().all(|x| x.bytes == WireBytes::CAP));
         assert_eq!(m[3].bytes.get(), 600 * FLIT_BYTES);
-        assert_eq!(
-            m.iter().map(|x| (x.first, x.last)).collect::<Vec<_>>(),
-            [(true, false), (false, false), (false, false), (false, true)]
-        );
         assert_eq!(m.iter().map(|x| x.bytes.get()).sum::<u64>(), p.get());
-        // Exactly one cap is one message, both first and last.
+        // Exactly one cap is one message.
         let one: Vec<Message> = Payload::from(WireBytes::CAP).messages().collect();
-        assert_eq!(one.len(), 1);
-        assert!(one[0].first && one[0].last);
+        assert_eq!(
+            one,
+            [Message {
+                offset: 0,
+                bytes: WireBytes::CAP
+            }]
+        );
     }
 
     /// An operand is cut at whole stick columns, each fragment one contiguous run within the width,

@@ -234,25 +234,24 @@ impl<T: Tp> TpSend<T> {
     }
 }
 
-/// ONE F-SEND of a [`TpSend`]: one message of its payload, at the matching offset on both ends.
+/// ONE F-SEND of a [`TpSend`]: one message of its payload, at the matching offset on both ends —
+/// a complete send in itself, carrying none of a run's protocol bits (the count law on
+/// [`Message`], #1429).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TpMessage<T: Tp> {
     pub source_offset: u64,
     pub window_offset: u64,
     pub bytes: WireBytes,
-    /// The send section's own protocol bits: this message's place in the run.
-    pub first: bool,
-    pub last: bool,
     /// Where it lands — and so the sid it signals on and every peer waits on.
     pub slot: LandingSlot<T>,
 }
 
 impl<T: Tp> TpSend<T> {
-    /// ⭐ THE CUT: the send as the vendor's windowed P2P loop issues it — one F-send per message
-    /// ([`Payload::messages`]), each advancing the source and the landing together, and each in a
-    /// landing slot of its own ([`CutPayload::landings`]). Every one increments its slot's
-    /// write-done counter on the peer it lands on once, so a send of N messages is waited for N
-    /// times on that peer, once per slot (a wait consumes exactly one count).
+    /// ⭐ THE CUT: the send as one F-send per message ([`Payload::messages`]), each advancing the
+    /// source and the landing together, and each in a landing slot of its own
+    /// ([`CutPayload::landings`]). Every message is a complete send (the count law on
+    /// [`Message`]) — the only shape that raises every slot's count, so a send of N messages is
+    /// waited for N times, once per slot.
     pub fn messages(self) -> impl Iterator<Item = TpMessage<T>> {
         self.bytes
             .landings(self.cut)
@@ -260,8 +259,6 @@ impl<T: Tp> TpSend<T> {
                 source_offset: self.source_offset + m.offset,
                 window_offset: self.window_offset + m.offset,
                 bytes: m.bytes,
-                first: m.first,
-                last: m.last,
                 slot,
             })
     }
@@ -589,7 +586,6 @@ mod tests {
                 (x.source_offset, x.window_offset),
                 (8192 + at, (1 << 30) + at)
             );
-            assert_eq!((x.first, x.last), (k == 0, k == 2));
             assert_eq!(x.slot, LandingSlot::of(cut, k as u32).unwrap());
         }
         assert_eq!(m[2].bytes.get(), 256);
