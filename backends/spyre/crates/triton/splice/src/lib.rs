@@ -1967,6 +1967,29 @@ impl PagedStepTids {
             int32_zero: Self::RESERVED.int32_zero,
         }
     }
+
+    /// Every table a walk's trip reads at attention class `class` — its decode batch's chunk page
+    /// ids and chunk masks, and every packed-prefill window's page table and mask stack
+    /// ([`paged_window_of_class`]; window 0 is the class's own step tables).
+    pub fn walked_sources(class: usize) -> Vec<u32> {
+        let tids = Self::of_class(class);
+        let mut walked = vec![tids.chunk_pages, tids.chunk_masks];
+        for r in 0..ktir_superdsc::reserved_tids::PAGED_MAX_WINDOWS {
+            walked.push(paged_window_of_class(class, r, 1));
+            walked.push(paged_window_of_class(class, r, 2));
+        }
+        walked
+    }
+
+    /// Is `tid` a table some class's walk reads ([`Self::walked_sources`])? The class is decoded
+    /// from the tid itself ([`ktir_superdsc::reserved_tids::paged_step_class_of`]; class 0's tables
+    /// are the sentinels and the window region), so this answers for every class a model can state
+    /// without enumerating, or bounding, the classes.
+    pub fn is_walked_source(tid: u32) -> bool {
+        let class =
+            ktir_superdsc::reserved_tids::paged_step_class_of(tid).map_or(0, |c| c as usize);
+        Self::walked_sources(class).contains(&tid)
+    }
 }
 
 /// ⭐ A WINDOW'S TABLE AT AN ATTENTION CLASS — the class-aware statement of the packed prefill's
