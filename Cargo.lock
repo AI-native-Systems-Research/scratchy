@@ -1431,7 +1431,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b1f9e3d69d39e4862ffed03ed071a76f9a13ba1d9109d355b0f0aa6b15e393c4"
 dependencies = [
  "futures-core",
- "futures-sink",
 ]
 
 [[package]]
@@ -2523,32 +2522,16 @@ dependencies = [
 ]
 
 [[package]]
-name = "opentelemetry-http"
-version = "0.33.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "302249bd8ee804789faaa7b5b2cbf79bc61cb864714079c644e3828af5b7e811"
-dependencies = [
- "async-trait",
- "bytes",
- "http",
- "opentelemetry",
- "reqwest",
-]
-
-[[package]]
 name = "opentelemetry-otlp"
 version = "0.33.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0756af24841e367128ef31c831999937b8b5c5197d47914590d8f4e2e88c2e1a"
 dependencies = [
  "http",
- "httpdate",
  "opentelemetry",
- "opentelemetry-http",
  "opentelemetry-proto",
  "opentelemetry_sdk",
  "prost",
- "reqwest",
  "thiserror",
  "tokio",
  "tonic",
@@ -3131,7 +3114,6 @@ dependencies = [
  "base64 0.23.1",
  "bytes",
  "encoding_rs",
- "futures-channel",
  "futures-core",
  "futures-util",
  "h2",
@@ -3435,7 +3417,6 @@ dependencies = [
  "rand",
  "rand_distr",
  "scratchy-core-common",
- "scratchy-core-config",
  "scratchy-serving-api",
  "scratchy-serving-engine",
  "scratchy-tls",
@@ -3502,7 +3483,6 @@ dependencies = [
  "indicatif",
  "inventory",
  "safetensors",
- "scratchy-core-common",
  "scratchy-hf-hub-downloader",
  "serde",
  "serde_json",
@@ -3518,7 +3498,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
- "half",
  "reqwest",
  "rustls",
  "safetensors",
@@ -3550,7 +3529,6 @@ dependencies = [
  "scratchy-tensors",
  "scratchy-tls",
  "scratchy-vision",
- "serde",
  "serde_json",
  "ureq",
 ]
@@ -3571,7 +3549,6 @@ version = "0.1.0"
 dependencies = [
  "proc-macro2",
  "quote",
- "rayon",
  "scratchy-forward-compiler",
  "scratchy-forward-compiler-frontend",
  "scratchy-ir",
@@ -3771,7 +3748,6 @@ name = "scratchy-serving-worker"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "safetensors",
  "scratchy-core-common",
  "scratchy-core-config",
  "scratchy-serving-engine",
@@ -3928,9 +3904,7 @@ dependencies = [
  "scratchy-state-decoder-gdn",
  "scratchy-target-metal",
  "scratchy-target-metal-models",
- "serde_json",
  "tokenizers 0.23.2",
- "tokio",
  "tracing",
 ]
 

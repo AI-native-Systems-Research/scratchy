@@ -87,7 +87,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "registry"] }
 # OpenTelemetry (optional, behind "otel" feature)
 opentelemetry = "0.33"
 opentelemetry_sdk = { version = "0.33", features = ["rt-tokio"] }
-opentelemetry-otlp = { version = "0.33", features = ["grpc-tonic"] }
+# No default features: the exporter is gRPC only (`telemetry.rs` builds it `.with_tonic()`), so
+# the defaults' HTTP exporter (reqwest, url and its ICU stack) would be compiled and never called.
+opentelemetry-otlp = { version = "0.33", default-features = false, features = ["grpc-tonic", "trace"] }
 tracing-opentelemetry = "0.34"
 
 # Metrics. default-features=false drops the default `protobuf` feature: /metrics
