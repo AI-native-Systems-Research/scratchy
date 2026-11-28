@@ -1785,12 +1785,18 @@ pub enum SubOp<F: RopeForm = NeoX, S: OpStage = Tiled> {
 /// must be a power of two) AND the sentinel law's (a power-of-two vocab still
 /// needs pad lanes to land its all-NaN one-hot on, so a vocab that is already
 /// a power of two rounds to the NEXT one up: gemma-4's 262144 pads to
-/// 524288). ONE derivation, read by the host reference, the splice's
-/// constexpr flow, and the load-time table staging, so no two of them can
-/// disagree.
+/// 524288) — and NEVER NARROWER THAN ONE PICK GROUP
+/// (`SAMPLE_BLOCK · SAMPLE_GROUP_BLOCKS`), the chain's own law
+/// ([`mint_embed_chain`]: the sentinel is the last row only when the pad is a
+/// whole number of groups). A power of two at least one group wide is a whole
+/// number of groups, so every vocab — a parity fixture's 512 as much as a
+/// checkpoint's 262144 — gets a pad both laws hold for. ONE derivation, read
+/// by the host reference, the splice's constexpr flow, and the load-time table
+/// staging, so no two of them can disagree.
 pub fn sample_pad_vocab(vocab: u32) -> u32 {
     let pad = vocab.max(1).next_power_of_two();
-    if pad == vocab { pad * 2 } else { pad }
+    let strictly_above = if pad == vocab { pad * 2 } else { pad };
+    strictly_above.max(SAMPLE_BLOCK * SAMPLE_GROUP_BLOCKS)
 }
 
 /// The token draw's stick width — the idx stick's own lane count and the
