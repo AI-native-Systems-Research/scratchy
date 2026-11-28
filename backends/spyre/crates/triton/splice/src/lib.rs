@@ -7168,16 +7168,19 @@ mod walk_on_the_card {
     /// ⭐⭐ THE PROMPT TRIP IN torch-spyre's FORM — its compiled prefill's: the query rows split across
     /// the cores, each core holding whole query rows of every head (row `p·32 + h`), the scores and
     /// the value product each ONE contraction over every query head against the kv head's block
-    /// expanded once per query head of its group (read by every core at one start, from HBM), the
+    /// expanded once per query head of its group — laid by the expansion's own group-slot copies,
+    /// one copy op per query head of the group into the one kernel scratch (the phantom-axis
+    /// broadcast op that did it in one is deleted: its stick-moving device order was the rung-29
+    /// card corruption) — read by every core at one start, from HBM, the
     /// mask added a stick plane at a time sprayed over each query row's heads in place, and the
     /// scores, the softmax and the carried state all in each core's LX. The trip's ops do not grow
-    /// with the rows: 23 at either head dim, each page gathered in one op (the reference's trip is
+    /// with the rows: 29 at either head dim, each page gathered in one op (the reference's trip is
     /// 21). At 512 rows every value still fits, because a pin is held
     /// for its value's lifetime rather than the walk's (torch-spyre's placement), so values the trip
     /// is done with hand their bytes to the next.
     #[test]
     fn the_prompt_trip_splits_its_query_rows_across_the_cores_in_lx() {
-        for (mq, hd, trip) in [(128, 64, 23), (512, 64, 23), (128, 128, 23), (512, 128, 23)] {
+        for (mq, hd, trip) in [(128, 64, 29), (512, 64, 29), (128, 128, 29), (512, 128, 29)] {
             let blocks = 4;
             let node = walk_at(mq, blocks, hd);
             let layout = triton_ktir_superdsc::layout::for_node(&node).expect("the walk places");
@@ -7212,19 +7215,26 @@ mod walk_on_the_card {
                 })
                 .collect();
             let bmms = named("bmm");
+            // The walk's 32 query heads over its 8 kv heads: the group the expansion serves.
+            let group = 32 / 8;
             assert_eq!(
                 (expanded.len(), bmms.len()),
-                (2, 2),
-                "mq={mq} hd={hd}: one expansion and one contraction for the scores and for the \
-                 value product"
+                (2 * group, 2),
+                "mq={mq} hd={hd}: the expansion's group-slot copies — one per query head of the \
+                 group — and one contraction for the scores and for the value product"
             );
-            for (e, kernel) in bmms.iter().zip(&expanded) {
+            for e in bmms.iter() {
                 let [a, k, out] = e.arg_bindings.as_slice() else {
                     panic!("{}: activation, kernel, output", e.op_name);
                 };
+                let slots = expanded
+                    .iter()
+                    .filter(|kernel| k.buffer == **kernel)
+                    .count();
                 assert_eq!(
-                    k.buffer, *kernel,
-                    "mq={mq} hd={hd} {}: the expanded block",
+                    slots, group,
+                    "mq={mq} hd={hd} {}: its kernel scratch laid by one copy per query head of \
+                     its group",
                     e.op_name
                 );
                 assert!(
@@ -7371,17 +7381,24 @@ mod walk_on_the_card {
             })
             .collect();
         let bmms = named("bmm");
+        // The walk's 32 query heads over its 8 kv heads: the group the expansion serves.
+        let group = 32 / 8;
         assert_eq!(
             (expanded.len(), bmms.len()),
-            (2, 2),
-            "the scores and the value product: one expansion and one contraction each"
+            (2 * group, 2),
+            "the scores and the value product: the expansion's group-slot copies — one per \
+             query head of the group — and one contraction each"
         );
-        for (&i, kernel) in bmms.iter().zip(&expanded) {
+        for &i in &bmms {
             let e = &ops[i];
             assert!(e.walk.is_some(), "{}: on the trip", e.op_name);
+            let slots = expanded
+                .iter()
+                .filter(|kernel| e.arg_bindings[1].buffer == **kernel)
+                .count();
             assert_eq!(
-                e.arg_bindings[1].buffer, *kernel,
-                "{}: its kernel is the expanded block",
+                slots, group,
+                "{}: its kernel scratch laid by one copy per query head of its group",
                 e.op_name
             );
         }

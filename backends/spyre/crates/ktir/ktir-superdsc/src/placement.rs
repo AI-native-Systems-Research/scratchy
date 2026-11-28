@@ -1471,6 +1471,14 @@ impl BundleLayout {
         extents
     }
 
+    /// The arrangement the authority HOLDS for `name` — the record a consumer reads to address
+    /// the tensor as its producer laid it, the one statement [`Self::declare_arrangement`] wrote;
+    /// `None` when no op has declared the tensor yet — a consumer that needs the bytes to copy
+    /// then refuses rather than assumes.
+    pub fn arrangement_of(&self, name: &str) -> Option<StickLayout> {
+        self.arrangements.borrow().get(name).copied()
+    }
+
     /// THE arrangement authority. Record that tensor `name` is addressed through `want`; a later op that
     /// addresses it NON-equivalently ([`StickLayout::addr_eq`]) is a build `Err` naming the tensor.
     /// `addr_eq` is true for the same layout, and for a byte-identical RESHAPE (same total elements, both
