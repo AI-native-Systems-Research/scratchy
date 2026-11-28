@@ -1343,18 +1343,16 @@ impl<'a> HeadMajorCopies<'a> {
         sym_id_base: &mut i64,
         layout: &BundleLayout,
     ) -> Result<Vec<super::EmittedOp<T>>, Error> {
-        use crate::ir::bridge::tiled_op_sdsc_op::{StickRuns, assemble_stick_runs_copy};
+        use crate::ir::bridge::tiled_op_sdsc_op::{
+            StickRuns, assemble_stick_runs_copy, stick_runs_chunks,
+        };
         let stick = crate::work::FP16_ELEMS_PER_STICK;
         let (a, b, n) = (self.a, self.b, self.sticks);
-        // ⛔ AT MOST ONE RUN A CORE: a copy of more runs than cores hands a core several, which the
-        // card steps by the run's device-extent pitch — a stride no copy here has run with. Past the
-        // cores, the runs go out a core's worth an op, each op's runs one a core.
-        let per_op = crate::device_gen::BUILD_CORES;
-        let chunks = a.div_ceil(per_op);
-        let mut ops = Vec::with_capacity((n * chunks) as usize);
+        // ⛔ AT MOST ONE RUN A CORE — [`stick_runs_chunks`]'s own law, consumed here.
+        let chunks = stick_runs_chunks(a);
+        let mut ops = Vec::with_capacity(n as usize * chunks.len());
         for s in 0..n {
-            for k in 0..chunks {
-                let (first, count) = (k * per_op, per_op.min(a - k * per_op));
+            for (k, (first, count)) in chunks.iter().copied().enumerate() {
                 // Block side: run `a` at `a·S·B + s·B` sticks; head-major side: at `s·A·B + a·B`.
                 let (block_pitch, block_elems) = (n * b, s * b * stick + first * n * b * stick);
                 let (heads_pitch, heads_elems) = (b, s * a * b * stick + first * b * stick);
@@ -1387,7 +1385,7 @@ impl<'a> HeadMajorCopies<'a> {
                         },
                     )
                 };
-                let op_name = match chunks {
+                let op_name = match chunks.len() {
                     1 => format!("heads{s}_o{}", dst.tid),
                     _ => format!("heads{s}r{k}_o{}", dst.tid),
                 };
@@ -7532,17 +7530,26 @@ fn lower_function_folded<T: crate::collective::Tp>(
                         w.v_cols / crate::work::FP16_ELEMS_PER_STICK,
                         layout,
                     );
-                    out.push(
+                    // ⭐ THE EXPANSION'S GEOMETRY IS A TYPED FACT, verified against the kernel's
+                    // own frame by the sealed constructor — a source that is not `batch` blocks
+                    // of `block_rows` rows refuses at bake.
+                    let blocks = crate::ir::bridge::tiled_op_sdsc_op::ExpandedBlocks::of(
+                        batch,
+                        heads / batch,
+                        block_rows,
+                        w.v_cols,
+                        w.v_rows,
+                        w.v_cols,
+                    )
+                    .map_err(|message| Error {
+                        message: format!("{}: {message}", f.name),
+                    })?;
+                    out.extend(
                         crate::ir::bridge::tiled_op_sdsc_op::assemble_expand_blocks(
                             &format!("expand_o{tid}"),
                             &w.name(),
                             &expanded.name(),
-                            crate::ir::bridge::tiled_op_sdsc_op::ExpandedBlocks {
-                                batch,
-                                group: heads / batch,
-                                rows: block_rows,
-                                cols: w.v_cols,
-                            },
+                            blocks,
                             sym_id_base,
                             Some(layout),
                         )

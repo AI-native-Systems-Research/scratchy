@@ -46,7 +46,7 @@ pub use pointwise::{
     assemble_pointwise_broadcast_off_from_tile, assemble_pointwise_seeded_from_tile,
     assemble_scatter_copy, assemble_stick_permute, assemble_stick_runs_copy, gather_copy_opspec,
     index_select_opspec, page_gather_copy_opspec, pointwise_broadcast_opspec_from_tile,
-    pointwise_opspec_from_tile, scatter_copy_opspec, stick_permute_opspec,
+    pointwise_opspec_from_tile, scatter_copy_opspec, stick_permute_opspec, stick_runs_chunks,
 };
 pub use reduce::{
     ReduceDivided, ReduceDivision, ReduceOffSpec, ReduceSplit, ScalingExtent, assemble_reduce,

@@ -41,13 +41,13 @@ pub(crate) struct BundleMeta {
     /// Program index in the shared session (see [`SpyreSession::run_step`]).
     #[cfg(not(feature = "spyre-hw"))]
     pub(crate) prog: usize,
-    /// The paged step this bundle's attention reads — its page table, mask stack and write rows,
-    /// staged every step from the request's KV blocks (`scratchy_target_spyre::paged_step`), and
-    /// the pool they index.
+    /// The paged steps this bundle's attention reads — one per attention class, class-sorted —
+    /// their page tables, mask stacks and write rows, staged every step from the request's KV
+    /// blocks (`scratchy_target_spyre::paged_step`), and the pool they share.
     ///
     /// ⛔ EMULATOR-ONLY (cfg'd): the card's own staging rides its forward tape.
     #[cfg(not(feature = "spyre-hw"))]
-    pub(crate) paged: Option<scratchy_target_spyre::wiring::PagedStep>,
+    pub(crate) paged: Vec<scratchy_target_spyre::wiring::PagedStep>,
     /// Prefix capacity (mask cols) — max context length this bundle serves.
     pub(crate) capacity: usize,
     /// Baked query-row count: 1 (decode) or M (batched prefill).
@@ -109,12 +109,13 @@ pub(crate) struct BundleMeta {
 
 impl BundleMeta {
     /// The positions this bundle's attention reaches: on the emulator its page walk's
-    /// ([`scratchy_target_spyre::wiring::PagedStep::reach`]), so a step whose positions end at or
-    /// below it can run here from any start; on the card, its prefix capacity.
+    /// ([`scratchy_target_spyre::wiring::PagedStep::reach`]) — the WIDEST class's, so a step
+    /// whose positions end at or below it can run here from any start; on the card, its prefix
+    /// capacity.
     pub(crate) fn reach(&self) -> usize {
         #[cfg(not(feature = "spyre-hw"))]
-        if let Some(p) = self.paged {
-            return p.reach();
+        if let Some(r) = self.paged.iter().map(|p| p.reach()).max() {
+            return r;
         }
         self.capacity
     }

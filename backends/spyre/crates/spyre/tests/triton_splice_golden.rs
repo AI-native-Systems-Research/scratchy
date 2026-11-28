@@ -2573,32 +2573,75 @@ fn attn_ir_fp8(s: AttnShape, scale: f32) -> SubtileIR {
     )
 }
 
-/// spyre-inference's paged kernels attend causally, so a sliding-window attention (gemma's local
-/// layers) is refused by name rather than run as causal.
+/// ⭐ A SLIDING-WINDOW ATTENTION LOWERS — the window rides the MASK STACK, never the kernels (the
+/// reference's own law: a window is host metadata), so the spliced op is the causal one's own
+/// shape — same op count, same operand family — and the WALK alone is bounded by the window
+/// (`window_walk_blocks`, the reference's `_max_active_blocks`), never widened past the causal
+/// sweep the rung states.
 #[test]
-fn a_sliding_window_attention_is_refused() {
+fn a_sliding_window_attention_lowers_on_the_mask_stack() {
     let s = ATTN_SHAPES[0];
-    let mut ir = attn_ir(s, 0.015625);
-    let node = ir.nodes.last_mut().expect("the attention");
+    let window = std::num::NonZeroU32::new(4096).expect("a window");
+    let causal = attn_ir(s, 0.015625);
+    let mut windowed = attn_ir(s, 0.015625);
+    let node = windowed.nodes.last_mut().expect("the attention");
     let scratchy_subtile::subtile_ir::SubOp::AttnDecode { mask, .. } = &mut node.op else {
         panic!("the last node is the attention");
     };
-    *mask = scratchy_subtile::subtile_ir::AttnMask::SlidingWindow {
-        window: std::num::NonZeroU32::new(4096).expect("a window"),
+    *mask = scratchy_subtile::subtile_ir::AttnMask::SlidingWindow { window };
+    let lower = |ir: &scratchy_subtile::subtile_ir::SubtileIR| {
+        scratchy_triton_splice::lower_attn::<ktir_superdsc::collective::TpWorld<1>, _>(
+            ir.nodes.last().expect("the attention"),
+            ir,
+            scratchy_subtile::subtile_ir::AttnScaleSite::InKernel,
+            s.active_cap(),
+            // One request of the graph's `mq` rows.
+            pair_of_one_request(s.mq),
+            PagedRows::Sequence,
+        )
     };
-    let node = ir.nodes.last().expect("the attention");
-    let Err(e) = scratchy_triton_splice::lower_attn::<ktir_superdsc::collective::TpWorld<1>, _>(
-        node,
-        &ir,
-        scratchy_subtile::subtile_ir::AttnScaleSite::InKernel,
-        s.active_cap(),
-        // One request of the graph's `mq` rows — the walk this refusal gates.
-        pair_of_one_request(s.mq),
-        PagedRows::Sequence,
-    ) else {
-        panic!("a sliding window must be refused");
+    let c = lower(&causal).expect("the causal attention lowers");
+    let w = lower(&windowed)
+        .expect("a windowed attention lowers on the mask stack — the window is host metadata");
+    // One request: one op each, binding the SAME operands — the window changes which blocks the
+    // staged page table names and what the mask tiles hold, never the splice's own shape.
+    assert_eq!(c.len(), w.len(), "one window a request, windowed or causal");
+    assert_eq!(
+        c[0].ktir
+            .as_ref()
+            .expect("a spliced op carries its ktir node")
+            .bindings,
+        w[0].ktir
+            .as_ref()
+            .expect("a spliced op carries its ktir node")
+            .bindings
+    );
+    // And the step's walk is the window's own bound, capped by the causal sweep the rung states.
+    let step_of = |ir: &scratchy_subtile::subtile_ir::SubtileIR| {
+        scratchy_target_spyre::lower_subtile_tape_to_ktir::paged_step_of_ir(
+            ir,
+            s.active_cap(),
+            PagedRows::Sequence,
+            pair_of_one_request(s.mq),
+        )
+        .expect("the step derives")
+        .pop()
+        .expect("the graph has attention")
     };
-    assert!(e.contains("sliding window"), "{e}");
+    let cw = step_of(&causal);
+    let ww = step_of(&windowed);
+    assert_eq!(ww.window.map(|x| x.get()), Some(window.get()));
+    let bound = scratchy_triton_splice::window_walk_blocks(
+        ww.pages,
+        window,
+        s.mq,
+        scratchy_triton_splice::SchedulerBlockTokens::REFERENCE.get(),
+    );
+    assert_eq!(
+        ww.walk,
+        cw.walk.min(bound),
+        "the windowed walk is its own bound inside the causal sweep, never wider"
+    );
 }
 
 /// ⛔ A POOL NO BIGGER THAN A CHUNK IS REFUSED BY NAME — spyre-inference's own eligibility
@@ -3222,6 +3265,7 @@ fn execute_one_paged_step(s: AttnShape, cached: usize) {
         pair_of_one_request(s.mq),
     )
     .expect("the paged step derives")
+    .pop()
     .expect("the graph has attention");
     let mq = s.mq as usize;
     let rows = StepRows::new(cached, mq).expect("the golden step holds its query rows");
@@ -3530,6 +3574,7 @@ fn execute_one_decode_batch(s: AttnShape, contexts: &[usize]) {
         batch_pair_of_one_row_each(s.mq),
     )
     .expect("the paged step derives")
+    .pop()
     .expect("the graph has attention");
     let (b, n) = (s.mq as usize, contexts.len());
     let slots = step.page_slots as usize;

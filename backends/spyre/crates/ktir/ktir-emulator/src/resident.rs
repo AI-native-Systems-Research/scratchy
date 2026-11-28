@@ -670,6 +670,41 @@ impl ResidentExecutor {
         Ok(())
     }
 
+    /// THE ROW OUT'S OWN WINDOW, WRITTEN — the mint's `[width, hidden]` words, encoded
+    /// at the MODEL dtype into the stick's first words. The stick's derived extent is
+    /// the WIDEST view that addresses the tid (the allocation law,
+    /// [`write_door_stick`]'s count contract), and a pointwise consumer of the rows
+    /// legitimately restates them at its DEVICE width (`DeviceWidth::for_pointwise`'s
+    /// util-floor bump: a 128-wide row allocates 512), so the words past the mint's own
+    /// window are that allocation's zero-fill — never the door's to write, never a
+    /// truncation to refuse. A window PAST the stick's extent is refused: an allocation
+    /// that cannot hold the mint's own window is a staging defect the door names.
+    fn write_door_window(&self, prog: usize, tid: u64, vals: &[f32]) -> Result<(), String> {
+        let s = *self
+            .stick
+            .get(&tid)
+            .ok_or_else(|| format!("door: t{tid} has no resident stick"))?;
+        let n = self.door_numel(prog, tid);
+        if n == 0 {
+            return Err(format!(
+                "door: t{tid} has no derived extent in program {prog}"
+            ));
+        }
+        if vals.len() > n {
+            return Err(format!(
+                "door: t{tid} states {n} elements; the door wrote {} — a window past the \
+                 stick's own extent is a staging defect, never a truncation",
+                vals.len()
+            ));
+        }
+        let bytes = crate::codec::encode(vals, self.dtype);
+        self.mem
+            .hbm
+            .borrow_mut()
+            .write_bytes(s * STICK_BYTES, &bytes);
+        Ok(())
+    }
+
     /// THE ROW DOOR, HOST FORM — the chained head's embedding-row production
     /// (#603), the golden's own law (`subtile_ir`'s EmbedRowGather eval arm)
     /// restated against resident HBM, on `run_fused_decode_attention`'s
@@ -717,7 +752,13 @@ impl ResidentExecutor {
     /// (logical `[hidden, vocab]`) walks before the lm-head matmul's view, so
     /// the tie between the two `[hidden, vocab]` views lands on the door's
     /// own: `rows = hidden`, the walk's own law.
-    fn run_embed_row_gather(&self, prog: usize, node: &NodeSpec, k: u32) -> Result<(), String> {
+    fn run_embed_row_gather(
+        &self,
+        prog: usize,
+        node: &NodeSpec,
+        k: u32,
+        hidden: u32,
+    ) -> Result<(), String> {
         let tids: Vec<u64> = node.bindings.iter().map(|b| b.tensor).collect();
         if tids.len() != 4 {
             return Err(format!(
@@ -733,12 +774,25 @@ impl ResidentExecutor {
                     .to_string(),
             );
         }
+        if hidden == 0 {
+            return Err(
+                "embed_row_gather: the payload states hidden = 0 — the gathered row's own \
+                 width is the walk's element count, and a zero hidden names no row"
+                    .to_string(),
+            );
+        }
         let (s_tid, l_tid, w_tid, o_tid) = (tids[0], tids[1], tids[2], tids[3]);
-        // ⭐ THE WIDTH, OFF THE ROW OUT'S OWN STATED EXTENT — `[width, hidden]`,
-        // one gathered row per request. The skeleton's Shape-only view states
-        // the tensor's own dims, so the widest-shape walk hands the door the
-        // mint's own statement; a 0-width or non-matrix out is a graph the
-        // mint never made.
+        // ⭐ THE WIDTH, OFF THE ROW OUT'S OWN STATED EXTENT — its ROW count, one
+        // gathered row per request; no device law pads a view's rows, so every view of
+        // the out agrees on it. A 0-width or non-matrix out is a graph the mint never
+        // made. ⛔ THE HIDDEN IS THE PAYLOAD'S OWN STATEMENT, never the out's stated
+        // cols: the resident's per-tid shape is the WIDEST view that addresses the tid
+        // (the allocation law), and a pointwise consumer of the rows legitimately
+        // restates them at its DEVICE width — `DeviceWidth::for_pointwise`'s
+        // unconditional util-floor bump pads a 128-wide row to 512 — so the merged
+        // view's cols are the allocation's padded width, not the mint's hidden. The
+        // weight check below carries the graph-the-mint-never-made guard, against the
+        // payload's own number.
         let o_shape = self.door_shape(prog, o_tid).ok_or_else(|| {
             format!("embed_row_gather: the row out t{o_tid} has no derived shape")
         })?;
@@ -750,7 +804,7 @@ impl ResidentExecutor {
                 o_shape
             ));
         }
-        let (width, hidden) = (o_shape[0], o_shape[1]);
+        let width = o_shape[0];
         // The weight at its OWN view dtype (an fp8-packed view reads one byte per
         // element — the same per-tid law the pointer binding and the readback
         // use), full extent.
@@ -765,11 +819,12 @@ impl ResidentExecutor {
             ));
         }
         let (rows, cols) = (shape[0], shape[1]);
+        let hidden = hidden as usize;
         if rows != hidden {
             return Err(format!(
-                "embed_row_gather: the row out t{o_tid} states hidden {hidden} but the weight \
-                 t{w_tid} states {rows} rows — the mint states one hidden off the matrix's own \
-                 row count; a disagreement is a graph the mint never made"
+                "embed_row_gather: the payload states hidden {hidden} but the weight t{w_tid} \
+                 states {rows} rows — the mint states one hidden off the matrix's own row \
+                 count; a disagreement is a graph the mint never made"
             ));
         }
         let w_stick = *self.stick.get(&w_tid).ok_or_else(|| {
@@ -835,7 +890,7 @@ impl ResidentExecutor {
         }
         // The rows out decode at the MODEL dtype on readback (the doors' views
         // are Shape-only, so `meta_for`'s per-tid lookup falls to `self.dtype`).
-        self.write_door_stick(prog, o_tid, &out)?;
+        self.write_door_window(prog, o_tid, &out)?;
         Ok(())
     }
 
@@ -1457,8 +1512,8 @@ impl ResidentExecutor {
                     // attention's oracle below: the door's decomposed path is the
                     // missing-Strides refusal, not a fallback.
                     let door_ran = match node.program {
-                        Program::EmbedRowGather { k } => {
-                            self.run_embed_row_gather(idx, node, k)?;
+                        Program::EmbedRowGather { k, hidden } => {
+                            self.run_embed_row_gather(idx, node, k, hidden)?;
                             true
                         }
                         Program::ChainStage { hidden, k, .. } => {
@@ -1495,13 +1550,46 @@ impl ResidentExecutor {
                         // No per-segment read-back (outputs flow via HBM; see the
                         // Fused arm) — the final read-back below decodes the results.
                         let key = self.seg_plan_key(func.operations);
-                        execute_function_in_exec_only(
-                            &self.mem,
-                            func.operations,
-                            grid,
-                            &input_ptrs,
-                            Some(key),
-                        )?;
+                        // ⭐ THE ENTRY FOLLOWS THE PROGRAM'S OWN WINDOW, not the
+                        // segment shape. A program that stated a pin window is a
+                        // baked bundle on the CARD path, and its native segments are
+                        // as much that path as its fused ones: the pinned entry arms
+                        // `ConvertModel::Card` (the `dl16tofp32` lane stagger every
+                        // f16→f32 widen of a baked program writes, the arrangement
+                        // the bundle's tables and seat are staged in) and charges the
+                        // pin window the bake proved. Running a window-stating
+                        // program's native body through the UNPINNED entry arms the
+                        // IEEE widen model instead — value-exact, UNPERMUTED — so
+                        // the widened rows meet stagger-staged tables lane for wrong
+                        // lane (MEASURED, gemma-4 tiny-paged bundle `8e4a8ace`: the
+                        // batch rung's sampler, isolated native at grid `[32]`, drew
+                        // 169 where its own logits' argmax — and the golden — was
+                        // 149; the same row through the fused/pinned entry drew 149).
+                        // A program that stated NO window is the window-less
+                        // decomposed executor's own (`new_native`), where nothing was
+                        // staged in the card arrangement — that path keeps the
+                        // unpinned entry and the IEEE model.
+                        match self.programs[idx].lx_pin_window_bytes {
+                            Some(window) => {
+                                execute_function_in_exec_only_pinned(
+                                    &self.mem,
+                                    func.operations,
+                                    grid,
+                                    &input_ptrs,
+                                    Some(key),
+                                    window,
+                                )?;
+                            }
+                            None => {
+                                execute_function_in_exec_only(
+                                    &self.mem,
+                                    func.operations,
+                                    grid,
+                                    &input_ptrs,
+                                    Some(key),
+                                )?;
+                            }
+                        }
                     }
                 }
             }

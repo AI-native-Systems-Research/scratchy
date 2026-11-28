@@ -1935,6 +1935,153 @@ impl PagedStepTids {
         chunk_masks: ktir_superdsc::reserved_tids::PAGED_CHUNK_MASKS_TID,
         int32_zero: ktir_superdsc::reserved_tids::PAGED_INT32_ZERO_TID,
     };
+
+    /// The step's tables at attention class `class` ([`attn_step_classes`]'s order). Class 0 IS
+    /// [`Self::RESERVED`] — a uniform model (one geometry) has exactly one class, so its ops name
+    /// the same tids as before and its bundle is byte-identical. Classes past the first take the
+    /// class region's class-dependent slots, [`PAGED_STEP_CLASS_STRIDE`] a class: the seven step
+    /// tables (query rows and the int32 zero stick are shared), then the per-window tables
+    /// [`paged_window_of_class`] reads.
+    pub fn of_class(class: usize) -> PagedStepTids {
+        if class == 0 {
+            return Self::RESERVED;
+        }
+        // The seven class-dependent tables, in PagedStepTids field order; class 1 takes the
+        // region's BASE slot (class 0 lives on the sentinels, so no slot is wasted).
+        let slot = |table: usize| {
+            ktir_superdsc::reserved_tids::paged_step_class_tid(
+                (class as u32 - 1) * ktir_superdsc::reserved_tids::PAGED_STEP_CLASS_STRIDE
+                    + table as u32,
+            )
+        };
+        PagedStepTids {
+            mask: slot(0),
+            page_table: slot(1),
+            write_rows: slot(2),
+            kv_row_pool: slot(3),
+            rep_rows: slot(4),
+            chunk_pages: slot(5),
+            chunk_masks: slot(6),
+            query_rows: Self::RESERVED.query_rows,
+            int32_zero: Self::RESERVED.int32_zero,
+        }
+    }
+
+    /// Every table a walk's trip reads at attention class `class` — its decode batch's chunk page
+    /// ids and chunk masks, and every packed-prefill window's page table and mask stack
+    /// ([`paged_window_of_class`]; window 0 is the class's own step tables).
+    pub fn walked_sources(class: usize) -> Vec<u32> {
+        let tids = Self::of_class(class);
+        let mut walked = vec![tids.chunk_pages, tids.chunk_masks];
+        for r in 0..ktir_superdsc::reserved_tids::PAGED_MAX_WINDOWS {
+            walked.push(paged_window_of_class(class, r, 1));
+            walked.push(paged_window_of_class(class, r, 2));
+        }
+        walked
+    }
+
+    /// Is `tid` a table some class's walk reads ([`Self::walked_sources`])? The class is decoded
+    /// from the tid itself ([`ktir_superdsc::reserved_tids::paged_step_class_of`]; class 0's tables
+    /// are the sentinels and the window region), so this answers for every class a model can state
+    /// without enumerating, or bounding, the classes.
+    pub fn is_walked_source(tid: u32) -> bool {
+        let class =
+            ktir_superdsc::reserved_tids::paged_step_class_of(tid).map_or(0, |c| c as usize);
+        Self::walked_sources(class).contains(&tid)
+    }
+}
+
+/// ⭐ A WINDOW'S TABLE AT AN ATTENTION CLASS — the class-aware statement of the packed prefill's
+/// window family. [`reserved_tids::paged_window_tid`] names window `r`'s three per-request tables
+/// (0 the query row index, 1 the page index table, 2 the mask stack) with window 0 IS the
+/// `paged_step` sentinels; THIS is the same family per class: the query row index is the graph's
+/// own rows — one table a window, EVERY class's — while the page table and mask stack are the
+/// class's own (a window changes which blocks the table names and what the mask tiles hold, and a
+/// hybrid model's classes carry different windows), window 0 being the class's own step tables
+/// ([`PagedStepTids::of_class`]; class 0's are the sentinels, so a uniform model binds the tids it
+/// has always bound, byte for byte) and the windows past the first the class region's slots
+/// ([`reserved_tids::paged_step_class_window_tid`]).
+///
+/// ONE source: the splice's operand binding and the wiring's mask-family check both read this
+/// function, so a class's bound masks cannot be one family at the kernel and another at the staged
+/// tables.
+pub fn paged_window_of_class(class: usize, window: u32, table: u32) -> u32 {
+    if class == 0 {
+        return ktir_superdsc::reserved_tids::paged_window_tid(window, table);
+    }
+    match table {
+        // The query row index gathers the graph's own rows — class-independent.
+        0 => ktir_superdsc::reserved_tids::paged_window_tid(window, 0),
+        1 | 2 => {
+            if window == 0 {
+                let tids = PagedStepTids::of_class(class);
+                if table == 1 {
+                    tids.page_table
+                } else {
+                    tids.mask
+                }
+            } else {
+                ktir_superdsc::reserved_tids::paged_step_class_window_tid(
+                    class as u32,
+                    window,
+                    table,
+                )
+            }
+        }
+        _ => unreachable!("a window owns three tables (paged_window_tid's own assert)"),
+    }
+}
+
+/// ⭐ THE ATTENTION STEP CLASSES — the tape's DISTINCT paged-step geometries, one per
+/// `(window, nkvh)` pair an `AttnDecode` states (window `0` = causal, no window), sorted
+/// DESCENDING so class 0 is the widest-windowed. A hybrid-attention model (gemma-4: sliding
+/// `W=1024, nkvh=8` layers and global full-attention `nkvh=1` layers) carries two; a uniform
+/// model carries one, and its class 0 keeps [`PagedStepTids::RESERVED`]'s tids so its bundle is
+/// byte-identical to the pre-class layout — the same law as
+/// `reserved_tids::rope_p_class_hds`.
+///
+/// This is the reference's own fact stated as a list: spyre-inference builds ONE
+/// `SpyreAttentionMetadataBuilder` per kv-cache group (`spyre_attn.py` 316-345, from the group's
+/// spec including its `sliding_window`), so each geometry gets its own metadata tables. ONE
+/// source: the splice's tid binding and the wiring mint both read this list, so a class index
+/// cannot mean one geometry at the kernel and another at the staged tables.
+pub fn attn_step_classes<F: scratchy_subtile::subtile_ir::RopeForm>(
+    ir: &SubtileIR<F>,
+) -> Vec<(u32, u32)> {
+    let mut out: Vec<(u32, u32)> = ir
+        .nodes
+        .iter()
+        .filter_map(|n| match &n.op {
+            SubOp::AttnDecode {
+                mask, attention, ..
+            } => Some((
+                mask.window().map(|w| w.get()).unwrap_or(0),
+                attention.class(mask.class()).kv_heads().get(),
+            )),
+            _ => None,
+        })
+        .collect();
+    out.sort_unstable_by(|a, b| b.cmp(a));
+    out.dedup();
+    out
+}
+
+/// The class of one attention's step in [`attn_step_classes`]'s order.
+pub fn attn_step_class_of<F: scratchy_subtile::subtile_ir::RopeForm>(
+    ir: &SubtileIR<F>,
+    window: Option<std::num::NonZeroU32>,
+    nkvh: u32,
+) -> Result<usize, String> {
+    let key = (window.map(|w| w.get()).unwrap_or(0), nkvh);
+    attn_step_classes(ir)
+        .iter()
+        .position(|k| *k == key)
+        .ok_or_else(|| {
+            format!(
+                "triton splice: an AttnDecode of window {key:?} is not among the graph's \
+                 attention step classes"
+            )
+        })
 }
 
 /// THE ATTENTION FAMILY's prefill kernel — `page_attn_head_major_prefill.py`, spyre-inference's
@@ -2056,6 +2203,23 @@ fn whole<F: scratchy_subtile::subtile_ir::RopeForm>(
     Ok(())
 }
 
+/// ⭐ THE WINDOW'S WALK BOUND — the reference's `_max_active_blocks` (`spyre_attn.py`): the widest
+/// span ONE request's queries can sweep. A query at the walk's end reaches back `window` positions,
+/// and a wide query pushes its earliest window start back `per_request − 1` more, so the span is
+/// `window + per_request − 1` positions; the block straddling the window's start adds one more,
+/// and the pool caps all of it — `min(pages, ceil((window + per_request − 1) / block) + 1)`, the
+/// `block` the READER'S OWN pages are sized by (the scheduler's reference page at the splice, the
+/// step's own `page_slots` at the wiring — the mint states they are the same number). The ONE
+/// bound every reader of a windowed walk caps by, never restated.
+pub fn window_walk_blocks(
+    pages: u32,
+    window: std::num::NonZeroU32,
+    per_request: u32,
+    block: u32,
+) -> u32 {
+    ((window.get() + per_request - 1).div_ceil(block) + 1).min(pages)
+}
+
 /// ⭐ A DECODE BATCH'S CHUNK FITS ITS POOL — it gathers fewer pages than the pool holds: a gather of
 /// the whole pool faults the card (torch-spyre#4033), and this port has no per-sequence loop to
 /// serve that step. The ONE statement the splice checks at the pool it lowers over and the bake's
@@ -2065,24 +2229,46 @@ pub fn chunk_fits_pool(chunking: &BatchChunking, pool_pages: u32) -> bool {
 }
 
 /// ⭐ THE WALK — how many blocks of the page table a rung's attention reads (`NUM_BLOCKS`): the rung's
-/// swept extent in pages. Every page of the context at `ActiveCap::FULL` (a decode step's keys can sit
-/// anywhere below it); the pool may hold more pages than the context, and the walk never reaches past
-/// the context. At `ActiveCap::NONE` (a prompt chunk baked with no resident
-/// prefix) the pages its own `mq` rows fill.
+/// swept extent in pages. Every page of the CONTEXT at `ActiveCap::FULL` (a decode step's keys can sit
+/// anywhere below it); the pool may hold fewer pages than the context (the bake's budget law,
+/// [`crate::pool_pages`]), and no request is scheduled past the pool, so the walk over the context
+/// is the walk over what any request can hold. At `ActiveCap::NONE` (a prompt chunk baked with no
+/// resident prefix) the pages its own `mq` rows fill — `mq` the ARM's own fill (the graph's rows
+/// for a decode batch, one request's width for a prefill chunk), `per_request` one request's query
+/// width.
+///
+/// A windowed op caps the walk at its own [`window_walk_blocks`]: whatever the rung sweeps, no
+/// request can touch past its window's span, so the walk stops at the bound. The bound never
+/// widens a walk — `min`, never `max` — so a chunk narrower than the window keeps its own pages.
 ///
 /// Blocks past a sequence's length carry a fully-masked tile, so a walk wider than the context costs
 /// time, never correctness; a walk NARROWER than the context drops keys. So the walk is also the reach
-/// of the rung: a step whose positions end at or below `walk · SchedulerBlockTokens::REFERENCE` can run on it, whatever its
+/// of the rung: a step whose span fits `walk · SchedulerBlockTokens::REFERENCE` can run on it, whatever its
 /// start — the mask stack, not the rung, says which of the walked keys each row attends. The splice
 /// bakes it and the wiring states it (`PagedStep::walk`) from this one function.
-pub fn walk_pages(context: u32, mq: u32, active_cap: ktir_superdsc::ktir_node::ActiveCap) -> u32 {
-    let swept = active_cap.resolve(context, ktir_superdsc::sdsc_abstract::POOL_STICK);
+pub fn walk_pages(
+    context_pages: u32,
+    mq: u32,
+    per_request: u32,
+    active_cap: ktir_superdsc::ktir_node::ActiveCap,
+    window: Option<std::num::NonZeroU32>,
+) -> u32 {
+    let swept = active_cap.resolve(
+        context_pages * SchedulerBlockTokens::REFERENCE.get(),
+        ktir_superdsc::sdsc_abstract::POOL_STICK,
+    );
     let walked = if swept == 0 { mq } else { swept };
-    walked
-        .div_ceil(SchedulerBlockTokens::REFERENCE.get())
-        .min(std::num::NonZeroU32::new(context).map_or(0, |c| ContextPages::of_slots(c).get()))
+    let mut blocks = walked.div_ceil(SchedulerBlockTokens::REFERENCE.get());
+    if let Some(w) = window {
+        blocks = blocks.min(window_walk_blocks(
+            context_pages,
+            w,
+            per_request,
+            SchedulerBlockTokens::REFERENCE.get(),
+        ));
+    }
+    blocks.min(context_pages)
 }
-
 /// ⭐ THE WALK RUNGS — spyre-inference's `SpyreAttnBucketer` (`spyre_attn_bucketer.py`, 297fc48): its
 /// kv buckets are the powers of two from one block up to `max_model_len`, plus `max_model_len`
 /// itself, and the kernel is specialized on `num_blocks = ceil(kv / block)` of each. Over a pool of
@@ -2098,6 +2284,45 @@ pub fn walk_buckets(pages: u32) -> Vec<u32> {
     }
     buckets.push(pages);
     buckets
+}
+
+#[cfg(test)]
+mod window_walk_law {
+    use super::*;
+    use ktir_superdsc::ktir_node::ActiveCap;
+
+    fn nz(n: u32) -> std::num::NonZeroU32 {
+        std::num::NonZeroU32::new(n).expect("nonzero")
+    }
+
+    /// The reference's `_max_active_blocks`: `ceil((W + w − 1)/B) + 1`, the straddling block's
+    /// +1 included. Pinned at B = 64 (half the reference's own 128, the walk's real block — see
+    /// `a_windowed_walk_caps_the_sweep_at_its_bound`): a 1024-position window at one query row
+    /// walks 17 blocks; a 64-row prefill chunk's wider reach pushes the earliest window start
+    /// back and the bound to 18; the pool caps a bound past it.
+    #[test]
+    fn the_bound_is_the_reference_s_max_active_blocks() {
+        assert_eq!(window_walk_blocks(780, nz(1024), 1, 64), 17);
+        assert_eq!(window_walk_blocks(780, nz(1024), 64, 64), 18);
+        assert_eq!(window_walk_blocks(4, nz(1024), 1, 64), 4);
+    }
+
+    /// A windowed body never walks the rung's whole sweep: the pool's 780 blocks at FULL cap to
+    /// the 9-block bound (the reference's own 128-token block — a 1024-position window at one
+    /// query row: `ceil(1024/128) + 1`), and a windowless op keeps every block — the cap only
+    /// ever narrows.
+    #[test]
+    fn a_windowed_walk_caps_the_sweep_at_its_bound() {
+        assert_eq!(walk_pages(780, 1, 1, ActiveCap::FULL, Some(nz(1024))), 9);
+        assert_eq!(walk_pages(780, 1, 1, ActiveCap::FULL, None), 780);
+    }
+
+    /// The cap never widens a walk: a chunk narrower than its window keeps its own pages — a
+    /// prefix-free chunk's 64 rows fill one page, below the 17-block bound.
+    #[test]
+    fn a_chunk_narrower_than_its_window_keeps_its_own_pages() {
+        assert_eq!(walk_pages(780, 64, 64, ActiveCap::NONE, Some(nz(1024))), 1);
+    }
 }
 
 /// The KV cache's allocation in a one-kernel bundle — see
@@ -2156,15 +2381,12 @@ pub fn lower_attn<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile
             "triton splice: lower_attn called on a node that is not an AttnDecode".to_string(),
         );
     };
-    // Their paged kernels attend causally; a sliding window (gemma's local layers) is not theirs.
-    if let scratchy_subtile::subtile_ir::AttnMask::SlidingWindow { window } = mask {
-        return Err(format!(
-            "triton splice: AttnDecode t{}: a {window}-position sliding window — spyre-inference's \
-             paged attention kernels attend every position up to the query's own, and have no \
-             window",
-            node.output.tensor.index()
-        ));
-    }
+    // The window rides the MASK STACK, never the kernels: every paged kernel takes its keys'
+    // liveness from the additive mask the step stages, and a windowed step stages exactly the
+    // reference's windowed tiles (a key live for the query at `pos` iff `pos − window + 1 ≤
+    // kv ≤ pos`) over the walk the window bounds. The op's own window reaches here at ONE
+    // source — `mask.window()`, the walk's bound below and the wiring's staged tiles above —
+    // and nothing else about a windowed op differs from a causal one.
     if node.inputs.len() < 5 {
         return Err(format!(
             "triton splice: AttnDecode t{} expects 5 inputs [q, k cache, v cache, new k, new v], \
@@ -2229,13 +2451,29 @@ pub fn lower_attn<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile
     // number, which is why one `mq` served until S > 1; a packed rung's walk must cover one
     // request's `width` rows of its own record, not `width · S` rows of both records fused. The
     // decode kernel (one query row) and the batched kernel (the request axis carried inside one
-    // launch) keep the graph's row count, exactly as before.
+    // launch) keep the graph's row count, exactly as before. The window's span bound always reads
+    // ONE request's width — a batch's sequences sweep their own windows, never each other's.
+    let window = mask.window();
     let blocks = if batch || decode {
-        walk_pages(*valid_len, mq, active_cap)
+        walk_pages(
+            view.get(),
+            mq,
+            query_rows.per_request().get(),
+            active_cap,
+            window,
+        )
     } else {
-        walk_pages(*valid_len, query_rows.per_request().get(), active_cap)
+        let w = query_rows.per_request().get();
+        walk_pages(view.get(), w, w, active_cap, window)
     };
-    let tids = PagedStepTids::RESERVED;
+    // ⭐ THE NODE'S OWN CLASS'S TABLES — a hybrid's geometries each carry their own, and this
+    // node's `(window, nkvh)` names its class in the one list the mint also reads.
+    // ⭐ THE STEP'S CLASS — its tables bind this class's tids, so a hybrid model's two attention
+    // geometries each read their own staged page table, mask stack and write rows. The class is
+    // hoisted because the window family below is class-aware too: a window's page table and mask
+    // stack are the class's own ([`paged_window_of_class`]).
+    let class = attn_step_class_of(ir, window, nkvh)?;
+    let tids = PagedStepTids::of_class(class);
     // ⭐ THE POOLS' FORMAT IS THE TAPE'S — the writer this attention's cache names
     // ([`attn_pool_format`]), never a build selection.
     let format = attn_pool_format(ir, node)?;
@@ -2340,8 +2578,10 @@ pub fn lower_attn<T: ktir_superdsc::collective::Tp, F: scratchy_subtile::subtile
     let KtirNode { func, program, .. } = positional;
     let mut out = Vec::with_capacity(windows as usize);
     for r in 0..windows {
-        let window =
-            |table: u32| BufferId::new(ktir_superdsc::reserved_tids::paged_window_tid(r, table));
+        // ⭐ THE WINDOW FAMILY AT THE OP'S OWN CLASS — the query row index is the graph's own rows
+        // (shared), the page table and mask stack are the class's own ([`paged_window_of_class`],
+        // the one law the wiring's mask-family check also reads).
+        let window = |table: u32| BufferId::new(paged_window_of_class(class, r, table));
         let mut bindings = vec![
             t(&node.inputs[0]),
             window(0),
@@ -2677,12 +2917,64 @@ pub fn lower_kv_write<
     )?;
     let t =
         |tr: &scratchy_subtile::subtile_ir::TensorRegion| BufferId::new(tr.tensor.index() as u32);
+    // ⭐ THE WRITE ROWS' CLASS — a hybrid model's attention geometries each carry their own
+    // write-row table (the kv-head count sizes a row's index), and the attention a writer serves
+    // names it: `KvCacheProducer::SameForwardRopeAppend { producer_node_idx }` points back at
+    // THIS node, so the writer's class is its reader's. A writer no attention names has no step
+    // to stage its rows — refused rather than guessed.
+    let idx = ir
+        .nodes
+        .iter()
+        .position(|n| n.id == node.id)
+        .ok_or_else(|| {
+            format!(
+                "triton splice: RopeAppend {} is not among the graph's nodes",
+                node.id.index()
+            )
+        })? as u32;
+    let (window, reader_nkvh) = ir
+        .nodes
+        .iter()
+        .filter_map(|n| match &n.op {
+            SubOp::AttnDecode {
+                mask,
+                attention,
+                producer:
+                    scratchy_subtile::subtile_ir::KvCacheProducer::SameForwardRopeAppend {
+                        producer_node_idx,
+                        ..
+                    },
+                ..
+            } if *producer_node_idx == idx => Some((
+                mask.window(),
+                attention.class(mask.class()).kv_heads().get(),
+            )),
+            _ => None,
+        })
+        .next()
+        .ok_or_else(|| {
+            format!(
+                "triton splice: RopeAppend t{} writes a cache no attention in this graph reads — \
+                 its write rows belong to no paged step",
+                node.output.tensor.index()
+            )
+        })?;
+    if reader_nkvh != nkvh {
+        return Err(format!(
+            "triton splice: RopeAppend t{} writes {} kv head(s) for an attention of {} — the \
+             writer and its reader disagree about the cache's geometry",
+            node.output.tensor.index(),
+            nkvh,
+            reader_nkvh
+        ));
+    }
+    let class = attn_step_class_of(ir, window, nkvh)?;
     let bindings = vec![
         t(key),
         t(value),
         t(k_pool),
         t(v_pool),
-        BufferId::new(PagedStepTids::RESERVED.write_rows),
+        BufferId::new(PagedStepTids::of_class(class).write_rows),
     ];
     let name = format!("kvwrite_s{}", node.id.index());
     let k = rebind(positional, name.clone(), bindings, None)?;
@@ -4311,10 +4603,13 @@ pub fn operand_dfs<F: scratchy_subtile::subtile_ir::RopeForm>(
         };
         match arg {
             ArgSpec::Ptr(t) => dfs.push(df_of_stated_type(&p.name, t)?),
-            // A scalar parameter is not an operand buffer; the zip with the
-            // binding law below refuses any kernel whose parameters are not
-            // exactly its operands.
-            ArgSpec::Scalar(_) => {}
+            // ⭐ A RUNTIME SCALAR IS STILL AN OPERAND — the rung-3 scalar shape
+            // (`scalarwmul.py`'s `w`): the node binds a `[1]`-element staged buffer
+            // and the launch reads its single value into the scalar, so the census
+            // carries that binding at the scalar's own stated dtype. A kernel whose
+            // scalar has no matching binding is still refused by the zip's count
+            // below.
+            ArgSpec::Scalar(t) => dfs.push(df_of_stated_type(&p.name, t)?),
             ArgSpec::Constexpr => unreachable!("is_constexpr filtered the parameter above"),
         }
     }
@@ -4972,9 +5267,11 @@ mod production_ktir_dump {
             block: SchedulerBlockTokens::REFERENCE,
             pages: ContextPages::new(nz(4)),
             blocks: WalkBlocks::new(nz(walk_pages(
-                4 * SchedulerBlockTokens::REFERENCE.get(),
+                4,
+                64,
                 64,
                 ktir_superdsc::ktir_node::ActiveCap::NONE,
+                None,
             ))),
             scale,
         })
@@ -6875,16 +7172,19 @@ mod walk_on_the_card {
     /// ⭐⭐ THE PROMPT TRIP IN torch-spyre's FORM — its compiled prefill's: the query rows split across
     /// the cores, each core holding whole query rows of every head (row `p·32 + h`), the scores and
     /// the value product each ONE contraction over every query head against the kv head's block
-    /// expanded once per query head of its group (read by every core at one start, from HBM), the
+    /// expanded once per query head of its group — laid by the expansion's own group-slot copies,
+    /// one copy op per query head of the group into the one kernel scratch (the phantom-axis
+    /// broadcast op that did it in one is deleted: its stick-moving device order was the rung-29
+    /// card corruption) — read by every core at one start, from HBM, the
     /// mask added a stick plane at a time sprayed over each query row's heads in place, and the
     /// scores, the softmax and the carried state all in each core's LX. The trip's ops do not grow
-    /// with the rows: 23 at either head dim, each page gathered in one op (the reference's trip is
+    /// with the rows: 29 at either head dim, each page gathered in one op (the reference's trip is
     /// 21). At 512 rows every value still fits, because a pin is held
     /// for its value's lifetime rather than the walk's (torch-spyre's placement), so values the trip
     /// is done with hand their bytes to the next.
     #[test]
     fn the_prompt_trip_splits_its_query_rows_across_the_cores_in_lx() {
-        for (mq, hd, trip) in [(128, 64, 23), (512, 64, 23), (128, 128, 23), (512, 128, 23)] {
+        for (mq, hd, trip) in [(128, 64, 29), (512, 64, 29), (128, 128, 29), (512, 128, 29)] {
             let blocks = 4;
             let node = walk_at(mq, blocks, hd);
             let layout = triton_ktir_superdsc::layout::for_node(&node).expect("the walk places");
@@ -6919,19 +7219,26 @@ mod walk_on_the_card {
                 })
                 .collect();
             let bmms = named("bmm");
+            // The walk's 32 query heads over its 8 kv heads: the group the expansion serves.
+            let group = 32 / 8;
             assert_eq!(
                 (expanded.len(), bmms.len()),
-                (2, 2),
-                "mq={mq} hd={hd}: one expansion and one contraction for the scores and for the \
-                 value product"
+                (2 * group, 2),
+                "mq={mq} hd={hd}: the expansion's group-slot copies — one per query head of the \
+                 group — and one contraction for the scores and for the value product"
             );
-            for (e, kernel) in bmms.iter().zip(&expanded) {
+            for e in bmms.iter() {
                 let [a, k, out] = e.arg_bindings.as_slice() else {
                     panic!("{}: activation, kernel, output", e.op_name);
                 };
+                let slots = expanded
+                    .iter()
+                    .filter(|kernel| k.buffer == **kernel)
+                    .count();
                 assert_eq!(
-                    k.buffer, *kernel,
-                    "mq={mq} hd={hd} {}: the expanded block",
+                    slots, group,
+                    "mq={mq} hd={hd} {}: its kernel scratch laid by one copy per query head of \
+                     its group",
                     e.op_name
                 );
                 assert!(
@@ -7078,17 +7385,24 @@ mod walk_on_the_card {
             })
             .collect();
         let bmms = named("bmm");
+        // The walk's 32 query heads over its 8 kv heads: the group the expansion serves.
+        let group = 32 / 8;
         assert_eq!(
             (expanded.len(), bmms.len()),
-            (2, 2),
-            "the scores and the value product: one expansion and one contraction each"
+            (2 * group, 2),
+            "the scores and the value product: the expansion's group-slot copies — one per \
+             query head of the group — and one contraction each"
         );
-        for (&i, kernel) in bmms.iter().zip(&expanded) {
+        for &i in &bmms {
             let e = &ops[i];
             assert!(e.walk.is_some(), "{}: on the trip", e.op_name);
+            let slots = expanded
+                .iter()
+                .filter(|kernel| e.arg_bindings[1].buffer == **kernel)
+                .count();
             assert_eq!(
-                e.arg_bindings[1].buffer, *kernel,
-                "{}: its kernel is the expanded block",
+                slots, group,
+                "{}: its kernel scratch laid by one copy per query head of its group",
                 e.op_name
             );
         }

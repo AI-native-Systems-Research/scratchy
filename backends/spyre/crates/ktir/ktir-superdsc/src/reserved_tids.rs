@@ -446,7 +446,7 @@ pub const PAGED_CHUNK_MASKS_TID: u32 = reserved_region("paged_step").at(7);
 pub const PAGED_INT32_ZERO_TID: u32 = reserved_region("paged_step").at(8);
 
 /// Every reserved region, in one place. Order is high tid → low.
-pub const RESERVED_REGIONS: [TidRegion; 10] = [
+pub const RESERVED_REGIONS: [TidRegion; 11] = [
     // The single sentinels (`ROPE_P_TID` .. `IDENTITY_TID`) occupy MAX-1 .. MAX-19.
     TidRegion {
         name: "sentinels",
@@ -527,6 +527,16 @@ pub const RESERVED_REGIONS: [TidRegion; 10] = [
         name: "paged_window",
         base: PAGED_WINDOW_BASE,
         slots: PAGED_WINDOW_TABLES * (PAGED_MAX_WINDOWS - 1),
+    },
+    // ⭐ THE PAGED STEP's CLASS REGION — the class-dependent tables of every attention class past
+    // the first (class 0 keeps the `paged_step` sentinels; see [`PAGED_STEP_CLASS_BASE`]): the
+    // seven step tables plus the per-window tables of every packed-prefill window past the first
+    // ([`paged_step_class_window_tid`]). The LOWEST region, so it holds every whole class stride
+    // down to [`RESERVED_ID_HALF`]: the model's own class count, with no cap.
+    TidRegion {
+        name: "paged_step_class",
+        base: PAGED_STEP_CLASS_BASE,
+        slots: PAGED_STEP_CLASS_STRIDE * PAGED_STEP_CLASS_STRIDES,
     },
 ];
 
@@ -609,6 +619,120 @@ pub const fn paged_window_tid(window: u32, table: u32) -> u32 {
     }
 }
 
+/// ⭐⭐⭐⭐⭐ THE PAGED STEP's **CLASS** REGION — the step tables of every attention class past the
+/// first.
+///
+/// A hybrid-attention model (gemma-4: sliding `W=1024, nkvh=8` layers and global full-attention
+/// `nkvh=1` layers) carries TWO paged steps in one tape, and one set of tables cannot serve both:
+/// the window changes which blocks the page table names (the ACTIVE blocks, `spyre_attn.py`'s
+/// `_build_active_tiles_with_skip`) and the mask tiles' content, and the kv-head count changes the
+/// write-row index, `kv_row_pool` and a decode batch's chunking. The reference states the same
+/// fact its own way: ONE `SpyreAttentionMetadataBuilder` per kv-cache group (`spyre_attn.py`
+/// 316-345, built from the group's spec including its `sliding_window`), so each class gets its
+/// own metadata tables.
+///
+/// ## Class ordering, and why class 0 keeps the sentinel tids
+/// Classes are the tape's DISTINCT attention step geometries — the `(window, nkvh)` pairs — sorted
+/// DESCENDING, so class 0 is the widest-windowed. Class 0 answers the `paged_step` region's own
+/// [`PAGED_MASK_TID`] .. [`PAGED_CHUNK_MASKS_TID`] sentinels: a UNIFORM model (every attention one
+/// geometry) has exactly one class, so its ops still name those tids and its bundle is
+/// byte-identical to the pre-class layout. Classes `1..N-1` take this region's slots,
+/// [`PAGED_STEP_CLASS_STRIDE`] a class: the seven class-dependent step tables (mask, page table,
+/// write rows, `kv_row_pool`, `rep_row_ids`, `chunk_page_ids`, `mask_by_chunk`; the query-row index
+/// and the int32 zero stick are shared), then the page table and mask stack of every packed-prefill
+/// window past the first ([`paged_step_class_window_tid`] — window 0 IS the class's own step
+/// tables, class 0's being the `paged_step` sentinels).
+///
+/// ## Why below `paged_window`, a NEW region rather than widening it
+/// The same law every region below `paged_step` follows: the regions above are numbers baked into
+/// existing bundles' bindings, and sliding a floor down to grow one would repoint ids already
+/// baked into artifacts. This region takes the untouched space below `paged_window`'s floor, and
+/// the compile-time disjointness proof covers it.
+pub const PAGED_STEP_CLASS_BASE: u32 =
+    PAGED_WINDOW_BASE - PAGED_WINDOW_TABLES * (PAGED_MAX_WINDOWS - 1);
+
+/// How many class-DEPENDENT step tables one attention class past the first owns (see
+/// [`PAGED_STEP_CLASS_BASE`]'s class law for which seven).
+pub const PAGED_STEP_CLASS_TABLES: u32 = 7;
+
+/// How many class-DEPENDENT tables one PACKED PREFILL WINDOW past the first owns: the page index
+/// table and the mask stack, in [`paged_window_tid`]'s own numbering (the query row index is the
+/// graph's own rows — one table per window, every class's, through [`paged_window_tid`]).
+pub const PAGED_STEP_CLASS_WINDOW_TABLES: u32 = 2;
+
+/// One attention class's whole stride in the class region: its seven step tables plus the
+/// per-window tables of every packed-prefill window past the first. The class law the splice's
+/// `PagedStepTids::of_class` and [`paged_step_class_window_tid`] both count by — ONE statement of
+/// the layout, in the region that owns the arithmetic.
+pub const PAGED_STEP_CLASS_STRIDE: u32 =
+    PAGED_STEP_CLASS_TABLES + PAGED_STEP_CLASS_WINDOW_TABLES * (PAGED_MAX_WINDOWS - 1);
+
+/// ⭐ THE RESERVED HALF OF THE TID SPACE — every reserved region lives at or above it, and a graph's
+/// own tensors index the space below it ([`real_tids_fit`]). A partition of the `u32` id space, not
+/// a count of any model's tensors or attention classes: the regions are proven inside the upper
+/// half at compile time ([`PAGED_STEP_CLASS_FAMILY_IS_BOUNDED`]), and a bake proves its graph's
+/// tensor count below it, so a reserved tid and a real one can never coincide.
+pub const RESERVED_ID_HALF: u32 = 1 << 31;
+
+/// The class region's whole class strides — as many as fit from [`PAGED_STEP_CLASS_BASE`] down to
+/// [`RESERVED_ID_HALF`]. Every attention class past the first takes one stride, so the region holds
+/// the model's own class count, whatever it is: there is no class cap sized to any checkpoint.
+const PAGED_STEP_CLASS_STRIDES: u32 =
+    (PAGED_STEP_CLASS_BASE - RESERVED_ID_HALF + 1) / PAGED_STEP_CLASS_STRIDE;
+
+/// Does a graph of `tensors` real tensors fit below [`RESERVED_ID_HALF`]? Its ids are `0..tensors`,
+/// so it fits exactly while the count does. The bake asks this where it places the graph's
+/// tensors, so a real tid can never land on a reserved one.
+pub const fn real_tids_fit(tensors: usize) -> bool {
+    tensors <= RESERVED_ID_HALF as usize
+}
+
+/// The attention class (`>= 1`) whose slot `tid` is in the class region, or `None` for a tid
+/// outside it — [`paged_step_class_window_tid`]'s arithmetic, inverted: class `c`'s slots are
+/// `(c - 1)·STRIDE .. c·STRIDE` below the base. A reader asking "is this tid one of some class's
+/// tables?" decodes the class here and asks that class, so it never enumerates classes it cannot
+/// bound.
+pub const fn paged_step_class_of(tid: u32) -> Option<u32> {
+    let r = reserved_region("paged_step_class");
+    if tid > r.base || tid < r.floor() {
+        return None;
+    }
+    Some((r.base - tid) / PAGED_STEP_CLASS_STRIDE + 1)
+}
+
+/// Reserved tid for slot `idx` of the paged-step class region — the class-dependent step tables of
+/// the classes past the first (see [`PAGED_STEP_CLASS_BASE`] for the class law and the seven-table
+/// layout). The splice owns which slot is which table; this is only the region's arithmetic.
+pub const fn paged_step_class_tid(idx: u32) -> u32 {
+    reserved_region("paged_step_class").at(idx)
+}
+
+/// ⭐ A CLASS's PACKED PREFILL WINDOW past the first — window `window`'s copy of `table` for the
+/// attention class `class` ≥ 1, in [`paged_window_tid`]'s OWN numbering (1 the page index table,
+/// 2 the mask stack; the query row index is shared and never passes through here). The
+/// class-aware half of `paged_window_tid`'s family law: window 0 IS the class's own step tables
+/// (class 0's being the `paged_step` sentinels), and the windows past the first take this region's
+/// slots — stated here so the splice and the wiring's mask-family check read ONE law.
+pub const fn paged_step_class_window_tid(class: u32, window: u32, table: u32) -> u32 {
+    assert!(class >= 1, "class 0's windows are the paged_window family");
+    assert!(window >= 1, "window 0 is the class's own step tables");
+    assert!(
+        window < PAGED_MAX_WINDOWS,
+        "a packed rung asked for a window past PAGED_MAX_WINDOWS"
+    );
+    assert!(
+        table == 1 || table == 2,
+        "a window past the first owns the page table and the mask stack, in paged_window_tid's \
+         own numbering (the query row index is shared)"
+    );
+    paged_step_class_tid(
+        (class - 1) * PAGED_STEP_CLASS_STRIDE
+            + PAGED_STEP_CLASS_TABLES
+            + (window - 1) * PAGED_STEP_CLASS_WINDOW_TABLES
+            + (table - 1),
+    )
+}
+
 /// Is `tid` one of the reserved synthetics — a sentinel, a slot of any region, or `LAST_HIDDEN_TID`
 /// (which sits at `u32::MAX`, one ABOVE the sentinels region's base, so a region scan alone misses
 /// it)?
@@ -673,6 +797,7 @@ const _: () = {
     let _ = RESERVED_REGIONS_ARE_DISJOINT;
     let _ = EVERY_NAMED_REGION_RESOLVES;
     let _ = PAGED_WINDOW_0_IS_THE_SENTINELS;
+    let _ = PAGED_STEP_CLASS_FAMILY_IS_BOUNDED;
 };
 
 /// ⭐⭐⭐ EVERY NAME THIS MODULE ADDRESSES A REGION BY, RESOLVED AT COMPILE TIME.
@@ -689,6 +814,7 @@ pub const EVERY_NAMED_REGION_RESOLVES: () = {
     assert!(reserved_region("kct_resident").slots > 0);
     assert!(reserved_region("paged_step").base == PAGED_STEP_BASE);
     assert!(reserved_region("paged_window").base == PAGED_WINDOW_BASE);
+    assert!(reserved_region("paged_step_class").base == PAGED_STEP_CLASS_BASE);
 };
 
 /// ⭐ WINDOW 0 IS THE SENTINELS — the law a solo rung's byte-identity stands on. Every window
@@ -711,6 +837,30 @@ pub const PAGED_WINDOW_0_IS_THE_SENTINELS: () = {
         r.floor() > PAGED_WINDOW_BASE - PAGED_WINDOW_TABLES * PAGED_MAX_WINDOWS,
         "the paged_window region runs into tids below its own widest use"
     );
+};
+
+/// ⭐ ONE CLASS'S TABLES FILL EXACTLY ITS OWN STRIDE, AND THE REGION STAYS IN THE RESERVED HALF —
+/// the laws the class family's disjointness stands on. A class's last window table (the widest
+/// window's mask stack) is the last slot of its stride, so classes never overlap one another; the
+/// region holds whole strides down to [`RESERVED_ID_HALF`], and [`paged_step_class_of`] inverts
+/// the same arithmetic.
+pub const PAGED_STEP_CLASS_FAMILY_IS_BOUNDED: () = {
+    let r = reserved_region("paged_step_class");
+    assert!(
+        paged_step_class_window_tid(1, PAGED_MAX_WINDOWS - 1, PAGED_WINDOW_TABLES - 1)
+            == r.base - (PAGED_STEP_CLASS_STRIDE - 1),
+        "class 1's last window table is not the last slot of its stride — classes would overlap"
+    );
+    assert!(
+        r.floor() >= RESERVED_ID_HALF,
+        "the paged_step_class region runs below the reserved half of the tid space"
+    );
+    assert!(
+        matches!(paged_step_class_of(r.floor()), Some(c) if c == PAGED_STEP_CLASS_STRIDES),
+        "the region's floor does not decode to its last class"
+    );
+    assert!(matches!(paged_step_class_of(r.base), Some(1)));
+    assert!(paged_step_class_of(r.base + 1).is_none());
 };
 
 pub const SENTINELS_ARE_INSIDE_THEIR_REGION: () = {

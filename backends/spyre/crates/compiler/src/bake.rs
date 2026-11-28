@@ -522,8 +522,29 @@ fn emit_superdsc_wiring(
     // that reads the mask names its layer's K pool (a `PrefixK` source) and V pool (a `PrefixV`
     // source). Nothing else of the layer leaves the device — the step's K/V are scattered into the
     // pools by the layer's own write — so the pools are the whole per-layer wiring.
+    //
+    // ⭐ EVERY CLASS'S MASK FAMILY — a hybrid model's classes each read their OWN mask
+    // (`attn_mask` is class 0's), so the scan admits a node binding ANY step's family: the
+    // step's mask at each of its windows (`paged_window_of_class`, the one family law), or
+    // the batch's chunk masks. The `layers` list is keyed by the layer the POOL names, so
+    // classes cannot collide there.
     let mut layers: Vec<(u64, u32, u32)> = Vec::new();
-    if let Some(mask) = gk.attn_mask {
+    if gk.attn_mask.is_some() {
+        let masks: std::collections::HashSet<u32> = gk
+            .paged
+            .iter()
+            .flat_map(|p| match p.paged_rows {
+                scratchy_target_spyre::paged_step::PagedRows::Batch => {
+                    vec![p.chunk_masks]
+                }
+                scratchy_target_spyre::paged_step::PagedRows::Sequence => (0..p
+                    .extent
+                    .requests()
+                    .get())
+                    .map(|r| scratchy_triton_splice::paged_window_of_class(p.class as usize, r, 2))
+                    .collect(),
+            })
+            .collect();
         let pk: std::collections::HashMap<u32, u64> = lwd
             .bindings()
             .iter()
@@ -543,7 +564,7 @@ fn emit_superdsc_wiring(
             })
             .collect();
         for node in &gk.nodes {
-            if !node.args.iter().any(|a| *a as u32 == mask) {
+            if !node.args.iter().any(|a| masks.contains(&(*a as u32))) {
                 continue;
             }
             let k_pool = node
@@ -553,7 +574,16 @@ fn emit_superdsc_wiring(
                 .find(|a| pk.contains_key(a));
             let v_pool = node.args.iter().map(|a| *a as u32).find(|a| pv.contains(a));
             if let (Some(ks), Some(vs)) = (k_pool, v_pool) {
-                layers.push((pk[&ks], ks, vs));
+                // ⭐ THE PACKED PREFILL'S WINDOW COPIES state the SAME wiring once per window
+                // (`attn_s{id}_w{r}`, one node a request window, each binding the layer's own
+                // pools beside its own window tables) — a copy RESTATES a layer's wiring, never
+                // binds it a second time, so the triple is collected once. A node claiming a
+                // layer a DIFFERENT pool names is the real "bound twice" defect the lock below
+                // exists to catch, and an exact-duplicate filter leaves it caught.
+                let entry = (pk[&ks], ks, vs);
+                if !layers.contains(&entry) {
+                    layers.push(entry);
+                }
             }
         }
         layers.sort_by_key(|x| x.0);
@@ -896,10 +926,13 @@ fn emit_superdsc_wiring(
         }
         None => quote! { ::core::option::Option::None },
     };
-    // ⭐ THE PAGED STEP, as the bake derived it (`paged_step_of_ir`) — the worker stages its three
-    // sources every step against this pool.
-    let paged = match gk.paged {
-        Some(p) => {
+    // ⭐ THE PAGED STEPS, as the bake derived them (`paged_step_of_ir`) — one per attention
+    // class, class-sorted, and the worker stages every class's sources each step against the one
+    // pool they share.
+    let paged: Vec<proc_macro2::TokenStream> = gk
+        .paged
+        .iter()
+        .map(|p| {
             let (m, t, w) = (u32l(p.mask), u32l(p.page_table), u32l(p.write_rows));
             let (q, kvp) = (u32l(p.query_rows), u32l(p.kv_row_pool));
             let (rr, cp, cm) = (u32l(p.rep_rows), u32l(p.chunk_pages), u32l(p.chunk_masks));
@@ -907,6 +940,7 @@ fn emit_superdsc_wiring(
             let (pages, slots) = (u32l(p.pages), u32l(p.page_slots));
             let (rows, nkvh, walk) = (u32l(p.rows), u32l(p.nkvh), u32l(p.walk));
             let (q_width, head_size) = (u32l(p.q_width), u32l(p.head_size));
+            let class = u32l(p.class);
             // ⭐ THE EXTENT PAIR, re-minted in the wiring's own static by the ONE mint
             // (`QueryExtent::of_baked_rung`, the same constructor the bake's codegen minted
             // the pair by) — const, so the static carries it. Every `None` arm names a pair
@@ -950,19 +984,39 @@ fn emit_superdsc_wiring(
                     quote! { ::scratchy_target_spyre::paged_step::PagedRows::Sequence }
                 }
             };
+            // ⭐ THE OP'S OWN WINDOW, re-minted by the ONE constructor the type has —
+            // `NonZeroU32::new` is const, and a `None` here names a bake bug (the mint
+            // refuses a zero window), so it is a const panic in the static, never a
+            // runtime fact.
+            let window = match p.window {
+                Some(w) => {
+                    let w = u32l(w.get());
+                    quote! {
+                        match ::core::num::NonZeroU32::new(#w) {
+                            ::core::option::Option::Some(v) => ::core::option::Option::Some(v),
+                            ::core::option::Option::None => ::core::panic!(
+                                "the wiring's sliding window is zero — a bake bug this static \
+                                 cannot carry"
+                            ),
+                        }
+                    }
+                }
+                None => quote! { ::core::option::Option::None },
+            };
             quote! {
-                ::core::option::Option::Some(::scratchy_target_spyre::wiring::PagedStep {
+                ::scratchy_target_spyre::wiring::PagedStep {
                     mask: #m, page_table: #t, write_rows: #w, query_rows: #q, kv_row_pool: #kvp,
                     rep_rows: #rr, chunk_pages: #cp, chunk_masks: #cm, int32_zero: #zero,
                     pages: #pages, page_slots: #slots, rows: #rows, nkvh: #nkvh, q_width: #q_width,
                     head_size: #head_size, walk: #walk,
                     paged_rows: #paged_rows,
                     extent: #extent,
-                })
+                    window: #window,
+                    class: #class,
+                }
             }
-        }
-        None => quote! { ::core::option::Option::None },
-    };
+        })
+        .collect();
 
     // ⭐ THE KERNEL-TABLE CLASS SETS, FROM THE BAKE — NOT THE TABLES THEMSELVES. The tables are
     // pure functions of each class's head dim, but baking them as literals was the gemma-4 defect
@@ -1142,7 +1196,7 @@ fn emit_superdsc_wiring(
             result_dtype: #result_dtype,
             num_sources: #num_sources,
             attn_mask: #mask,
-            paged: #paged,
+            paged: &[#(#paged),*],
             decode_position: #dp,
             tensor_shapes: &[#(#shapes),*],
             embed_src: #embed_src_lit,
@@ -2580,22 +2634,28 @@ impl<T: ktir_superdsc::collective::Tp> PooledSession for Declared<T> {
             &rolled.layout,
             rungs.iter().map(|(_, _, rung)| &rung.layout),
             &rolled.kv_pools,
-            self.gk.paged,
+            // The pool facts are ONE across classes (the scheduler grants one block
+            // table per request, shared by every layer) — class 0's step states them.
+            self.gk.paged.first().copied(),
         ))
     }
     fn place(&mut self, pool: PoolPages) {
-        self.gk.paged = self.gk.paged.map(|step| step.over_pool(pool));
-        let step = self.gk.paged;
-        let placed = match &mut self.walked {
-            Ok((rolled, rungs)) => std::iter::once(rolled)
-                .chain(rungs.iter_mut().map(|(_, _, rung)| rung))
-                .try_for_each(|walk| {
-                    scratchy_target_spyre::lower_subtile_tape_to_superdsc::place_kv_pools_at(
-                        walk, step, pool,
-                    )
-                }),
-            Err(_) => Ok(()),
-        };
+        for step in &mut self.gk.paged {
+            *step = step.over_pool(pool);
+        }
+        let placed =
+            match &mut self.walked {
+                Ok((rolled, rungs)) => std::iter::once(rolled)
+                    .chain(rungs.iter_mut().map(|(_, _, rung)| rung))
+                    .try_for_each(|walk| {
+                        self.gk.paged.iter().try_for_each(|step| {
+                        scratchy_target_spyre::lower_subtile_tape_to_superdsc::place_kv_pools_at(
+                            walk, Some(*step), pool,
+                        )
+                    })
+                    }),
+                Err(_) => Ok(()),
+            };
         if let Err(e) = placed {
             self.walked = Err(e);
         }
@@ -3343,7 +3403,12 @@ pub(crate) fn dump_wavefront_mega(
                 // reach its context.
                 let context_pages = ContextPages::of_slots(prefix_len).get();
                 let ceiling_walk = scratchy_target_spyre::paged_step::walk_pages(
-                    prefix_len.get(), prefill_mq.unwrap_or(decode_rows), active_cap);
+                    context_pages,
+                    prefill_mq.unwrap_or(decode_rows),
+                    prefill_mq.unwrap_or(1),
+                    active_cap,
+                    None,
+                );
                 let walked = superdsc::lower_subtile_tape_to_superdsc::<$W, _>(
                     &tape_rolled,
                     &krg,
@@ -4018,11 +4083,14 @@ pub(crate) fn dump_wavefront_mega(
                                         // selection it runs (`paged_step::prove_ladder_walks`),
                                         // so a ladder read as no walk fails here, not on a card.
                                         if card
-                                            && let Some(step) = gk.paged
-                                            && let Err(e) =
-                                                scratchy_target_spyre::paged_step::prove_ladder_walks(
-                                                    &meta, step,
-                                                )
+                                            && let Err(e) = gk
+                                                .paged
+                                                .iter()
+                                                .try_for_each(|&step| {
+                                                    scratchy_target_spyre::paged_step::prove_ladder_walks(
+                                                        &meta, step,
+                                                    )
+                                                })
                                         {
                                             panic!("[spyre-superdsc] {base}: {e}");
                                         }
@@ -5931,6 +5999,8 @@ mod tests {
                 q_width: 32 * 64,
                 head_size: 64,
                 walk: 16,
+                window: None,
+                class: 0,
                 paged_rows: scratchy_target_spyre::paged_step::PagedRows::Sequence,
                 extent: QueryExtent::of_baked_rung(
                     RungWidth::of_baked_rows(rows).expect("nonzero rows"),

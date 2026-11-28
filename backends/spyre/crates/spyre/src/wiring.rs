@@ -364,7 +364,12 @@ impl Wiring {
         rows: StagedRows,
         n_consts: usize,
     ) -> crate::forward_tape::ForwardShape {
-        self.forward_shape_within(self.baked_row_capacity(), rows, self.paged, n_consts)
+        self.forward_shape_within(
+            self.baked_row_capacity(),
+            rows,
+            self.paged.to_vec(),
+            n_consts,
+        )
     }
 
     /// [`Self::forward_shape`] with the capacity and the paged step supplied by the CALLER rather
@@ -389,8 +394,9 @@ impl Wiring {
         cap: RowCapacity,
         // ⛔ THE ROWS THIS LAUNCH FILLS — 1 for a decode step, `mq` for a prompt chunk.
         rows: StagedRows,
-        // The step of the body that runs — this wiring's own for its own bundle.
-        paged: Option<PagedStep>,
+        // The steps of the body that runs — this wiring's own for its own bundle, one per
+        // attention class, already adjusted to the body (`PagedStep::on_body`).
+        paged: Vec<PagedStep>,
         n_consts: usize,
     ) -> crate::forward_tape::ForwardShape {
         assert!(
@@ -695,6 +701,22 @@ pub struct PagedStep {
     /// by [`Self::on_body`]'s own re-mint, so a `PagedStep` can never carry a pair its rows
     /// disagree with.
     pub extent: QueryExtent,
+    /// ⭐ THE OP'S OWN SLIDING WINDOW — [`scratchy_subtile::subtile_ir::AttnMask::SlidingWindow`]'s
+    /// `window`, `None` for a causal op. The step's one statement of its queries' reach: a query
+    /// at absolute position `p` attends keys `[p − window + 1, p]`, so every reader that bounds
+    /// or masks the walk by "every position up to the query's own" reads this instead — the
+    /// walk's span ([`crate::paged_step`]'s laws), the mask stack's window cutoff, the page
+    /// table's first active block. Minted from the op's mask at the one mint
+    /// ([`crate::lower_subtile_tape_to_ktir::paged_step_of_ir`], inside its agreement check), a
+    /// model constant the op itself states — never a fact of which model is baking.
+    pub window: Option<std::num::NonZeroU32>,
+    /// ⭐ THE STEP'S CLASS — its index among the graph's distinct attention step geometries (the
+    /// `(window, nkvh)` pairs, widest-windowed first;
+    /// `scratchy_triton_splice::attn_step_classes`). Class 0 is the only class a uniform model
+    /// has; the tids above are that class's. A hybrid model's classes each get their own step,
+    /// their own tables through `PagedStepTids::of_class`, and their own packed-prefill window
+    /// family through `scratchy_triton_splice::paged_window_of_class`.
+    pub class: u32,
 }
 
 /// ⭐ THE ROW POOL'S PAGE — the bytes one page of `kv_row_pool` holds on the card: the run of
@@ -754,12 +776,24 @@ impl PagedStep {
         }
     }
 
-    /// ⭐ THE BUNDLE'S REACH — the positions its attention's walk covers. A step whose positions end at
-    /// or below this can run on the bundle from ANY start: the mask stack decides which walked keys each
-    /// row attends, so a prompt chunk over a cached prefix is this bundle's to run whenever the prefix
-    /// and the chunk both sit inside the walk. A step that ends past it would lose keys.
+    /// ⭐ THE BUNDLE'S REACH — the positions its attention's walk covers, in the walk's own frame:
+    /// the walk's blocks from its anchor. A step runs on the bundle when its
+    /// [`span`](Self::span) fits this — the whole step for a causal op (so a step whose positions
+    /// end at or below this runs from ANY start: the mask stack decides which walked keys each row
+    /// attends), the window's span for a windowed one, whatever the step's absolute position. A
+    /// step whose span exceeds it would lose keys.
     pub const fn reach(self) -> usize {
         self.walk as usize * self.page_slots as usize
+    }
+
+    /// ⭐ THE STEP'S SPAN — the positions its queries' windows sweep, in the walk's own frame:
+    /// from the earliest query's reach ([`crate::paged_step::first_active`]'s block) to the step's
+    /// last position. The whole step (`rows.end()`) for a causal op; the window's span for a
+    /// windowed one. The reach question's one answer — the number [`crate::paged_step`]'s check
+    /// admits against [`Self::reach`], never re-derived: a causal step's span is its end, so the
+    /// law it has always been is this law at `window: None`.
+    pub fn span(self, rows: &crate::paged_step::StepRows) -> usize {
+        rows.end() - crate::paged_step::first_active(&self, rows) * self.page_slots as usize
     }
 
     /// A decode batch's chunking of this bundle's walk (`batched_decode_chunking`), derived from the
@@ -854,17 +888,22 @@ impl PagedStep {
                 ]);
             }
             None => {
-                // ⭐ ONE ROW PER WINDOW, AT ITS OWN WINDOW TID — window `r`'s three tables (page
-                // table, mask stack, query rows) at
-                // [`ktir_superdsc::reserved_tids::paged_window_tid`] `r`, each its own region
-                // sized the ONE-REQUEST size (the step's walk), the windows
-                // packed in window order after the write rows. Window 0's tids ARE the step's
-                // own sentinels, so at one request the rows are exactly today's — same tids,
-                // same sizes, same order, byte for byte.
+                // ⭐ ONE ROW PER WINDOW, AT ITS OWN WINDOW TID OF THE STEP'S OWN CLASS — window
+                // `r`'s three tables (page table, mask stack, query rows) at
+                // `scratchy_triton_splice::paged_window_of_class` (class 0's family being the
+                // `paged_window_tid` sentinels' own), each its own region sized the ONE-REQUEST
+                // size (the pool's whole walk, as ever), the windows packed in window order
+                // after the write rows. Window 0's tids ARE the class's own step tables, so at
+                // one class and one request the rows are exactly today's — same tids, same
+                // sizes, same order, byte for byte.
                 let w = u64::from(self.extent.per_request().get());
                 let windows = u64::from(self.extent.requests().get());
                 let window_tid = |r: u64, table: u32| {
-                    ktir_superdsc::reserved_tids::paged_window_tid(r as u32, table)
+                    scratchy_triton_splice::paged_window_of_class(
+                        self.class as usize,
+                        r as u32,
+                        table,
+                    )
                 };
                 for r in 0..windows {
                     v.extend([
@@ -908,6 +947,12 @@ impl PagedStep {
     /// `swept` slots, whole pages for every body (a `walk_buckets` rung, or the ceiling's walk).
     /// `None` when `swept` is no walk of this pool.
     ///
+    /// ⭐ A WINDOWED BODY WALKS ITS OWN BOUND, not the rung's sweep: whatever the ladder swept to
+    /// reach the context (the causal class's need), the windowed body baked
+    /// [`window_walk_blocks`][crate::paged_step::window_walk_blocks] at, and the step the worker
+    /// stages must name the same walk its body walks — the same bound, the same one function, never
+    /// restated. The cap never widens: a rung narrower than the bound keeps its own sweep.
+    ///
     /// ⭐ THE EXTENT IS THE LAUNCH'S OWN PAIR, by the launch's own kind — never a comparison
     /// against the wiring's stated pair. The wiring states ONE representative of a tape the
     /// ladders bake at several widths (the prefill ladder's rungs all bind the same tensor ids,
@@ -922,7 +967,7 @@ impl PagedStep {
         paged_rows: crate::paged_step::PagedRows,
         swept: u32,
     ) -> Option<PagedStep> {
-        let walk = swept / self.page_slots;
+        let mut walk = swept / self.page_slots;
         let extent = match paged_rows {
             crate::paged_step::PagedRows::Sequence => {
                 QueryExtent::of_baked_rung(RungWidth::of_baked_rows(rows)?, RungCap::ONE)?
@@ -931,6 +976,14 @@ impl PagedStep {
                 QueryExtent::of_baked_rung(RungWidth::ONE, RungCap::of_baked_seqs(rows)?)?
             }
         };
+        if let Some(w) = self.window {
+            walk = walk.min(crate::paged_step::window_walk_blocks(
+                self.pages,
+                w,
+                extent.per_request().get(),
+                self.page_slots,
+            ));
+        }
         (rows > 0 && walk > 0 && swept.is_multiple_of(self.page_slots) && walk <= self.pages)
             .then_some(PagedStep {
                 rows,
@@ -950,7 +1003,15 @@ impl PagedStep {
     /// there is no pair to re-derive from the launch's rows. Only the walk is the launch's to
     /// derive, from the sweep of the body the session selected — exactly `on_body`'s own law.
     pub fn on_body_packed(self, swept: u32) -> Option<PagedStep> {
-        let walk = swept / self.page_slots;
+        let mut walk = swept / self.page_slots;
+        if let Some(w) = self.window {
+            walk = walk.min(crate::paged_step::window_walk_blocks(
+                self.pages,
+                w,
+                self.extent.per_request().get(),
+                self.page_slots,
+            ));
+        }
         (self.extent.requests().get() > 1
             && walk > 0
             && swept.is_multiple_of(self.page_slots)
@@ -991,8 +1052,11 @@ pub struct Wiring {
     pub num_sources: u32,
     /// The AttnDecode runtime length mask, if the model has a maskable decode.
     pub attn_mask: Option<u32>,
-    /// The paged step's sources and pool — see [`PagedStep`]. `None` for a graph with no attention.
-    pub paged: Option<PagedStep>,
+    /// The paged steps' sources and pools, one per attention class, class-sorted (widest window
+    /// first; see [`PagedStep`]) — a hybrid-attention model's geometries each carry their own
+    /// tables, the reference's one `SpyreAttentionMetadataBuilder` per kv-cache group. A uniform
+    /// model carries exactly one, at class 0's sentinel tids. EMPTY for a graph with no attention.
+    pub paged: &'static [PagedStep],
     /// Baked `valid_len - 1`; a worker overrides per generated token.
     pub decode_position: u32,
     /// `[rows, cols]` per tensor id.
@@ -2375,10 +2439,11 @@ impl Wiring {
         r as usize * c as usize
     }
 
-    /// The KV capacity the bundle was baked at — its pools' token slots.
+    /// The KV capacity the bundle was baked at — its pools' token slots. The classes share one
+    /// pool (refused at the mint), so the first step's capacity is every class's.
     #[inline]
     pub fn capacity(&self) -> Option<usize> {
-        self.paged.map(PagedStep::capacity)
+        self.paged.first().map(|p| p.capacity())
     }
 }
 
@@ -3037,7 +3102,7 @@ mod constant_tape_tests {
             result_dtype: scratchy_tensors::DType::F16,
             num_sources: 0,
             attn_mask: None,
-            paged: None,
+            paged: &[],
             decode_position: 0,
             tensor_shapes: &[],
             embed_src: 0,

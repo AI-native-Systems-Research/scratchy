@@ -8690,8 +8690,12 @@ mod embed_row_gather_tests {
                 return_type: None,
             },
             // k = `entries` — the payload's stated entry count for this
-            // fixture's hidden (the mint's own law answer).
-            program: Program::EmbedRowGather { k: entries },
+            // fixture's hidden (the mint's own law answer); `hidden` — the
+            // out's own stated width, the mint's statement the door reads.
+            program: Program::EmbedRowGather {
+                k: entries,
+                hidden: out_shape.1 as u32,
+            },
             bindings: vec![
                 BufferId::new(301),
                 BufferId::new(302),

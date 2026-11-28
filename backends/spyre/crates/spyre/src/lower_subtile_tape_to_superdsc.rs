@@ -774,6 +774,17 @@ pub fn compute_bundle_layout<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     // never re-derived from graph rows (see [`bundle_registry`]'s own parameter note).
     query_rows: ktir_superdsc::sdsc_abstract::QueryExtent,
 ) -> Result<BundleLayout, SuperDscError> {
+    // ⭐ THE GRAPH'S OWN TIDS SIT BELOW THE RESERVED HALF — the one place real tensors are placed
+    // beside the reserved regions, so the partition `reserved_tids::RESERVED_ID_HALF` states is
+    // proven here for the graph being baked.
+    if !ktir_superdsc::reserved_tids::real_tids_fit(ir.tensors.len()) {
+        return Err(SuperDscError(format!(
+            "the graph states {} tensors — its ids reach the reserved half of the tid space \
+             (RESERVED_ID_HALF = {}), where every reserved region lives",
+            ir.tensors.len(),
+            ktir_superdsc::reserved_tids::RESERVED_ID_HALF
+        )));
+    }
     // fp8 W8A8 weights (SEN143_FP8: 1-byte / 128-elem stick) are `input[1]` of any arity-3 MatmulTile.
     // Their device footprint is HALF the fp16 weight — this is the unfakeable 1-byte-read proxy: it is
     // what shrinks `seg_bytes[1]` (the weight segment). A dequant-to-f16 transient would NOT shrink it.
@@ -1605,18 +1616,15 @@ pub fn compute_bundle_layout<T: ktir_superdsc::collective::Tp, F: RopeForm>(
         seg_bytes[a] = align128(off + 2);
     }
 
-    // ── THE PAGED STEP'S SOURCES ── spyre-inference's operands the host stages each step
-    //    (`crate::paged_step`): the page index table, the mask stack, the KV write index and the
-    //    query row index, at their reserved tids in the ACTIVATION segment like every per-step
-    //    binding (the reserved-tid law above), and the decode kernel's `kv_row_pool` and int32 zero
-    //    in the second intermediate colour: a segment neither a layer's launch nor a walk's
-    //    relaunch shifts (the KV segment moves with every layer), and one the synthetic allocator
-    //    never grows. `kv_row_pool` is the pool's pages long and sits last in that colour, after its
-    //    intermediates and the int32 zero, so no synthetic's offset and no other placement depends
-    //    on the pool's page count.
-    //    `PagedStep::card_placements` is the one statement of what they are and how big — the card
-    //    stagers stage within it.
-    if let Some(step) = crate::lower_subtile_tape_to_ktir::paged_step_of_ir(
+    // ── THE PAGED STEPS' SOURCES ── spyre-inference's operands the host stages each step
+    //    (`crate::paged_step`), ONE STEP PER ATTENTION CLASS: the page index table, the mask
+    //    stack, the KV write index and the query row index, at their reserved tids in the
+    //    ACTIVATION segment like every per-step binding (the reserved-tid law above), and the
+    //    decode kernel's `kv_row_pool` and int32 zero in the intermediate segment, which neither
+    //    a layer's launch nor a walk's relaunch shifts (the KV segment moves with every layer).
+    //    `PagedStep::card_placements` is the one statement of what they are and how big — the
+    //    card stagers stage within it, each class its own step.
+    for step in crate::lower_subtile_tape_to_ktir::paged_step_of_ir(
         ir,
         ActiveCap::FULL,
         paged_rows,
@@ -4141,12 +4149,36 @@ fn stage_gate_probe<T: ktir_superdsc::collective::Tp, F: RopeForm>(
         rung.query_rows,
     )
     .map_err(|e| e.0)?;
-    let paged_hd = ir.nodes.iter().find_map(|n| match &n.op {
-        SubOp::AttnDecode {
-            mask, attention, ..
-        } => Some(attention.class(mask.class()).head_dim().get() as usize),
-        _ => None,
-    });
+    // ⭐ EACH POOL'S OWN CLASS — a hybrid model's classes carry different head dims (gemma-4: 256
+    // at the sliding layers, 512 at the global ones), so a pool's stimulus lays into its pages by
+    // ITS class's step and head dim, matched by the pool tid to the AttnDecode that reads it —
+    // never one class's facts for every pool. The classes share one pool extent (refused at the
+    // mint), so `blocks` and `step_rows` below are any step's.
+    let pool_class: std::collections::HashMap<u32, (crate::wiring::PagedStep, usize)> = ir
+        .nodes
+        .iter()
+        .filter_map(|n| match &n.op {
+            SubOp::AttnDecode {
+                mask, attention, ..
+            } if n.inputs.len() >= 3 => {
+                let g = attention.class(mask.class());
+                let key = (
+                    mask.window().map(|w| w.get()).unwrap_or(0),
+                    g.kv_heads().get(),
+                );
+                let step = paged
+                    .iter()
+                    .find(|p| (p.window.map(|w| w.get()).unwrap_or(0), p.nkvh) == key)?;
+                let hd = g.head_dim().get() as usize;
+                Some([
+                    (n.inputs[1].tensor.index() as u32, (*step, hd)),
+                    (n.inputs[2].tensor.index() as u32, (*step, hd)),
+                ])
+            }
+            _ => None,
+        })
+        .flatten()
+        .collect();
     let pool_tids: std::collections::HashSet<u32> = ir
         .nodes
         .iter()
@@ -4159,7 +4191,7 @@ fn stage_gate_probe<T: ktir_superdsc::collective::Tp, F: RopeForm>(
         })
         .flatten()
         .collect();
-    let step_rows = match (prefill, paged) {
+    let step_rows = match (prefill, paged.first()) {
         (Some(pg), _) => crate::paged_step::StepRows::new(0, pg.mq as usize).expect(
             "the prefill wiring's rung holds no query rows — the bake cannot stage its step",
         ),
@@ -4175,7 +4207,15 @@ fn stage_gate_probe<T: ktir_superdsc::collective::Tp, F: RopeForm>(
                 })
                 .max()
                 .unwrap_or(0);
-            crate::paged_step::StepRows::one_at(cached.min(p.capacity().saturating_sub(1)))
+            // ⭐ THE RUNG'S OWN ROWS, NOT ONE — a decode rung's step carries every row the rung
+            // bakes: the solo rung's one row (`one_at`, byte for byte) and a batch rung's one
+            // token of EACH of its requests. Row `r` at `start + r` is the golden's own
+            // `own_pos = seq_len − mq + qi` over the same region, so every request's window
+            // reads the very keys the reference's does — the law a windowed class needs, which
+            // one request padded to the rung's rows only matched under a causal mask.
+            let rows = rung.query_rows.graph_rows().get() as usize;
+            crate::paged_step::StepRows::new(cached.min(p.capacity().saturating_sub(1)), rows)
+                .expect("the rung's query rows are its step's — a zero-row rung cannot bake")
         }
         (None, None) => crate::paged_step::StepRows::one_at(0),
     };
@@ -4183,6 +4223,7 @@ fn stage_gate_probe<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     // every page through the table rather than at its block's own index, and the pages the step
     // touches stay at the pool's start (the staging below writes only that prefix).
     let blocks: Vec<u32> = paged
+        .first()
         .map(|p| {
             let need = step_rows.end().div_ceil(p.page_slots as usize) as u32;
             if need < p.pages {
@@ -4224,16 +4265,16 @@ fn stage_gate_probe<T: ktir_superdsc::collective::Tp, F: RopeForm>(
         } else {
             (0..n).map(|j| dbg_synth_val(seed(tid), j)).collect()
         };
-        match (paged, paged_hd) {
-            (Some(p), Some(hd)) if pool_tids.contains(&tid) => {
-                let pool = crate::paged_step::pool_of_rows(&p, hd, &blocks, &vals, step_rows.start)
+        match pool_class.get(&tid) {
+            Some((p, hd)) => {
+                let pool = crate::paged_step::pool_of_rows(p, *hd, &blocks, &vals, step_rows.start)
                     .map_err(|e| format!("the gate's pool t{tid}: {e}"))?;
                 if !pool.is_empty() {
                     let rows = pool.len() / t.cols as usize;
                     sources.push((tid as u64, pool, vec![rows, t.cols as usize]));
                 }
             }
-            _ => sources.push((tid as u64, vals, vec![t.rows as usize, t.cols as usize])),
+            None => sources.push((tid as u64, vals, vec![t.rows as usize, t.cols as usize])),
         }
     }
     // The compile-time scalars, at their reserved tids — the reader-side law
@@ -4252,11 +4293,12 @@ fn stage_gate_probe<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     for (i, v) in sm.iter().enumerate() {
         sources.push((u64::from(scalarmul_scale_tid(i)), vec![*v], vec![1, 1]));
     }
-    // The paged step's three sources, by the worker's law: the mask stack an f16 source like any
-    // other, the page table and the write rows int32 words on the typed channel (the f16 source
-    // channel would encode them into half the bytes their views span).
-    if let Some(p) = paged {
-        let srcs = crate::paged_step::request_sources(&p, &blocks, &step_rows)
+    // Every class's paged step sources, by the worker's law: the mask stack an f16 source like
+    // any other, the page table and the write rows int32 words on the typed channel (the f16
+    // source channel would encode them into half the bytes their views span). One request's
+    // blocks and rows serve every class — the classes share one pool.
+    for p in &paged {
+        let srcs = crate::paged_step::request_sources(p, &blocks, &step_rows)
             .map_err(|e| format!("the gate's paged step: {e}"))?;
         for (tid, bytes, shape) in srcs.int32 {
             emu_weights.push((tid as usize, bytes, scratchy_tensors::DType::I32, shape));
@@ -7736,9 +7778,18 @@ fn tiled_trips_alias<T: ktir_superdsc::collective::Tp>(e: &EmittedOp<T>) -> bool
     if e.time <= 1 {
         return false;
     }
-    // ldsIdx of every OUTPUT (write) tensor: the computeOp_ outputLabeledDs names
-    // are `Tensor{i}-idx{i}`, so the output ldsIdx set is derivable, but the simpler
-    // robust signal is the LabeledDs dsType_ == "OUTPUT". Collect those ldsIdx.
+    // ldsIdx of every WRITE tensor — the operands the device writes, which is the BINDING's own
+    // `is_input` fact, never the LabeledDs `dsType_`. The pointwise family labels EVERY operand
+    // `Role::Output` (the bmm-bias DDL convention: a READ operand shares the OUTPUT dsType
+    // bucket, `is_input=true` marking it read-only — `AnyTensorArg::set_is_input`'s own law, the
+    // same rule `emit_sdsc`'s collision guard states as "non-input OUTPUT-role args"), so
+    // `dsType_ == "OUTPUT"` counts a broadcast READ operand as a per-trip write: the seat hash's
+    // `[rows, 1]` Col words sit at ONE constant stick address across every trip BY DESIGN
+    // (`rewrite_op_for_time_tile`'s collapsed-along-the-tiled-dim exemption, pinned by
+    // `time_tiled_broadcast_operand_is_address_stable`), and a dsType-keyed write set false-fired
+    // GUARD #14 on exactly that designed case (gemma-4 12b fp8 decode, `muli32toi32_o2435`).
+    // `!is_input` names exactly the tensors written; a missing binding stays in the write set
+    // (fail-closed).
     //
     // A K-SPLIT (reduction/`in`-dim) matmul legitimately has MULTIPLE cores accumulate a partial
     // product into the SAME shared output address WITHIN one trip (dxp PSUM-accumulates them) —
@@ -7760,14 +7811,12 @@ fn tiled_trips_alias<T: ktir_superdsc::collective::Tp>(e: &EmittedOp<T>) -> bool
             std::collections::BTreeSet::new();
         for dsc_map in &trip.dscs_ {
             for dsc in dsc_map.values() {
-                let out_lds: std::collections::BTreeSet<u32> = dsc
-                    .labeledDs_
-                    .iter()
-                    .filter(|l| l.dsType_ == "OUTPUT")
-                    .map(|l| l.ldsIdx_)
-                    .collect();
                 for node in &dsc.scheduleTree_ {
-                    if node.component_ != "hbm" || !out_lds.contains(&node.ldsIdx_) {
+                    if node.component_ != "hbm"
+                        || e.arg_bindings
+                            .get(node.ldsIdx_ as usize)
+                            .is_some_and(|b| b.is_input)
+                    {
                         continue;
                     }
                     for v in node.startAddressCoreCorelet_.data_.values() {
@@ -8361,23 +8410,18 @@ fn ktir_groups_via_superdsc<T: ktir_superdsc::collective::Tp>(
     // this reason; this is the bake's proof that nothing else slipped in.
     if let Some(l) = layout {
         let act = SegRole::Activation.segment();
-        let step_tids = scratchy_triton_splice::PagedStepTids::RESERVED;
         for e in sdsc_ops.iter().filter(|e| e.walk.is_some()) {
             for b in &e.arg_bindings {
                 let Some(ktir_superdsc::place::PlaceId::Act(tid)) = l.id_of(&b.buffer) else {
                     continue;
                 };
                 let in_act = l.placements.get(&tid).is_some_and(|p| p.segment == act);
-                // The sources a trip walks: one sequence's page table and mask stack — or a
-                // PACKED rung's, one per window (`paged_window_tid(r, ·)`; window 0 IS the
-                // step's sentinels, so the family states the solo case too) — or a decode
-                // batch's chunk page ids and chunk masks.
-                let mut walked = vec![step_tids.chunk_pages, step_tids.chunk_masks];
-                for r in 0..ktir_superdsc::reserved_tids::PAGED_MAX_WINDOWS {
-                    walked.push(ktir_superdsc::reserved_tids::paged_window_tid(r, 1));
-                    walked.push(ktir_superdsc::reserved_tids::paged_window_tid(r, 2));
-                }
-                if in_act && !walked.contains(&tid) {
+                // The sources a trip walks: one class's page table and mask stack — or a
+                // PACKED rung's, one per window of the class's family — or a decode batch's chunk
+                // page ids and chunk masks (`PagedStepTids::walked_sources`). The class is the
+                // tid's own, decoded from it, so the guard is a fact of the reserved families at
+                // every class a model can state, never of a class count.
+                if in_act && !scratchy_triton_splice::PagedStepTids::is_walked_source(tid) {
                     return Err(SuperDscError(format!(
                         "[spyre-superdsc] walk body op '{}' reads t{tid} from the activation \
                          segment, which its relaunch shifts one step per trip — only the step's \

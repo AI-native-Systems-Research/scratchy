@@ -58,11 +58,21 @@ pub(crate) type StagedWeight = (usize, HostBytes, SDType, Vec<usize>);
 fn prefill_pool_statics(
     wirings: &'static scratchy_target_spyre::wiring::Wirings,
 ) -> ExecutorResult<Vec<(u32, Vec<u8>)>> {
-    let Some(step) = wirings.prefill.as_ref().unwrap_or(&wirings.decode).paged else {
-        return Ok(Vec::new());
-    };
-    scratchy_target_spyre::paged_step::card_statics(&step)
-        .map_err(|e| werr(format!("the prefill sessions' KV pool statics: {e}")))
+    // ⭐ EVERY CLASS'S OWN STATICS — a hybrid model's classes each read their own
+    // `kv_row_pool` (their kv-head counts differ), while the int32 zero stick is one
+    // shared tid: staged once, by the first class that names it.
+    let steps = wirings.prefill.as_ref().unwrap_or(&wirings.decode).paged;
+    let mut out: Vec<(u32, Vec<u8>)> = Vec::new();
+    for step in steps {
+        for (tid, bytes) in scratchy_target_spyre::paged_step::card_statics(step)
+            .map_err(|e| werr(format!("the prefill sessions' KV pool statics: {e}")))?
+        {
+            if !out.iter().any(|(t, _)| *t == tid) {
+                out.push((tid, bytes));
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// ⭐ EVERYTHING A BORROWING SESSION NEEDS FROM THE OWNER, AS ONE CALL: the resident segments it
@@ -156,9 +166,9 @@ pub(crate) struct Parsed {
     // the layers list whose length the load log prints).
     #[cfg(not(feature = "spyre-hw"))]
     pub(crate) embed_src: usize,
-    /// The paged step the wiring states — see `BundleMeta::paged`.
+    /// The paged steps the wiring states, one per attention class — see `BundleMeta::paged`.
     #[cfg(not(feature = "spyre-hw"))]
-    pub(crate) paged: Option<scratchy_target_spyre::wiring::PagedStep>,
+    pub(crate) paged: Vec<scratchy_target_spyre::wiring::PagedStep>,
     /// cos / sin runtime sources as `(source id, full column width, rotary class)`.
     /// GQA gives more than one width (Q vs K); a hybrid-attention arch (gemma-4)
     /// gives classes different tables. Each is filled by tiling the class's own
@@ -249,7 +259,7 @@ pub(crate) fn wiring_to_parsed(
         #[cfg(not(feature = "spyre-hw"))]
         output_ids: vec![w.result as usize],
         #[cfg(not(feature = "spyre-hw"))]
-        paged: w.paged,
+        paged: w.paged.to_vec(),
     })
 }
 
@@ -1449,12 +1459,15 @@ impl SpyreWorker {
                 // the prefix capacity (mask cols) — same block_size the paged path uses.
                 let vocab = dparsed.vocab;
                 let kv_dim = dparsed.kv_dim;
-                // ⭐ THE KV POOL IS THE BAKE'S — every layer's K and V pools, each layer its own region of
-                // the KV segment, at the decode wiring's own page count (the model's context). Nothing
-                // here sizes it: the OWNER session allocates the regions once, and every other session
-                // aliases them.
-                let step = wirings.decode.paged.ok_or_else(|| {
-                    werr("the decode bundle states no paged step — its attention reads no KV pool")
+                // ⭐ THE KV POOL IS THE BAKE'S — every layer's K and V pools, each layer its
+                // own region of the KV segment, placed at the decode wiring's own page count
+                // (the model's context, or as much of it as one device region holds:
+                // `paged_step::pool_slots`). Nothing here sizes it: the OWNER session
+                // allocates the regions once, and every other session aliases them.
+                // The classes share one pool (the mint refuses otherwise), so the FIRST
+                // step's pool facts — pages, page_slots, capacity — are every class's.
+                let step = wirings.decode.paged.first().ok_or_else(|| {
+                    werr("this bundle states no paged step — its attention has no pools")
                 })?;
                 let num_blocks = step.pages as usize;
                 let pool_need_bytes = code.layout.kv_pool_bytes();
@@ -2487,7 +2500,7 @@ impl SpyreWorker {
                 // device half (the prepare wave below) waits for.
                 // ⭐ AND THE POOL'S STATICS — `kv_row_pool` and the int32 zero, which the one-request
                 // decode kernel's walk reads; every other session's kernels read none.
-                let pool_statics = scratchy_target_spyre::paged_step::card_statics(&step)
+                let pool_statics = scratchy_target_spyre::paged_step::card_statics(step)
                     .map_err(|e| werr(format!("the KV pool's statics: {e}")))?;
                 let mut ss = SuperDscSession::new(
                     cards,
@@ -3059,8 +3072,24 @@ impl SpyreWorker {
             let page_slots =
                 scratchy_target_spyre::paged_step::SchedulerBlockTokens::REFERENCE.as_usize();
             let at_walk = |mut meta: BundleMeta, reach: Option<usize>| {
-                if let (Some(r), Some(p)) = (reach, meta.paged.as_mut()) {
-                    p.walk = (r / page_slots) as u32;
+                // ⭐ EACH CLASS'S OWN WALK AT THE RUNG'S REACH — the rung's causal
+                // sweep, capped by a windowed class's own bound (the same
+                // `window_walk_blocks` law `PagedStep::on_body` states for a launch).
+                if let Some(r) = reach {
+                    for p in meta.paged.iter_mut() {
+                        let swept = (r / page_slots) as u32;
+                        p.walk = match p.window {
+                            Some(w) => {
+                                swept.min(scratchy_target_spyre::paged_step::window_walk_blocks(
+                                    p.pages,
+                                    w,
+                                    p.extent.per_request().get(),
+                                    p.page_slots,
+                                ))
+                            }
+                            None => swept,
+                        };
+                    }
                 }
                 meta
             };

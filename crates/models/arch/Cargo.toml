@@ -144,6 +144,10 @@ all-arches = [
 "gemma-4-12b-it" = ["arch-gemma4"]
 "gemma-4-12b-it-parity-tiny" = ["arch-gemma4"]
 "gemma-4-12b-it-parity-tiny-allglobal" = ["arch-gemma4"]
+# The paged compose's own tiny fixture: a context of 8192 (64 pool pages) and head_dim 128/global
+# 256 on the two attention classes, whole float8 sticks, so `kv-fp8` selects it — the smallest
+# hybrid-attention model the spyre emu+lower bake runs end to end.
+"gemma-4-12b-it-parity-tiny-paged" = ["arch-gemma4"]
 "gemma-4-31b-it" = ["arch-gemma4"]
 
 # gemma4-moe (6 configs)
@@ -353,6 +357,7 @@ all-arches = [
     "gemma-4-12b-it",
     "gemma-4-12b-it-parity-tiny",
     "gemma-4-12b-it-parity-tiny-allglobal",
+    "gemma-4-12b-it-parity-tiny-paged",
     "gemma-4-31b-it",
 ]
 "gemma4-moe" = [
@@ -553,6 +558,7 @@ all = [
     "gemma-4-12b-it",
     "gemma-4-12b-it-parity-tiny",
     "gemma-4-12b-it-parity-tiny-allglobal",
+    "gemma-4-12b-it-parity-tiny-paged",
     "gemma-4-31b-it",
     "gemma-4-26b-a4b-it",
     "gemma-4-26b-a4b-it-parity-tiny",

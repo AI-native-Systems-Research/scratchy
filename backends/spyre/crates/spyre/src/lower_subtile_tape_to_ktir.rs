@@ -521,11 +521,14 @@ fn chain_skeleton<F: RopeForm>(
     })
 }
 
-/// The gathered row's program — `Program::EmbedRowGather { k }`, `[s_stick, l_stick, weight]`
-/// in and the `[1, hidden]` row out, hand-minted over the node's own regions. `k` is the
+/// The gathered row's program — `Program::EmbedRowGather { k, hidden }`, `[s_stick, l_stick,
+/// weight]` in and the `[1, hidden]` row out, hand-minted over the node's own regions. `k` is the
 /// ONE SPELLING'S spyre-side call: this node carries no k of its own (the ChainStage's
 /// payload does), so the emitter asks [`chain_slab_entries`] at THIS node's own `hidden`
 /// — the same pure fn the mint stated, called on the same hidden, the ruled third site.
+/// `hidden` is the node's own payload statement carried verbatim, so the door reads the
+/// LOGICAL hidden from the payload, never from the row out's stated shape (whose cols are the
+/// widest ALLOCATION view — a pointwise consumer's device-width restatement).
 fn embed_row_gather_emitted<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     node: &SubtileNode<F>,
     ir: &SubtileIR<F>,
@@ -547,7 +550,7 @@ fn embed_row_gather_emitted<T: ktir_superdsc::collective::Tp, F: RopeForm>(
         "embed_row_gather",
         node,
         ir,
-        ktir_superdsc::ktir_node::Program::EmbedRowGather { k: entries },
+        ktir_superdsc::ktir_node::Program::EmbedRowGather { k: entries, hidden },
     )?;
     Ok(ktir_only(k))
 }
@@ -1409,8 +1412,9 @@ pub struct BundleWiring {
     /// fills it per forward step (see [`crate::wiring::PagedStep`]); it is NOT one of
     /// `num_sources` and is written by no node.
     pub attn_mask: Option<u32>,
-    /// The paged step's sources and pool — see [`crate::wiring::PagedStep`].
-    pub paged: Option<crate::wiring::PagedStep>,
+    /// The paged steps' sources and pools — ONE STEP PER ATTENTION CLASS, class-sorted (widest
+    /// window first), `[]` when the graph has no attention — see [`crate::wiring::PagedStep`].
+    pub paged: Vec<crate::wiring::PagedStep>,
     /// EVERY compile-time scalar the programs read, in registry order: entry `i` is the value the
     /// worker must bind at [`scalarmul_scale_tid`]`(i)` — the model's own multipliers and RMSNorm
     /// epsilons, exactly the set and exactly the order `subtile→superdsc` registers.
@@ -1633,75 +1637,115 @@ pub fn paged_step_of_ir<F: RopeForm>(
     active_cap: ActiveCap,
     paged_rows: scratchy_triton_splice::PagedRows,
     query_rows: ktir_superdsc::sdsc_abstract::QueryExtent,
-) -> Result<Option<crate::wiring::PagedStep>, SuperDscError> {
-    let tids = scratchy_triton_splice::PagedStepTids::RESERVED;
+) -> Result<Vec<crate::wiring::PagedStep>, SuperDscError> {
     let slots = scratchy_triton_splice::SchedulerBlockTokens::REFERENCE.get();
-    let mut out: Option<crate::wiring::PagedStep> = None;
-    for n in &ir.nodes {
-        let SubOp::AttnDecode {
-            valid_len,
-            mask,
-            attention,
-            ..
-        } = &n.op
-        else {
-            continue;
-        };
-        let cache = n.inputs.get(1).ok_or_else(|| {
-            SuperDscError(format!(
-                "AttnDecode t{} states no K cache input",
-                n.output.tensor.index()
-            ))
-        })?;
-        let rows = ir.tensors[cache.tensor.index()].rows;
-        if rows == 0 || !rows.is_multiple_of(slots) {
-            return Err(SuperDscError(format!(
-                "AttnDecode t{}: its K cache holds {rows} slots, not a whole number of \
-                 {slots}-slot pages",
-                n.output.tensor.index()
-            )));
-        }
-        let (pages, mq) = (rows / slots, n.output.region.rows.len);
-        if query_rows.graph_rows().get() != mq {
-            return Err(SuperDscError(format!(
-                "AttnDecode t{}: the graph runs {mq} query row(s) but the rung's minted extent \
-                 states {} ({} per request, {} request(s)) — the mint and the graph disagree, a \
-                 bake bug named here",
-                n.output.tensor.index(),
-                query_rows.graph_rows().get(),
-                query_rows.per_request().get(),
-                query_rows.requests().get(),
-            )));
-        }
-        let walk = scratchy_triton_splice::walk_pages(*valid_len, mq, active_cap);
-        let step = crate::wiring::PagedStep {
-            mask: tids.mask,
-            page_table: tids.page_table,
-            write_rows: tids.write_rows,
-            query_rows: tids.query_rows,
-            kv_row_pool: tids.kv_row_pool,
-            rep_rows: tids.rep_rows,
-            chunk_pages: tids.chunk_pages,
-            chunk_masks: tids.chunk_masks,
-            int32_zero: tids.int32_zero,
-            pages,
-            page_slots: slots,
-            rows: mq,
-            nkvh: attention.class(mask.class()).kv_heads().get(),
-            q_width: attention.class(mask.class()).q_width(),
-            head_size: attention.class(mask.class()).head_dim().get(),
-            walk,
-            paged_rows,
-            extent: query_rows,
-        };
-        match out {
-            Some(prev) if prev != step => {
+    // ⭐ ONE STEP PER ATTENTION CLASS — the graph's distinct step geometries, in
+    // `attn_step_classes`'s order (the one list the splice's tid binding also reads, so a class
+    // index means one geometry at the kernel and one at the staged tables). Within a class the
+    // step is ONE (the old agreement, scoped to the class); across classes the POOL facts are
+    // one — the scheduler grants one block table per request, shared by every layer — while the
+    // geometry (kv heads, head width, window, and the walk they bound) is each class's own.
+    // The reference states the same fact its own way: one SpyreAttentionMetadataBuilder per
+    // kv-cache group (spyre_attn.py 316-345, from the group's spec including its
+    // sliding_window).
+    let classes = scratchy_triton_splice::attn_step_classes(ir);
+    let mut out: Vec<crate::wiring::PagedStep> = Vec::new();
+    for (class, (window, nkvh)) in classes.iter().enumerate() {
+        let tids = scratchy_triton_splice::PagedStepTids::of_class(class);
+        let mut step_of_class: Option<crate::wiring::PagedStep> = None;
+        for n in &ir.nodes {
+            let SubOp::AttnDecode {
+                mask, attention, ..
+            } = &n.op
+            else {
+                continue;
+            };
+            let g = attention.class(mask.class());
+            if (
+                mask.window().map(|w| w.get()).unwrap_or(0),
+                g.kv_heads().get(),
+            ) != (*window, *nkvh)
+            {
+                continue;
+            }
+            let cache = n.inputs.get(1).ok_or_else(|| {
+                SuperDscError(format!(
+                    "AttnDecode t{} states no K cache input",
+                    n.output.tensor.index()
+                ))
+            })?;
+            let rows = ir.tensors[cache.tensor.index()].rows;
+            if rows == 0 || !rows.is_multiple_of(slots) {
                 return Err(SuperDscError(format!(
-                    "the graph's attentions disagree about the paged step ({prev:?} vs {step:?}) — \
-                     one page table, one mask stack and one write-row table serve every layer"
+                    "AttnDecode t{}: its K cache holds {rows} slots, not a whole number of \
+                     {slots}-slot pages",
+                    n.output.tensor.index()
                 )));
             }
-            _ => out = Some(step),
+            let (pages, mq) = (rows / slots, n.output.region.rows.len);
+            if query_rows.graph_rows().get() != mq {
+                return Err(SuperDscError(format!(
+                    "AttnDecode t{}: the graph runs {mq} query row(s) but the rung's minted extent \
+                     states {} ({} per request, {} request(s)) — the mint and the graph disagree, a \
+                     bake bug named here",
+                    n.output.tensor.index(),
+                    query_rows.graph_rows().get(),
+                    query_rows.per_request().get(),
+                    query_rows.requests().get(),
+                )));
+            }
+            if let Some(prev) = &out.first()
+                && (prev.pages, prev.page_slots) != (pages, slots)
+            {
+                return Err(SuperDscError(format!(
+                    "the graph's attention classes disagree about the pool (class 0 holds {} \
+                     page(s) of {} slot(s), this class {} of {}) — one block table serves every \
+                     layer",
+                    prev.pages, prev.page_slots, pages, slots
+                )));
+            }
+            let walk = scratchy_triton_splice::walk_pages(
+                pages,
+                mq,
+                query_rows.per_request().get(),
+                active_cap,
+                mask.window(),
+            );
+            let step = crate::wiring::PagedStep {
+                mask: tids.mask,
+                page_table: tids.page_table,
+                write_rows: tids.write_rows,
+                query_rows: tids.query_rows,
+                kv_row_pool: tids.kv_row_pool,
+                rep_rows: tids.rep_rows,
+                chunk_pages: tids.chunk_pages,
+                chunk_masks: tids.chunk_masks,
+                int32_zero: tids.int32_zero,
+                pages,
+                page_slots: slots,
+                rows: mq,
+                nkvh: g.kv_heads().get(),
+                q_width: g.q_width(),
+                head_size: g.head_dim().get(),
+                walk,
+                paged_rows,
+                extent: query_rows,
+                window: mask.window(),
+                class: class as u32,
+            };
+            match &step_of_class {
+                Some(prev) if prev != &step => {
+                    return Err(SuperDscError(format!(
+                        "the class's attentions disagree about its paged step ({prev:?} vs \
+                         {step:?}) — one page table, one mask stack and one write-row table serve \
+                         every layer of a geometry"
+                    )));
+                }
+                _ => step_of_class = Some(step),
+            }
+        }
+        if let Some(step) = step_of_class {
+            out.push(step);
         }
     }
     Ok(out)
@@ -1897,29 +1941,33 @@ pub fn graph_wiring<T: ktir_superdsc::collective::Tp, F: RopeForm>(
     // weight's STATED cols at the pad while the host stages the real vocab region).
     let tensor_shapes: Vec<(u32, u32)> = tensor_shapes_of_ir(ir)?;
     let paged = paged_step_of_ir(ir, active_cap, paged_rows, query_rows)?;
-    let attn_mask = match (masks.first().copied(), paged) {
-        (Some((_, cap)), Some(p)) => {
+    let attn_mask = match (masks.first().copied(), paged.as_slice()) {
+        (Some((_, cap)), [p, ..]) => {
             // The step's three sources are RESERVED tids (their shapes are the paged step's own
             // statement, not entries of this tid-indexed list).
-            // ⭐ THE MASK IS THE ARM'S OWN FAMILY: the batched kernel reads the step's per-chunk
-            // masks (`tids.chunk_masks`), one table for its one window; the sequence kernels
-            // read window r's own mask stack (`paged_window_tid(r, mask)` — window 0 IS the
-            // step's sentinel `tids.mask`), one per window of the rung's pair. The programs
-            // must have bound EXACTLY that family: a missing window's mask is staged by
-            // nothing, a tid outside the family is a mask staged onto another table.
+            // ⭐ EVERY EMITTED MASK IS ONE CLASS'S — the batched kernel reads its step's per-chunk
+            // masks (`chunk_masks`), one table for its one window; the sequence kernels read
+            // window r's own mask stack of THEIR class (`paged_window_of_class(class, r, mask)` —
+            // window 0 IS the class's own step tables), one per window of the rung's pair. The
+            // programs must have bound EXACTLY the union of the classes' families: a missing
+            // window's mask is staged by nothing, a tid outside them is a mask staged onto
+            // another table.
             let batch = paged_rows == scratchy_triton_splice::PagedRows::Batch;
             let windows = if batch {
                 1
             } else {
                 query_rows.requests().get()
             };
-            let expected: std::collections::BTreeSet<u32> = if batch {
-                std::iter::once(p.chunk_masks).collect()
-            } else {
-                (0..windows)
-                    .map(|r| ktir_superdsc::reserved_tids::paged_window_tid(r, 2))
-                    .collect()
-            };
+            let mut expected: std::collections::BTreeSet<u32> = Default::default();
+            for step in &paged {
+                if batch {
+                    expected.insert(step.chunk_masks);
+                } else {
+                    expected.extend((0..windows).map(|r| {
+                        scratchy_triton_splice::paged_window_of_class(step.class as usize, r, 2)
+                    }));
+                }
+            }
             let bound: std::collections::BTreeSet<u32> =
                 masks.iter().map(|&(tid, _)| tid).collect();
             if bound != expected {
@@ -1930,13 +1978,16 @@ pub fn graph_wiring<T: ktir_superdsc::collective::Tp, F: RopeForm>(
                         .join(", ")
                 };
                 return Err(SuperDscError(format!(
-                    "the attention binds its masks at [{}] but the paged step's {} window(s) \
-                     name [{}] — the step's sources have one family of ids",
+                    "the attention binds its masks at [{}] but the paged step's {} class(es) at {} \
+                     window(s) name [{}] — the step's sources have one family of ids",
                     show(&bound),
+                    paged.len(),
                     windows,
                     show(&expected)
                 )));
             }
+            // The classes share one pool (refused at the mint), so one capacity comparison
+            // serves every class's step.
             if cap as usize != p.capacity() {
                 return Err(SuperDscError(format!(
                     "the attention's K pool holds {cap} slots but the paged step states {} — one \
@@ -1944,11 +1995,11 @@ pub fn graph_wiring<T: ktir_superdsc::collective::Tp, F: RopeForm>(
                     p.capacity()
                 )));
             }
-            // Window 0's tid, the family's first — proven bound above; the family past
-            // window 0 is `paged_window_tid`'s own law, stated once in reserved_tids.
+            // Class 0's window-0 mask, the family's first — proven bound above; the family past
+            // window 0 is `paged_window_of_class`'s own law, stated once in the splice.
             Some(if batch { p.chunk_masks } else { p.mask })
         }
-        (None, None) => None,
+        (None, []) => None,
         (masks, paged) => {
             return Err(SuperDscError(format!(
                 "the attention programs bind masks {masks:?} while the graph's paged step is \
