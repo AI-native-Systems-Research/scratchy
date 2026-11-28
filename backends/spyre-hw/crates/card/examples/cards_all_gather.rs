@@ -20,8 +20,25 @@
 //! consumed by exactly its wait); every `XSEG` entry unchanged (a send never re-points one); RDMA
 //! error status 0.
 //!
+//! The slot is TWO messages wide (`RDMA_MESSAGE_CAP_BYTES` each), and the mode names the exchange's
+//! shape — issue #1429's probe ladder:
+//! - `vendor` (default): the vendor door per pair, one sid per sender, its own windowed loop — the
+//!   shape whose second message the 8-MiB run silently drops;
+//! - `run2`: the production CB shape — two per-message F-sends per pair in ONE `submit_batch`
+//!   (`build_rdma_send_cb`), each message its own sid and landing slot, the run's `first`/`last`
+//!   flags, then one wdone wait per message slot: the exact flush the (1024,1) rung wedges in;
+//! - `alone2`: the fix candidate — the same, every message `RunPlace::ALONE`;
+//! - `split2`: the production shape across TWO doorbells — the sends synchronized on their own,
+//!   then the waits — deciding whether the stuck CB is the message-1 SEND (the sends never
+//!   retire) or the slot-1 WAIT (the sends retire, the waits hang).
+//!
+//! `run2`/`alone2` take a wdone census (every watched sid, on every card) at 1/5/10/30 s after the
+//! doorbell, BEFORE synchronizing: a wait that never satisfies leaves its sid's count wherever the
+//! landing left it — 0 for a message that never landed, 1 for one that landed and was never
+//! consumed — which is the drop-vs-wait split, read while the card is stuck.
+//!
 //! ```text
-//! cargo run --release -p scratchy-target-spyre --features spyre-hw --example cards_all_gather -- <N>
+//! cargo run --release -p scratchy-target-spyre-card --features snt1p0 --example cards_all_gather -- <N> [vendor|run2|alone2|split2]
 //! ```
 //! N cards: the first N of this host's card table (`CardTable`), opened by PCI address.
 
@@ -38,23 +55,36 @@ use flex_rs::dma::{DmaDirection, DmaParams, DmaShaping, HostVirtualAddress};
 use flex_rs::hal_sbf::rdma_xseg;
 use flex_rs::scheduler::{
     DeviceAddressResolver, FlexAllocatorAddressResolver, P2PRdmaSendParams, P2PRdmaWaitParams,
+    RunPlace,
 };
 use flex_rs::stream::{RuntimeStream, RuntimeStreamMode, RuntimeStreamPriority};
-use scratchy_target_spyre::bundle_code::collective::TpWorld;
+use scratchy_target_spyre::bundle_code::collective::{RDMA_MESSAGE_CAP_BYTES, TpWorld, WireBytes};
 use scratchy_target_spyre_card::runtime::CardRuntime as AnyCard;
-use scratchy_target_spyre_card::runtime::{CardTable, WorldCards};
+use scratchy_target_spyre_card::runtime::{
+    BatchedCb, CardTable, Chunk0, DevAddr, RdmaEnd, RdmaSend, Stream, WorldCards,
+};
 
 /// A raw flex-level probe: the cards are driven below the world-typed p2p link, so they are opened
 /// as one card's runtime each.
 type CardRuntime<'a> = AnyCard<'a, TpWorld<1>>;
 
-/// One slot: one card's message.
-const SLOT_BYTES: u64 = 64 * 1024;
+/// One slot: one card's message — TWO of them at the message cap, the width whose second message
+/// the vendor loop drops (#1429).
+const SLOT_BYTES: u64 = 8 << 20;
+/// The wire's message cap: the chunk width of the vendor's windowed loop and of the production
+/// per-message F-sends.
+const CAP: u64 = RDMA_MESSAGE_CAP_BYTES;
+/// The messages one slot's send is, at this width.
+const MSGS: u64 = SLOT_BYTES / CAP;
 
-/// Card `i`'s pattern: distinct per card, so a send landing in another card's slot is a mismatch.
+/// Card `i`'s pattern: distinct per card, and distinct per 4-MiB message of the slot (the
+/// `^ (j >> 22) * 0x5B` term flips every byte of the second half — the bare polynomial repeats
+/// every 4 MiB as a byte, which cannot tell a dropped message from one landed on top of message
+/// 0), so a send landing in another card's slot — or the wrong half of the right one — is a
+/// mismatch.
 fn pattern(i: usize) -> Vec<u8> {
     (0..SLOT_BYTES as usize)
-        .map(|j| ((j * 7 + 3 + 31 * (i + 1)) ^ (j >> 8)) as u8)
+        .map(|j| ((j * 7 + 3 + 31 * (i + 1)) ^ (j >> 8) ^ ((j >> 22) * 0x5B)) as u8)
         .collect()
 }
 
@@ -136,6 +166,27 @@ impl<'a, 'c> Side<'a, 'c> {
         flat_va(self.segment, self.offset_bytes + i as u64 * SLOT_BYTES)
     }
 
+    /// Slot `i`'s message `m`, as its own allocation view — the operand a per-message F-send names
+    /// (`source` and `window` both: the send's window word is its own card's view, the peer's
+    /// sitting at the same address).
+    fn half(&self, i: usize, m: u64) -> DevAddr {
+        let c = self.buf.chunks()[0];
+        DevAddr::from_chunk(Chunk0 {
+            region: c.addr.region_id,
+            offset: ByteOffset(c.addr.offset.0 + i as u64 * SLOT_BYTES + m * CAP),
+            size: ByteSize(CAP),
+            domain: c.domain_id,
+        })
+    }
+
+    /// Where slot `i`'s message `m` lands — the flat VA the receiver's `XSEG[sid]` entry names.
+    fn half_va(&self, i: usize, m: u64) -> u64 {
+        flat_va(
+            self.segment,
+            self.offset_bytes + i as u64 * SLOT_BYTES + m * CAP,
+        )
+    }
+
     fn dma(&self, host: *const u8, len: usize, dir: DmaDirection) -> Result<()> {
         let p = DmaParams::with_explicit_size(
             HostVirtualAddress(host as usize),
@@ -154,12 +205,42 @@ impl<'a, 'c> Side<'a, 'c> {
     }
 }
 
+/// The exchange's shape (issue #1429's probe ladder).
+enum Mode {
+    /// The vendor door per pair — `launch_p2p_rdma_send`'s own windowed loop, one sid per sender.
+    Vendor,
+    /// The production CB shape: per-message F-sends through ONE `submit_batch`, each message its
+    /// own sid and landing slot, the run's `first`/`last` flags, one wdone wait per message slot.
+    Run,
+    /// The fix candidate: the same, every message `RunPlace::ALONE` — each its own complete send.
+    Alone,
+    /// The production shape split across two doorbells: the sends synchronized on their own
+    /// first, then the waits — deciding whether the stuck CB is the message-1 SEND (the sends
+    /// never retire) or the slot-1 WAIT (the sends retire, the waits hang).
+    Split,
+}
+
+impl Mode {
+    /// Sender `i`'s message `m` signals sid `2i + m` (the vendor mode's one sid is the sender's
+    /// index itself).
+    fn sid(i: usize, m: u64) -> u8 {
+        (2 * i as u64 + m) as u8
+    }
+}
+
 fn main() -> Result<()> {
     let n: usize = std::env::args()
         .nth(1)
-        .context("usage: cards_all_gather <N>")?
+        .context("usage: cards_all_gather <N> [vendor|run2|alone2|split2]")?
         .parse()
         .context("N is a card count")?;
+    let mode = match std::env::args().nth(2).as_deref() {
+        None | Some("vendor") => Mode::Vendor,
+        Some("run2") => Mode::Run,
+        Some("alone2") => Mode::Alone,
+        Some("split2") => Mode::Split,
+        Some(other) => bail!("unknown mode {other:?}: vendor | run2 | alone2 | split2"),
+    };
     // ── The cards: the first N of this host's card table, each a world of one (this probe drives
     //    its own link and sends, not a tensor-parallel world). ──
     let table =
@@ -209,12 +290,12 @@ fn main() -> Result<()> {
             .into_iter()
             .map(|r| r.into_first())
             .collect();
-        exchange(&cards, n)
+        exchange(&cards, n, mode)
     })
 }
 
 /// The exchange over the opened runtimes: link, buffers, landing, sends, waits, judgment.
-fn exchange(cards: &[CardRuntime<'_>], n: usize) -> Result<()> {
+fn exchange(cards: &[CardRuntime<'_>], n: usize, mode: Mode) -> Result<()> {
     // ── Link: every card's BAT entry for every peer. ──
     let bar2: Vec<u64> = cards
         .iter()
@@ -250,76 +331,242 @@ fn exchange(cards: &[CardRuntime<'_>], n: usize) -> Result<()> {
             .with_context(|| format!("card {i} H2D"))?;
     }
 
-    // ── Landing: on receiver j, XSEG[sid = sender i] → j's slot i. All before any send. ──
-    let mut xseg = vec![vec![0u32; n]; n];
+    // ── Landing: on receiver j, XSEG[sid = sender i] → j's slot i (vendor), or XSEG[2i+m] → j's
+    //    slot i's half m (the per-message shapes). All before any send. ──
+    let mut xseg = vec![vec![0u32; 2 * n]; n];
     for (j, s) in sides.iter().enumerate() {
         for i in (0..n).filter(|&i| i != j) {
-            let word = rdma_xseg(s.slot_va(i) + Flits::BYTES).map_err(|e| anyhow!("{e}"))?;
-            s.card
-                .card()
-                .write_xseg(i as u8, word)
-                .map_err(|e| anyhow!("card {j} XSEG[{i}]: {e}"))?;
-            let back = s
-                .card
-                .card()
-                .read_xseg(i as u8)
-                .map_err(|e| anyhow!("{e}"))?;
-            ensure!(
-                back == word,
-                "card {j} XSEG[{i}] read back 0x{back:08X}, wrote 0x{word:08X}"
-            );
-            xseg[j][i] = word;
+            let point = |sid: u8, va: u64| -> Result<u32> {
+                let word = rdma_xseg(va + Flits::BYTES).map_err(|e| anyhow!("{e}"))?;
+                s.card
+                    .card()
+                    .write_xseg(sid, word)
+                    .map_err(|e| anyhow!("card {j} XSEG[{sid}]: {e}"))?;
+                let back = s.card.card().read_xseg(sid).map_err(|e| anyhow!("{e}"))?;
+                ensure!(
+                    back == word,
+                    "card {j} XSEG[{sid}] read back 0x{back:08X}, wrote 0x{word:08X}"
+                );
+                Ok(word)
+            };
+            match mode {
+                Mode::Vendor => xseg[j][i] = point(i as u8, s.slot_va(i))?,
+                Mode::Run | Mode::Alone | Mode::Split => {
+                    for m in 0..MSGS {
+                        xseg[j][2 * i + m as usize] = point(Mode::sid(i, m), s.half_va(i, m))?;
+                    }
+                }
+            }
         }
     }
 
-    // ── Send then wait, every card at once: card i's slot i to every peer on sid i, then one
-    //    wait per peer on that peer's sid. ──
+    // ── The exchange. `vendor`: card i's slot i to every peer on sid i through the vendor door,
+    //    then one wait per peer on that peer's sid. `run2`/`alone2`: ONE submit_batch per card —
+    //    card i's slot i, BOTH halves, to every peer (message m on sid 2i+m, the run's flags in
+    //    `run2`, `ALONE` in `alone2`, the CTRL barrier on the batch's first send only), then one
+    //    wdone wait per message slot on its sender's sid — the production flush's own shape. ──
     let t = Instant::now();
-    for (i, s) in sides.iter().enumerate() {
-        for (j, peer) in sides.iter().enumerate().filter(|&(j, _)| j != i) {
-            s.stream
-                .launch_p2p_rdma_send(
-                    P2PRdmaSendParams {
-                        sync_key: format!("ag-{i}-{j}"),
-                        dest_ranks: vec![j as u64],
-                        sid_list: vec![i as u32],
-                        device_address: s.slot(i),
-                        op_name: format!("all-gather {i}->{j}"),
-                        dst_offset: peer.slot_va(i),
-                    },
-                    false,
-                    None,
-                )
-                .map_err(|e| anyhow!("card {i} send to {j}: {e}"))?;
+    match mode {
+        Mode::Vendor => {
+            for (i, s) in sides.iter().enumerate() {
+                for (j, peer) in sides.iter().enumerate().filter(|&(j, _)| j != i) {
+                    s.stream
+                        .launch_p2p_rdma_send(
+                            P2PRdmaSendParams {
+                                sync_key: format!("ag-{i}-{j}"),
+                                dest_ranks: vec![j as u64],
+                                sid_list: vec![i as u32],
+                                device_address: s.slot(i),
+                                op_name: format!("all-gather {i}->{j}"),
+                                dst_offset: peer.slot_va(i),
+                            },
+                            false,
+                            None,
+                        )
+                        .map_err(|e| anyhow!("card {i} send to {j}: {e}"))?;
+                }
+            }
+            // `ONE_WAIT=1`: each card waits ONCE, on every peer's sid in one wait CB (the wdone
+            // barrier's list bitmask) — the question being whether one multi-sid wait consumes one
+            // count per sid.
+            let one_wait = std::env::var_os("ONE_WAIT").is_some();
+            for (j, s) in sides.iter().enumerate() {
+                let peers: Vec<u32> = (0..n).filter(|&i| i != j).map(|i| i as u32).collect();
+                let lists: Vec<Vec<u32>> = if one_wait {
+                    vec![peers]
+                } else {
+                    peers.into_iter().map(|i| vec![i]).collect()
+                };
+                for sid_list in lists {
+                    s.stream
+                        .launch_p2p_rdma_wait(P2PRdmaWaitParams { sid_list }, false, None)
+                        .map_err(|e| anyhow!("card {j} wait: {e}"))?;
+                }
+            }
+            for (j, s) in sides.iter().enumerate() {
+                s.stream
+                    .synchronize()
+                    .map_err(|e| anyhow!("card {j}: synchronize after the exchange: {e}"))?;
+            }
         }
-    }
-    // `ONE_WAIT=1`: each card waits ONCE, on every peer's sid in one wait CB (the wdone barrier's
-    // list bitmask) — the question being whether one multi-sid wait consumes one count per sid.
-    let one_wait = std::env::var_os("ONE_WAIT").is_some();
-    for (j, s) in sides.iter().enumerate() {
-        let peers: Vec<u32> = (0..n).filter(|&i| i != j).map(|i| i as u32).collect();
-        let lists: Vec<Vec<u32>> = if one_wait {
-            vec![peers]
-        } else {
-            peers.into_iter().map(|i| vec![i]).collect()
-        };
-        for sid_list in lists {
-            s.stream
-                .launch_p2p_rdma_wait(P2PRdmaWaitParams { sid_list }, false, None)
-                .map_err(|e| anyhow!("card {j} wait: {e}"))?;
+        Mode::Run | Mode::Alone | Mode::Split => {
+            let cap_msg = WireBytes::new(CAP).context("the message cap is not a legal message")?;
+            let streams: Vec<Stream<'_>> = cards
+                .iter()
+                .map(|c| Stream::create(c).map_err(|e| anyhow!("create stream: {e}")))
+                .collect::<Result<_>>()?;
+            let waits = |me: usize| -> Vec<BatchedCb> {
+                (0..n)
+                    .filter(|&from| from != me)
+                    .flat_map(|from| {
+                        (0..MSGS).map(move |m| BatchedCb::Wait {
+                            sids: vec![Mode::sid(from, m)],
+                        })
+                    })
+                    .collect()
+            };
+            for (i, s) in sides.iter().enumerate() {
+                let mut sends = Vec::new();
+                let mut first_send = true;
+                for k in (0..n).filter(|&k| k != i) {
+                    for m in 0..MSGS {
+                        sends.push(BatchedCb::Send(RdmaSend {
+                            sid: Mode::sid(i, m),
+                            dest_tid: k as u8,
+                            bytes: cap_msg,
+                            source: RdmaEnd {
+                                base: s.half(i, m),
+                                segment: s.segment as u8,
+                                offset: 0,
+                            },
+                            window: RdmaEnd {
+                                base: s.half(i, m),
+                                segment: s.segment as u8,
+                                offset: 0,
+                            },
+                            place: match mode {
+                                Mode::Alone => RunPlace::ALONE,
+                                _ => RunPlace {
+                                    first: m == 0,
+                                    last: m == MSGS - 1,
+                                },
+                            },
+                            barrier: std::mem::replace(&mut first_send, false),
+                        }));
+                    }
+                }
+                match mode {
+                    // `split2`: the sends are their own doorbell, synchronized on their own — a
+                    // hang THERE names the message-1 send as the stuck CB; only once they retire
+                    // do the waits go down.
+                    Mode::Split => {
+                        streams[i]
+                            .submit_batch(&sends, true, None)
+                            .map_err(|e| anyhow!("card {i} sends ({} items): {e}", sends.len()))?;
+                    }
+                    _ => {
+                        let mut items = sends;
+                        items.extend(waits(i));
+                        streams[i]
+                            .submit_batch(&items, true, None)
+                            .map_err(|e| anyhow!("card {i} batch ({} items): {e}", items.len()))?;
+                    }
+                }
+            }
+            if matches!(mode, Mode::Split) {
+                println!(
+                    "split2: sends submitted; synchronizing the sends ALONE (a hang here = the \
+                     message-1 send never retires; retiring sends = the wait is the stuck CB)"
+                );
+                for j in 0..n {
+                    streams[j]
+                        .synchronize()
+                        .map_err(|e| anyhow!("card {j}: synchronize after the sends: {e}"))?;
+                }
+                println!("split2: every card's sends RETIRED");
+                for (j, s) in sides.iter().enumerate() {
+                    let sids: Vec<u8> = (0..n)
+                        .filter(|&i| i != j)
+                        .flat_map(|i| (0..MSGS).map(move |m| Mode::sid(i, m)))
+                        .collect();
+                    let counts = sids
+                        .iter()
+                        .map(|&sid| {
+                            s.card
+                                .card()
+                                .read_wdone(sid)
+                                .map_err(|e| anyhow!("card {j} wdone[{sid}]: {e}"))
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    println!(
+                        "split2 census (sends retired, no waits yet): card {j}: {}",
+                        sids.iter()
+                            .zip(&counts)
+                            .map(|(&sid, wd)| format!("sid{sid}={wd}"))
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    );
+                }
+                println!("split2: submitting the waits (a hang here = the wait cannot consume)");
+                for i in 0..n {
+                    let items = waits(i);
+                    streams[i]
+                        .submit_batch(&items, true, None)
+                        .map_err(|e| anyhow!("card {i} waits ({} items): {e}", items.len()))?;
+                }
+            }
+            // ── The census, BEFORE synchronizing: a wait that never satisfies leaves its sid's
+            //    count wherever the landing left it — 0 for a message that never landed, 1 for one
+            //    that landed and was never consumed. That split is the whole probe. ──
+            let watched: Vec<Vec<u8>> = (0..n)
+                .map(|j| {
+                    (0..n)
+                        .filter(|&i| i != j)
+                        .flat_map(|i| (0..MSGS).map(move |m| Mode::sid(i, m)))
+                        .collect()
+                })
+                .collect();
+            let started = Instant::now();
+            for checkpoint in [1_u64, 5, 10, 30] {
+                let target = std::time::Duration::from_secs(checkpoint);
+                if let Some(remain) = target.checked_sub(started.elapsed()) {
+                    std::thread::sleep(remain);
+                }
+                for (j, s) in sides.iter().enumerate() {
+                    let counts = watched[j]
+                        .iter()
+                        .map(|&sid| {
+                            s.card
+                                .card()
+                                .read_wdone(sid)
+                                .map_err(|e| anyhow!("card {j} wdone[{sid}]: {e}"))
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    println!(
+                        "census t={checkpoint:>2}s card {j}: {}",
+                        watched[j]
+                            .iter()
+                            .zip(&counts)
+                            .map(|(&sid, wd)| format!("sid{sid}={wd}"))
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    );
+                }
+            }
+            println!("synchronizing (a wedged wait hangs here; the census above is the verdict)");
+            for j in 0..n {
+                streams[j]
+                    .synchronize()
+                    .map_err(|e| anyhow!("card {j}: synchronize after the exchange: {e}"))?;
+            }
         }
-    }
-    for (j, s) in sides.iter().enumerate() {
-        s.stream
-            .synchronize()
-            .map_err(|e| anyhow!("card {j}: synchronize after the exchange: {e}"))?;
     }
     let secs = t.elapsed().as_secs_f64();
     let moved = (n * (n - 1)) as u64 * SLOT_BYTES;
     println!(
-        "exchange: {} sends of {} KiB, {:.3} ms, {:.2} GB/s aggregate",
-        n * (n - 1),
-        SLOT_BYTES / 1024,
+        "exchange: {} messages of {} KiB, {:.3} ms, {:.2} GB/s aggregate",
+        n * (n - 1) * MSGS as usize,
+        CAP / 1024,
         secs * 1e3,
         moved as f64 / secs / 1e9
     );
@@ -339,23 +586,22 @@ fn exchange(cards: &[CardRuntime<'_>], n: usize) -> Result<()> {
                 bad += 1;
             }
         }
-        for i in (0..n).filter(|&i| i != j) {
-            let wd = s
-                .card
-                .card()
-                .read_wdone(i as u8)
-                .map_err(|e| anyhow!("{e}"))?;
-            let xs = s
-                .card
-                .card()
-                .read_xseg(i as u8)
-                .map_err(|e| anyhow!("{e}"))?;
+        let sids: Vec<(u8, usize)> = match mode {
+            Mode::Vendor => (0..n).filter(|&i| i != j).map(|i| (i as u8, i)).collect(),
+            Mode::Run | Mode::Alone | Mode::Split => (0..n)
+                .filter(|&i| i != j)
+                .flat_map(|i| (0..MSGS).map(move |m| (Mode::sid(i, m), 2 * i + m as usize)))
+                .collect(),
+        };
+        for (sid, xs_idx) in sids {
+            let wd = s.card.card().read_wdone(sid).map_err(|e| anyhow!("{e}"))?;
+            let xs = s.card.card().read_xseg(sid).map_err(|e| anyhow!("{e}"))?;
             if wd != 0 {
-                println!("card {j} sid {i}: wdone {wd} left over after its wait");
+                println!("card {j} sid {sid}: wdone {wd} left over after its wait");
                 bad += 1;
             }
-            if xs != xseg[j][i] {
-                println!("card {j} XSEG[{i}] re-pointed to 0x{xs:08X}");
+            if xs != xseg[j][xs_idx] {
+                println!("card {j} XSEG[{sid}] re-pointed to 0x{xs:08X}");
                 bad += 1;
             }
         }

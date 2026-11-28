@@ -1,16 +1,18 @@
 #!/usr/bin/env bash
 # ⭐ THE CARD-HOST GATE: every check CI used to run on backends/spyre-hw that must
-# COMPILE senlib-rs's flex-rs. The workspace resolves flex-rs by path into a sibling
+# COMPILE senlib-rs's flex-rs, plus the card runs that prove the transport live. The
+# workspace resolves flex-rs by path into a sibling
 # senlib-rs checkout (IBM-internal git — a card host fact), so no GitHub runner can
 # run these; CI's counterpart (scripts/ci-senlib-stub.sh) covers the steps that only
 # resolve. Run this on a card host, from anywhere in the scratchy tree:
 #
 #   scripts/spyre-hw-card-gate.sh
 #
-# It fails loudly (never skips) when the sibling checkout is absent. Nothing here
-# links the card runtime — clippy and compile-only doctests — so the export-controlled
-# stub senlib-rs names is enough; no `--config patches/oco.toml` (that route is for
-# the builds that link: the card binary, the card leg).
+# It fails loudly (never skips) when the sibling checkout is absent. Everything here
+# but the last leg is clippy and compile-only doctests — the export-controlled stub
+# senlib-rs names is enough for those; the last leg LINKS and RUNS on the cards
+# (`cards_all_gather alone2`, #1429's count law), so it takes the oco route
+# (`--config patches/oco.toml`) the card binary's builds take.
 set -euo pipefail
 
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -58,3 +60,17 @@ SCRATCHY_SKIP_SENDNN_CXX=1 cargo clippy -p scratchy-target-spyre-cli \
 
 # The card crate's compile_fail doctests (the nightly job's leg).
 SCRATCHY_SKIP_SENDNN_CXX=1 cargo +nightly test --doc -p scratchy-target-spyre-card --features snt1p0
+
+# ⭐ THE COUNT LAW, LIVE ON THE CARDS (#1429): the wdone counter bumps once per run,
+# on the last message, on the sid that message carries — so every message of a
+# multi-message send must be its own complete send (`RunPlace::ALONE`). `alone2` is
+# the 8-MiB two-message all-gather through the production CB path (per-message
+# F-sends, one wdone wait per slot) and must pass byte-exact; the run-flags shape it
+# replaces wedges the card — zero completions, no error — which is the defect this
+# leg exists to keep out. The one leg here that links and runs: it takes the oco
+# route, like every link-bearing build.
+SCRATCHY_SKIP_SENDNN_CXX=1 cargo --config patches/oco.toml build --release \
+    --example cards_all_gather -p scratchy-target-spyre-card --features snt1p0
+DEEPTOOLS_PATH=/opt/ibm/spyre/deeptools/share \
+LD_LIBRARY_PATH="/opt/ibm/spyre/senlib/lib:/opt/ibm/spyre/runtime/lib:/opt/ibm/spyre/deeptools/lib:/opt/ibm/spyre/spyre-comms/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+    target/release/examples/cards_all_gather 4 alone2
